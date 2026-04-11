@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TX_BIN="${SCRIPT_DIR}/tx"
+
 usage() {
   cat <<'EOF'
-Usage: ./bench.sh SOURCE_DIRECTORY [options]
+Usage: ./run SOURCE_DIRECTORY [options]
 
 Arguments:
   SOURCE_DIRECTORY           Remote source directory for copy (required).
@@ -14,11 +17,11 @@ Options:
   --discard                  Alias for --skip-write.
   --flamegraph               Run copy benchmark under perf and emit flamegraph SVG.
   --trace                    Capture runtime/trace for client and server (view with go tool trace).
-  --build                    Build ./tx before benchmarking (default: true).
+  --build                    Build local ./tx before benchmarking (default: true).
   --no-build                 Skip build step.
   --server-url ADDR          File listener address for CLI (default: 127.0.0.1:3453).
   --server-startup-timeout S Seconds to wait for file listener readiness (default: 30).
-  --target-dir PATH          Target directory for copy (default: bench/data/dst).
+  --target-dir PATH          Target directory for copy (default: data/dst).
   --skip-fsync               Skip fdatasync after each file/window (passed to copy).
   --no-sync                  Alias for --skip-fsync.
   --concurrency N            Copy command concurrency (default: adaptive).
@@ -54,6 +57,19 @@ require_value() {
   fi
 }
 
+abs_path() {
+  local raw="$1"
+  if [[ -z "${raw}" ]]; then
+    echo "empty path" >&2
+    exit 2
+  fi
+  if [[ "${raw}" == /* ]]; then
+    printf '%s\n' "${raw}"
+    return
+  fi
+  printf '%s/%s\n' "$(pwd)" "${raw}"
+}
+
 BUILD=true
 FLAMEGRAPH=false
 TRACE=false
@@ -62,7 +78,7 @@ SKIP_WRITE=false
 SERVER_URL="127.0.0.1:3453"
 SERVER_STARTUP_TIMEOUT_SEC=30
 SOURCE_DIRECTORY=""
-TARGET_DIR="bench/data/dst"
+TARGET_DIR="data/dst"
 CONCURRENCY=""
 ENCRYPT_MODE=""
 COMPRESS_MODE=""
@@ -88,6 +104,7 @@ if [[ $# -lt 1 || "${1:-}" == --* ]]; then
 fi
 SOURCE_DIRECTORY="$1"
 shift
+SOURCE_DIRECTORY="$(abs_path "${SOURCE_DIRECTORY}")"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -205,7 +222,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-require_cmd go
 require_cmd rm
 require_cmd time
 
@@ -239,8 +255,12 @@ fi
 
 # ── tx mode ────────────────────────────────────────────────────────────
 if [[ "$BUILD" == "true" ]]; then
-  echo "Building tx..."
-  go build -o tx ./cmd/tx
+  require_cmd go
+  echo "Building local tx into ${TX_BIN}..."
+  go build -o "${TX_BIN}" ../cmd/tx
+elif [[ ! -x "${TX_BIN}" ]]; then
+  echo "missing local tx binary: ${TX_BIN} (run 'make -C .. build-bench' or omit --no-build)" >&2
+  exit 1
 fi
 
 SERVER_IN="/tmp/tx/in"
@@ -305,14 +325,14 @@ start_server() {
   read -r host port < <(split_host_port "${SERVER_URL}")
   mkdir -p "${SERVER_IN}" "${SERVER_OUT}" "${SERVER_KEYS}"
   echo "Starting server in background..."
-  local server_args=(filesrv -l "${SERVER_URL}" -k "${SERVER_KEYS}")
+  local server_args=(send -l "${SERVER_URL}" -k "${SERVER_KEYS}")
   if [[ "${TRACE}" == "true" ]]; then
     server_args+=(--trace "${SERVER_TRACE}")
   fi
   if [[ "${DISABLE_ZERO_COPY}" == "true" ]]; then
     server_args+=(--disable-zero-copy)
   fi
-  ./tx "${server_args[@]}" >"${SERVER_LOG}" 2>&1 &
+  "${TX_BIN}" "${server_args[@]}" >"${SERVER_LOG}" 2>&1 &
   SERVER_PID=$!
   SERVER_APP_PID="${SERVER_PID}"
 
@@ -345,7 +365,7 @@ echo "bench: source=${SOURCE_DIRECTORY} target=${TARGET_DIR}"
 echo "Cleaning prior benchmark output..."
 rm -rf "${TARGET_DIR}/" "${STATE_DIR}/"
 
-COPY_CMD=(./tx filecli "${SERVER_URL}" copy)
+COPY_CMD=("${TX_BIN}" recv "${SERVER_URL}" copy)
 if [[ -n "${CONCURRENCY}" ]]; then
   COPY_CMD+=(--concurrency "${CONCURRENCY}")
 fi
@@ -368,7 +388,7 @@ COPY_CMD+=("${SOURCE_DIRECTORY}" "${TARGET_DIR}")
 
 if [[ "$FLAMEGRAPH" != "true" ]]; then
   echo "Running timed copy benchmark..."
-  { time "${COPY_CMD[@]}" 2>/dev/null | awk '!/^start-file: /'; } 2>&1
+  { time "${COPY_CMD[@]}" | awk '!/^start-file: /'; } 2>&1
   if [[ "${TRACE}" == "true" ]]; then
     echo "Client trace written to: ${CLIENT_TRACE}  (view with: go tool trace ${CLIENT_TRACE})"
     echo "Server trace written to: ${SERVER_TRACE}  (view with: go tool trace ${SERVER_TRACE})"

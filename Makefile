@@ -10,6 +10,7 @@ build:
 build-bench:
 	@mkdir -p bench
 	go build -o bench/bench ./internal/bench
+	CGO_ENABLED=0 go build -a -tags netgo -ldflags='-s -w -extldflags "-static"' -o bench/tx ./cmd/tx
 
 test: build unit acceptance
 
