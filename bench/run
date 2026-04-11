@@ -9,8 +9,8 @@ Arguments:
   SOURCE_DIRECTORY           Remote source directory for copy (required).
 
 Options:
-  --rsync                    Run an rsync baseline instead of a pinch copy.
-  --skip-write               Benchmark pinch copy with --skip-write (no target-dir writes).
+  --rsync                    Run an rsync baseline instead of a tx copy.
+  --skip-write               Benchmark tx copy with --skip-write (no target-dir writes).
   --discard                  Alias for --skip-write.
   --flamegraph               Run copy benchmark under perf and emit flamegraph SVG.
   --trace                    Capture runtime/trace for client and server (view with go tool trace).
@@ -18,7 +18,7 @@ Options:
   --no-build                 Skip build step.
   --server-url ADDR          File listener address for CLI (default: 127.0.0.1:3453).
   --server-startup-timeout S Seconds to wait for file listener readiness (default: 30).
-  --target-dir PATH          Target directory for copy (default: /var/lib/pinch/data).
+  --target-dir PATH          Target directory for copy (default: bench/data/dst).
   --skip-fsync               Skip fdatasync after each file/window (passed to copy).
   --no-sync                  Alias for --skip-fsync.
   --concurrency N            Copy command concurrency (default: adaptive).
@@ -26,14 +26,14 @@ Options:
   --compress MODE            Compression mode passed to copy (adapt|none|lz4|zstd).
   --disable-zero-copy        Force server to use buffered send path (no tee/splice).
   --freq HZ                  perf sample frequency (default: 199).
-  --perf-data PATH           perf.data output path (default: /tmp/pinch-copy.perf.data).
-  --flamegraph-svg PATH      Flamegraph SVG output path (default: /tmp/pinch-copy.svg).
-  --server-perf-data PATH    Server perf.data output path (default: /tmp/pinch-server.perf.data).
+  --perf-data PATH           perf.data output path (default: /tmp/tx-copy.perf.data).
+  --flamegraph-svg PATH      Flamegraph SVG output path (default: /tmp/tx-copy.svg).
+  --server-perf-data PATH    Server perf.data output path (default: /tmp/tx-server.perf.data).
   --server-flamegraph-svg PATH
-                             Server flamegraph SVG output path (default: /tmp/pinch-server.svg).
+                             Server flamegraph SVG output path (default: /tmp/tx-server.svg).
   --flamegraph-dir PATH      Path to FlameGraph repo (optional if scripts on PATH).
-  --client-trace PATH        Client trace output path (default: /tmp/pinch-copy.trace).
-  --server-trace PATH        Server trace output path (default: /tmp/pinch-server.trace).
+  --client-trace PATH        Client trace output path (default: /tmp/tx-copy.trace).
+  --server-trace PATH        Server trace output path (default: /tmp/tx-server.trace).
   -h, --help                 Show help.
 EOF
 }
@@ -62,20 +62,20 @@ SKIP_WRITE=false
 SERVER_URL="127.0.0.1:3453"
 SERVER_STARTUP_TIMEOUT_SEC=30
 SOURCE_DIRECTORY=""
-TARGET_DIR="/var/lib/pinch/data"
+TARGET_DIR="bench/data/dst"
 CONCURRENCY=""
 ENCRYPT_MODE=""
 COMPRESS_MODE=""
 DISABLE_ZERO_COPY=false
 SKIP_FSYNC=false
 PERF_FREQ="199"
-PERF_DATA="/tmp/pinch-copy.perf.data"
-FLAMEGRAPH_SVG="/tmp/pinch-copy.svg"
-SERVER_PERF_DATA="/tmp/pinch-server.perf.data"
-SERVER_FLAMEGRAPH_SVG="/tmp/pinch-server.svg"
+PERF_DATA="/tmp/tx-copy.perf.data"
+FLAMEGRAPH_SVG="/tmp/tx-copy.svg"
+SERVER_PERF_DATA="/tmp/tx-server.perf.data"
+SERVER_FLAMEGRAPH_SVG="/tmp/tx-server.svg"
 FLAMEGRAPH_DIR=""
-CLIENT_TRACE="/tmp/pinch-copy.trace"
-SERVER_TRACE="/tmp/pinch-server.trace"
+CLIENT_TRACE="/tmp/tx-copy.trace"
+SERVER_TRACE="/tmp/tx-server.trace"
 
 if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
   usage
@@ -214,7 +214,7 @@ if [[ -n "${ENCRYPT_MODE}" && "${ENCRYPT_MODE}" != "auto" && "${ENCRYPT_MODE}" !
   exit 2
 fi
 if [[ "${RSYNC}" == "true" && "${SKIP_WRITE}" == "true" ]]; then
-  echo "--skip-write is only supported for pinch copy benchmarks, not --rsync" >&2
+  echo "--skip-write is only supported for tx copy benchmarks, not --rsync" >&2
   exit 2
 fi
 
@@ -237,16 +237,16 @@ if [[ "${RSYNC}" == "true" ]]; then
   exit 0
 fi
 
-# ── pinch mode ────────────────────────────────────────────────────────────
+# ── tx mode ────────────────────────────────────────────────────────────
 if [[ "$BUILD" == "true" ]]; then
   echo "Building tx..."
   go build -o tx ./cmd/tx
 fi
 
-SERVER_IN="/tmp/pinch/in"
-SERVER_OUT="/tmp/pinch/out"
-SERVER_KEYS="/tmp/pinch/keys"
-SERVER_LOG="/tmp/pinch-bench-server.log"
+SERVER_IN="/tmp/tx/in"
+SERVER_OUT="/tmp/tx/out"
+SERVER_KEYS="/tmp/tx/keys"
+SERVER_LOG="/tmp/tx-bench-server.log"
 SERVER_PID=""
 SERVER_APP_PID=""
 SERVER_PERF_PID=""
@@ -331,7 +331,7 @@ start_server_perf() {
     exit 1
   fi
   echo "Recording async server perf profile (sudo may prompt)..."
-  sudo perf record -o "${SERVER_PERF_DATA}" -F "${PERF_FREQ}" -g --call-graph fp -p "${SERVER_APP_PID}" >/tmp/pinch-server-perf.log 2>&1 &
+  sudo perf record -o "${SERVER_PERF_DATA}" -F "${PERF_FREQ}" -g --call-graph fp -p "${SERVER_APP_PID}" >/tmp/tx-server-perf.log 2>&1 &
   SERVER_PERF_PID=$!
 }
 
