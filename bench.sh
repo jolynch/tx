@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: ./bench.sh SOURCE_DIRECTORY [options]
+
+Arguments:
+  SOURCE_DIRECTORY           Remote source directory for copy (required).
+
+Options:
+  --rsync                    Run an rsync baseline instead of a pinch copy.
+  --skip-write               Benchmark pinch copy with --skip-write (no target-dir writes).
+  --discard                  Alias for --skip-write.
+  --flamegraph               Run copy benchmark under perf and emit flamegraph SVG.
+  --trace                    Capture runtime/trace for client and server (view with go tool trace).
+  --build                    Build ./tx before benchmarking (default: true).
+  --no-build                 Skip build step.
+  --server-url ADDR          File listener address for CLI (default: 127.0.0.1:3453).
+  --server-startup-timeout S Seconds to wait for file listener readiness (default: 30).
+  --target-dir PATH          Target directory for copy (default: /var/lib/pinch/data).
+  --skip-fsync               Skip fdatasync after each file/window (passed to copy).
+  --no-sync                  Alias for --skip-fsync.
+  --concurrency N            Copy command concurrency (default: adaptive).
+  --encrypt MODE             Client encryption mode (supported: auto|aes|chacha20).
+  --compress MODE            Compression mode passed to copy (adapt|none|lz4|zstd).
+  --disable-zero-copy        Force server to use buffered send path (no tee/splice).
+  --freq HZ                  perf sample frequency (default: 199).
+  --perf-data PATH           perf.data output path (default: /tmp/pinch-copy.perf.data).
+  --flamegraph-svg PATH      Flamegraph SVG output path (default: /tmp/pinch-copy.svg).
+  --server-perf-data PATH    Server perf.data output path (default: /tmp/pinch-server.perf.data).
+  --server-flamegraph-svg PATH
+                             Server flamegraph SVG output path (default: /tmp/pinch-server.svg).
+  --flamegraph-dir PATH      Path to FlameGraph repo (optional if scripts on PATH).
+  --client-trace PATH        Client trace output path (default: /tmp/pinch-copy.trace).
+  --server-trace PATH        Server trace output path (default: /tmp/pinch-server.trace).
+  -h, --help                 Show help.
+EOF
+}
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+require_value() {
+  local opt="$1"
+  if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
+    echo "missing value for ${opt}" >&2
+    usage >&2
+    exit 2
+  fi
+}
+
+BUILD=true
+FLAMEGRAPH=false
+TRACE=false
+RSYNC=false
+SKIP_WRITE=false
+SERVER_URL="127.0.0.1:3453"
+SERVER_STARTUP_TIMEOUT_SEC=30
+SOURCE_DIRECTORY=""
+TARGET_DIR="/var/lib/pinch/data"
+CONCURRENCY=""
+ENCRYPT_MODE=""
+COMPRESS_MODE=""
+DISABLE_ZERO_COPY=false
+SKIP_FSYNC=false
+PERF_FREQ="199"
+PERF_DATA="/tmp/pinch-copy.perf.data"
+FLAMEGRAPH_SVG="/tmp/pinch-copy.svg"
+SERVER_PERF_DATA="/tmp/pinch-server.perf.data"
+SERVER_FLAMEGRAPH_SVG="/tmp/pinch-server.svg"
+FLAMEGRAPH_DIR=""
+CLIENT_TRACE="/tmp/pinch-copy.trace"
+SERVER_TRACE="/tmp/pinch-server.trace"
+
+if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
+  usage
+  exit 0
+fi
+if [[ $# -lt 1 || "${1:-}" == --* ]]; then
+  echo "missing required argument: SOURCE_DIRECTORY" >&2
+  usage >&2
+  exit 2
+fi
+SOURCE_DIRECTORY="$1"
+shift
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --flamegraph)
+      FLAMEGRAPH=true
+      shift
+      ;;
+    --rsync)
+      RSYNC=true
+      shift
+      ;;
+    --skip-write|--discard)
+      SKIP_WRITE=true
+      shift
+      ;;
+    --trace)
+      TRACE=true
+      shift
+      ;;
+    --client-trace)
+      require_value "$1" "${2:-}"
+      CLIENT_TRACE="$2"
+      shift 2
+      ;;
+    --server-trace)
+      require_value "$1" "${2:-}"
+      SERVER_TRACE="$2"
+      shift 2
+      ;;
+    --build)
+      BUILD=true
+      shift
+      ;;
+    --no-build)
+      BUILD=false
+      shift
+      ;;
+    --server-url)
+      require_value "$1" "${2:-}"
+      SERVER_URL="$2"
+      shift 2
+      ;;
+    --server-startup-timeout)
+      require_value "$1" "${2:-}"
+      SERVER_STARTUP_TIMEOUT_SEC="$2"
+      shift 2
+      ;;
+    --target-dir)
+      require_value "$1" "${2:-}"
+      TARGET_DIR="$2"
+      shift 2
+      ;;
+    --skip-fsync|--no-sync)
+      SKIP_FSYNC=true
+      shift
+      ;;
+    --concurrency)
+      require_value "$1" "${2:-}"
+      CONCURRENCY="$2"
+      shift 2
+      ;;
+    --encrypt)
+      require_value "$1" "${2:-}"
+      ENCRYPT_MODE="$2"
+      shift 2
+      ;;
+    --compress)
+      require_value "$1" "${2:-}"
+      COMPRESS_MODE="$2"
+      shift 2
+      ;;
+    --disable-zero-copy)
+      DISABLE_ZERO_COPY=true
+      shift
+      ;;
+    --freq)
+      require_value "$1" "${2:-}"
+      PERF_FREQ="$2"
+      shift 2
+      ;;
+    --perf-data)
+      require_value "$1" "${2:-}"
+      PERF_DATA="$2"
+      shift 2
+      ;;
+    --flamegraph-svg)
+      require_value "$1" "${2:-}"
+      FLAMEGRAPH_SVG="$2"
+      shift 2
+      ;;
+    --server-perf-data)
+      require_value "$1" "${2:-}"
+      SERVER_PERF_DATA="$2"
+      shift 2
+      ;;
+    --server-flamegraph-svg)
+      require_value "$1" "${2:-}"
+      SERVER_FLAMEGRAPH_SVG="$2"
+      shift 2
+      ;;
+    --flamegraph-dir)
+      require_value "$1" "${2:-}"
+      FLAMEGRAPH_DIR="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+require_cmd go
+require_cmd rm
+require_cmd time
+
+if [[ -n "${ENCRYPT_MODE}" && "${ENCRYPT_MODE}" != "auto" && "${ENCRYPT_MODE}" != "aes" && "${ENCRYPT_MODE}" != "chacha20" ]]; then
+  echo "unsupported --encrypt value: ${ENCRYPT_MODE} (supported: auto, aes, chacha20)" >&2
+  exit 2
+fi
+if [[ "${RSYNC}" == "true" && "${SKIP_WRITE}" == "true" ]]; then
+  echo "--skip-write is only supported for pinch copy benchmarks, not --rsync" >&2
+  exit 2
+fi
+
+# ── rsync baseline mode ──────────────────────────────────────────────────
+if [[ "${RSYNC}" == "true" ]]; then
+  require_cmd rsync
+  echo "bench (rsync baseline): source=${SOURCE_DIRECTORY} target=${TARGET_DIR}"
+  rm -rf "${TARGET_DIR}/"
+  mkdir -p "${TARGET_DIR}"
+
+  RSYNC_CMD=(rsync -aW --no-compress --info=progress2)
+  if [[ "${SKIP_FSYNC}" != "true" ]]; then
+    RSYNC_CMD+=(--fsync)
+  fi
+  # Trailing slash on source so rsync copies contents, not the directory itself.
+  RSYNC_CMD+=("${SOURCE_DIRECTORY%/}/" "${TARGET_DIR%/}/")
+
+  echo "Running: ${RSYNC_CMD[*]}"
+  { time "${RSYNC_CMD[@]}"; } 2>&1
+  exit 0
+fi
+
+# ── pinch mode ────────────────────────────────────────────────────────────
+if [[ "$BUILD" == "true" ]]; then
+  echo "Building tx..."
+  go build -o tx ./cmd/tx
+fi
+
+SERVER_IN="/tmp/pinch/in"
+SERVER_OUT="/tmp/pinch/out"
+SERVER_KEYS="/tmp/pinch/keys"
+SERVER_LOG="/tmp/pinch-bench-server.log"
+SERVER_PID=""
+SERVER_APP_PID=""
+SERVER_PERF_PID=""
+
+stop_server_perf() {
+  if [[ -n "${SERVER_PERF_PID}" ]] && kill -0 "${SERVER_PERF_PID}" >/dev/null 2>&1; then
+    sudo kill -INT "${SERVER_PERF_PID}" >/dev/null 2>&1 || true
+    wait "${SERVER_PERF_PID}" >/dev/null 2>&1 || true
+  fi
+}
+
+cleanup_server() {
+  stop_server_perf
+  if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
+    kill "${SERVER_PID}" >/dev/null 2>&1 || true
+    wait "${SERVER_PID}" >/dev/null 2>&1 || true
+  fi
+}
+
+split_host_port() {
+  local addr="$1"
+  local host="${addr%:*}"
+  local port="${addr##*:}"
+  if [[ -z "${host}" || -z "${port}" || "${host}" == "${addr}" ]]; then
+    echo "invalid --server-url address: ${addr}; expected host:port" >&2
+    exit 2
+  fi
+  echo "${host}" "${port}"
+}
+
+wait_for_file_listener() {
+  local host="$1"
+  local port="$2"
+  local attempts=$(( SERVER_STARTUP_TIMEOUT_SEC * 10 ))
+  if (( attempts < 1 )); then
+    attempts=1
+  fi
+  for _ in $(seq 1 "${attempts}"); do
+    if (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1; then
+      exec 3>&-
+      exec 3<&-
+      return 0
+    fi
+    if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
+      echo "server exited before becoming ready; log: ${SERVER_LOG}" >&2
+      tail -n 50 "${SERVER_LOG}" >&2 || true
+      exit 1
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+start_server() {
+  local host port
+  read -r host port < <(split_host_port "${SERVER_URL}")
+  mkdir -p "${SERVER_IN}" "${SERVER_OUT}" "${SERVER_KEYS}"
+  echo "Starting server in background..."
+  local server_args=(filesrv -l "${SERVER_URL}" -k "${SERVER_KEYS}")
+  if [[ "${TRACE}" == "true" ]]; then
+    server_args+=(--trace "${SERVER_TRACE}")
+  fi
+  if [[ "${DISABLE_ZERO_COPY}" == "true" ]]; then
+    server_args+=(--disable-zero-copy)
+  fi
+  ./tx "${server_args[@]}" >"${SERVER_LOG}" 2>&1 &
+  SERVER_PID=$!
+  SERVER_APP_PID="${SERVER_PID}"
+
+  if wait_for_file_listener "${host}" "${port}"; then
+    echo "Server is ready at ${SERVER_URL}"
+    return
+  fi
+  echo "server did not become ready in ${SERVER_STARTUP_TIMEOUT_SEC}s; log: ${SERVER_LOG}" >&2
+  tail -n 50 "${SERVER_LOG}" >&2 || true
+  exit 1
+}
+
+start_server_perf() {
+  if [[ -z "${SERVER_APP_PID}" ]]; then
+    echo "missing server pid for async perf record" >&2
+    exit 1
+  fi
+  echo "Recording async server perf profile (sudo may prompt)..."
+  sudo perf record -o "${SERVER_PERF_DATA}" -F "${PERF_FREQ}" -g --call-graph fp -p "${SERVER_APP_PID}" >/tmp/pinch-server-perf.log 2>&1 &
+  SERVER_PERF_PID=$!
+}
+
+trap cleanup_server EXIT INT TERM
+start_server
+
+PARENT_DIR="$(dirname "${TARGET_DIR}")"
+STATE_DIR="${PARENT_DIR}/.pinch"
+
+echo "bench: source=${SOURCE_DIRECTORY} target=${TARGET_DIR}"
+echo "Cleaning prior benchmark output..."
+rm -rf "${TARGET_DIR}/" "${STATE_DIR}/"
+
+COPY_CMD=(./tx filecli "${SERVER_URL}" copy)
+if [[ -n "${CONCURRENCY}" ]]; then
+  COPY_CMD+=(--concurrency "${CONCURRENCY}")
+fi
+if [[ -n "${ENCRYPT_MODE}" ]]; then
+  COPY_CMD+=(--encrypt "${ENCRYPT_MODE}")
+fi
+if [[ -n "${COMPRESS_MODE}" ]]; then
+  COPY_CMD+=(--compress "${COMPRESS_MODE}")
+fi
+if [[ "${SKIP_WRITE}" == "true" ]]; then
+  COPY_CMD+=(--skip-write)
+fi
+if [[ "${SKIP_FSYNC}" == "true" ]]; then
+  COPY_CMD+=(--skip-fsync)
+fi
+if [[ "${TRACE}" == "true" ]]; then
+  COPY_CMD+=(--trace "${CLIENT_TRACE}")
+fi
+COPY_CMD+=("${SOURCE_DIRECTORY}" "${TARGET_DIR}")
+
+if [[ "$FLAMEGRAPH" != "true" ]]; then
+  echo "Running timed copy benchmark..."
+  { time "${COPY_CMD[@]}" 2>/dev/null | awk '!/^start-file: /'; } 2>&1
+  if [[ "${TRACE}" == "true" ]]; then
+    echo "Client trace written to: ${CLIENT_TRACE}  (view with: go tool trace ${CLIENT_TRACE})"
+    echo "Server trace written to: ${SERVER_TRACE}  (view with: go tool trace ${SERVER_TRACE})"
+  else
+    echo "Flamegraph disabled. Re-run with --flamegraph to generate ${FLAMEGRAPH_SVG} and ${SERVER_FLAMEGRAPH_SVG}."
+  fi
+  exit 0
+fi
+
+require_cmd perf
+
+STACKCOLLAPSE="stackcollapse-perf.pl"
+FLAMEGRAPH_PL="flamegraph.pl"
+if [[ -n "$FLAMEGRAPH_DIR" ]]; then
+  STACKCOLLAPSE="${FLAMEGRAPH_DIR%/}/stackcollapse-perf.pl"
+  FLAMEGRAPH_PL="${FLAMEGRAPH_DIR%/}/flamegraph.pl"
+fi
+
+if ! command -v "$STACKCOLLAPSE" >/dev/null 2>&1 && [[ ! -x "$STACKCOLLAPSE" ]]; then
+  echo "missing stackcollapse-perf.pl; set --flamegraph-dir or add it to PATH" >&2
+  exit 1
+fi
+if ! command -v "$FLAMEGRAPH_PL" >/dev/null 2>&1 && [[ ! -x "$FLAMEGRAPH_PL" ]]; then
+  echo "missing flamegraph.pl; set --flamegraph-dir or add it to PATH" >&2
+  exit 1
+fi
+
+PERF_TXT="${PERF_DATA}.txt"
+PERF_FOLDED="${PERF_DATA}.folded"
+SERVER_PERF_TXT="${SERVER_PERF_DATA}.txt"
+SERVER_PERF_FOLDED="${SERVER_PERF_DATA}.folded"
+
+echo "Recording perf profile (sudo may prompt)..."
+start_server_perf
+sudo perf record -o "${PERF_DATA}" -F "${PERF_FREQ}" -g --call-graph fp -- "${COPY_CMD[@]}"
+stop_server_perf
+
+echo "Generating client flamegraph..."
+sudo perf script -i "${PERF_DATA}" > "${PERF_TXT}"
+"${STACKCOLLAPSE}" "${PERF_TXT}" > "${PERF_FOLDED}"
+"${FLAMEGRAPH_PL}" "${PERF_FOLDED}" > "${FLAMEGRAPH_SVG}"
+
+echo "Generating server flamegraph..."
+sudo perf script -i "${SERVER_PERF_DATA}" > "${SERVER_PERF_TXT}"
+"${STACKCOLLAPSE}" "${SERVER_PERF_TXT}" > "${SERVER_PERF_FOLDED}"
+"${FLAMEGRAPH_PL}" "${SERVER_PERF_FOLDED}" > "${SERVER_FLAMEGRAPH_SVG}"
+
+echo "Flamegraph written to: ${FLAMEGRAPH_SVG}"
+echo "Server flamegraph written to: ${SERVER_FLAMEGRAPH_SVG}"
+echo "Perf data written to: ${PERF_DATA}"
+echo "Server perf data written to: ${SERVER_PERF_DATA}"

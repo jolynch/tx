@@ -1,0 +1,157 @@
+package ftcp
+
+import (
+	"errors"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/jolynch/tx/internal/filexfer/limit"
+	intstore "github.com/jolynch/tx/internal/filexfer/store"
+)
+
+type Transfer = intstore.Transfer
+type TransferFileState = intstore.TransferFileState
+type TransferFileStateUpdate = intstore.TransferFileStateUpdate
+type FileRef = intstore.FileRef
+type FileLookupError = intstore.FileLookupError
+type TransferObservedLinkUpdate = intstore.TransferObservedLinkUpdate
+
+const (
+	TransferStateStarted = intstore.TransferStateStarted
+	TransferStateRunning = intstore.TransferStateRunning
+	TransferStateDone    = intstore.TransferStateDone
+	TransferStateMissing = intstore.TransferStateMissing
+)
+
+type Deps interface {
+	NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, error)
+	DeleteTransfer(txferID string) bool
+	RegisterTransferFileState(txferID string, updatesCh <-chan TransferFileStateUpdate, state uint8) <-chan struct{}
+	ClipTransfer(txferID string) bool
+
+	GetTransfer(txferID string) (Transfer, bool)
+	ListTransfers() []Transfer
+	SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool
+	GetTransferGentleLimiter(txferID string, fallbackLinkMbps int64, gentleBWPct int, burstBytes int64) *limit.Limiter
+	ReportTransferObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool)
+	GetTransferLimiterBps(txferID string) int64
+	GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error)
+	GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error)
+
+	SetTransferFileState(txferID string, fileID uint64, state uint8) bool
+	SetTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool
+	VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool
+	AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool
+
+	SetTransferDeadline(txferID string, deadlineMS int64) bool
+	RecordTransferFirstSend(txferID string) (time.Time, bool)
+	MarkTransferTooSlow(txferID string) bool
+
+	Root() string
+}
+
+type runtimeDeps struct {
+	rootDir string
+}
+
+func NewRuntimeDeps() Deps {
+	return runtimeDeps{rootDir: "/"}
+}
+
+func NewRuntimeDepsWithRoot(root string) Deps {
+	if root == "" {
+		root = "/"
+	}
+	return runtimeDeps{rootDir: filepath.Clean(root)}
+}
+
+func (d runtimeDeps) Root() string { return d.rootDir }
+
+func (runtimeDeps) NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, error) {
+	return intstore.NewTransfer(directory, numFiles, totalSize)
+}
+
+func (runtimeDeps) DeleteTransfer(txferID string) bool {
+	return intstore.DeleteTransfer(txferID)
+}
+
+func (runtimeDeps) RegisterTransferFileState(txferID string, updatesCh <-chan TransferFileStateUpdate, state uint8) <-chan struct{} {
+	return intstore.RegisterTransferFileState(txferID, updatesCh, state)
+}
+
+func (runtimeDeps) ClipTransfer(txferID string) bool {
+	return intstore.ClipTransfer(txferID)
+}
+
+func (runtimeDeps) GetTransfer(txferID string) (Transfer, bool) {
+	return intstore.GetTransfer(txferID)
+}
+
+func (runtimeDeps) ListTransfers() []Transfer {
+	return intstore.ListTransfers()
+}
+
+func (runtimeDeps) SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
+	return intstore.SetTransferHints(txferID, mode, linkMbps, concurrency)
+}
+
+func (runtimeDeps) GetTransferGentleLimiter(txferID string, fallbackLinkMbps int64, gentleBWPct int, burstBytes int64) *limit.Limiter {
+	return intstore.GetTransferGentleLimiter(txferID, fallbackLinkMbps, gentleBWPct, burstBytes)
+}
+
+func (runtimeDeps) ReportTransferObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool) {
+	return intstore.ReportTransferObservedLink(txferID, observedLinkMbps, gentleBWPct, burstBytes, emaAlpha)
+}
+
+func (runtimeDeps) GetTransferLimiterBps(txferID string) int64 {
+	return intstore.GetTransferLimiterBps(txferID)
+}
+
+func (runtimeDeps) GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error) {
+	return intstore.GetFile(txferID, fileID, fullPathRaw)
+}
+
+func (runtimeDeps) GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {
+	return intstore.GetFileRef(txferID, fileID, fullPathRaw)
+}
+
+func (runtimeDeps) SetTransferFileState(txferID string, fileID uint64, state uint8) bool {
+	return intstore.SetTransferFileState(txferID, fileID, state)
+}
+
+func (runtimeDeps) SetTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool {
+	return intstore.SetTransferFileWindowHash(txferID, fileID, endBytes, hashToken)
+}
+
+func (runtimeDeps) VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool {
+	return intstore.VerifyTransferFileWindowHash(txferID, fileID, endBytes, hashToken)
+}
+
+func (runtimeDeps) AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool {
+	return intstore.AcknowledgeTransferFile(txferID, fileID, ackBytes)
+}
+
+func (runtimeDeps) SetTransferDeadline(txferID string, deadlineMS int64) bool {
+	return intstore.SetTransferDeadline(txferID, deadlineMS)
+}
+
+func (runtimeDeps) RecordTransferFirstSend(txferID string) (time.Time, bool) {
+	return intstore.RecordTransferFirstSend(txferID)
+}
+
+func (runtimeDeps) MarkTransferTooSlow(txferID string) bool {
+	return intstore.MarkTransferTooSlow(txferID)
+}
+
+func mapLookupError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var lookupErr *intstore.FileLookupError
+	if errors.As(err, &lookupErr) {
+		return protocolErr{code: mapHTTPErrorCode(lookupErr.Code), message: lookupErr.Msg}
+	}
+	return protocolErr{code: mapHTTPErrorCode(http.StatusInternalServerError), message: "internal server error"}
+}
