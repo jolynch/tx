@@ -1,0 +1,4 @@
+tx
+.codex
+**/testdata/fuzz/
+**/testdata/fuzz/**
