@@ -3,7 +3,7 @@ package policy
 import (
 	"time"
 
-	"github.com/jolynch/pinch/internal/filexfer/encoding"
+	"github.com/jolynch/tx/server/internal/filexfer/encoding"
 )
 
 type CompressionMode uint8

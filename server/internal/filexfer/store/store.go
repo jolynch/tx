@@ -14,9 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
-	"github.com/jolynch/pinch/internal/filexfer/limit"
-	"github.com/jolynch/pinch/internal/filexfer/policy"
+	intencoding "github.com/jolynch/tx/server/internal/filexfer/encoding"
+	"github.com/jolynch/tx/server/internal/filexfer/limit"
+	"github.com/jolynch/tx/server/internal/filexfer/policy"
 	"github.com/zeebo/xxh3"
 )
 

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
+	intencoding "github.com/jolynch/tx/server/internal/filexfer/encoding"
 	"golang.org/x/time/rate"
 )
 

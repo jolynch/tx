@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"filippo.io/age"
-	"github.com/jolynch/pinch/internal/aead"
-	ftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
-	intlimit "github.com/jolynch/pinch/internal/filexfer/limit"
+	"github.com/jolynch/tx/server/internal/aead"
+	ftcp "github.com/jolynch/tx/server/internal/filexfer/ftcp"
+	intlimit "github.com/jolynch/tx/server/internal/filexfer/limit"
 )
 
 const maxTCPLineBytes = 4 * 1024 * 1024

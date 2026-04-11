@@ -22,9 +22,9 @@ import (
 	"unsafe"
 
 	"filippo.io/age"
-	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
-	intlimit "github.com/jolynch/pinch/internal/filexfer/limit"
-	"github.com/jolynch/pinch/utils"
+	intencoding "github.com/jolynch/tx/server/internal/filexfer/encoding"
+	intlimit "github.com/jolynch/tx/server/internal/filexfer/limit"
+	"github.com/jolynch/tx/server/utils"
 	"github.com/zeebo/xxh3"
 )
 

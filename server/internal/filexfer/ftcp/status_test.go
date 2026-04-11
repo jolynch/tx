@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jolynch/pinch/internal/filexfer/limit"
+	"github.com/jolynch/tx/server/internal/filexfer/limit"
 )
 
 type fakeDeps struct {

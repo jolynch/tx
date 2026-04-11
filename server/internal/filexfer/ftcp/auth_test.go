@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"filippo.io/age"
-	"github.com/jolynch/pinch/internal/aead"
+	"github.com/jolynch/tx/server/internal/aead"
 )
 
 func TestResolveAuthCipher(t *testing.T) {

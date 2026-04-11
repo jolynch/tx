@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jolynch/pinch/internal/filexfer/encoding"
+	"github.com/jolynch/tx/server/internal/filexfer/encoding"
 	"github.com/zeebo/xxh3"
 )
 

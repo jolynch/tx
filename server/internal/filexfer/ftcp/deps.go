@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/jolynch/pinch/internal/filexfer/limit"
-	intstore "github.com/jolynch/pinch/internal/filexfer/store"
+	"github.com/jolynch/tx/server/internal/filexfer/limit"
+	intstore "github.com/jolynch/tx/server/internal/filexfer/store"
 )
 
 type Transfer = intstore.Transfer

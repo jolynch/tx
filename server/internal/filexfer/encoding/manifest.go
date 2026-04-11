@@ -10,7 +10,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/jolynch/pinch/utils"
+	"github.com/jolynch/tx/server/utils"
 )
 
 // Entry type constants for the manifest wire format.

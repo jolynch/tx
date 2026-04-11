@@ -19,9 +19,9 @@ import (
 	"testing"
 	"time"
 
-	intencoding "github.com/jolynch/pinch/internal/filexfer/encoding"
-	intftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
-	"github.com/jolynch/pinch/utils"
+	intencoding "github.com/jolynch/tx/server/internal/filexfer/encoding"
+	intftcp "github.com/jolynch/tx/server/internal/filexfer/ftcp"
+	"github.com/jolynch/tx/server/utils"
 	"github.com/zeebo/xxh3"
 )
 

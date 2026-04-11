@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"filippo.io/age"
-	"github.com/jolynch/pinch/internal/aead"
-	"github.com/jolynch/pinch/internal/filexfer"
-	"github.com/jolynch/pinch/internal/filexfer/limit"
+	"github.com/jolynch/tx/server/internal/aead"
+	"github.com/jolynch/tx/server/internal/filexfer"
+	"github.com/jolynch/tx/server/internal/filexfer/limit"
 )
 
 const (

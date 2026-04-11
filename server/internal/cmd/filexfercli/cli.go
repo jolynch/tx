@@ -25,9 +25,9 @@ import (
 	"sync/atomic"
 
 	"filippo.io/age"
-	. "github.com/jolynch/pinch/filexfer"
-	"github.com/jolynch/pinch/internal/filexfer"
-	"github.com/jolynch/pinch/internal/filexfer/encoding"
+	. "github.com/jolynch/tx/server/filexfer"
+	"github.com/jolynch/tx/server/internal/filexfer"
+	"github.com/jolynch/tx/server/internal/filexfer/encoding"
 	"github.com/zeebo/xxh3"
 )
 

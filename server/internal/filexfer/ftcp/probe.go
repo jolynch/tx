@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jolynch/pinch/internal/filexfer/encoding"
-	"github.com/jolynch/pinch/internal/filexfer/limit"
-	"github.com/jolynch/pinch/utils"
+	"github.com/jolynch/tx/server/internal/filexfer/encoding"
+	"github.com/jolynch/tx/server/internal/filexfer/limit"
+	"github.com/jolynch/tx/server/utils"
 )
 
 const maxProbeBytes int64 = 32 * 1024 * 1024

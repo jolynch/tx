@@ -20,11 +20,11 @@ import (
 	"time"
 
 	"filippo.io/age"
-	. "github.com/jolynch/pinch/filexfer"
-	"github.com/jolynch/pinch/internal/aead"
-	intfilexfer "github.com/jolynch/pinch/internal/filexfer"
-	"github.com/jolynch/pinch/internal/filexfer/encoding"
-	intftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
+	. "github.com/jolynch/tx/server/filexfer"
+	"github.com/jolynch/tx/server/internal/aead"
+	intfilexfer "github.com/jolynch/tx/server/internal/filexfer"
+	"github.com/jolynch/tx/server/internal/filexfer/encoding"
+	intftcp "github.com/jolynch/tx/server/internal/filexfer/ftcp"
 	"github.com/zeebo/xxh3"
 )
 
