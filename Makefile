@@ -1,4 +1,4 @@
-.PHONY: all acceptance build test unit bench
+.PHONY: all acceptance build build-bench test unit bench
 
 FUZZTIME ?= 5s
 
@@ -6,6 +6,10 @@ all: build test
 
 build:
 	CGO_ENABLED=0 go build -a -tags netgo -ldflags='-s -w -extldflags "-static"' -o tx ./cmd/tx
+
+build-bench:
+	@mkdir -p bench
+	go build -o bench/bench ./internal/bench
 
 test: build unit acceptance
 
