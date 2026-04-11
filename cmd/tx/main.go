@@ -122,8 +122,8 @@ func printUsage() {
 	fmt.Fprint(os.Stderr, `usage: tx <command> [options]
 
 Commands:
-  filesrv    Start the file transfer TCP server
-  filecli    File transfer CLI client
+  send       Start the file transfer TCP server
+  recv       File transfer CLI client
 
 Run 'tx <command> --help' for command-specific options.
 `)
@@ -135,9 +135,9 @@ func main() {
 		os.Exit(2)
 	}
 	switch os.Args[1] {
-	case "filecli":
+	case "recv":
 		os.Exit(filexfercli.RunCLI(os.Args[2:], os.Stdout, os.Stderr))
-	case "filesrv":
+	case "send":
 		os.Exit(runFileSrv(os.Args[2:]))
 	case "--help", "-h", "help":
 		printUsage()
@@ -149,10 +149,10 @@ func main() {
 }
 
 func runFileSrv(args []string) int {
-	fs := flag.NewFlagSet("filesrv", flag.ContinueOnError)
+	fs := flag.NewFlagSet("send", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `usage: pinch filesrv [options]
+		fmt.Fprint(os.Stderr, `usage: tx send [options]
 
 Start the file transfer TCP server.
 

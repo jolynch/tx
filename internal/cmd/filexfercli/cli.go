@@ -379,7 +379,7 @@ func validateServerURL(raw string) error {
 }
 
 func printCLIUsage(w io.Writer) {
-	fmt.Fprintf(w, `usage: pinch filecli [<addr>] <command> [options]
+	fmt.Fprintf(w, `usage: tx recv [<addr>] <command> [options]
 
 Commands:
   copy       Copy REMOTE_SRC to LOCAL_DST
@@ -388,7 +388,7 @@ Commands:
 
 State is stored in <local-dst>/../.tx/ (manifest, progress, staging).
 Default server address: %s
-Run 'pinch filecli <command> --help' for command-specific options.
+Run 'tx recv <command> --help' for command-specific options.
 `, defaultFileListener)
 }
 
@@ -554,7 +554,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf := newCLIFlags("copy")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch filecli [addr] copy [flags] REMOTE_SRC LOCAL_DST")
+		fmt.Fprintln(stderr, "usage: tx recv [addr] copy [flags] REMOTE_SRC LOCAL_DST")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Copy REMOTE_SRC from the remote to LOCAL_DST on the local machine.")
 		fmt.Fprintln(stderr)
@@ -1147,7 +1147,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	cf := newCLIFlags("transfer")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch filecli transfer -s <dir> [flags] <target-dir>")
+		fmt.Fprintln(stderr, "usage: tx recv transfer -s <dir> [flags] <target-dir>")
 		cf.PrintDefaults(stderr)
 	}
 	var sourceDir string
@@ -1313,7 +1313,7 @@ func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.W
 	cf := newCLIFlags("status")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch filecli [addr] status [--tid <id>] [LOCAL_DST]")
+		fmt.Fprintln(stderr, "usage: tx recv [addr] status [--tid <id>] [LOCAL_DST]")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Query and monitor transfer progress.")
 		fmt.Fprintln(stderr)
@@ -1538,7 +1538,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	cf := newCLIFlags("get")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch filecli [addr] get [flags] REMOTE_PATH")
+		fmt.Fprintln(stderr, "usage: tx recv [addr] get [flags] REMOTE_PATH")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Download a single remote file. REMOTE_PATH must be an absolute path to a file")
 		fmt.Fprintln(stderr, "on the server. Output defaults to the file's basename in the current directory.")
@@ -1760,7 +1760,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf := newCLIFlags("sync")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch filecli sync [-s <dir>] [flags] <target-dir>")
+		fmt.Fprintln(stderr, "usage: tx recv sync [-s <dir>] [flags] <target-dir>")
 		cf.PrintDefaults(stderr)
 	}
 	var sourceDir string
@@ -2217,7 +2217,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	cf := newCLIFlags("start")
 	cf.SetOutput(stderr)
 	cf.fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: pinch filecli start [flags] <target-dir>")
+		fmt.Fprintln(stderr, "usage: tx recv start [flags] <target-dir>")
 		cf.PrintDefaults(stderr)
 	}
 	var encryptMode string

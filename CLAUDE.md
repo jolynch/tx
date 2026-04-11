@@ -16,7 +16,7 @@ This document covers the protocol, server, client library, and testing conventio
     CLI.md                         # CLI usage reference
 
 cmd/tx/
-  main.go                          # Binary entrypoint: filesrv and filecli subcommands
+  main.go                          # Binary entrypoint: send and recv subcommands
 
 internal/filexfer/
   ftcp/                            # Server-side FTCP command handlers

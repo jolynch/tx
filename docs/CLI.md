@@ -1,6 +1,6 @@
 # File Transfer CLI
 
-This document describes the current `pinch filecli` command line, the
+This document describes the current `tx recv` command line, the
 high-level copy workflow, and the `fast` / `gentle` transfer strategies used by
 the transfer layer.
 
@@ -15,7 +15,7 @@ The file transfer CLI currently exposes three public commands:
 Top-level usage:
 
 ```text
-pinch filecli [<addr>] <command> [options]
+tx recv [<addr>] <command> [options]
 ```
 
 - `<addr>` defaults to `127.0.0.1:3453`
@@ -33,7 +33,7 @@ The state directory contains:
 `copy` is the main entry point.
 
 ```text
-pinch filecli [<addr>] copy [flags] REMOTE_SRC LOCAL_DST
+tx recv [<addr>] copy [flags] REMOTE_SRC LOCAL_DST
 ```
 
 Behavior:
@@ -47,12 +47,12 @@ Behavior:
 Common examples:
 
 ```bash
-pinch filecli copy /srv/data /var/lib/pinch/data
-pinch filecli copy --clean /srv/data /var/lib/pinch/data
-pinch filecli copy --mode gentle /srv/data /var/lib/pinch/data
-pinch filecli copy --verify-meta /srv/data /var/lib/pinch/data
-pinch filecli copy --verify-data-sample 5 /srv/data /var/lib/pinch/data
-pinch filecli copy --deadline 30m /srv/data /var/lib/pinch/data
+tx recv copy /srv/data /var/lib/pinch/data
+tx recv copy --clean /srv/data /var/lib/pinch/data
+tx recv copy --mode gentle /srv/data /var/lib/pinch/data
+tx recv copy --verify-meta /srv/data /var/lib/pinch/data
+tx recv copy --verify-data-sample 5 /srv/data /var/lib/pinch/data
+tx recv copy --deadline 30m /srv/data /var/lib/pinch/data
 ```
 
 Important flags:
@@ -86,13 +86,13 @@ Typical pattern:
 1. Run a bounded first pass:
 
    ```bash
-   pinch filecli copy --deadline 30m --mode gentle /srv/data /var/lib/pinch/data
+   tx recv copy --deadline 30m --mode gentle /srv/data /var/lib/pinch/data
    ```
 
 2. Run the same command again in fast mode to get deltas:
 
    ```bash
-   pinch filecli copy /srv/data /var/lib/pinch/data
+   tx recv copy /srv/data /var/lib/pinch/data
    ```
 
 3. Keep rerunning until the sync phase reports:
@@ -116,7 +116,7 @@ If you want an explicit final check, add `--verify-meta` to the last run.
 `status` queries transfer progress. It supports three modes:
 
 ```text
-pinch filecli [<addr>] status [--tid <id>] [LOCAL_DST]
+tx recv [<addr>] status [--tid <id>] [LOCAL_DST]
 ```
 
 - **With `LOCAL_DST`**: reads `.tx/manifest.server` for the transfer ID and
@@ -127,9 +127,9 @@ pinch filecli [<addr>] status [--tid <id>] [LOCAL_DST]
 Examples:
 
 ```bash
-pinch filecli status /var/lib/pinch/data
-pinch filecli status --tid bc17bc4e
-pinch filecli status
+tx recv status /var/lib/pinch/data
+tx recv status --tid bc17bc4e
+tx recv status
 ```
 
 ## `get`
@@ -137,7 +137,7 @@ pinch filecli status
 `get` downloads a single remote file by its absolute server path.
 
 ```text
-pinch filecli [<addr>] get [flags] REMOTE_PATH
+tx recv [<addr>] get [flags] REMOTE_PATH
 ```
 
 - `REMOTE_PATH` must be an absolute path to a file on the server.
@@ -146,10 +146,10 @@ pinch filecli [<addr>] get [flags] REMOTE_PATH
 Examples:
 
 ```bash
-pinch filecli get /srv/data/file.bin
-pinch filecli get -o /tmp/out.bin /srv/data/file.bin
-pinch filecli get -o - /srv/data/file.bin          # write to stdout
-pinch filecli get --skip-write /srv/data/file.bin   # fetch without writing
+tx recv get /srv/data/file.bin
+tx recv get -o /tmp/out.bin /srv/data/file.bin
+tx recv get -o - /srv/data/file.bin          # write to stdout
+tx recv get --skip-write /srv/data/file.bin   # fetch without writing
 ```
 
 Important flags:
