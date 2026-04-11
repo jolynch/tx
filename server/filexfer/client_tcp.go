@@ -1,0 +1,967 @@
+package filexfer
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+
+	"filippo.io/age"
+	"github.com/jolynch/pinch/internal/aead"
+	ftcp "github.com/jolynch/pinch/internal/filexfer/ftcp"
+	intlimit "github.com/jolynch/pinch/internal/filexfer/limit"
+)
+
+const maxTCPLineBytes = 4 * 1024 * 1024
+
+type tcpAuthState struct {
+	publicKey      string // client's age public key
+	identity       string // client's age identity (private key)
+	parsedIdentity age.Identity
+	serverKey      string // server's age public key (discovered via AUTH key)
+	hasAuth        bool
+	encMode        string // resolved cipher: "aes" or "chacha20"
+}
+
+type probeResponse struct {
+	ServerCPU       int
+	ServerIODepth   int
+	GentleCPUPct    int
+	GentleBWPct     int
+	CTS0            int64
+	CTS1            int64
+	STS0            int64
+	STS1            int64
+	ProbeBytes      int64
+	ServerWmemBytes int64
+	LimiterBps      int64
+}
+
+func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
+	if c == nil {
+		return nil, errors.New("nil client")
+	}
+	addr := strings.TrimSpace(c.FileAddr)
+	if addr == "" {
+		return nil, errors.New("missing file listener address")
+	}
+	dialer := c.contextDialer
+	if dialer == nil {
+		dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+			if c.SocketReadBufferBytes > 0 {
+				_ = tc.SetReadBuffer(c.SocketReadBufferBytes)
+			}
+		}
+		return conn, nil
+	}
+	conn, err := dialer(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+		if c.SocketReadBufferBytes > 0 {
+			_ = tc.SetReadBuffer(c.SocketReadBufferBytes)
+		}
+	}
+	return conn, nil
+}
+
+func makeLenToken(raw string) string {
+	return strconv.Itoa(len(raw)) + ":" + raw
+}
+
+func parseErrControlFrame(line string) error {
+	code, msg, ok := parseErrControlPayload(line)
+	if !ok {
+		return nil
+	}
+	return controlFrameError{Code: code, Message: msg}
+}
+
+type controlFrameError struct {
+	Code    string
+	Message string
+}
+
+func (e controlFrameError) Error() string {
+	if strings.TrimSpace(e.Message) == "" {
+		return e.Code
+	}
+	return strings.TrimSpace(e.Code + " " + e.Message)
+}
+
+func parseErrControlPayload(line string) (code string, message string, ok bool) {
+	msg := strings.TrimSpace(line)
+	if msg == "" {
+		return "", "", false
+	}
+	if strings.HasPrefix(msg, "ERR ") {
+		rest := strings.TrimSpace(strings.TrimPrefix(msg, "ERR "))
+		if rest == "" {
+			return "ERR", "", true
+		}
+		code, message, hasMessage := strings.Cut(rest, " ")
+		if !hasMessage {
+			return strings.TrimSpace(code), "", true
+		}
+		return strings.TrimSpace(code), strings.TrimSpace(message), true
+	}
+	return "", "", false
+}
+
+func parseOKStatusLine(line string) (message string, ok bool) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "OK" {
+		return "", true
+	}
+	if strings.HasPrefix(trimmed, "OK ") {
+		return strings.TrimSpace(strings.TrimPrefix(trimmed, "OK ")), true
+	}
+	return "", false
+}
+
+func isStatusLine(line string) bool {
+	if _, ok := parseOKStatusLine(line); ok {
+		return true
+	}
+	_, _, ok := parseErrControlPayload(line)
+	return ok
+}
+
+func readTCPLine(br *bufio.Reader, maxBytes int) (string, error) {
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	if maxBytes > 0 && len(line) > maxBytes {
+		return "", errors.New("line too large")
+	}
+	line = strings.TrimSuffix(line, "\n")
+	line = strings.TrimSuffix(line, "\r")
+	return line, nil
+}
+
+func writeTCPLine(w io.Writer, line string) error {
+	_, err := io.WriteString(w, line+"\r\n")
+	return err
+}
+
+func (c *Client) resolveTCPAuthState(ctx context.Context) (tcpAuthState, error) {
+	encMode := strings.ToLower(strings.TrimSpace(c.EncryptMode))
+	if encMode == "" || encMode == "none" {
+		return tcpAuthState{}, nil
+	}
+	if encMode != "auto" && encMode != "aes" && encMode != "chacha20" {
+		return tcpAuthState{}, fmt.Errorf("unsupported encrypt mode: %s", encMode)
+	}
+
+	// Generate ephemeral client identity if not provided.
+	requestPub := strings.TrimSpace(c.ClientAgePublicKey)
+	requestIdentity := strings.TrimSpace(c.ClientAgeIdentity)
+	if requestPub == "" || requestIdentity == "" {
+		identity, err := age.GenerateX25519Identity()
+		if err != nil {
+			return tcpAuthState{}, fmt.Errorf("generate age identity: %w", err)
+		}
+		requestPub = identity.Recipient().String()
+		requestIdentity = identity.String()
+	}
+
+	parsed, err := parseAgeIdentity(requestIdentity)
+	if err != nil {
+		return tcpAuthState{}, err
+	}
+
+	// Discover the server's public key and recommended cipher via AUTH key.
+	recommendedCipher, serverKey, err := c.discoverServerKey(ctx)
+	if err != nil {
+		return tcpAuthState{}, fmt.Errorf("discover server key: %w", err)
+	}
+
+	// Resolve "auto" to the server's recommended cipher.
+	if encMode == "auto" {
+		encMode = recommendedCipher
+	}
+
+	return tcpAuthState{
+		publicKey:      requestPub,
+		identity:       requestIdentity,
+		parsedIdentity: parsed,
+		serverKey:      serverKey,
+		hasAuth:        true,
+		encMode:        encMode,
+	}, nil
+}
+
+// discoverServerKey sends AUTH key on a fresh connection and reads back the
+// server's recommended cipher and public key from the OK response.
+// Response format: "OK <cipher> <pubkey>\r\n"
+func (c *Client) discoverServerKey(ctx context.Context) (recommendedCipher string, serverKey string, err error) {
+	conn, dialErr := c.dialTCP(ctx)
+	if dialErr != nil {
+		return "", "", fmt.Errorf("dial for key exchange: %w", dialErr)
+	}
+	defer conn.Close()
+	if err := writeTCPLine(conn, "AUTH key"); err != nil {
+		return "", "", err
+	}
+	br := bufio.NewReader(conn)
+	line, err := readTCPLine(br, maxTCPLineBytes)
+	if err != nil {
+		return "", "", fmt.Errorf("read key exchange response: %w", err)
+	}
+	msg, ok := parseOKStatusLine(line)
+	if !ok {
+		if lineErr := parseErrControlFrame(line); lineErr != nil {
+			return "", "", lineErr
+		}
+		return "", "", fmt.Errorf("unexpected key exchange response: %s", line)
+	}
+	parts := strings.Fields(msg)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("malformed AUTH key response: expected '<cipher> <pubkey>', got %q", msg)
+	}
+	cipher := parts[0]
+	key := parts[1]
+	if cipher != "aes" && cipher != "chacha20" {
+		return "", "", fmt.Errorf("unsupported server cipher: %s", cipher)
+	}
+	if _, err := age.ParseX25519Recipient(key); err != nil {
+		return "", "", fmt.Errorf("invalid server public key: %w", err)
+	}
+	return cipher, key, nil
+}
+
+func (c *Client) sendTCPAuth(conn net.Conn, state tcpAuthState) error {
+	if !state.hasAuth {
+		return nil
+	}
+	recipient, err := age.ParseX25519Recipient(state.serverKey)
+	if err != nil {
+		return fmt.Errorf("parse server key: %w", err)
+	}
+	// Encrypt the client's public key to the server using AEAD.
+	encrypted := c.acquireScratchBuffer(0)
+	defer c.releaseScratchBuffer(encrypted)
+	ew, encErr := aead.Encrypt(encrypted, recipient, aeadOptionsForMode(state.encMode))
+	if encErr != nil {
+		return encErr
+	}
+	if _, err := ew.Write([]byte(state.publicKey)); err != nil {
+		return err
+	}
+	if err := ew.Close(); err != nil {
+		return err
+	}
+	encoded := base64.StdEncoding.EncodeToString(encrypted.Bytes())
+	return writeTCPLine(conn, "AUTH "+state.encMode+" "+encoded)
+}
+
+func aeadOptionsForMode(mode string) aead.Options {
+	switch mode {
+	case "aes":
+		return aead.Options{Algorithm: aead.AlgorithmAES}
+	case "chacha20":
+		return aead.Options{Algorithm: aead.AlgorithmChaCha20}
+	default:
+		return aead.Options{} // RecommendedCipher
+	}
+}
+
+func (c *Client) sendTCPCommand(conn net.Conn, state tcpAuthState, payload string) error {
+	if !state.hasAuth {
+		return writeTCPLine(conn, payload)
+	}
+	recipient, err := age.ParseX25519Recipient(state.serverKey)
+	if err != nil {
+		return err
+	}
+	ew, err := aead.Encrypt(conn, recipient, aeadOptionsForMode(state.encMode))
+	if err != nil {
+		return err
+	}
+	if err := writeTCPLine(ew, payload); err != nil {
+		_ = ew.Close()
+		return err
+	}
+	return ew.Close()
+}
+
+func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Reader, error) {
+	if !state.hasAuth {
+		return conn, nil
+	}
+	identity := state.parsedIdentity
+	if identity == nil {
+		return nil, errors.New("missing identity for encrypted response")
+	}
+	decReader, err := aead.Decrypt(conn, identity)
+	if err != nil {
+		return nil, fmt.Errorf("decryption failed: %w", err)
+	}
+	return decReader, nil
+}
+
+// dialAndAuth resolves auth state, dials a TCP connection, and sends the
+// AUTH handshake. The caller is responsible for closing the returned connection.
+func (c *Client) dialAndAuth(ctx context.Context) (net.Conn, tcpAuthState, error) {
+	state, err := c.resolveTCPAuthState(ctx)
+	if err != nil {
+		return nil, tcpAuthState{}, err
+	}
+	conn, err := c.dialTCP(ctx)
+	if err != nil {
+		return nil, tcpAuthState{}, fmt.Errorf("dial file listener: %w", err)
+	}
+	if err := c.sendTCPAuth(conn, state); err != nil {
+		conn.Close()
+		return nil, tcpAuthState{}, fmt.Errorf("send AUTH: %w", err)
+	}
+	return conn, state, nil
+}
+
+// sendAndReadTCP sends a command on the connection and returns a buffered
+// reader for the (possibly decrypted) response stream.
+func (c *Client) sendAndReadTCP(conn net.Conn, state tcpAuthState, cmd string) (*bufio.Reader, error) {
+	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
+		return nil, err
+	}
+	responseReader, err := c.responseReaderForTCP(conn, state)
+	if err != nil {
+		return nil, err
+	}
+	return bufio.NewReader(responseReader), nil
+}
+
+func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {
+	conn, state, err := c.dialAndAuth(ctx)
+	if err != nil {
+		return GetManifestResponse{}, err
+	}
+	defer conn.Close()
+
+	cmd := "TXFER " + makeLenToken(request.Directory)
+	if request.Verbose {
+		cmd += " verbose=1"
+	}
+	if request.MaxChunkSize > 0 {
+		cmd += " max-manifest-chunk-size=" + strconv.Itoa(request.MaxChunkSize)
+	}
+	cmd += " mode=" + request.Mode
+	cmd += " link-mbps=" + strconv.FormatInt(request.LinkMbps, 10)
+	cmd += " concurrency=" + strconv.Itoa(request.Concurrency)
+	if request.DeadlineMS > 0 {
+		cmd += " deadline-ms=" + strconv.FormatInt(request.DeadlineMS, 10)
+	}
+	br, err := c.sendAndReadTCP(conn, state, cmd)
+	if err != nil {
+		return GetManifestResponse{}, fmt.Errorf("TXFER: %w", err)
+	}
+
+	raw := c.acquireScratchBuffer(maxTCPLineBytes)
+	defer c.releaseScratchBuffer(raw)
+	for {
+		line, err := readTCPLine(br, maxTCPLineBytes)
+		if err != nil {
+			return GetManifestResponse{}, fmt.Errorf("read TXFER response: %w", err)
+		}
+		if message, ok := parseOKStatusLine(line); ok {
+			_ = message
+			manifest, err := parseManifest(raw.Bytes())
+			if err != nil {
+				return GetManifestResponse{}, err
+			}
+			return GetManifestResponse{Manifest: manifest}, nil
+		}
+		if err := parseErrControlFrame(line); err != nil {
+			return GetManifestResponse{}, err
+		}
+		raw.WriteString(line)
+		raw.WriteByte('\n')
+	}
+}
+
+func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestRequest) (SyncManifestResponse, error) {
+	conn, state, err := c.dialAndAuth(ctx)
+	if err != nil {
+		return SyncManifestResponse{}, err
+	}
+	defer conn.Close()
+
+	// Send SYNC command line.
+	cmd := "SYNC " + makeLenToken(request.Directory) +
+		" mode=" + request.Mode +
+		" link-mbps=" + strconv.FormatInt(request.LinkMbps, 10) +
+		" concurrency=" + strconv.Itoa(request.Concurrency)
+	if request.DeadlineMS > 0 {
+		cmd += " deadline-ms=" + strconv.FormatInt(request.DeadlineMS, 10)
+	}
+	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("send SYNC: %w", err)
+	}
+
+	// Send old manifest body followed by blank line terminator.
+	oldManifestBytes, err := marshalManifest(request.OldManifest)
+	if err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("marshal old manifest: %w", err)
+	}
+	if _, err := conn.Write(oldManifestBytes); err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("write old manifest: %w", err)
+	}
+	if _, err := io.WriteString(conn, "\r\n"); err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("write manifest terminator: %w", err)
+	}
+
+	// Build ID→path index from the old manifest so we can resolve RM fileIDs.
+	oldByID := make(map[uint64]string, len(request.OldManifest.Entries))
+	for _, e := range request.OldManifest.Entries {
+		oldByID[e.ID] = e.Path
+	}
+
+	// Read response: FM/1 lines, then RM lines, then OK.
+	responseReader, err := c.responseReaderForTCP(conn, state)
+	if err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("initialize SYNC response stream: %w", err)
+	}
+	br := bufio.NewReader(responseReader)
+
+	manifestBuf := c.acquireScratchBuffer(maxTCPLineBytes)
+	defer c.releaseScratchBuffer(manifestBuf)
+	var rmPaths []string
+
+	for {
+		line, err := readTCPLine(br, maxTCPLineBytes)
+		if err != nil {
+			return SyncManifestResponse{}, fmt.Errorf("read SYNC response: %w", err)
+		}
+		if _, ok := parseOKStatusLine(line); ok {
+			manifest, parseErr := parseManifest(manifestBuf.Bytes())
+			if parseErr != nil {
+				return SyncManifestResponse{}, parseErr
+			}
+			return SyncManifestResponse{
+				Manifest:     manifest,
+				RemovedPaths: rmPaths,
+			}, nil
+		}
+		if err := parseErrControlFrame(line); err != nil {
+			return SyncManifestResponse{}, err
+		}
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "RM ") {
+			fileID, parseErr := strconv.ParseUint(trimmed[3:], 10, 64)
+			if parseErr != nil {
+				return SyncManifestResponse{}, fmt.Errorf("parse RM line: %w", parseErr)
+			}
+			path, ok := oldByID[fileID]
+			if !ok {
+				return SyncManifestResponse{}, fmt.Errorf("RM fileID %d not in old manifest", fileID)
+			}
+			rmPaths = append(rmPaths, path)
+			continue
+		}
+		// FM/1 header or manifest entry line.
+		manifestBuf.WriteString(line)
+		manifestBuf.WriteByte('\n')
+	}
+}
+
+func (c *Client) fetchFileWindowTCP(
+	ctx context.Context,
+	txferID string,
+	fileID uint64,
+	fullPath string,
+	offset int64,
+	size int64,
+) (io.ReadCloser, *FileFrameMeta, error) {
+	if txferID == "" {
+		return nil, nil, errors.New("missing transfer id")
+	}
+	if fullPath == "" {
+		return nil, nil, errors.New("missing full path")
+	}
+	conn, state, err := c.dialAndAuth(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	effectiveSize := size
+	if effectiveSize < 0 {
+		effectiveSize = 0
+	}
+	loadStrategy := normalizeLoadStrategy(c.LoadStrategy)
+	var cmd strings.Builder
+	cmd.WriteString("SEND ")
+	cmd.WriteString(txferID)
+	cmd.WriteString(" fd=")
+	cmd.WriteString(strconv.FormatUint(fileID, 10))
+	cmd.WriteString(" ")
+	cmd.WriteString(makeLenToken(fullPath))
+	cmd.WriteString(" mode=")
+	cmd.WriteString(loadStrategy)
+	if offset != 0 {
+		cmd.WriteString(" offset=")
+		cmd.WriteString(strconv.FormatInt(offset, 10))
+	}
+	if effectiveSize > 0 {
+		cmd.WriteString(" size=")
+		cmd.WriteString(strconv.FormatInt(effectiveSize, 10))
+	}
+	br, err := c.sendAndReadTCP(conn, state, cmd.String())
+	if err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("SEND: %w", err)
+	}
+	firstLine, err := readSENDFirstLine(br)
+	if err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+
+	prefixed := io.MultiReader(strings.NewReader(firstLine), br)
+	stream, meta, streamErr := c.newFileStream(&readerWithCloser{Reader: prefixed, Closer: conn}, "", effectiveSize)
+	if streamErr != nil {
+		conn.Close()
+		return nil, nil, streamErr
+	}
+	if meta.FileID != fileID {
+		stream.Close()
+		return nil, nil, fmt.Errorf("file id mismatch: expected %d got %d", fileID, meta.FileID)
+	}
+	return stream, meta, nil
+}
+
+func (c *Client) fetchFileBatchTCP(
+	ctx context.Context,
+	txferID string,
+	targets []FetchFileTarget,
+) (io.ReadCloser, error) {
+	if txferID == "" {
+		return nil, errors.New("missing transfer id")
+	}
+	if len(targets) == 0 {
+		return nil, errors.New("missing file targets")
+	}
+	conn, state, err := c.dialAndAuth(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var b strings.Builder
+	loadStrategy := normalizeLoadStrategy(c.LoadStrategy)
+	b.WriteString("SEND ")
+	b.WriteString(txferID)
+	for _, t := range targets {
+		if strings.TrimSpace(t.FullPath) == "" {
+			conn.Close()
+			return nil, errors.New("missing full path")
+		}
+		b.WriteString(" fd=")
+		b.WriteString(strconv.FormatUint(t.FileID, 10))
+		b.WriteString(" ")
+		b.WriteString(makeLenToken(t.FullPath))
+		b.WriteString(" mode=")
+		b.WriteString(loadStrategy)
+		if t.Comp != "" {
+			b.WriteString(" comp=")
+			b.WriteString(t.Comp)
+		}
+		if t.Offset != 0 {
+			b.WriteString(" offset=")
+			b.WriteString(strconv.FormatInt(t.Offset, 10))
+		}
+		if t.Size > 0 {
+			b.WriteString(" size=")
+			b.WriteString(strconv.FormatInt(t.Size, 10))
+		}
+	}
+	br, err := c.sendAndReadTCP(conn, state, b.String())
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("SEND batch: %w", err)
+	}
+	firstLine, err := readSENDFirstLine(br)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return &readerWithCloser{Reader: io.MultiReader(strings.NewReader(firstLine), br), Closer: conn}, nil
+}
+
+func readTCPStatus(br *bufio.Reader) (string, error) {
+	line, err := readTCPLine(br, maxTCPLineBytes)
+	if err != nil {
+		return "", err
+	}
+	if err := parseErrControlFrame(line); err != nil {
+		return "", err
+	}
+	message, ok := parseOKStatusLine(line)
+	if !ok {
+		return "", fmt.Errorf("unexpected response: %s", strings.TrimSpace(line))
+	}
+	return message, nil
+}
+
+// readStreamFirstLine reads and validates the first line of a streaming
+// response (SEND, CXSUM). Returns the raw first line (including trailing
+// newline) for prefixing back onto the stream, or an error if the server
+// sent ERR or an unexpected OK.
+func readStreamFirstLine(br *bufio.Reader, verb string) (string, error) {
+	firstLine, err := br.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("read %s response: %w", verb, err)
+	}
+	trimmed := strings.TrimRight(firstLine, "\r\n")
+	if err := parseErrControlFrame(trimmed); err != nil {
+		return "", err
+	}
+	if _, ok := parseOKStatusLine(trimmed); ok {
+		return "", fmt.Errorf("unexpected OK response for %s", verb)
+	}
+	return firstLine, nil
+}
+
+// readSENDFirstLine reads the first line of a SEND streaming response,
+// wrapping NOT_FOUND errors as ErrFileMissing.
+func readSENDFirstLine(br *bufio.Reader) (string, error) {
+	firstLine, err := readStreamFirstLine(br, "SEND")
+	if err != nil {
+		var controlErr controlFrameError
+		if errors.As(err, &controlErr) && strings.EqualFold(controlErr.Code, "NOT_FOUND") {
+			return "", fmt.Errorf("%w: %w", ErrFileMissing, &fileMissingError{Status: 404, Body: strings.TrimSpace(controlErr.Message)})
+		}
+		return "", err
+	}
+	return firstLine, nil
+}
+
+func (c *Client) probeTCP(ctx context.Context, req ProbeRequest, probeBytes int64) (probeResponse, error) {
+	if probeBytes <= 0 {
+		return probeResponse{}, errors.New("probe bytes must be > 0")
+	}
+	conn, state, err := c.dialAndAuth(ctx)
+	if err != nil {
+		return probeResponse{}, err
+	}
+	defer conn.Close()
+
+	cts0 := time.Now().UnixMilli()
+	localCPU := runtime.NumCPU()
+	cmd := fmt.Sprintf("PROBE cpu=%d probe-bytes=%d cts0=%d", localCPU, probeBytes, cts0)
+	if txferID := strings.TrimSpace(req.TransferID); txferID != "" {
+		cmd += " txferid=" + txferID
+		if req.ObservedLinkMbps > 0 {
+			cmd += " obs-link-mbps=" + strconv.FormatInt(req.ObservedLinkMbps, 10)
+		}
+	}
+	if err := c.sendTCPProbe(conn, state, cmd, probeBytes); err != nil {
+		return probeResponse{}, fmt.Errorf("send PROBE: %w", err)
+	}
+
+	responseReader, err := c.responseReaderForTCP(conn, state)
+	if err != nil {
+		return probeResponse{}, fmt.Errorf("initialize PROBE response stream: %w", err)
+	}
+	capture := &firstReadTimestampReader{reader: responseReader}
+	br := bufio.NewReader(capture)
+	line, err := readTCPLine(br, maxTCPLineBytes)
+	if err != nil {
+		return probeResponse{}, fmt.Errorf("read PROBE response line: %w", err)
+	}
+	if err := parseErrControlFrame(line); err != nil {
+		return probeResponse{}, err
+	}
+	probeResp, err := parseProbeResponseLine(line)
+	if err != nil {
+		return probeResponse{}, err
+	}
+	if probeResp.ProbeBytes != probeBytes {
+		return probeResponse{}, fmt.Errorf("probe byte mismatch: sent=%d got=%d", probeBytes, probeResp.ProbeBytes)
+	}
+	if _, err := io.CopyN(io.Discard, br, probeResp.ProbeBytes); err != nil {
+		return probeResponse{}, fmt.Errorf("read PROBE payload: %w", err)
+	}
+	if _, err := readTCPStatus(br); err != nil {
+		return probeResponse{}, fmt.Errorf("read PROBE status: %w", err)
+	}
+	probeResp.CTS1 = capture.FirstTS()
+	if probeResp.CTS1 == 0 {
+		probeResp.CTS1 = time.Now().UnixMilli()
+	}
+	return probeResp, nil
+}
+
+func (c *Client) sendTCPProbe(conn net.Conn, state tcpAuthState, cmd string, probeBytes int64) error {
+	if !state.hasAuth {
+		if err := writeTCPLine(conn, cmd); err != nil {
+			return err
+		}
+		_, err := io.CopyN(conn, rand.Reader, probeBytes)
+		return err
+	}
+	recipient, err := age.ParseX25519Recipient(state.serverKey)
+	if err != nil {
+		return err
+	}
+	ew, err := aead.Encrypt(conn, recipient, aeadOptionsForMode(state.encMode))
+	if err != nil {
+		return err
+	}
+	if err := writeTCPLine(ew, cmd); err != nil {
+		_ = ew.Close()
+		return err
+	}
+	if _, err := io.CopyN(ew, rand.Reader, probeBytes); err != nil {
+		_ = ew.Close()
+		return err
+	}
+	return ew.Close()
+}
+
+type firstReadTimestampReader struct {
+	reader io.Reader
+	first  int64
+}
+
+func (r *firstReadTimestampReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 && r.first == 0 {
+		r.first = time.Now().UnixMilli()
+	}
+	return n, err
+}
+
+func (r *firstReadTimestampReader) FirstTS() int64 {
+	if r == nil {
+		return 0
+	}
+	return r.first
+}
+
+func parseProbeResponseLine(line string) (probeResponse, error) {
+	req, err := ftcp.ParseRequest([]byte(strings.TrimSpace(line)))
+	if err != nil {
+		return probeResponse{}, fmt.Errorf("parse PROBE response: %w", err)
+	}
+	if req.Verb != ftcp.VerbPROBE || len(req.Params) != 1 {
+		return probeResponse{}, errors.New("invalid PROBE response")
+	}
+	p := req.Params[0]
+	serverCPU, err := strconv.Atoi(strings.TrimSpace(p["cpu"]))
+	if err != nil || serverCPU <= 0 {
+		return probeResponse{}, errors.New("invalid PROBE response cpu")
+	}
+	cts0, err := strconv.ParseInt(strings.TrimSpace(p["cts0"]), 10, 64)
+	if err != nil || cts0 < 0 {
+		return probeResponse{}, errors.New("invalid PROBE response cts0")
+	}
+	sts0, err := strconv.ParseInt(strings.TrimSpace(p["sts0"]), 10, 64)
+	if err != nil || sts0 < 0 {
+		return probeResponse{}, errors.New("invalid PROBE response sts0")
+	}
+	sts1, err := strconv.ParseInt(strings.TrimSpace(p["sts1"]), 10, 64)
+	if err != nil || sts1 < 0 {
+		return probeResponse{}, errors.New("invalid PROBE response sts1")
+	}
+	probeBytes, err := strconv.ParseInt(strings.TrimSpace(p["probe-bytes"]), 10, 64)
+	if err != nil || probeBytes < 0 {
+		return probeResponse{}, errors.New("invalid PROBE response probe-bytes")
+	}
+	ioDepth, _ := strconv.Atoi(strings.TrimSpace(p["io-depth"]))
+	if ioDepth <= 0 {
+		ioDepth = 1
+	}
+	gentleCPUPct, _ := strconv.Atoi(strings.TrimSpace(p["gentle-cpu-pct"]))
+	gentleCPUPct = intlimit.NormalizeGentleCPUPct(gentleCPUPct)
+	gentleBWPct, _ := strconv.Atoi(strings.TrimSpace(p["gentle-bw-pct"]))
+	gentleBWPct = intlimit.NormalizeGentleBWPct(gentleBWPct)
+	wmemBytes, _ := strconv.ParseInt(strings.TrimSpace(p["wmem"]), 10, 64)
+	if wmemBytes < 0 {
+		wmemBytes = 0
+	}
+	limiterBps, _ := strconv.ParseInt(strings.TrimSpace(p["limiter-bps"]), 10, 64)
+	if limiterBps < 0 {
+		limiterBps = 0
+	}
+	return probeResponse{
+		ServerCPU:       serverCPU,
+		ServerIODepth:   ioDepth,
+		GentleCPUPct:    gentleCPUPct,
+		GentleBWPct:     gentleBWPct,
+		CTS0:            cts0,
+		STS0:            sts0,
+		STS1:            sts1,
+		ProbeBytes:      probeBytes,
+		ServerWmemBytes: wmemBytes,
+		LimiterBps:      limiterBps,
+	}, nil
+}
+
+func (c *Client) acknowledgeFileProgressTCP(ctx context.Context, request AcknowledgeFileProgressRequest, ackToken string) (AcknowledgeFileProgressResponse, error) {
+	return c.acknowledgeFileProgressBatchTCP(ctx, []acknowledgeFileProgressCommand{
+		{request: request, ackToken: ackToken},
+	})
+}
+
+func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands []acknowledgeFileProgressCommand) (AcknowledgeFileProgressResponse, error) {
+	if len(commands) == 0 {
+		return AcknowledgeFileProgressResponse{}, errors.New("missing ack requests")
+	}
+	txferID := strings.TrimSpace(commands[0].request.TransferID)
+	if txferID == "" {
+		return AcknowledgeFileProgressResponse{}, errors.New("missing transfer id")
+	}
+	conn, state, err := c.dialAndAuth(ctx)
+	if err != nil {
+		return AcknowledgeFileProgressResponse{}, err
+	}
+	defer conn.Close()
+
+	var cmd strings.Builder
+	cmd.WriteString("ACK ")
+	cmd.WriteString(txferID)
+	for _, ack := range commands {
+		request := ack.request
+		if request.TransferID != txferID {
+			return AcknowledgeFileProgressResponse{}, errors.New("ack requests must share transfer id")
+		}
+		cmd.WriteString(" fd=")
+		cmd.WriteString(strconv.FormatUint(request.FileID, 10))
+		cmd.WriteString(" ")
+		cmd.WriteString(makeLenToken(request.FullPath))
+		cmd.WriteString(" ack-token=")
+		cmd.WriteString(ack.ackToken)
+		if request.AckBytes >= 0 {
+			cmd.WriteString(" delta-bytes=")
+			cmd.WriteString(strconv.FormatInt(request.DeltaBytes, 10))
+			cmd.WriteString(" recv-ms=")
+			cmd.WriteString(strconv.FormatInt(request.RecvMS, 10))
+			cmd.WriteString(" sync-ms=")
+			cmd.WriteString(strconv.FormatInt(request.SyncMS, 10))
+		}
+	}
+	br, err := c.sendAndReadTCP(conn, state, cmd.String())
+	if err != nil {
+		return AcknowledgeFileProgressResponse{}, fmt.Errorf("ACK: %w", err)
+	}
+	if _, err := readTCPStatus(br); err != nil {
+		return AcknowledgeFileProgressResponse{}, fmt.Errorf("read ACK response: %w", err)
+	}
+	return AcknowledgeFileProgressResponse{}, nil
+}
+
+func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (GetStatusResponse, error) {
+	conn, state, err := c.dialAndAuth(ctx)
+	if err != nil {
+		return GetStatusResponse{}, err
+	}
+	defer conn.Close()
+
+	br, err := c.sendAndReadTCP(conn, state, "STATUS "+request.TransferID)
+	if err != nil {
+		return GetStatusResponse{}, fmt.Errorf("STATUS: %w", err)
+	}
+	message, err := readTCPStatus(br)
+	if err != nil {
+		return GetStatusResponse{}, fmt.Errorf("read STATUS response: %w", err)
+	}
+	if strings.TrimSpace(message) == "" {
+		return GetStatusResponse{}, errors.New("missing STATUS JSON payload")
+	}
+	var status TransferStatus
+	if err := json.NewDecoder(strings.NewReader(message)).Decode(&status); err != nil {
+		return GetStatusResponse{}, fmt.Errorf("decode transfer status: %w", err)
+	}
+	return GetStatusResponse{Status: &status}, nil
+}
+
+func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesRequest) (ListStatusesResponse, error) {
+	conn, state, err := c.dialAndAuth(ctx)
+	if err != nil {
+		return ListStatusesResponse{}, err
+	}
+	defer conn.Close()
+
+	br, err := c.sendAndReadTCP(conn, state, "STATUS")
+	if err != nil {
+		return ListStatusesResponse{}, fmt.Errorf("STATUS list: %w", err)
+	}
+	countLine, err := readTCPStatus(br)
+	if err != nil {
+		return ListStatusesResponse{}, fmt.Errorf("read STATUS response: %w", err)
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(countLine))
+	if err != nil {
+		return ListStatusesResponse{}, fmt.Errorf("parse STATUS count %q: %w", countLine, err)
+	}
+	statuses := make([]TransferStatus, 0, count)
+	for i := 0; i < count; i++ {
+		line, lineErr := readTCPLine(br, maxTCPLineBytes)
+		if lineErr != nil {
+			return ListStatusesResponse{}, fmt.Errorf("read STATUS entry %d: %w", i, lineErr)
+		}
+		var s TransferStatus
+		if jsonErr := json.Unmarshal([]byte(strings.TrimSpace(line)), &s); jsonErr != nil {
+			return ListStatusesResponse{}, fmt.Errorf("decode STATUS entry %d: %w", i, jsonErr)
+		}
+		statuses = append(statuses, s)
+	}
+	return ListStatusesResponse{Statuses: statuses}, nil
+}
+
+func (c *Client) getChecksumTCP(ctx context.Context, request GetChecksumRequest) (io.ReadCloser, error) {
+	conn, state, err := c.dialAndAuth(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var cmd strings.Builder
+	cmd.WriteString("CXSUM ")
+	cmd.WriteString(request.TransferID)
+	for _, target := range request.Targets {
+		cmd.WriteString(" fd=")
+		cmd.WriteString(strconv.FormatUint(target.FileID, 10))
+		cmd.WriteByte(' ')
+		cmd.WriteString(makeLenToken(target.FullPath))
+		if target.Offset > 0 {
+			cmd.WriteString(" offset=")
+			cmd.WriteString(strconv.FormatInt(target.Offset, 10))
+		}
+		if target.Size > 0 {
+			cmd.WriteString(" size=")
+			cmd.WriteString(strconv.FormatInt(target.Size, 10))
+		}
+		if algo := strings.TrimSpace(target.Algo); algo != "" {
+			cmd.WriteString(" algo=")
+			cmd.WriteString(algo)
+		}
+	}
+	br, err := c.sendAndReadTCP(conn, state, cmd.String())
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("CXSUM: %w", err)
+	}
+	firstLine, err := readStreamFirstLine(br, "CXSUM")
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return &readerWithCloser{Reader: io.MultiReader(strings.NewReader(firstLine), br), Closer: conn}, nil
+}

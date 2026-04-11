@@ -1,0 +1,374 @@
+package encoding
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/user"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/zeebo/xxh3"
+)
+
+var userNameCache sync.Map  // map[string]string  uid  → username
+var groupNameCache sync.Map // map[string]string  gid  → group name
+
+func lookupUserName(uid string) string {
+	if v, ok := userNameCache.Load(uid); ok {
+		return v.(string)
+	}
+	name := "unknown"
+	if u, err := user.LookupId(uid); err == nil {
+		name = u.Username
+	}
+	userNameCache.Store(uid, name)
+	return name
+}
+
+func lookupGroupName(gid string) string {
+	if v, ok := groupNameCache.Load(gid); ok {
+		return v.(string)
+	}
+	name := "unknown"
+	if g, err := user.LookupGroupId(gid); err == nil {
+		name = g.Name
+	}
+	groupNameCache.Store(gid, name)
+	return name
+}
+
+type FileFrameMetadata struct {
+	Size    int64
+	MtimeNS int64
+	Mode    string
+	UID     string
+	GID     string
+	User    string
+	Group   string
+}
+
+func CollectFileFrameMetadata(path string, info os.FileInfo) FileFrameMetadata {
+	meta := FileFrameMetadata{
+		Size:    info.Size(),
+		MtimeNS: info.ModTime().UnixNano(),
+		Mode:    fmt.Sprintf("%04o", info.Mode().Perm()|(info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky))),
+		UID:     "unknown",
+		GID:     "unknown",
+		User:    "unknown",
+		Group:   "unknown",
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		meta.UID = strconv.FormatUint(uint64(st.Uid), 10)
+		meta.GID = strconv.FormatUint(uint64(st.Gid), 10)
+		meta.User = lookupUserName(meta.UID)
+		meta.Group = lookupGroupName(meta.GID)
+	}
+	_ = path
+	return meta
+}
+
+func (m FileFrameMetadata) trailerTokens() []string {
+	return []string{
+		fmt.Sprintf("meta:size=%d", m.Size),
+		fmt.Sprintf("meta:mtime_ns=%d", m.MtimeNS),
+		fmt.Sprintf("meta:mode=%s", m.Mode),
+		fmt.Sprintf("meta:uid=%s", m.UID),
+		fmt.Sprintf("meta:gid=%s", m.GID),
+		fmt.Sprintf("meta:user=%s", strings.ReplaceAll(m.User, " ", "_")),
+		fmt.Sprintf("meta:group=%s", strings.ReplaceAll(m.Group, " ", "_")),
+	}
+}
+
+type WriteArgs struct {
+	FileID       uint64
+	Offset       int64
+	Size         int64
+	WSize        int64
+	Comp         string
+	HeaderHash   string
+	MaxWSizeHint *int64
+	HeaderTS     int64
+	Payload      []byte
+	TrailerTS    int64
+	HashTokens   []string
+	FileHashes   []string
+	Next         int64
+	Metadata     *FileFrameMetadata
+}
+
+type WriteStats struct {
+	WriteLatency      time.Duration
+	WireThroughputBps float64
+}
+
+func WriteFrame(w io.Writer, args WriteArgs) (WriteStats, error) {
+	start := time.Now()
+	header := ""
+	if args.MaxWSizeHint != nil {
+		header = fmt.Sprintf(
+			"FX/1 %d offset=%d size=%d wsize=%d comp=%s hash=%s max-wsize=%d ts=%d\n",
+			args.FileID, args.Offset, args.Size, args.WSize, args.Comp, args.HeaderHash, *args.MaxWSizeHint, args.HeaderTS,
+		)
+	} else {
+		header = fmt.Sprintf(
+			"FX/1 %d offset=%d size=%d wsize=%d comp=%s hash=%s ts=%d\n",
+			args.FileID, args.Offset, args.Size, args.WSize, args.Comp, args.HeaderHash, args.HeaderTS,
+		)
+	}
+	if _, err := w.Write([]byte(header)); err != nil {
+		return WriteStats{}, err
+	}
+
+	if len(args.Payload) > 0 {
+		if _, err := w.Write(args.Payload); err != nil {
+			return WriteStats{}, err
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "FXT/1 %d status=ok ts=%d", args.FileID, args.TrailerTS)
+	for _, token := range args.FileHashes {
+		if token != "" {
+			b.WriteString(" file-hash=")
+			b.WriteString(token)
+		}
+	}
+	b.WriteString(" next=")
+	b.WriteString(strconv.FormatInt(args.Next, 10))
+	if args.Metadata != nil {
+		for _, token := range args.Metadata.trailerTokens() {
+			b.WriteString(" ")
+			b.WriteString(token)
+		}
+	}
+	trailerPrefix := b.String()
+	frameHasher := xxh3.New()
+	_, _ = frameHasher.Write([]byte(header))
+	if len(args.Payload) > 0 {
+		_, _ = frameHasher.Write(args.Payload)
+	}
+	_, _ = frameHasher.Write([]byte(trailerPrefix))
+	frameHashToken := fmt.Sprintf("xxh64:%016x", frameHasher.Sum64())
+	trailer := trailerPrefix + " hash=" + frameHashToken + "\n"
+	if _, err := w.Write([]byte(trailer)); err != nil {
+		return WriteStats{}, err
+	}
+
+	if fl, ok := w.(interface{ Flush() }); ok {
+		fl.Flush()
+	}
+	writeLatency := time.Since(start)
+	wireBps := 0.0
+	if writeLatency > 0 && args.WSize > 0 {
+		wireBps = float64(args.WSize) / writeLatency.Seconds()
+	}
+	return WriteStats{
+		WriteLatency:      writeLatency,
+		WireThroughputBps: wireBps,
+	}, nil
+}
+
+type FileFrameMeta struct {
+	FileID          uint64
+	Comp            string
+	Offset          int64
+	Size            int64
+	WireSize        int64
+	MaxWireSizeHint int64
+	HeaderTS        int64
+}
+
+type FrameTrailer struct {
+	FileID         uint64
+	TS             int64
+	HashToken      string
+	FileHashToken  string
+	ChecksumPrefix string
+	Next           *int64
+}
+
+func ParseFXHeader(line string) (FileFrameMeta, error) {
+	fields := strings.Fields(line)
+	if len(fields) < 3 || fields[0] != "FX/1" {
+		return FileFrameMeta{}, errors.New("invalid FX/1 header")
+	}
+	fileID, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return FileFrameMeta{}, fmt.Errorf("invalid header file id: %w", err)
+	}
+	props := make(map[string]string, len(fields)-2)
+	for _, token := range fields[2:] {
+		parts := strings.SplitN(token, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		props[parts[0]] = parts[1]
+	}
+
+	comp := props["comp"]
+	offset, err := parseHeaderInt(props["offset"], "offset")
+	if err != nil {
+		return FileFrameMeta{}, err
+	}
+	size, err := parseHeaderInt(props["size"], "size")
+	if err != nil {
+		return FileFrameMeta{}, err
+	}
+	wsize, err := parseHeaderInt(props["wsize"], "wsize")
+	if err != nil {
+		return FileFrameMeta{}, err
+	}
+	ts, err := parseHeaderInt(props["ts"], "ts")
+	if err != nil {
+		return FileFrameMeta{}, err
+	}
+	maxWSizeHint := int64(0)
+	if raw, ok := props["max-wsize"]; ok {
+		maxWSizeHint, err = parseHeaderInt(raw, "max-wsize")
+		if err != nil {
+			return FileFrameMeta{}, err
+		}
+		if maxWSizeHint <= 0 {
+			return FileFrameMeta{}, errors.New("invalid header max-wsize")
+		}
+	}
+	if ts < 0 {
+		return FileFrameMeta{}, errors.New("invalid header ts")
+	}
+	if comp == "" {
+		return FileFrameMeta{}, errors.New("missing required frame properties")
+	}
+	return FileFrameMeta{
+		FileID:          fileID,
+		Comp:            comp,
+		Offset:          offset,
+		Size:            size,
+		WireSize:        wsize,
+		MaxWireSizeHint: maxWSizeHint,
+		HeaderTS:        ts,
+	}, nil
+}
+
+func parseHeaderInt(raw string, key string) (int64, error) {
+	if raw == "" {
+		return 0, fmt.Errorf("missing header property: %s", key)
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid header property %s: %w", key, err)
+	}
+	return v, nil
+}
+
+func ParseFXTrailer(line string) (FrameTrailer, error) {
+	prefix, hashToken, err := splitTrailerPrefixAndHash(line)
+	if err != nil {
+		return FrameTrailer{}, err
+	}
+	fields := strings.Fields(prefix)
+	if len(fields) < 3 || fields[0] != "FXT/1" {
+		return FrameTrailer{}, errors.New("invalid FXT/1 trailer")
+	}
+	fileID, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return FrameTrailer{}, fmt.Errorf("invalid trailer file id: %w", err)
+	}
+	status := ""
+	var fileHashToken string
+	var ts int64 = -1
+	var nextOffset *int64
+	for _, token := range fields[2:] {
+		if strings.HasPrefix(token, "status=") {
+			status = strings.TrimPrefix(token, "status=")
+		}
+		if strings.HasPrefix(token, "ts=") {
+			tsRaw := strings.TrimPrefix(token, "ts=")
+			parsedTS, parseErr := strconv.ParseInt(tsRaw, 10, 64)
+			if parseErr != nil || parsedTS < 0 {
+				return FrameTrailer{}, errors.New("invalid trailer ts")
+			}
+			ts = parsedTS
+		}
+		if strings.HasPrefix(token, "file-hash=") {
+			fileHashToken = strings.TrimPrefix(token, "file-hash=")
+		}
+		if strings.HasPrefix(token, "next=") {
+			nextRaw := strings.TrimPrefix(token, "next=")
+			nextValue, parseErr := strconv.ParseInt(nextRaw, 10, 64)
+			if parseErr != nil || nextValue < 0 {
+				return FrameTrailer{}, errors.New("invalid trailer next offset")
+			}
+			nextOffset = &nextValue
+		}
+	}
+	if status != "ok" {
+		return FrameTrailer{}, fmt.Errorf("trailer status not ok: %s", status)
+	}
+	if ts < 0 {
+		return FrameTrailer{}, errors.New("trailer missing ts")
+	}
+	if fileHashToken != "" && !ValidHashToken(fileHashToken) {
+		return FrameTrailer{}, errors.New("trailer invalid file hash token")
+	}
+	return FrameTrailer{
+		FileID:         fileID,
+		TS:             ts,
+		HashToken:      hashToken,
+		FileHashToken:  fileHashToken,
+		ChecksumPrefix: prefix,
+		Next:           nextOffset,
+	}, nil
+}
+
+func splitTrailerPrefixAndHash(line string) (string, string, error) {
+	idx := strings.LastIndex(line, " hash=")
+	if idx <= 0 {
+		return strings.TrimSpace(line), "", nil
+	}
+	prefix := line[:idx]
+	hashToken := strings.TrimSpace(line[idx+len(" hash="):])
+	if !ValidHashToken(hashToken) {
+		return "", "", errors.New("trailer missing or invalid hash token")
+	}
+	return prefix, hashToken, nil
+}
+
+func ValidHashToken(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	parts := strings.SplitN(raw, ":", 2)
+	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+}
+
+func AbbrevHashToken(raw string) string {
+	raw = strings.TrimSpace(raw)
+	parts := strings.SplitN(raw, ":", 2)
+	if len(parts) != 2 {
+		return raw
+	}
+	if len(parts[1]) <= 8 {
+		return raw
+	}
+	return parts[0] + ":" + parts[1][:8] + "..."
+}
+
+func DecodePayloadReaderByComp(payload io.Reader, comp string) (io.ReadCloser, error) {
+	switch comp {
+	case "none":
+		return io.NopCloser(payload), nil
+	case EncodingZstd, EncodingLz4:
+		reader, err := WrapDecompressedReader(payload, comp)
+		if err != nil {
+			return nil, err
+		}
+		return reader, nil
+	default:
+		return nil, fmt.Errorf("unsupported compression mode: %s", comp)
+	}
+}

@@ -1,0 +1,289 @@
+# Filexfer Framing Specification (Draft v1)
+
+This document defines the wire framing for fast efficient
+file transfers over plain TCP sockets.
+
+## Scope
+
+- Transport: plain TCP stream.
+- This framing is for per-file transfer messages after a manifest has been exchanged out of band.
+- `file_id` is an integer index into that exchanged manifest (0-based).
+
+## Frame Structure
+
+Each file transfer response frame is:
+
+1. Header line (ASCII, UTF-8 safe)
+2. Raw payload bytes
+3. Trailer line (ASCII, UTF-8 safe)
+
+Header and trailer lines are terminated by `\n`.
+
+### First Header Line
+
+Format:
+
+```text
+FX/1 <file_id> <properties...>
+```
+
+- `FX/1`: protocol version token.
+- `<file_id>`: manifest-relative file ID (unsigned integer).
+- `<properties...>`: space-separated `property=value` tokens.
+
+Example:
+
+```text
+FX/1 12 offset=0 size=1048576 wsize=262144 comp=zstd hash=xxh128:9f12ab... deadline:30s
+<262144 payload bytes>
+FXT/1 12 status=ok hash=xxh64:1af3bc9d00ee42aa
+```
+
+## Properties
+
+Properties are ASCII and case-sensitive.
+
+### Required
+
+- `comp=<mode>`: compression mode.
+- `offset=<n>`: byte offset within the logical file where payload data belongs.
+- `size=<n>`: number of original (logical, uncompressed) bytes represented by this frame.
+- `wsize=<n>`: number of payload bytes on the wire for this frame.
+- `ts=<unix_ms>`: server timestamp (unix milliseconds) when this frame header is emitted.
+
+### Optional
+
+- `hash=<algo>:<value>`: checksum token carried on frame headers/trailers.
+  - Current trailer frame checksum algorithm is `xxh64`.
+  - Header `hash` is backward-compatible metadata from transfer emission flow.
+  - At most one `hash` token per frame.
+- `max-wsize=<bytes>`: server hint for maximum wire payload bytes per frame for this response window.
+  - Emitted on the first `/fs/file` frame.
+  - Current bucket algorithm is ceiling in `{1,2,4,8,16,32,64} MiB`.
+- `deadline:<duration>`: per-frame deadline using Go-style duration syntax (for example `30s`, `2m`, `500ms`).
+
+## Compression
+
+`comp` allowed values:
+
+- `none`
+- `zstd`
+- `lz4`
+
+Receiver behavior:
+
+- `none`: write bytes directly.
+- `zstd` or `lz4`: decompress before writing to destination offset.
+
+## Parsing Rules
+
+- Maximum header bytes: 16 KiB (defensive limit).
+- Unknown properties are ignored.
+- Missing required fields (`comp`, `offset`, `size`, `wsize`) reject frame.
+- Invalid `file_id` reject frame.
+- Invalid numeric value formats reject frame.
+- Invalid `deadline` duration format rejects frame when `deadline:` is present.
+- Header must be exactly one line; no multi-line property blocks.
+
+## Semantics
+
+- `mtime`, mode/permissions, and full-file `size` are manifest properties, not framing properties.
+- `offset` allows resumable/partial writes.
+- `size` is the logical uncompressed bytes covered by this frame.
+- `wsize` is the exact payload byte count that follows the header newline.
+- For `comp=none`, `size` must equal `wsize`.
+- For `comp=zstd|lz4`, decompressed bytes must equal `size`.
+- Trailer `hash=<algo>:<value>` is used for frame-integrity validation/logging.
+- `deadline:<duration>` limits how long receiver should allow this frame to complete; exceeded deadline is a protocol timeout.
+
+## Error Handling
+
+Receiver must close the TCP connection on framing errors:
+
+- malformed version token
+- malformed property syntax
+- invalid numeric conversion
+- invalid `deadline` duration
+- payload shorter/longer than declared `wsize`
+- decompressed segment length not equal to declared `size`
+
+Receiver should emit protocol error code in logs with offending `file_id` when available.
+
+## Versioning
+
+- `FX/1` is the current version.
+- Breaking framing changes require new token (`FX/2`).
+- New optional properties are backward-compatible within `FX/1`.
+
+## Response Framing
+
+Receiver responses use a three-part frame:
+
+1. Response header line
+2. Exactly `wsize` payload bytes
+3. Response trailer line
+
+Both header and trailer are single lines terminated by `\n`.
+
+Format:
+
+```text
+FXR/1 <file_id> <properties...>
+```
+
+- `FXR/1`: response protocol version token.
+- `<file_id>`: same manifest-relative file ID from request.
+- `<properties...>`: space-separated properties.
+
+Example:
+
+```text
+FXR/1 12 status=ok comp=zstd offset=0 size=1048576 wsize=262144 elapsed=420ms
+<262144 payload bytes>
+FXT/1 12 status=ok hash=xxh64:1af3bc9d00ee42aa
+```
+
+### Required Response Properties
+
+- `status=<code>`: `ok` or error code (for example `timeout`, `bad_frame`, `checksum_mismatch`).
+- `offset=<n>`: segment offset processed.
+- `size=<n>`: actual logical bytes processed.
+- `wsize=<n>`: exact number of payload bytes that follow header.
+
+### Optional Response Properties
+
+- `comp=<mode>`: compression mode actually applied.
+- `deadline:<duration>`: effective deadline used for this segment.
+- `elapsed=<duration>`: observed processing duration.
+- `detail=<token>`: machine-readable short detail code.
+
+### Response Trailer
+
+Trailer format:
+
+```text
+FXT/1 <file_id> <properties...>
+```
+
+Trailer is used for realized post-transfer metadata, especially checksums.
+
+Common trailer properties:
+
+- `status=<code>`: final trailer status (`ok` or error code).
+- `hash=<algo>:<value>`: frame checksum value.
+- `detail=<token>`: optional machine-readable detail.
+
+### Response Semantics
+
+- `size` and `wsize` in response are authoritative observed values.
+- Receiver must emit exactly `wsize` payload bytes after `FXR/1`.
+- Trailer is emitted after payload and carries final checksum values.
+- `status=ok` indicates segment accepted and written.
+- Non-`ok` status indicates segment rejected or incomplete; sender should treat as failed for retry logic.
+- Trailer `hash=<algo>:<value>` is the frame checksum token for this frame payload and framing bytes.
+
+## TCP Command Contract
+
+The command protocol is line-based:
+
+- command line: `<VERB> <args...>\r\n`
+- status line:
+  - `OK\r\n`
+  - `OK <message>\r\n`
+  - `ERR <code> <message>\r\n`
+
+Commands:
+
+- `AUTH [<blob>]` (optional unless server requires auth)
+- `TXFER <path> [verbose=<0|1>] [max-manifest-chunk-size=<n>]`
+- `SEND <txferid> [comp=<mode>] <fid> <offset> <size> <path> ...`
+- `ACK <txferid> <fid> <ack-token> <delta-bytes> <recv-ms> <sync-ms> <path>`
+- `CXSUM <txferid> fd=<fid> <path> [offset=<n>] [size=<n>] [algo=xxh128|xxh64] ...`
+- `STATUS <txferid>`
+
+Path/blob args are encoded as quoted strings or length-prefixed tokens (`<len>:<bytes>`).
+
+`SEND` returns one or more `FX/1` frame triplets, then a terminal status line:
+
+1. `FX/1` header line
+2. `wsize` payload bytes (raw or compressed per `comp`)
+3. `FXT/1` trailer line
+4. `OK` or `ERR ...` status line
+
+The server repeats these triplets until each requested window is complete.
+Default logical frame size cap is `8 MiB`.
+
+For `SEND` responses, header properties are emitted in this order:
+`offset`, `size`, `wsize`, `comp`, `hash`, optional `max-wsize`, then `ts`.
+Current implementation supports adaptive compression and may vary `comp` per frame.
+
+Current trailer shape for `SEND`:
+
+```text
+FXT/1 <file_id> status=ok ts=<unix_ms> [file-hash=<algo>:<value>] next=<offset> [meta:*=...]
+```
+
+`next` is the offset that the following frame starts at (`offset + size`).
+The final trailer uses `next=0` as a terminal marker.
+
+`file-hash` is emitted on final trailer as the checksum token for the served request window.
+The final trailer also includes file metadata tokens:
+`meta:size`, `meta:mtime_ns`, `meta:mode`, `meta:uid`, `meta:gid`, `meta:user`, `meta:group`.
+Clients may use `meta:mode`, `meta:uid`, and `meta:gid` to mirror ownership/permissions
+only after payload integrity verification succeeds.
+
+`file-hash=<algo>:<value>` on terminal trailer is the authoritative per-window
+checksum token. Current implementation emits `file-hash=xxh128:<hex32>`.
+
+`max-wsize` is a first-frame hint only. Clients may use it to pre-size a reusable
+frame buffer, but they may cap allocation (current client default cap is `64 MiB`)
+and still stream larger frames in multiple reads.
+
+## `ACK` Semantics
+
+`ack-bytes` is interpreted as:
+
+- `-1` for missing-file acknowledgement.
+- `<bytes>@<server_ts_ms>@<algo>:<value>` for positive window acknowledgement.
+
+Positive ack hash token is required and must match the server-stored expected
+window hash for that `ack-bytes` boundary.
+
+Legacy positive numeric-only acks are not accepted.
+
+Acks are submitted using the `ACK` command:
+
+```text
+ACK <txferid> <fid> <ack-token> <delta-bytes> <recv-ms> <sync-ms> <path>
+```
+
+Successful ack requests return status line `OK` (or `OK <message>`).
+
+## `CXSUM` Contract
+
+`CXSUM` returns framing lines only (no payload bytes), followed by a terminal
+status line:
+
+1. `FX/1` header line
+2. zero payload bytes (`wsize=0`)
+3. `FXT/1` trailer line
+4. terminal status line (`OK` or `ERR ...`)
+
+The response emits one frame per requested checksum range and flushes after every frame when possible.
+
+Command arguments:
+
+- `fd=<fid>` starts a checksum item and may repeat.
+- `<path>` is required for each item and may be quoted or `<len>:<bytes>`.
+- `offset=<n>` is optional and defaults to `0`.
+- `size=<n>` is optional and defaults to EOF.
+- `algo=<name>` is optional.
+  - supported: `xxh128`, `xxh64`
+  - default: `xxh128`
+
+Checksum trailer semantics:
+
+- Each requested range produces exactly one terminal frame (`next=0`).
+- `file-hash=<algo>:<value>` is the checksum token for that requested range, not a rolling cumulative checksum.
+- Every frame still includes `hash=xxh64:<hex16>` as frame integrity checksum.
+- Every checksum frame may include the same metadata tokens as `SEND`; current implementation includes them on terminal checksum frames.
