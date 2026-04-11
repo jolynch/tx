@@ -19,7 +19,7 @@ pinch filecli [<addr>] <command> [options]
 ```
 
 - `<addr>` defaults to `127.0.0.1:3453`
-- state is stored in `<LOCAL_DST>/../.pinch/`
+- state is stored in `<LOCAL_DST>/../.tx/`
 
 The state directory contains:
 
@@ -42,7 +42,7 @@ Behavior:
   directory and then renames it into place
 - if `LOCAL_DST` already exists, `copy` switches to sync mode and applies the
   delta needed to converge the local tree to the remote tree
-- successful non-`--skip-fetch` runs clean up `.pinch` after they finish
+- successful non-`--skip-fetch` runs clean up `.tx` after they finish
 
 Common examples:
 
@@ -119,7 +119,7 @@ If you want an explicit final check, add `--verify-meta` to the last run.
 pinch filecli [<addr>] status [--tid <id>] [LOCAL_DST]
 ```
 
-- **With `LOCAL_DST`**: reads `.pinch/manifest.server` for the transfer ID and
+- **With `LOCAL_DST`**: reads `.tx/manifest.server` for the transfer ID and
   polls with combined server + client progress.
 - **With `--tid <id>`**: polls server-side status only for that transfer.
 - **With no arguments**: lists all active transfers on the server.

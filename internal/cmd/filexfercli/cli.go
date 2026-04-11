@@ -205,15 +205,15 @@ const maxSyncRounds = 3
 
 // pinchState computes all state file paths from a target output directory.
 // Given targetDir="/var/lib/pinch/dst", state lives in a per-target subdir
-// of the parent's .pinch directory so sibling transfers don't collide:
+// of the parent's .tx directory so sibling transfers don't collide:
 //
-//	/var/lib/pinch/.pinch/dst/manifest         ← client state: what's on disk (written by start/sync)
-//	/var/lib/pinch/.pinch/dst/manifest.server  ← server state: written by transfer, read by start/get
-//	/var/lib/pinch/.pinch/dst/manifest.progress
-//	/var/lib/pinch/.pinch/dst/remote/          (staging for start)
+//	/var/lib/pinch/.tx/dst/manifest         ← client state: what's on disk (written by start/sync)
+//	/var/lib/pinch/.tx/dst/manifest.server  ← server state: written by transfer, read by start/get
+//	/var/lib/pinch/.tx/dst/manifest.progress
+//	/var/lib/pinch/.tx/dst/remote/          (staging for start)
 type pinchState struct {
 	TargetDir          string // the user-facing output directory
-	StateDir           string // parent/.pinch/<basename>
+	StateDir           string // parent/.tx/<basename>
 	ManifestPath       string // StateDir/manifest        (client state: what's on disk)
 	ServerManifestPath string // StateDir/manifest.server (server state: from transfer)
 	ProgressPath       string // StateDir/manifest.progress
@@ -226,7 +226,7 @@ func newPinchState(targetDir string) (*pinchState, error) {
 	if parent == targetDir {
 		return nil, fmt.Errorf("target directory %q has no distinct parent", targetDir)
 	}
-	stateDir := filepath.Join(parent, ".pinch", filepath.Base(targetDir))
+	stateDir := filepath.Join(parent, ".tx", filepath.Base(targetDir))
 	return &pinchState{
 		TargetDir:          targetDir,
 		StateDir:           stateDir,
@@ -386,7 +386,7 @@ Commands:
   status     Query and monitor transfer progress
   get        Download a single remote file
 
-State is stored in <local-dst>/../.pinch/ (manifest, progress, staging).
+State is stored in <local-dst>/../.tx/ (manifest, progress, staging).
 Default server address: %s
 Run 'pinch filecli <command> --help' for command-specific options.
 `, defaultFileListener)
@@ -1318,7 +1318,7 @@ func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.W
 		fmt.Fprintln(stderr, "Query and monitor transfer progress.")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Modes:")
-		fmt.Fprintln(stderr, "  status LOCAL_DST       Discover transfer from .pinch/ state and poll until complete")
+		fmt.Fprintln(stderr, "  status LOCAL_DST       Discover transfer from .tx/ state and poll until complete")
 		fmt.Fprintln(stderr, "  status --tid <id>      Poll a transfer by ID (server-side progress only)")
 		fmt.Fprintln(stderr, "  status                 List all active transfers on the server")
 		fmt.Fprintln(stderr)
@@ -1339,7 +1339,7 @@ func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.W
 
 	client := tx.NewClient(serverURL)
 
-	// Mode 1: LOCAL_DST given — discover transfer from .pinch/ state.
+	// Mode 1: LOCAL_DST given — discover transfer from .tx/ state.
 	if cf.NArg() == 1 {
 		localDst := cf.Arg(0)
 		ps, err := newPinchState(localDst)
@@ -1686,7 +1686,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 			onProgressUpdate(update)
 		}
 	}
-	// Use a no-op progress writer (no .pinch state for single-file get).
+	// Use a no-op progress writer (no .tx state for single-file get).
 	go func() {
 		for update := range progressUpdates {
 			forwardProgress(update)

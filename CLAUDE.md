@@ -140,9 +140,9 @@ TCP helpers live in `client_tcp.go`. Each method dials a fresh connection (no pe
 
 Three user-facing commands defined in `cli.go`:
 
-- **`copy`**: full directory download with probes, manifest fetch, parallel SEND batches, ACK, optional verify. Writes `.pinch/` state (manifest + progress file) for resume.
-- **`get`**: single-file download. Skips probes and `.pinch/` state.
-- **`status`**: monitors a transfer. With `LOCAL_DST` reads `.pinch/manifest.server` for the transfer ID and polls with combined server+client progress. With `--tid` polls server only. With no args lists all active transfers.
+- **`copy`**: full directory download with probes, manifest fetch, parallel SEND batches, ACK, optional verify. Writes `.tx/` state (manifest + progress file) for resume.
+- **`get`**: single-file download. Skips probes and `.tx/` state.
+- **`status`**: monitors a transfer. With `LOCAL_DST` reads `.tx/manifest.server` for the transfer ID and polls with combined server+client progress. With `--tid` polls server only. With no args lists all active transfers.
 
 ## Testing
 

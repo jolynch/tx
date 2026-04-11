@@ -339,7 +339,7 @@ trap cleanup_server EXIT INT TERM
 start_server
 
 PARENT_DIR="$(dirname "${TARGET_DIR}")"
-STATE_DIR="${PARENT_DIR}/.pinch"
+STATE_DIR="${PARENT_DIR}/.tx"
 
 echo "bench: source=${SOURCE_DIRECTORY} target=${TARGET_DIR}"
 echo "Cleaning prior benchmark output..."
