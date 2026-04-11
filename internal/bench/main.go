@@ -31,9 +31,10 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage: bench <command> [args]
 
 commands:
-  generate <spec> [<spec>...]
-      Generate random files for benchmarks. Spec form: <outdir>:<count>@<size>
-      Example: generate bench/data/src:100@10MiB bench/data/src-small:500@16KiB
+  generate [-source rand|silesia:<csv>] <spec> [<spec>...]
+      Generate benchmark files. Spec form: <outdir>:<count>@<size>
+      Example: generate bench/data/src:100@10MiB
+      Example: generate -source silesia:osdb,nci bench/data/src:10@100MiB
 
   report [path]
       Parse raw go test -bench output and print a summary table.
