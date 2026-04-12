@@ -366,8 +366,14 @@ type GetManifestRequest struct {
 }
 
 type ProbeRequest struct {
-	Samples          int
-	ProbeBytes       int64
+	// ProbeBytes is the payload size for the throughput-measurement phase.
+	// ProbeBytes <= 1 runs discovery only (1-byte round trip, no throughput phase).
+	ProbeBytes int64
+	// Parallelism controls the throughput phase:
+	//   0: auto — fast mode fans out to ServerCPU conns; gentle runs linear samples.
+	//   1: single-connection probe regardless of mode (cheap in-flight refresh).
+	//   >1: forced fanout to this many parallel connections.
+	Parallelism      int
 	LoadStrategy     string
 	TransferID       string
 	ObservedLinkMbps int64
@@ -378,8 +384,11 @@ type ProbeResponse struct {
 	ServerIODepth        int
 	GentleCPUPct         int
 	GentleBWPct          int
-	AvgLatencyMS         int64
-	LinkMbps             int64
+	AvgLatencyMS         int64 // RTT from the 1-byte discovery probe
+	LinkMbps             int64 // primary link estimate (aggregate in fast, average in gentle)
+	PerConnMbps          int64 // median per-connection throughput
+	AggregateMbps        int64 // sum across parallel conns (== LinkMbps in fast, equal to PerConnMbps in gentle)
+	ParallelConns        int   // connections used in the throughput phase
 	SuggestedConcurrency int
 	ServerSendBufBytes   int64
 	SuggestedCipher      string // resolved cipher suggested for this connection (e.g. "aes", "chacha20", or "" if none)
@@ -1899,10 +1908,6 @@ func (c *Client) ProbeLink(ctx context.Context, req ProbeRequest) (ProbeResponse
 	if c == nil {
 		return ProbeResponse{}, errors.New("nil client")
 	}
-	samples := req.Samples
-	if samples <= 0 {
-		samples = defaultClientProbeSamples
-	}
 	probeBytes := req.ProbeBytes
 	if probeBytes <= 0 {
 		probeBytes = defaultClientProbeBytes
@@ -1913,53 +1918,170 @@ func (c *Client) ProbeLink(ctx context.Context, req ProbeRequest) (ProbeResponse
 	}
 	loadStrategy = normalizeLoadStrategy(loadStrategy)
 
-	probeResults := make([]probeResponse, 0, samples)
-	for i := 0; i < samples; i++ {
-		result, err := c.probeTCP(ctx, req, probeBytes)
-		if err != nil {
-			return ProbeResponse{}, fmt.Errorf("probe %d failed: %w", i+1, err)
-		}
-		probeResults = append(probeResults, result)
+	// Phase A: single 1-byte probe discovers server state and measures RTT.
+	discovery, err := c.probeTCP(ctx, req, 1)
+	if err != nil {
+		return ProbeResponse{}, fmt.Errorf("probe discovery failed: %w", err)
 	}
-	response := summarizeProbeSamples(probeResults, probeBytes)
-	response.SuggestedConcurrency = clampConcurrency(suggestedConcurrencyFromProbe(response.ServerCPU, response.ServerIODepth, loadStrategy, response.GentleCPUPct))
-
-	// Resolve the cipher name for display. If encryption is enabled,
-	// resolveTCPAuthState resolves "auto" to the server's recommendation.
+	response := probeDiscoveryResponse(discovery)
+	response.SuggestedConcurrency = clampConcurrency(
+		suggestedConcurrencyFromProbe(response.ServerCPU, response.ServerIODepth, loadStrategy, response.GentleCPUPct),
+	)
 	if authState, authErr := c.resolveTCPAuthState(ctx); authErr == nil && authState.hasAuth {
 		response.SuggestedCipher = authState.encMode
+	}
+
+	// Mini-probe caller: discovery only.
+	if probeBytes <= 1 {
+		response.ParallelConns = 1
+		return response, nil
+	}
+
+	// Phase B: throughput measurement. Fast mode fans out to ServerCPU conns;
+	// gentle mode runs a sequence of linear samples. Parallelism=1 forces a
+	// single-conn probe regardless of mode (used by the in-flight reporter).
+	parallelism := req.Parallelism
+	if parallelism == 0 {
+		if loadStrategy == LoadStrategyGentle {
+			parallelism = -1 // sentinel: gentle → linear default samples
+		} else {
+			parallelism = max(1, response.ServerCPU)
+		}
+	}
+
+	var phaseB probeThroughput
+	switch {
+	case parallelism < 0:
+		phaseB, err = c.probeLinear(ctx, req, probeBytes, defaultClientProbeSamples)
+	case parallelism <= 1:
+		phaseB, err = c.probeLinear(ctx, req, probeBytes, 1)
+	default:
+		phaseB, err = c.probeParallel(ctx, req, probeBytes, parallelism)
+	}
+	if err != nil {
+		return ProbeResponse{}, err
+	}
+
+	response.LinkMbps = phaseB.aggregateMbps
+	response.AggregateMbps = phaseB.aggregateMbps
+	response.PerConnMbps = phaseB.perConnMbps
+	response.ParallelConns = phaseB.conns
+	if phaseB.limiterBps > 0 {
+		response.ServerLimiterBps = phaseB.limiterBps
 	}
 	return response, nil
 }
 
-func summarizeProbeSamples(results []probeResponse, probeBytes int64) ProbeResponse {
-	if len(results) == 0 {
-		return ProbeResponse{}
+type probeThroughput struct {
+	aggregateMbps int64
+	perConnMbps   int64
+	conns         int
+	limiterBps    int64
+}
+
+func probeDiscoveryResponse(result probeResponse) ProbeResponse {
+	intervalMS := max(int64(1), (result.CTS1-result.CTS0)-(result.STS1-result.STS0))
+	return ProbeResponse{
+		ServerCPU:          result.ServerCPU,
+		ServerIODepth:      result.ServerIODepth,
+		GentleCPUPct:       result.GentleCPUPct,
+		GentleBWPct:        result.GentleBWPct,
+		AvgLatencyMS:       intervalMS,
+		ServerSendBufBytes: result.ServerWmemBytes,
+		ServerLimiterBps:   result.LimiterBps,
+	}
+}
+
+func probeConnMbps(result probeResponse, probeBytes int64) int64 {
+	intervalMS := max(int64(1), (result.CTS1-result.CTS0)-(result.STS1-result.STS0))
+	return (probeBytes * 8 * 1000) / intervalMS / 1_000_000
+}
+
+func roundMbps(mbps int64) int64 {
+	return ((mbps + 50) / 100) * 100
+}
+
+func (c *Client) probeLinear(ctx context.Context, req ProbeRequest, probeBytes int64, samples int) (probeThroughput, error) {
+	if samples <= 0 {
+		samples = 1
+	}
+	results := make([]probeResponse, 0, samples)
+	for i := 0; i < samples; i++ {
+		result, err := c.probeTCP(ctx, req, probeBytes)
+		if err != nil {
+			return probeThroughput{}, fmt.Errorf("probe %d failed: %w", i+1, err)
+		}
+		results = append(results, result)
 	}
 	totalIntervalMS := int64(0)
-	serverCPU := 0
-	serverIODepth := 0
-	serverSendBufBytes := int64(0)
-	for _, result := range results {
-		serverCPU = result.ServerCPU
-		serverIODepth = result.ServerIODepth
-		serverSendBufBytes = result.ServerWmemBytes
-		intervalMS := max(int64(1), (result.CTS1-result.CTS0)-(result.STS1-result.STS0))
-		totalIntervalMS += intervalMS
+	for _, r := range results {
+		totalIntervalMS += max(int64(1), (r.CTS1-r.CTS0)-(r.STS1-r.STS0))
 	}
 	avgMS := max(int64(1), totalIntervalMS/int64(len(results)))
-	mbps := ((probeBytes * 8 * 1000) / avgMS) / 1_000_000
-	roundedMbps := ((mbps + 50) / 100) * 100
-	return ProbeResponse{
-		ServerCPU:          serverCPU,
-		ServerIODepth:      serverIODepth,
-		GentleCPUPct:       results[0].GentleCPUPct,
-		GentleBWPct:        results[0].GentleBWPct,
-		AvgLatencyMS:       avgMS,
-		LinkMbps:           roundedMbps,
-		ServerSendBufBytes: serverSendBufBytes,
-		ServerLimiterBps:   results[len(results)-1].LimiterBps,
+	mbps := roundMbps((probeBytes * 8 * 1000) / avgMS / 1_000_000)
+	return probeThroughput{
+		aggregateMbps: mbps,
+		perConnMbps:   mbps,
+		conns:         1,
+		limiterBps:    results[len(results)-1].LimiterBps,
+	}, nil
+}
+
+func (c *Client) probeParallel(ctx context.Context, req ProbeRequest, probeBytes int64, n int) (probeThroughput, error) {
+	if n < 2 {
+		return c.probeLinear(ctx, req, probeBytes, 1)
 	}
+	type outcome struct {
+		result probeResponse
+		err    error
+	}
+	outcomes := make([]outcome, n)
+	startCh := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			<-startCh
+			r, e := c.probeTCP(ctx, req, probeBytes)
+			outcomes[idx] = outcome{result: r, err: e}
+		}(i)
+	}
+	close(startCh)
+	wg.Wait()
+
+	rates := make([]int64, 0, n)
+	var (
+		minStart int64
+		maxEnd   int64
+		limiter  int64
+	)
+	for i, o := range outcomes {
+		if o.err != nil {
+			return probeThroughput{}, fmt.Errorf("parallel probe %d failed: %w", i+1, o.err)
+		}
+		if i == 0 || o.result.CTS0 < minStart {
+			minStart = o.result.CTS0
+		}
+		if o.result.CTS1 > maxEnd {
+			maxEnd = o.result.CTS1
+		}
+		rates = append(rates, probeConnMbps(o.result, probeBytes))
+		limiter = o.result.LimiterBps
+	}
+	sort.Slice(rates, func(i, j int) bool { return rates[i] < rates[j] })
+	perConn := roundMbps(rates[len(rates)/2])
+
+	wallMS := max(int64(1), maxEnd-minStart)
+	totalBytes := int64(n) * probeBytes
+	aggMbps := roundMbps((totalBytes * 8 * 1000) / wallMS / 1_000_000)
+
+	return probeThroughput{
+		aggregateMbps: aggMbps,
+		perConnMbps:   perConn,
+		conns:         n,
+		limiterBps:    limiter,
+	}, nil
 }
 
 func buildManifestBatchesByBytes(entries []ManifestEntry, maxBytes int64) [][]ManifestEntry {
