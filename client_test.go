@@ -186,27 +186,44 @@ func TestNewClientLoadStrategyOption(t *testing.T) {
 	}
 }
 
-func TestSummarizeProbeResultsAndConcurrency(t *testing.T) {
-	results := []probeResponse{
-		{ServerCPU: 24, GentleCPUPct: 25, CTS0: 1000, CTS1: 1040, STS0: 1005, STS1: 1010},
-		{ServerCPU: 24, GentleCPUPct: 25, CTS0: 2000, CTS1: 2045, STS0: 2005, STS1: 2010},
-		{ServerCPU: 24, GentleCPUPct: 25, CTS0: 3000, CTS1: 3030, STS0: 3005, STS1: 3010},
+func TestProbeDiscoveryResponseAndConcurrency(t *testing.T) {
+	discovery := probeResponse{
+		ServerCPU: 24, ServerIODepth: 8, GentleCPUPct: 25, GentleBWPct: 40,
+		CTS0: 1000, CTS1: 1012, STS0: 1002, STS1: 1005,
+		ServerWmemBytes: 4 * 1024 * 1024, LimiterBps: 500 * 1024 * 1024,
 	}
-	summary := summarizeProbeSamples(results, 1*1024*1024)
+	summary := probeDiscoveryResponse(discovery)
 	if summary.ServerCPU != 24 {
 		t.Fatalf("expected server cpu 24, got %d", summary.ServerCPU)
 	}
-	if summary.AvgLatencyMS <= 0 {
-		t.Fatalf("expected avg ms > 0, got %d", summary.AvgLatencyMS)
+	if summary.ServerIODepth != 8 {
+		t.Fatalf("expected io-depth 8, got %d", summary.ServerIODepth)
 	}
-	if summary.LinkMbps <= 0 {
-		t.Fatalf("expected rounded mbps > 0, got %d", summary.LinkMbps)
+	if summary.AvgLatencyMS != 9 {
+		t.Fatalf("expected avg ms 9, got %d", summary.AvgLatencyMS)
+	}
+	if summary.ServerLimiterBps != 500*1024*1024 {
+		t.Fatalf("expected limiter 500 MiB/s, got %d", summary.ServerLimiterBps)
 	}
 	if got := suggestedConcurrencyFromProbe(24, 8, LoadStrategyGentle, 25); got != 6 {
 		t.Fatalf("expected gentle concurrency 6, got %d", got)
 	}
 	if got := suggestedConcurrencyFromProbe(24, 8, LoadStrategyFast, 25); got != 192 {
 		t.Fatalf("expected fast concurrency 192, got %d", got)
+	}
+}
+
+func TestProbeConnMbpsAndRoundMbps(t *testing.T) {
+	result := probeResponse{CTS0: 1000, CTS1: 1010, STS0: 1002, STS1: 1004}
+	mbps := probeConnMbps(result, 1*1024*1024)
+	if mbps <= 0 {
+		t.Fatalf("expected mbps > 0, got %d", mbps)
+	}
+	if got := roundMbps(949); got != 900 {
+		t.Fatalf("expected round to 900, got %d", got)
+	}
+	if got := roundMbps(950); got != 1000 {
+		t.Fatalf("expected round to 1000, got %d", got)
 	}
 }
 

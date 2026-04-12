@@ -388,7 +388,7 @@ COPY_CMD+=("${SOURCE_DIRECTORY}" "${TARGET_DIR}")
 
 if [[ "$FLAMEGRAPH" != "true" ]]; then
   echo "Running timed copy benchmark..."
-  { time "${COPY_CMD[@]}" | awk '!/^start-file: /'; } 2>&1
+  { time "${COPY_CMD[@]}"; } 2>&1
   if [[ "${TRACE}" == "true" ]]; then
     echo "Client trace written to: ${CLIENT_TRACE}  (view with: go tool trace ${CLIENT_TRACE})"
     echo "Server trace written to: ${SERVER_TRACE}  (view with: go tool trace ${SERVER_TRACE})"

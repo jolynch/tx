@@ -3,6 +3,7 @@ data/src/*
 data/dst/*
 data/silesia/*
 !data/silesia/.keep
+data/.tx/
 results/
 bench
 tx

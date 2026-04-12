@@ -109,6 +109,39 @@ func formatStartBatchProbeLine(linkMiBPerSec int64, suggestedConcurrency int, pl
 	)
 }
 
+// formatProbeLinkSummary is a one-liner summary of the probe link estimate
+// used inside existing status lines (sync-delta, start-plan). Fast mode expands
+// to "<agg>Mbps (<N>x<per-conn>)"; gentle/single collapses to "<link>Mbps".
+func formatProbeLinkSummary(probe tx.ProbeResponse) string {
+	if probe.ParallelConns > 1 {
+		return fmt.Sprintf("%dMbps (%dx%dMbps)", probe.AggregateMbps, probe.ParallelConns, probe.PerConnMbps)
+	}
+	return fmt.Sprintf("%dMbps", probe.LinkMbps)
+}
+
+// formatProbeLinkLine renders the throughput phase of a probe. In fast mode a
+// fanout across N connections is shown with per-conn median + aggregate; in
+// gentle/single-conn modes we print just the averaged per-conn link.
+func formatProbeLinkLine(probe tx.ProbeResponse, probeBytes int64) string {
+	linkMiBPerSec := probe.LinkMbps * 1_000_000 / 8 / (1 << 20)
+	if probe.ParallelConns > 1 {
+		return fmt.Sprintf(
+			"txfer-link    : %d×%s parallel -> agg=%dMbps (%d MiB/s) per-conn-median=%dMbps",
+			probe.ParallelConns,
+			encoding.HumanBytes(probeBytes),
+			probe.AggregateMbps,
+			linkMiBPerSec,
+			probe.PerConnMbps,
+		)
+	}
+	return fmt.Sprintf(
+		"txfer-link    : 1x%s linear -> link=%dMbps (%d MiB/s)",
+		encoding.HumanBytes(probeBytes),
+		probe.LinkMbps,
+		linkMiBPerSec,
+	)
+}
+
 type synchronizedWriter struct {
 	mu *sync.Mutex
 	w  io.Writer
@@ -175,8 +208,8 @@ func startTransferProbeReporter(ctx context.Context, client *tx.Client, transfer
 				return
 			case <-ticker.C:
 				resp, err := client.ProbeLink(probeCtx, tx.ProbeRequest{
-					Samples:          1,
 					ProbeBytes:       probeBytes,
+					Parallelism:      1,
 					LoadStrategy:     strategy,
 					TransferID:       transferID,
 					ObservedLinkMbps: observed.Load(),
@@ -819,7 +852,7 @@ func verifyCopy(serverURL string, cfg copyCLIConfig, stdout io.Writer, stderr io
 	}
 	files, hardlinks, symlinks, dirs := countManifestEntryTypes(serverManifest.Entries)
 	fmt.Fprintf(
-		stdout,
+		stderr,
 		"copy-verify-meta: ok total=%d files=%d hardlinks=%d symlinks=%d dirs=%d\n",
 		len(serverManifest.Entries),
 		files,
@@ -830,12 +863,12 @@ func verifyCopy(serverURL string, cfg copyCLIConfig, stdout io.Writer, stderr io
 	if cfg.verifyDataSamplePct <= 0 {
 		return 0
 	}
-	sampledFiles, sampledRanges, err := verifyCopyDataSamples(serverURL, cfg, serverManifest, stdout)
+	sampledFiles, sampledRanges, err := verifyCopyDataSamples(serverURL, cfg, serverManifest, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "copy-verify-data: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "copy-verify-data: ok files=%d samples=%d pct=%d\n", sampledFiles, sampledRanges, cfg.verifyDataSamplePct)
+	fmt.Fprintf(stderr, "copy-verify-data: ok files=%d samples=%d pct=%d\n", sampledFiles, sampledRanges, cfg.verifyDataSamplePct)
 	return 0
 }
 
@@ -905,7 +938,7 @@ type verifySampleTask struct {
 	samples    []verifySample
 }
 
-func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Manifest, stdout io.Writer) (int, int, error) {
+func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Manifest, stderr io.Writer) (int, int, error) {
 	if manifest == nil {
 		return 0, 0, errors.New("missing manifest")
 	}
@@ -946,7 +979,7 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 	var wg sync.WaitGroup
 	var completed atomic.Int64
 	var progressDone chan struct{}
-	if stdout != nil {
+	if stderr != nil {
 		progressDone = make(chan struct{})
 		go func() {
 			defer close(progressDone)
@@ -958,7 +991,7 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 					return
 				case <-ticker.C:
 					done := completed.Load()
-					fmt.Fprintf(stdout, "copy-verify-data: progress files=%d/%d samples=%d pct=%d\n", done, len(tasks), totalRanges, cfg.verifyDataSamplePct)
+					fmt.Fprintf(stderr, "copy-verify-data: progress files=%d/%d samples=%d pct=%d\n", done, len(tasks), totalRanges, cfg.verifyDataSamplePct)
 				}
 			}
 		}()
@@ -1247,7 +1280,6 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 	client := tx.NewClient(serverURL, tx.WithLoadStrategy(cfg.loadStrategy), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode))
 	start := time.Now()
 	probeResult, err := client.ProbeLink(context.Background(), tx.ProbeRequest{
-		Samples:      3,
 		ProbeBytes:   cfg.probeBytes,
 		LoadStrategy: cfg.loadStrategy,
 	})
@@ -1260,14 +1292,14 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 		cipherDisplay = probeResult.SuggestedCipher
 	}
 	fmt.Fprintf(
-		stdout,
-		"txfer-probe   : strategy=%s cipher=%s avg_ms=%d est_link=%dMbps srv-conc=(%d cpu * %d io = %d)\n",
+		stderr,
+		"txfer-probe   : strategy=%s cipher=%s rtt_ms=%d srv-conc=(%d cpu * %d io = %d)\n",
 		cfg.loadStrategy,
 		cipherDisplay,
 		probeResult.AvgLatencyMS,
-		probeResult.LinkMbps,
 		probeResult.ServerCPU, probeResult.ServerIODepth, probeResult.SuggestedConcurrency,
 	)
+	fmt.Fprintln(stderr, formatProbeLinkLine(probeResult, cfg.probeBytes))
 	manifestResp, err := client.GetManifest(context.Background(), tx.GetManifestRequest{
 		Directory:    cfg.sourceDir,
 		Verbose:      cfg.verbosity >= 2,
@@ -1296,7 +1328,7 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 		return 1
 	}
 	fmt.Fprintf(
-		stdout,
+		stderr,
 		"txfer-loaded  : tid[%s] %d files (%s) from [%s] elapsed=%s\n",
 		manifest.TransferID,
 		len(manifest.Entries),
@@ -1658,7 +1690,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 
 	// Mini-probe to detect server send buffer and compute batch size.
 	var miniProbe tx.ProbeResponse
-	if probe, probeErr := client.ProbeLink(context.Background(), tx.ProbeRequest{Samples: 1, ProbeBytes: 1}); probeErr == nil {
+	if probe, probeErr := client.ProbeLink(context.Background(), tx.ProbeRequest{ProbeBytes: 1}); probeErr == nil {
 		miniProbe = probe
 	}
 	batchPlan := tx.ExplainBatchMaxBytes(
@@ -1910,7 +1942,6 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		// Probe link bandwidth.
 		client := tx.NewClient(serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode))
 		probeResult, err := client.ProbeLink(context.Background(), tx.ProbeRequest{
-			Samples:      3,
 			ProbeBytes:   cfg.probeBytes,
 			LoadStrategy: loadStrategy,
 		})
@@ -1970,27 +2001,27 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 
 		oldMem, _ := oldManifest.Size()
 		newMem, newDisk := newManifest.Size()
-		fmt.Fprintf(stdout,
+		fmt.Fprintf(stderr,
 			"sync-manifests[%d]: local %d files [mem=%s], remote %d files [mem=%s, disk=%s]\n",
 			round,
 			len(oldManifest.Entries), encoding.HumanBytes(oldMem),
 			len(newManifest.Entries), encoding.HumanBytes(newMem),
 			encoding.HumanBytes(newDisk),
 		)
-		fmt.Fprintf(stdout,
-			"sync-delta[%d]: new[%s (%s)] stale[%s (%s)] same[%s] rm[%s] link=%dMbps srv-conc=(%d cpu * %d io = %d) batch=%s\n",
+		fmt.Fprintf(stderr,
+			"sync-delta[%d]: new[%s (%s)] stale[%s (%s)] same[%s] rm[%s] link=%s srv-conc=(%d cpu * %d io = %d) batch=%s\n",
 			round,
 			newCount, encoding.HumanBytes(newBytes),
 			staleCount, encoding.HumanBytes(staleBytes),
 			unchangedCount,
 			rmCount,
-			probeResult.LinkMbps,
+			formatProbeLinkSummary(probeResult),
 			probeResult.ServerCPU, probeResult.ServerIODepth, probeResult.SuggestedConcurrency,
 			encoding.HumanBytes(batchSize),
 		)
 
 		if len(newFiles) == 0 && len(staleFiles) == 0 && len(rmPaths) == 0 {
-			fmt.Fprintln(stdout, "sync: remote and local converged, nothing to do")
+			fmt.Fprintln(stderr, "sync: remote and local converged, nothing to do")
 			return 0
 		}
 
@@ -2061,10 +2092,10 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 
 		if !pendingWork.hasAny() {
 			if cfg.skipWrite {
-				fmt.Fprintln(stdout, "sync: skip-write, no downloads needed")
+				fmt.Fprintln(stderr, "sync: skip-write, no downloads needed")
 				return 0
 			}
-			fmt.Fprintln(stdout, "sync: no downloads needed")
+			fmt.Fprintln(stderr, "sync: no downloads needed")
 			continue
 		}
 
@@ -2145,7 +2176,9 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 				}
 				persistFileDone(evt.File.Meta.FileID, entry.Size)
 				markMetadataDone(evt.File.Meta.FileID)
-				printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.File.WindowChecksumPassed, evt.File.WindowChecksumTotal, evt.Elapsed)
+				if cfg.verbosity >= 2 {
+					printStartFileSummary(stdout, evt.File.Meta.FileID, destPath, evt.File.Meta, evt.File.LocalFileHash, evt.File.WindowChecksumPassed, evt.File.WindowChecksumTotal, evt.Elapsed)
+				}
 			},
 			TotalCopied:      &totalCopied,
 			ProgressFilePath: cfg.progressFilePath,
@@ -2191,7 +2224,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		if elapsedAll > 0 {
 			overallSpeed = float64(totalTransferred) / elapsedAll.Seconds()
 		}
-		fmt.Fprintf(stdout,
+		fmt.Fprintf(stderr,
 			"sync complete[%d]: tid=%s downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s\n",
 			round,
 			mergedManifest.TransferID,
@@ -2433,7 +2466,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 
 	if len(pendingWork.files) > 0 {
 		var miniProbe tx.ProbeResponse
-		if probe, probeErr := client.ProbeLink(context.Background(), tx.ProbeRequest{Samples: 1, ProbeBytes: 1}); probeErr == nil {
+		if probe, probeErr := client.ProbeLink(context.Background(), tx.ProbeRequest{ProbeBytes: 1}); probeErr == nil {
 			miniProbe = probe
 		}
 		rawLinkMbps := max(manifest.LinkMbps, miniProbe.LinkMbps)
@@ -2456,37 +2489,37 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		)
 		linkMiBPerSec := rawLinkMbps * 1_000_000 / 8 / (1 << 20)
 		effectiveLinkMiBPerSec := effectiveLinkMbps * 1_000_000 / 8 / (1 << 20)
-		fmt.Fprintf(stdout, "start-plan:\n")
+		fmt.Fprintf(stderr, "start-plan:\n")
 		manifestMem, manifestDisk := manifest.Size()
-		fmt.Fprintf(stdout, "  manifest: %d files indexed in [mem=%s, serialized=%s]\n",
+		fmt.Fprintf(stderr, "  manifest: %d files indexed in [mem=%s, serialized=%s]\n",
 			len(manifest.Entries),
 			encoding.HumanBytesFixedWidth(manifestMem, 4),
 			encoding.HumanBytesFixedWidth(manifestDisk, 4))
 		if loadStrategy == tx.LoadStrategyGentle {
-			fmt.Fprintf(stdout, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s), %d%% gentle-cpu, %d%% gentle-bw\n",
+			fmt.Fprintf(stderr, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s), %d%% gentle-cpu, %d%% gentle-bw\n",
 				miniProbe.ServerCPU, miniProbe.ServerIODepth, rawLinkMbps, linkMiBPerSec, gentleCPUPct, gentleBWPct)
-			fmt.Fprintf(stdout, "  mode: [%s] → concurrency = %d cpu * %d%% = %d, bw-limit = %d MiB/s * %d%% = %d MiB/s\n",
+			fmt.Fprintf(stderr, "  mode: [%s] → concurrency = %d cpu * %d%% = %d, bw-limit = %d MiB/s * %d%% = %d MiB/s\n",
 				loadStrategy, miniProbe.ServerCPU, gentleCPUPct, miniProbe.SuggestedConcurrency, linkMiBPerSec, gentleBWPct, effectiveLinkMiBPerSec)
 		} else {
-			fmt.Fprintf(stdout, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s)\n",
+			fmt.Fprintf(stderr, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s)\n",
 				miniProbe.ServerCPU, miniProbe.ServerIODepth, rawLinkMbps, linkMiBPerSec)
-			fmt.Fprintf(stdout, "  mode: [%s] → concurrency = %d cpu * %d io-depth = %d, bw-limit = none\n",
+			fmt.Fprintf(stderr, "  mode: [%s] → concurrency = %d cpu * %d io-depth = %d, bw-limit = none\n",
 				loadStrategy, miniProbe.ServerCPU, miniProbe.ServerIODepth, miniProbe.SuggestedConcurrency)
 		}
 		if cfg.concurrencyExplicit {
-			fmt.Fprintf(stdout, "  concurrency: %d (override from --concurrency, server suggested %d)\n",
+			fmt.Fprintf(stderr, "  concurrency: %d (override from --concurrency, server suggested %d)\n",
 				effectiveConcurrency, miniProbe.SuggestedConcurrency)
 		} else {
-			fmt.Fprintf(stdout, "  concurrency: %d\n", effectiveConcurrency)
+			fmt.Fprintf(stderr, "  concurrency: %d\n", effectiveConcurrency)
 		}
-		fmt.Fprintf(stdout, "    window: %d\n", batchPlan.EffectiveWinConc)
-		fmt.Fprintf(stdout, "    batch-per-window: %d\n", batchPlan.PerFileWorkers)
-		fmt.Fprintf(stdout, "  batch: %s (from %s)\n",
+		fmt.Fprintf(stderr, "    window: %d\n", batchPlan.EffectiveWinConc)
+		fmt.Fprintf(stderr, "    batch-per-window: %d\n", batchPlan.PerFileWorkers)
+		fmt.Fprintf(stderr, "  batch: %s (from %s)\n",
 			encoding.HumanBytes(batchPlan.BatchMaxBytes),
 			formatStartBatchCause(batchPlan))
-		fmt.Fprintln(stdout, formatStartBatchWindowLine(client.FileRequestWindowBytes, batchPlan))
+		fmt.Fprintln(stderr, formatStartBatchWindowLine(client.FileRequestWindowBytes, batchPlan))
 		if bwProbeLine := formatStartBatchProbeLine(effectiveLinkMiBPerSec, miniProbe.SuggestedConcurrency, batchPlan); bwProbeLine != "" {
-			fmt.Fprintln(stdout, bwProbeLine)
+			fmt.Fprintln(stderr, bwProbeLine)
 		}
 		outputWriter := func(entry tx.ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
 			destPath := resolveDownloadDestinationPath(entry, outRoot, "")

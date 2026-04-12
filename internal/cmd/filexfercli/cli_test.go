@@ -726,7 +726,7 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	out := stdout.String()
+	out := stderr.String()
 	if !strings.Contains(out, "mode: [gentle]") ||
 		!strings.Contains(out, "concurrency: 2 (override from --concurrency") ||
 		!strings.Contains(out, "    window: ") ||
@@ -780,7 +780,7 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	out := stdout.String()
+	out := stderr.String()
 	if !strings.Contains(out, "mode: [fast]") ||
 		!strings.Contains(out, "concurrency: 5") ||
 		!strings.Contains(out, "    window: ") ||
@@ -1647,8 +1647,8 @@ func TestRunCLISyncNoOpSkipsPrompt(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("sync no-op: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "sync: remote and local converged, nothing to do") {
-		t.Fatalf("expected converged output, got: %s", stdout.String())
+	if !strings.Contains(stderr.String(), "sync: remote and local converged, nothing to do") {
+		t.Fatalf("expected converged output, got: %s", stderr.String())
 	}
 	if strings.Contains(stderr.String(), "proceed?") {
 		t.Fatalf("did not expect prompt for no-op sync, got stderr=%s", stderr.String())
@@ -2059,8 +2059,8 @@ func TestRunCLISyncSkipWriteSkipsTransferWhenOnlyNonFilesPending(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("sync skip-write non-files: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if got := probeCount.Load(); got != 3 {
-		t.Fatalf("expected only the initial 3 probe samples, got %d", got)
+	if got := probeCount.Load(); got != 1 {
+		t.Fatalf("expected a single 1-byte discovery probe, got %d", got)
 	}
 	if _, err := os.Stat(filepath.Join(targetDir, "sub")); !os.IsNotExist(err) {
 		t.Fatalf("expected skip-write mode to skip directory creation, stat err=%v", err)
@@ -2225,7 +2225,7 @@ func TestRunCLICopySkipFetchVerifyMeta(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("copy skip-fetch verify-meta: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "copy-verify-meta: ok total=2 files=1 hardlinks=0 symlinks=0 dirs=1") {
+	if !strings.Contains(stderr.String(), "copy-verify-meta: ok total=2 files=1 hardlinks=0 symlinks=0 dirs=1") {
 		t.Fatalf("expected verify output, got stdout=%s stderr=%s", stdout.String(), stderr.String())
 	}
 	if _, err := os.Stat(filepath.Join(tmp, ".tx", "dst")); err != nil {
@@ -2295,7 +2295,7 @@ func TestRunCLICopyMixedManifestTypesConverges(t *testing.T) {
 	if got := sendCount.Load(); got != 1 {
 		t.Fatalf("expected exactly one SEND across both runs, got %d", got)
 	}
-	if !strings.Contains(stdout.String(), "copy-verify-meta: ok total=4 files=1 hardlinks=1 symlinks=1 dirs=1") {
+	if !strings.Contains(stderr.String(), "copy-verify-meta: ok total=4 files=1 hardlinks=1 symlinks=1 dirs=1") {
 		t.Fatalf("expected verify-meta output, got stdout=%s stderr=%s", stdout.String(), stderr.String())
 	}
 
