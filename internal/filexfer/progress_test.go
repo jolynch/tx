@@ -1,32 +1,32 @@
 package filexfer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
 type progressStatusFixture struct {
-	mu     sync.Mutex
-	status string
-	pct    int
+	mu sync.Mutex
+	s  ProgressStatus
 }
 
-func (f *progressStatusFixture) set(status string, pct int) {
+func (f *progressStatusFixture) set(s ProgressStatus) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.status = status
-	f.pct = pct
+	f.s = s
 }
 
-func (f *progressStatusFixture) get() (string, int) {
+func (f *progressStatusFixture) get() ProgressStatus {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.status, f.pct
+	return f.s
 }
 
 func waitForFileContent(t *testing.T, path string, want string) {
@@ -48,51 +48,54 @@ func waitForFileContent(t *testing.T, path string, want string) {
 
 func TestStartProgressFileWriterTruncatesThenAppends(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "progress.txt")
-	if err := os.WriteFile(path, []byte("stale\n99\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("stale\n"), 0o644); err != nil {
 		t.Fatalf("seed progress file: %v", err)
 	}
 
 	status := &progressStatusFixture{}
-	status.set("first", 10)
-	stop := StartProgressFileWriter(context.Background(), path, 10*time.Millisecond, status.get)
+	s1 := ProgressStatus{Source: "s", DoneBytes: 10, TotalBytes: 100}
+	status.set(s1)
+	stop := StartProgressFileWriter(context.Background(), []ProgressTarget{{Path: path, Format: ProgressFormatJSON}}, 10*time.Millisecond, status.get)
 	t.Cleanup(func() { stop(false) })
 
-	waitForFileContent(t, path, "first\n10\n")
-	status.set("second", 20)
-	waitForFileContent(t, path, "first\n10\nsecond\n20\n")
+	json1 := FormatProgressStatusLine(s1.Source, s1.TxID, s1.DoneFiles, s1.TotalFiles, s1.DoneBytes, s1.TotalBytes)
+	waitForFileContent(t, path, json1+"\n")
+
+	s2 := ProgressStatus{Source: "s", DoneBytes: 20, TotalBytes: 100}
+	status.set(s2)
+	json2 := FormatProgressStatusLine(s2.Source, s2.TxID, s2.DoneFiles, s2.TotalFiles, s2.DoneBytes, s2.TotalBytes)
+	waitForFileContent(t, path, json1+"\n"+json2+"\n")
 }
 
-func TestStartProgressFileWriterDeduplicatesByStatusAndPct(t *testing.T) {
+func TestStartProgressFileWriterDeduplicates(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "progress.txt")
 	status := &progressStatusFixture{}
-	status.set("same", 42)
-	stop := StartProgressFileWriter(context.Background(), path, 10*time.Millisecond, status.get)
+	s := ProgressStatus{Source: "s", DoneBytes: 42, TotalBytes: 100}
+	status.set(s)
+	stop := StartProgressFileWriter(context.Background(), []ProgressTarget{{Path: path, Format: ProgressFormatInt}}, 10*time.Millisecond, status.get)
 	t.Cleanup(func() { stop(false) })
 
-	waitForFileContent(t, path, "same\n42\n")
+	waitForFileContent(t, path, "42\n")
 	time.Sleep(40 * time.Millisecond)
-	waitForFileContent(t, path, "same\n42\n")
+	waitForFileContent(t, path, "42\n")
 
-	status.set("other", 42)
-	waitForFileContent(t, path, "same\n42\nother\n42\n")
-
-	status.set("other", 43)
-	waitForFileContent(t, path, "same\n42\nother\n42\nother\n43\n")
+	status.set(ProgressStatus{Source: "s", DoneBytes: 43, TotalBytes: 100})
+	waitForFileContent(t, path, "42\n43\n")
 }
 
 func TestStartProgressFileWriterStopSuccessWritesFinal100(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "progress.txt")
 	status := &progressStatusFixture{}
-	status.set("done", 64)
+	status.set(ProgressStatus{Source: "s", DoneBytes: 64, TotalBytes: 100})
 
-	stop := StartProgressFileWriter(context.Background(), path, time.Hour, status.get)
+	stop := StartProgressFileWriter(context.Background(), []ProgressTarget{{Path: path, Format: ProgressFormatInt}}, time.Hour, status.get)
 	stop(true)
 
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read progress file: %v", err)
 	}
-	if got, want := string(raw), "done\n100\n"; got != want {
+	if got, want := string(raw), "100\n"; got != want {
 		t.Fatalf("final progress mismatch: got %q want %q", got, want)
 	}
 }
@@ -100,16 +103,16 @@ func TestStartProgressFileWriterStopSuccessWritesFinal100(t *testing.T) {
 func TestStartProgressFileWriterStopFailureWritesCurrentPct(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "progress.txt")
 	status := &progressStatusFixture{}
-	status.set("failed", 64)
+	status.set(ProgressStatus{Source: "s", DoneBytes: 64, TotalBytes: 100})
 
-	stop := StartProgressFileWriter(context.Background(), path, time.Hour, status.get)
+	stop := StartProgressFileWriter(context.Background(), []ProgressTarget{{Path: path, Format: ProgressFormatInt}}, time.Hour, status.get)
 	stop(false)
 
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read progress file: %v", err)
 	}
-	if got, want := string(raw), "failed\n64\n"; got != want {
+	if got, want := string(raw), "64\n"; got != want {
 		t.Fatalf("final progress mismatch: got %q want %q", got, want)
 	}
 }
@@ -133,14 +136,83 @@ func TestFormatProgressStatusLine(t *testing.T) {
 	if files["percent"] != "90.1" {
 		t.Fatalf("expected files percent string, got %#v", files["percent"])
 	}
-	bytes, ok := parsed["bytes"].(map[string]any)
+	bytesObj, ok := parsed["bytes"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected bytes object, got %#v", parsed["bytes"])
 	}
-	if bytes["percent"] != "97.7" {
-		t.Fatalf("expected bytes percent string, got %#v", bytes["percent"])
+	if bytesObj["percent"] != "97.7" {
+		t.Fatalf("expected bytes percent string, got %#v", bytesObj["percent"])
 	}
 	if _, ok := parsed["bytes_human"].(map[string]any); !ok {
 		t.Fatalf("expected bytes_human object, got %#v", parsed["bytes_human"])
+	}
+}
+
+func TestStartProgressFileWriterEmptyTargets(t *testing.T) {
+	stop := StartProgressFileWriter(context.Background(), nil, 10*time.Millisecond, func() ProgressStatus {
+		return ProgressStatus{Source: "nope", DoneBytes: 50, TotalBytes: 100}
+	})
+	stop(true)
+}
+
+func TestStartProgressFileWriterIntFormat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "progress.txt")
+	status := &progressStatusFixture{}
+	status.set(ProgressStatus{Source: "s", DoneBytes: 42, TotalBytes: 100})
+	stop := StartProgressFileWriter(context.Background(), []ProgressTarget{{Path: path, Format: ProgressFormatInt}}, 10*time.Millisecond, status.get)
+	t.Cleanup(func() { stop(false) })
+
+	waitForFileContent(t, path, "42\n")
+	status.set(ProgressStatus{Source: "s", DoneBytes: 80, TotalBytes: 100})
+	waitForFileContent(t, path, "42\n80\n")
+}
+
+func TestStartProgressFileWriterMultipleTargets(t *testing.T) {
+	dir := t.TempDir()
+	pathJSON := filepath.Join(dir, "json.txt")
+	pathInt := filepath.Join(dir, "int.txt")
+	status := &progressStatusFixture{}
+	s := ProgressStatus{Source: "s", DoneBytes: 10, TotalBytes: 100}
+	status.set(s)
+	targets := []ProgressTarget{
+		{Path: pathJSON, Format: ProgressFormatJSON},
+		{Path: pathInt, Format: ProgressFormatInt},
+	}
+	stop := StartProgressFileWriter(context.Background(), targets, 10*time.Millisecond, status.get)
+	t.Cleanup(func() { stop(false) })
+
+	jsonLine := FormatProgressStatusLine(s.Source, s.TxID, s.DoneFiles, s.TotalFiles, s.DoneBytes, s.TotalBytes)
+	waitForFileContent(t, pathJSON, jsonLine+"\n")
+	waitForFileContent(t, pathInt, "10\n")
+}
+
+func TestStartProgressFileWriterSamePathMultipleFormats(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "progress.txt")
+	status := &progressStatusFixture{}
+	s := ProgressStatus{Source: "s", DoneBytes: 10, TotalBytes: 100}
+	status.set(s)
+	targets := []ProgressTarget{
+		{Path: path, Format: ProgressFormatJSON},
+		{Path: path, Format: ProgressFormatInt},
+	}
+	stop := StartProgressFileWriter(context.Background(), targets, 10*time.Millisecond, status.get)
+	t.Cleanup(func() { stop(false) })
+
+	jsonLine := FormatProgressStatusLine(s.Source, s.TxID, s.DoneFiles, s.TotalFiles, s.DoneBytes, s.TotalBytes)
+	waitForFileContent(t, path, jsonLine+"\n10\n")
+}
+
+func TestStartProgressFileWriterStdoutTarget(t *testing.T) {
+	var buf bytes.Buffer
+	status := &progressStatusFixture{}
+	status.set(ProgressStatus{Source: "s", DoneBytes: 55, TotalBytes: 100})
+	targets := []ProgressTarget{
+		{Path: "-", Format: ProgressFormatInt, Stdout: &buf},
+	}
+	stop := StartProgressFileWriter(context.Background(), targets, 10*time.Millisecond, status.get)
+	stop(false)
+	got := buf.String()
+	if !strings.Contains(got, "55\n") {
+		t.Fatalf("stdout target: got %q, want it to contain %q", got, "55\n")
 	}
 }

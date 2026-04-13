@@ -6,6 +6,8 @@ import (
 	"io"
 	"strconv"
 	"strings"
+
+	filexfer "github.com/jolynch/tx/internal/filexfer"
 )
 
 // flagEntry records one option for combined help rendering.
@@ -69,6 +71,19 @@ func (c *cliFlags) IntVar(p *int, short, long string, defVal int, usage string) 
 		c.fs.IntVar(p, long, defVal, usage)
 	}
 	c.pairs = append(c.pairs, flagEntry{short: short, long: long, typ: "int", usage: usage, def: strconv.Itoa(defVal)})
+}
+
+// StringSliceVar registers a repeatable string flag. Each occurrence appends
+// to the slice. Pass short="" for long-only, long="" for short-only.
+func (c *cliFlags) StringSliceVar(p *[]string, short, long, usage string) {
+	f := &filexfer.StringSliceFlag{Values: p}
+	if short != "" {
+		c.fs.Var(f, short, usage)
+	}
+	if long != "" {
+		c.fs.Var(f, long, usage)
+	}
+	c.pairs = append(c.pairs, flagEntry{short: short, long: long, typ: "string", usage: usage, def: `""`})
 }
 
 // leftCol returns the formatted left column for a flag entry:

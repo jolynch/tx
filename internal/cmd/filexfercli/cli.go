@@ -474,8 +474,9 @@ type copyCLIConfig struct {
 	probeSizeRaw            string
 	deadlineRaw             string
 	traceFile               string
-	progressFilePath        string
-	progressFileIntervalRaw string
+	progressFilePaths       []string
+	progressFormats         []string
+	progressIntervalRaw string
 	clean                   bool
 	skipFetch               bool
 	skipWrite               bool
@@ -516,7 +517,7 @@ type syncArgs struct {
 	yes                 bool
 	probeBytes          int64
 	traceFile           string
-	progressFilePath    string
+	progressTargets     []filexfer.ProgressTarget
 	progressInterval    time.Duration
 }
 
@@ -534,7 +535,7 @@ type startArgs struct {
 	discard             bool
 	deadlineMS          int64
 	traceFile           string
-	progressFilePath    string
+	progressTargets     []filexfer.ProgressTarget
 	progressInterval    time.Duration
 }
 
@@ -605,7 +606,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cfg := copyCLIConfig{
 		ackEveryRaw:             encoding.HumanBytes(defaultCLIAckEveryBytes),
 		probeSizeRaw:            encoding.HumanBytes(defaultCLIProbeBytes),
-		progressFileIntervalRaw: "1s",
+		progressIntervalRaw: "1s",
 		progress:                true,
 	}
 	cf.BoolVar(&cfg.clean, "", "clean", false, "Remove LOCAL_DST first, then force a clean transfer")
@@ -620,8 +621,9 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf.IntVar(&cfg.concurrency, "", "concurrency", 0, "Parallel download / verification workers (0=adapt from server)")
 	cf.BoolVar(&cfg.progress, "", "progress", true, "Show transfer progress every 2s")
 	cf.BoolVar(&cfg.verbose, "v", "verbose", false, "Per-file progress output")
-	cf.StringVar(&cfg.progressFilePath, "", "progress-file", "", "Append progress status + integer % records to this file/pipe")
-	cf.StringVar(&cfg.progressFileIntervalRaw, "", "progress-file-interval", cfg.progressFileIntervalRaw, "Progress write interval (e.g. 500ms, 10s)")
+	cf.StringSliceVar(&cfg.progressFilePaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
+	cf.StringSliceVar(&cfg.progressFormats, "f", "progress-format", "Progress format: json|int; 1 applies to all targets, or one per target (default json)")
+	cf.StringVar(&cfg.progressIntervalRaw, "", "progress-interval", cfg.progressIntervalRaw, "Progress write interval (e.g. 500ms, 10s)")
 	cf.BoolVar(&cfg.yes, "y", "yes", false, "Skip confirmation prompt on sync paths")
 	cf.StringVar(&cfg.ackEveryRaw, "a", "ack-every", cfg.ackEveryRaw, "Bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
 	cf.StringVar(&cfg.probeSizeRaw, "", "probe-size", cfg.probeSizeRaw, "Probe payload size; e.g. 1B, 4KiB, 8MiB")
@@ -683,9 +685,14 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
 		return 2
 	}
-	progressInterval, err := time.ParseDuration(cfg.progressFileIntervalRaw)
+	progressInterval, err := time.ParseDuration(cfg.progressIntervalRaw)
 	if err != nil {
-		fmt.Fprintf(stderr, "invalid --progress-file-interval: %v\n", err)
+		fmt.Fprintf(stderr, "invalid --progress-interval: %v\n", err)
+		return 2
+	}
+	progressTargets, err := filexfer.ResolveProgressTargets(cfg.progressFilePaths, cfg.progressFormats)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --progress-path/--progress-format: %v\n", err)
 		return 2
 	}
 	var deadlineMS int64
@@ -755,7 +762,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 			yes:                 cfg.yes,
 			probeBytes:          probeBytes,
 			traceFile:           cfg.traceFile,
-			progressFilePath:    cfg.progressFilePath,
+			progressTargets:     progressTargets,
 			progressInterval:    progressInterval,
 		}
 		if code := runSync(serverURL, syncCfg, stdout, stderr); code != 0 {
@@ -777,7 +784,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 			discard:             cfg.skipWrite,
 			deadlineMS:          deadlineMS,
 			traceFile:           cfg.traceFile,
-			progressFilePath:    cfg.progressFilePath,
+			progressTargets:     progressTargets,
 			progressInterval:    progressInterval,
 		}
 		if code := runStart(serverURL, startCfg, stdout, stderr); code != 0 {
@@ -1588,8 +1595,9 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var progress bool
 	var deadlineRaw string
 	var traceFile string
-	var progressFilePath string
-	var progressFileIntervalRaw string
+	var progressFilePaths []string
+	var progressFormats []string
+	var progressIntervalRaw string
 	cf.StringVar(&outFile, "o", "", "", "Output file path, or '-' for stdout")
 	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
@@ -1598,8 +1606,9 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	cf.BoolVar(&skipFsync, "", "skip-fsync", false, "Acknowledge writes without fdatasync")
 	cf.BoolVar(&progress, "", "progress", true, "Show transfer progress every 2s")
 	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
-	cf.StringVar(&progressFilePath, "", "progress-file", "", "Append progress status + integer % records to this file/pipe")
-	cf.StringVar(&progressFileIntervalRaw, "", "progress-file-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
+	cf.StringSliceVar(&progressFilePaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
+	cf.StringSliceVar(&progressFormats, "f", "progress-format", "Progress format: json|int; 1 applies to all targets, or one per target (default json)")
+	cf.StringVar(&progressIntervalRaw, "", "progress-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
 	cf.StringVar(&deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
@@ -1621,9 +1630,14 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintln(stderr, "get requires REMOTE_PATH to be an absolute server path")
 		return 2
 	}
-	progressInterval, err := time.ParseDuration(progressFileIntervalRaw)
+	progressInterval, err := time.ParseDuration(progressIntervalRaw)
 	if err != nil {
-		fmt.Fprintf(stderr, "invalid --progress-file-interval: %v\n", err)
+		fmt.Fprintf(stderr, "invalid --progress-interval: %v\n", err)
+		return 2
+	}
+	progressTargets, err := filexfer.ResolveProgressTargets(progressFilePaths, progressFormats)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --progress-path/--progress-format: %v\n", err)
 		return 2
 	}
 	ackEvery, err := encoding.ParseByteSize(ackEveryRaw)
@@ -1738,9 +1752,9 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		}
 		return &countingWriter{Writer: w, total: &totalCopied}, syncFn, nil
 	}
-	if progressFilePath != "" {
+	if len(progressTargets) > 0 {
 		totalBytes := entry.Size
-		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), progressFilePath, progressInterval, func() (string, int) {
+		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), progressTargets, progressInterval, func() filexfer.ProgressStatus {
 			copied := totalCopied.Load()
 			if totalBytes > 0 && copied > totalBytes {
 				copied = totalBytes
@@ -1749,15 +1763,13 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 			if totalBytes <= 0 || copied >= totalBytes {
 				doneFiles = 1
 			}
-			pct := 100
-			if totalBytes > 0 {
-				pct = int(copied * 100 / totalBytes)
+			return filexfer.ProgressStatus{
+				Source:     "client",
+				DoneFiles:  doneFiles,
+				TotalFiles: 1,
+				DoneBytes:  copied,
+				TotalBytes: totalBytes,
 			}
-			status := filexfer.FormatProgressStatusLine("client", "", doneFiles, 1, copied, totalBytes)
-			if pct > 100 {
-				pct = 100
-			}
-			return status, pct
 		})
 		defer func() { stopProgressFile(err == nil) }()
 	}
@@ -1806,16 +1818,18 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	var yes bool
 	var probeSizeRaw string
 	var traceFile string
-	var progressFilePath string
-	var progressFileIntervalRaw string
+	var progressFilePaths []string
+	var progressFormats []string
+	var progressIntervalRaw string
 	cf.StringVar(&sourceDir, "s", "source-directory", "", "Absolute source directory on server (default: manifest root)")
 	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=manifest default)")
 	cf.BoolVar(&yes, "y", "yes", false, "Skip confirmation prompt")
 	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
-	cf.StringVar(&progressFilePath, "", "progress-file", "", "Append progress status + integer % records to this file/pipe")
-	cf.StringVar(&progressFileIntervalRaw, "", "progress-file-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
+	cf.StringSliceVar(&progressFilePaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
+	cf.StringSliceVar(&progressFormats, "f", "progress-format", "Progress format: json|int; 1 applies to all targets, or one per target (default json)")
+	cf.StringVar(&progressIntervalRaw, "", "progress-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; 1B, 4KiB, 8MiB")
 	cf.BoolVar(&skipWrite, "", "skip-write", false, "Do not mutate the target directory; fetch bodies to discard instead of writing them")
@@ -1834,9 +1848,14 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintln(stderr, "sync requires exactly one positional argument: <target-dir>")
 		return 2
 	}
-	progressInterval, err := time.ParseDuration(progressFileIntervalRaw)
+	progressInterval, err := time.ParseDuration(progressIntervalRaw)
 	if err != nil {
-		fmt.Fprintf(stderr, "invalid --progress-file-interval: %v\n", err)
+		fmt.Fprintf(stderr, "invalid --progress-interval: %v\n", err)
+		return 2
+	}
+	progressTargets, err := filexfer.ResolveProgressTargets(progressFilePaths, progressFormats)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --progress-path/--progress-format: %v\n", err)
 		return 2
 	}
 	ackEvery, err := encoding.ParseByteSize(ackEveryRaw)
@@ -1886,7 +1905,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		yes:                 yes,
 		probeBytes:          probeBytes,
 		traceFile:           traceFile,
-		progressFilePath:    progressFilePath,
+		progressTargets:     progressTargets,
 		progressInterval:    progressInterval,
 	}, stdout, stderr)
 }
@@ -2181,7 +2200,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 				}
 			},
 			TotalCopied:      &totalCopied,
-			ProgressFilePath: cfg.progressFilePath,
+			ProgressTargets: cfg.progressTargets,
 			ProgressInterval: cfg.progressInterval,
 			Stderr:           stderr,
 			Verbosity:        cfg.verbosity,
@@ -2262,13 +2281,15 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var progress bool
 	var discard bool
 	var deadlineRaw string
-	var progressFilePath string
-	var progressFileIntervalRaw string
+	var progressFilePaths []string
+	var progressFormats []string
+	var progressIntervalRaw string
 	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.BoolVar(&progress, "", "progress", true, "Show transfer progress every 2s")
 	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
-	cf.StringVar(&progressFilePath, "", "progress-file", "", "Append progress status + integer % records to this file/pipe")
-	cf.StringVar(&progressFileIntervalRaw, "", "progress-file-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
+	cf.StringSliceVar(&progressFilePaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
+	cf.StringSliceVar(&progressFormats, "f", "progress-format", "Progress format: json|int; 1 applies to all targets, or one per target (default json)")
+	cf.StringVar(&progressIntervalRaw, "", "progress-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
 	cf.BoolVar(&discard, "", "skip-write", false, "Discard downloaded file contents instead of writing to the target directory")
 	cf.BoolVar(&discard, "", "discard", false, "Discard downloaded file contents instead of writing to the target directory")
 	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=manifest default)")
@@ -2290,9 +2311,14 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintln(stderr, "start requires exactly one positional argument: <target-dir>")
 		return 2
 	}
-	progressInterval, err := time.ParseDuration(progressFileIntervalRaw)
+	progressInterval, err := time.ParseDuration(progressIntervalRaw)
 	if err != nil {
-		fmt.Fprintf(stderr, "invalid --progress-file-interval: %v\n", err)
+		fmt.Fprintf(stderr, "invalid --progress-interval: %v\n", err)
+		return 2
+	}
+	progressTargets, err := filexfer.ResolveProgressTargets(progressFilePaths, progressFormats)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid --progress-path/--progress-format: %v\n", err)
 		return 2
 	}
 	verbosity := verbosityFromFlags(progress, verbose)
@@ -2352,7 +2378,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		discard:             discard,
 		deadlineMS:          deadlineMS,
 		traceFile:           traceFile,
-		progressFilePath:    progressFilePath,
+		progressTargets:     progressTargets,
 		progressInterval:    progressInterval,
 	}, stdout, stderr)
 }
@@ -2556,7 +2582,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 				}
 			},
 			TotalCopied:      &totalCopied,
-			ProgressFilePath: cfg.progressFilePath,
+			ProgressTargets: cfg.progressTargets,
 			ProgressInterval: cfg.progressInterval,
 			Stderr:           stderr,
 			Verbosity:        cfg.verbosity,
@@ -2784,7 +2810,7 @@ type manifestDownloadConfig struct {
 	OutputWriter       func(tx.ManifestEntry, int64) (io.WriteCloser, func() error, error)
 	OnFileDone         func(tx.StartFileDoneEvent)
 	TotalCopied        *atomic.Int64
-	ProgressFilePath   string
+	ProgressTargets    []filexfer.ProgressTarget
 	ProgressInterval   time.Duration
 	Stderr             io.Writer
 	Verbosity          int
@@ -2878,23 +2904,21 @@ func downloadManifestFiles(cfg manifestDownloadConfig) (tx.StartFromManifestResp
 	}
 
 	success := false
-	if cfg.ProgressFilePath != "" {
+	if len(cfg.ProgressTargets) > 0 {
 		totalBytes := totalEntrySize(cfg.Entries)
 		totalFiles := uint64(len(cfg.Entries))
-		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), cfg.ProgressFilePath, cfg.ProgressInterval, func() (string, int) {
+		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), cfg.ProgressTargets, cfg.ProgressInterval, func() filexfer.ProgressStatus {
 			copied := totalCopied.Load()
 			if totalBytes > 0 && copied > totalBytes {
 				copied = totalBytes
 			}
-			pct := 100
-			if totalBytes > 0 {
-				pct = int(copied * 100 / totalBytes)
+			return filexfer.ProgressStatus{
+				Source:     "client",
+				DoneFiles:  doneFiles.Load(),
+				TotalFiles: totalFiles,
+				DoneBytes:  copied,
+				TotalBytes: totalBytes,
 			}
-			status := filexfer.FormatProgressStatusLine("client", "", doneFiles.Load(), totalFiles, copied, totalBytes)
-			if pct > 100 {
-				pct = 100
-			}
-			return status, pct
 		})
 		defer func() { stopProgressFile(success) }()
 	}

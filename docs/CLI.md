@@ -72,7 +72,7 @@ Important flags:
 - `-a`, `--ack-every`: bytes between progress acks (e.g. `1B`, `4KiB`, `8MiB`)
 - `--probe-size`: probe payload size (e.g. `1B`, `4KiB`, `8MiB`)
 - `-y`, `--yes`: skip confirmation prompt on sync paths
-- `--progress`, `-v`/`--verbose`, `--progress-file`, `--progress-file-interval`:
+- `--progress`, `-v`/`--verbose`, `--progress-path`, `--progress-interval`:
   control human and file-based progress output
 - `--trace`: write `runtime/trace` output to a file
 
@@ -162,7 +162,7 @@ Important flags:
 - `--skip-fsync`: acknowledge writes without `fdatasync`
 - `-a`, `--ack-every`: bytes between progress acks (e.g. `1B`, `4KiB`, `8MiB`)
 - `--deadline`: transfer deadline (e.g. 60s, 5m)
-- `--progress`, `-v`/`--verbose`, `--progress-file`, `--progress-file-interval`:
+- `--progress`, `-v`/`--verbose`, `--progress-path`, `--progress-interval`:
   control human and file-based progress output
 - `--trace`: write `runtime/trace` output to a file
 

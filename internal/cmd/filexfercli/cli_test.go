@@ -537,8 +537,8 @@ func TestRunCLIGetProgressFileWritesStatusAndPct(t *testing.T) {
 	var stderr bytes.Buffer
 	code := RunCLI([]string{
 		srv.URL, "get", "--progress=false",
-		"--progress-file", progressPath,
-		"--progress-file-interval", "1h",
+		"--progress-path", progressPath,
+		"--progress-interval", "1h",
 		"-o", outputPath,
 		"/remote/a.txt",
 	}, &stdout, &stderr)
@@ -551,7 +551,7 @@ func TestRunCLIGetProgressFileWritesStatusAndPct(t *testing.T) {
 		t.Fatalf("read progress file: %v", err)
 	}
 	wantStatus := intfilexfer.FormatProgressStatusLine("client", "", 1, 1, int64(len(payload)), int64(len(payload)))
-	want := wantStatus + "\n100\n"
+	want := wantStatus + "\n"
 	if got := string(raw); got != want {
 		t.Fatalf("unexpected progress file contents:\n got=%q\nwant=%q", got, want)
 	}
@@ -2430,8 +2430,8 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	if !strings.Contains(copyHelp, `--concurrency int`) || !strings.Contains(copyHelp, `(default 0)`) {
 		t.Fatalf("expected int default in copy help, got: %s", copyHelp)
 	}
-	if !strings.Contains(copyHelp, `--progress-file-interval string`) || !strings.Contains(copyHelp, `(default "1s")`) {
-		t.Fatalf("expected string default in copy help, got: %s", copyHelp)
+	if !strings.Contains(copyHelp, `--progress-interval string`) {
+		t.Fatalf("expected progress-interval in copy help, got: %s", copyHelp)
 	}
 	lines := strings.Split(copyHelp, "\n")
 	for _, line := range lines {
@@ -2448,7 +2448,7 @@ func TestRunCLIUsageErrors(t *testing.T) {
 			break
 		}
 		next := lines[i+1]
-		if len(next) > 0 && next[0] == ' ' && strings.Contains(next, "data verification") {
+		if len(next) > 0 && next[0] == ' ' && strings.Contains(next, "verification") {
 			wrappedVerifySample = true
 		}
 		break
@@ -2478,13 +2478,6 @@ func TestRunCLIUsageErrors(t *testing.T) {
 		t.Fatalf("expected removed --per-file flag error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--progress-path", "/tmp/pct", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for removed --progress-path flag, got %d", code)
-	}
-	if !strings.Contains(stderr.String(), "flag provided but not defined: -progress-path") {
-		t.Fatalf("expected removed --progress-path flag error, got: %s", stderr.String())
-	}
-	stderr.Reset()
 	if code := runCopyCLI("127.0.0.1:1", []string{"--probe-bytes", "1B", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for removed --probe-bytes flag, got %d", code)
 	}
@@ -2499,11 +2492,11 @@ func TestRunCLIUsageErrors(t *testing.T) {
 		t.Fatalf("expected invalid --probe-size error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--progress-file-interval", "bad", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for invalid --progress-file-interval, got %d", code)
+	if code := runCopyCLI("127.0.0.1:1", []string{"--progress-interval", "bad", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for invalid --progress-interval, got %d", code)
 	}
-	if !strings.Contains(stderr.String(), "invalid --progress-file-interval") {
-		t.Fatalf("expected invalid --progress-file-interval error, got: %s", stderr.String())
+	if !strings.Contains(stderr.String(), "invalid --progress-interval") {
+		t.Fatalf("expected invalid --progress-interval error, got: %s", stderr.String())
 	}
 	stderr.Reset()
 	if code := runCopyCLI("127.0.0.1:1", []string{"--verify-data-sample", "5", "--skip-fetch", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
