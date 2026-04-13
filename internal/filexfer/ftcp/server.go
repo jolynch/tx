@@ -41,8 +41,8 @@ type ServerOptions struct {
 	SocketWriteBufferBytes int
 	SyncTimeout            time.Duration // 0 = no timeout; bounds SYNC response write time
 	RootDir                string        // "/" or "" means unrestricted
-	ProgressPath           string        // append transfer status + % records to this file/pipe
-	ProgressInterval       time.Duration // tick interval for progress writes (default 1s)
+	ProgressTargets        []filexfer.ProgressTarget // progress output targets
+	ProgressInterval       time.Duration             // tick interval for progress writes (default 1s)
 	DisableZeroCopy        bool          // force buffered send path even when zero-copy is available
 	TargetIODepth          int           // target IO depth per CPU advertised in PROBE (default 4)
 }
@@ -70,7 +70,7 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 	}
 
 	var onTransferCreated func(string)
-	if opts.ProgressPath != "" {
+	if len(opts.ProgressTargets) > 0 {
 		interval := opts.ProgressInterval
 		if interval <= 0 {
 			interval = time.Second
@@ -78,24 +78,23 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 		var activeTransferID atomic.Value
 		onTransferCreated = func(id string) { activeTransferID.Store(id) }
 		stopProgress := filexfer.StartProgressFileWriter(
-			context.Background(), opts.ProgressPath, interval, func() (string, int) {
+			context.Background(), opts.ProgressTargets, interval, func() filexfer.ProgressStatus {
 				id, _ := activeTransferID.Load().(string)
 				if id == "" {
-					return filexfer.FormatProgressStatusLine("server", "", 0, 0, 0, 0), 0
+					return filexfer.ProgressStatus{Source: "server"}
 				}
 				t, ok := deps.GetTransfer(id)
 				if !ok {
-					return filexfer.FormatProgressStatusLine("server", id, 0, 0, 0, 0), 0
+					return filexfer.ProgressStatus{Source: "server", TxID: id}
 				}
-				status := filexfer.FormatProgressStatusLine("server", id, t.Done, uint64(t.NumFiles), t.DoneSize, t.TotalSize)
-				if t.TotalSize <= 0 {
-					return status, 0
+				return filexfer.ProgressStatus{
+					Source:     "server",
+					TxID:      id,
+					DoneFiles: t.Done,
+					TotalFiles: uint64(t.NumFiles),
+					DoneBytes: t.DoneSize,
+					TotalBytes: t.TotalSize,
 				}
-				pct := int(t.DoneSize * 100 / t.TotalSize)
-				if pct > 100 {
-					pct = 100
-				}
-				return status, pct
 			})
 		defer stopProgress(true)
 	}

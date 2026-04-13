@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -12,47 +13,124 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+type ProgressFormat string
+
+const (
+	ProgressFormatJSON ProgressFormat = "json"
+	ProgressFormatInt  ProgressFormat = "int"
+)
+
+type ProgressTarget struct {
+	Path   string
+	Format ProgressFormat
+	Stdout io.Writer // when Path=="-" and non-nil, write here instead of os.Stdout
+}
+
 const (
 	progressStatusBytesWidth = 10
 )
 
+// ProgressStatus holds the raw counters that callers provide each tick.
+// The progress writer formats these per-target (JSON for json targets,
+// integer percentage for int targets).
+type ProgressStatus struct {
+	Source     string
+	TxID       string
+	DoneFiles  uint64
+	TotalFiles uint64
+	DoneBytes  int64
+	TotalBytes int64
+}
+
+func (s ProgressStatus) pct() int {
+	if s.TotalBytes <= 0 {
+		return 0
+	}
+	pct := int(s.DoneBytes * 100 / s.TotalBytes)
+	return normalizeProgressPct(pct)
+}
+
+func formatProgressOutput(format ProgressFormat, s ProgressStatus) string {
+	pct := s.pct()
+	switch format {
+	case ProgressFormatInt:
+		return fmt.Sprintf("%d\n", pct)
+	default:
+		return fmt.Sprintf("%s\n", FormatProgressStatusLine(s.Source, s.TxID, s.DoneFiles, s.TotalFiles, s.DoneBytes, s.TotalBytes))
+	}
+}
+
 // StartProgressFileWriter starts a background goroutine that periodically
-// writes a two-line status record to a file or named pipe at path.
-// The file is opened non-blocking so FIFOs without a reader don't hang.
-// If the file/pipe doesn't exist or can't be opened, it silently retries
-// on the next tick.
+// writes progress records to one or more targets.
+// File targets are opened non-blocking so FIFOs without a reader don't hang.
+// If a file/pipe doesn't exist or can't be opened, it silently retries
+// on the next tick. Targets with Path "-" write to Stdout (or os.Stdout).
 //
 // The returned stop function must be called when the operation completes.
-// The first successful write truncates any existing file content; later writes
-// append two lines: a single-line status string and an integer percentage.
-// If success is true the final write forces the percentage to 100; otherwise the
-// current percentage from statusFn is written.
-func StartProgressFileWriter(ctx context.Context, path string, interval time.Duration, statusFn func() (string, int)) (stop func(success bool)) {
+// The first successful write to each file target truncates any existing
+// content; later writes append. If success is true the final write forces
+// the percentage to 100; otherwise the current percentage from statusFn is
+// written. Returns a no-op stop if targets is empty.
+func StartProgressFileWriter(ctx context.Context, targets []ProgressTarget, interval time.Duration, statusFn func() ProgressStatus) (stop func(success bool)) {
+	if len(targets) == 0 {
+		return func(bool) {}
+	}
+
+	needsJSON := false
+	for _, t := range targets {
+		if t.Format != ProgressFormatInt {
+			needsJSON = true
+			break
+		}
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	firstWrite := true
+	wroteFile := make(map[string]bool, len(targets))
 
-	writeOnce := func(status string, pct int, truncate bool) {
-		flags := unix.O_WRONLY | unix.O_CREAT | unix.O_NONBLOCK
-		if truncate {
-			flags |= unix.O_TRUNC
-		} else {
-			flags |= unix.O_APPEND
+	writeOnce := func(s ProgressStatus) {
+		pendingPaths := make([]string, 0, len(targets))
+		pendingOutput := make(map[string]string, len(targets))
+
+		for _, target := range targets {
+			output := formatProgressOutput(target.Format, s)
+			if target.Path == "-" {
+				w := target.Stdout
+				if w == nil {
+					w = os.Stdout
+				}
+				fmt.Fprint(w, output)
+				continue
+			}
+
+			if _, ok := pendingOutput[target.Path]; !ok {
+				pendingPaths = append(pendingPaths, target.Path)
+			}
+			pendingOutput[target.Path] += output
 		}
-		fd, err := unix.Open(path, flags, 0644)
-		if err != nil {
-			return
+
+		for _, path := range pendingPaths {
+			flags := unix.O_WRONLY | unix.O_CREAT | unix.O_NONBLOCK
+			if !wroteFile[path] {
+				flags |= unix.O_TRUNC
+			} else {
+				flags |= unix.O_APPEND
+			}
+			fd, err := unix.Open(path, flags, 0644)
+			if err != nil {
+				continue
+			}
+			f := os.NewFile(uintptr(fd), path)
+			fmt.Fprint(f, pendingOutput[path])
+			f.Close()
+			wroteFile[path] = true
 		}
-		f := os.NewFile(uintptr(fd), path)
-		fmt.Fprintf(f, "%s\n%d\n", status, normalizeProgressPct(pct))
-		f.Close()
-		firstWrite = false
 	}
 
-	var lastStatus string
-	lastWritten := -1
+	var lastPct int = -1
+	var lastJSON string
 
 	go func() {
 		defer wg.Done()
@@ -63,12 +141,16 @@ func StartProgressFileWriter(ctx context.Context, path string, interval time.Dur
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				status, pct := statusFn()
-				pct = normalizeProgressPct(pct)
-				if status != lastStatus || pct != lastWritten {
-					writeOnce(status, pct, firstWrite)
-					lastStatus = status
-					lastWritten = pct
+				s := statusFn()
+				pct := s.pct()
+				jsonStr := ""
+				if needsJSON {
+					jsonStr = FormatProgressStatusLine(s.Source, s.TxID, s.DoneFiles, s.TotalFiles, s.DoneBytes, s.TotalBytes)
+				}
+				if pct != lastPct || jsonStr != lastJSON {
+					writeOnce(s)
+					lastPct = pct
+					lastJSON = jsonStr
 				}
 			}
 		}
@@ -77,11 +159,12 @@ func StartProgressFileWriter(ctx context.Context, path string, interval time.Dur
 	return func(success bool) {
 		cancel()
 		wg.Wait()
-		status, pct := statusFn()
+		s := statusFn()
 		if success {
-			pct = 100
+			s.DoneBytes = s.TotalBytes
+			s.DoneFiles = s.TotalFiles
 		}
-		writeOnce(status, pct, firstWrite)
+		writeOnce(s)
 	}
 }
 

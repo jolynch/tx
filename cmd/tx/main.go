@@ -15,6 +15,7 @@ import (
 	"filippo.io/age"
 
 	"github.com/jolynch/tx/internal/cmd/filexfercli"
+	filexfer "github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/ftcp"
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/utils"
@@ -167,8 +168,9 @@ Options:
       --require-auth          require AUTH before commands
       --target-io-depth int   target IO depth per CPU advertised in PROBE (default 4)
       --trace string          write runtime/trace to this file
-      --progress-path string           append transfer status + integer % records to this file/pipe
-      --progress-path-interval string  progress write interval (default "1s")
+  -p, --progress-path string    progress output target; repeatable, use - for stdout
+  -f, --progress-format string  progress format: json|int; 1 applies to all, or one per target (default json)
+      --progress-interval string  progress write interval (default "1s")
       --disable-zero-copy              force buffered send path (for benchmarking)
 `)
 	}
@@ -191,10 +193,15 @@ Options:
 	targetIODepth := fs.Int("target-io-depth", 4, "")
 	disableZeroCopy := fs.Bool("disable-zero-copy", false, "")
 	traceFile := fs.String("trace", "", "")
-	var progressFilePath string
+	var progressPathVals, progressFormatVals []string
+	progressPaths := filexfer.StringSliceFlag{Values: &progressPathVals}
+	progressFormats := filexfer.StringSliceFlag{Values: &progressFormatVals}
 	var progressIntervalRaw string
-	fs.StringVar(&progressFilePath, "progress-path", "", "")
-	fs.StringVar(&progressIntervalRaw, "progress-path-interval", "1s", "")
+	fs.Var(&progressPaths, "progress-path", "")
+	fs.Var(&progressPaths, "p", "")
+	fs.Var(&progressFormats, "progress-format", "")
+	fs.Var(&progressFormats, "f", "")
+	fs.StringVar(&progressIntervalRaw, "progress-interval", "1s", "")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -204,7 +211,11 @@ Options:
 
 	progressInterval, err := time.ParseDuration(progressIntervalRaw)
 	if err != nil {
-		log.Fatalf("Invalid --progress-path-interval: %v", err)
+		log.Fatalf("Invalid --progress-interval: %v", err)
+	}
+	progressTargets, err := filexfer.ResolveProgressTargets(progressPathVals, progressFormatVals)
+	if err != nil {
+		log.Fatalf("Invalid --progress-path/--progress-format: %v", err)
 	}
 	gentleCPUPct, err := parsePercentFlag(gentleCPURaw, "--gentle-cpu")
 	if err != nil {
@@ -259,7 +270,7 @@ Options:
 		GentleBWPct:            gentleBWPct,
 		SocketWriteBufferBytes: socketWriteBufBytes,
 		RootDir:                chroot,
-		ProgressPath:           progressFilePath,
+		ProgressTargets:        progressTargets,
 		ProgressInterval:       progressInterval,
 		DisableZeroCopy:        *disableZeroCopy,
 		TargetIODepth:          *targetIODepth,
