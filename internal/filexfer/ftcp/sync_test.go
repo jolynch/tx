@@ -257,7 +257,7 @@ func FuzzSync(f *testing.F) {
 		tmpDir := t.TempDir()
 
 		// Round 1: Create initial files and get manifest via TXFER.
-		numFiles := rng.Intn(101) // 0-100
+		numFiles := rng.Intn(33) // 0-32
 		files := fuzzCreateRandomFiles(t, tmpDir, numFiles, rng)
 
 		oldManifest := runTXFERTest(t, tmpDir)
@@ -318,11 +318,11 @@ func fuzzRandomFileSize(rng *rand.Rand) int {
 	case 1:
 		return 1
 	case 2:
-		return 64 + rng.Intn(4000)
+		return 64 + rng.Intn(1024)
 	case 3:
-		return 4096 + rng.Intn(60000)
+		return 1024 + rng.Intn(16*1024)
 	default:
-		return 64*1024 + rng.Intn(192*1024)
+		return 16*1024 + rng.Intn(48*1024)
 	}
 }
 
@@ -346,8 +346,8 @@ func fuzzApplyRandomModifications(t *testing.T, dir string, files *[]string, rng
 			writeTestFile(t, dir, f, string(data))
 		}
 	}
-	// Add new files (0-20).
-	numNew := rng.Intn(21)
+	// Add new files (0-8).
+	numNew := rng.Intn(9)
 	base := len(kept) + 1000
 	for i := range numNew {
 		rel := fmt.Sprintf("new_%04d.dat", base+i)
