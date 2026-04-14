@@ -1,16 +1,17 @@
 .PHONY: all acceptance build build-bench test unit bench
 
 FUZZTIME ?= 5s
+FUZZDEADLINE ?= 20s
 
-all: build test
+all: build build-bench test
 
 build:
 	CGO_ENABLED=0 go build -a -tags netgo -ldflags='-s -w -extldflags "-static"' -o tx ./cmd/tx
 
-build-bench:
+build-bench: build
 	@mkdir -p bench
 	go build -o bench/bench ./internal/bench
-	CGO_ENABLED=0 go build -a -tags netgo -ldflags='-s -w -extldflags "-static"' -o bench/tx ./cmd/tx
+	cp tx bench/tx
 
 test: build unit acceptance
 
@@ -18,10 +19,10 @@ unit:
 	go test -race ./...
 
 acceptance:
-	go test -race ./internal/filexfer/encoding -run=^$$ -fuzz=FuzzRoundTrip -fuzztime=$(FUZZTIME)
-	go test -race ./internal/filexfer/ftcp     -run=^$$ -fuzz=FuzzSync      -fuzztime=$(FUZZTIME)
-	go test -race ./internal/utils             -run=^$$ -fuzz=FuzzCommonPrefixLen -fuzztime=$(FUZZTIME)
-	go test -race .                            -run=^$$ -fuzz=FuzzSuggestBatchMaxBytes -fuzztime=$(FUZZTIME)
+	go test -race ./internal/filexfer/encoding -run=^$$ -fuzz=FuzzRoundTrip -fuzztime=$(FUZZTIME) -timeout=$(FUZZDEADLINE)
+	go test -race ./internal/filexfer/ftcp     -run=^$$ -fuzz=FuzzSync      -fuzztime=$(FUZZTIME) -timeout=$(FUZZDEADLINE)
+	go test -race ./internal/utils             -run=^$$ -fuzz=FuzzCommonPrefixLen -fuzztime=$(FUZZTIME) -timeout=$(FUZZDEADLINE)
+	go test -race .                            -run=^$$ -fuzz=FuzzSuggestBatchMaxBytes -fuzztime=$(FUZZTIME) -timeout=$(FUZZDEADLINE)
 
 bench: build
 	@mkdir -p bench/results
