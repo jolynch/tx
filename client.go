@@ -209,6 +209,11 @@ type Client struct {
 
 	// scratchBufferPool caches reusable temporary byte buffers.
 	scratchBufferPool sync.Pool
+
+	// syncConnFallbacks counts how often a warmed connection pool request had to
+	// fall back to a synchronous dial because no ready pooled connection was
+	// available.
+	syncConnFallbacks atomic.Int64
 }
 
 type Manifest struct {
@@ -570,6 +575,15 @@ func (c *Client) Close() error {
 		pool.stop()
 	}
 	return nil
+}
+
+// SyncConnectionCount reports how many times this client fell back to a
+// synchronous connection dial after a warmed TCP pool was exhausted.
+func (c *Client) SyncConnectionCount() int64 {
+	if c == nil {
+		return 0
+	}
+	return c.syncConnFallbacks.Load()
 }
 
 func (c *Client) GetManifest(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {

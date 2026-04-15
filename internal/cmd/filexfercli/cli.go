@@ -2336,7 +2336,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			overallSpeed = float64(totalTransferred) / elapsedAll.Seconds()
 		}
 		fmt.Fprintf(stderr,
-			"sync complete[%d]: tid=%s downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s\n",
+			"sync complete[%d]: tid=%s downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s sync-fallbacks=%d\n",
 			round,
 			mergedManifest.TransferID,
 			completed,
@@ -2344,6 +2344,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			encoding.HumanBytes(totalTransferred),
 			encoding.HumanRate(overallSpeed),
 			elapsedAll.Round(time.Millisecond),
+			client.SyncConnectionCount(),
 		)
 		if len(finalFailures) > 0 {
 			return 1
@@ -2733,7 +2734,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 	}
 	fmt.Fprintf(
 		stdout,
-		"start-complete: tid=%s requested=%d downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s\n",
+		"start-complete: tid=%s requested=%d downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s sync-fallbacks=%d\n",
 		txferID,
 		len(manifest.Entries),
 		completed,
@@ -2741,6 +2742,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		encoding.HumanBytes(totalTransferred),
 		encoding.HumanRate(overallSpeed),
 		elapsedAll.Round(time.Millisecond),
+		client.SyncConnectionCount(),
 	)
 	if len(finalFailures) > 0 {
 		return 1

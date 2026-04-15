@@ -2126,6 +2126,9 @@ func TestTCPPoolFallsBackToSyncDialWhenEmpty(t *testing.T) {
 	if got := dialer.SuccessCount(); got != 5 {
 		t.Fatalf("expected one fallback sync dial after exhausting pool, got %d successful dials", got)
 	}
+	if got := client.SyncConnectionCount(); got != 1 {
+		t.Fatalf("expected one sync fallback after exhausting pool, got %d", got)
+	}
 	for _, reader := range readers {
 		_ = reader.Close()
 	}
@@ -2186,6 +2189,9 @@ func TestTCPPoolRefillsAfterStreamClose(t *testing.T) {
 	}
 	if statusResp.Status == nil || statusResp.Status.TransferID != "tx123" {
 		t.Fatalf("unexpected status response: %+v", statusResp.Status)
+	}
+	if got := client.SyncConnectionCount(); got != 0 {
+		t.Fatalf("expected no sync fallbacks after pool refill, got %d", got)
 	}
 }
 
