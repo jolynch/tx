@@ -67,7 +67,7 @@ func TestProcessAUTHRequestUsesExplicitCipher(t *testing.T) {
 		t.Fatalf("ParseRequest err: %v", err)
 	}
 
-	result, err := processAUTHRequest(req, serverID)
+	result, err := processAUTHRequest(req, serverID, nil)
 	if err != nil {
 		t.Fatalf("processAUTHRequest err: %v", err)
 	}
@@ -76,5 +76,100 @@ func TestProcessAUTHRequestUsesExplicitCipher(t *testing.T) {
 	}
 	if !result.encryptedRequests {
 		t.Fatal("expected encryptedRequests")
+	}
+}
+
+// buildAuthBlob returns a base64-encoded AUTH blob plaintext of the form
+// "<client_pubkey> [tok1 tok2 ...]" encrypted to the server identity.
+func buildAuthBlob(t *testing.T, serverID *age.X25519Identity, algo aead.Algorithm, plaintext string) string {
+	t.Helper()
+	var blob bytes.Buffer
+	ew, err := aead.Encrypt(&blob, serverID.Recipient(), aead.Options{Algorithm: algo})
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if _, err := io.WriteString(ew, plaintext); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := ew.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(blob.Bytes())
+}
+
+func TestProcessAUTHRequestAllowlistHit(t *testing.T) {
+	serverID, _ := age.GenerateX25519Identity()
+	clientID, _ := age.GenerateX25519Identity()
+	enc := buildAuthBlob(t, serverID, aead.AlgorithmAES, clientID.Recipient().String()+" shared-secret-123")
+	req, _ := ParseRequest([]byte("AUTH aes " + enc))
+
+	result, err := processAUTHRequest(req, serverID, []string{"other-tok", "shared-secret-123"})
+	if err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+	if !result.encryptedRequests {
+		t.Fatal("expected encryptedRequests")
+	}
+}
+
+func TestProcessAUTHRequestAllowlistMiss(t *testing.T) {
+	serverID, _ := age.GenerateX25519Identity()
+	clientID, _ := age.GenerateX25519Identity()
+	enc := buildAuthBlob(t, serverID, aead.AlgorithmAES, clientID.Recipient().String()+" wrong-token-xx")
+	req, _ := ParseRequest([]byte("AUTH aes " + enc))
+
+	_, err := processAUTHRequest(req, serverID, []string{"right-token-yy"})
+	if err == nil {
+		t.Fatal("expected NOT_AUTHORIZED on token miss")
+	}
+}
+
+func TestProcessAUTHRequestAllowlistPubkeyMatches(t *testing.T) {
+	serverID, _ := age.GenerateX25519Identity()
+	clientID, _ := age.GenerateX25519Identity()
+	// Client sends no extra tokens; server allowlist contains the client's pubkey.
+	enc := buildAuthBlob(t, serverID, aead.AlgorithmAES, clientID.Recipient().String())
+	req, _ := ParseRequest([]byte("AUTH aes " + enc))
+
+	result, err := processAUTHRequest(req, serverID, []string{clientID.Recipient().String()})
+	if err != nil {
+		t.Fatalf("expected success via pubkey match, got %v", err)
+	}
+	if !result.encryptedRequests {
+		t.Fatal("expected encryptedRequests")
+	}
+}
+
+func TestProcessAUTHRequestEmptyAllowlistAcceptsNoTokens(t *testing.T) {
+	serverID, _ := age.GenerateX25519Identity()
+	clientID, _ := age.GenerateX25519Identity()
+	enc := buildAuthBlob(t, serverID, aead.AlgorithmAES, clientID.Recipient().String())
+	req, _ := ParseRequest([]byte("AUTH aes " + enc))
+
+	if _, err := processAUTHRequest(req, serverID, nil); err != nil {
+		t.Fatalf("expected success with empty allowlist, got %v", err)
+	}
+}
+
+func TestProcessAUTHRequestEmptyAllowlistIgnoresPresentedTokens(t *testing.T) {
+	serverID, _ := age.GenerateX25519Identity()
+	clientID, _ := age.GenerateX25519Identity()
+	enc := buildAuthBlob(t, serverID, aead.AlgorithmAES, clientID.Recipient().String()+" spurious-token-xx")
+	req, _ := ParseRequest([]byte("AUTH aes " + enc))
+
+	if _, err := processAUTHRequest(req, serverID, nil); err != nil {
+		t.Fatalf("expected success (no allowlist), got %v", err)
+	}
+}
+
+func TestProcessAUTHRequestMultipleClientTokens(t *testing.T) {
+	serverID, _ := age.GenerateX25519Identity()
+	clientID, _ := age.GenerateX25519Identity()
+	enc := buildAuthBlob(t, serverID, aead.AlgorithmAES, clientID.Recipient().String()+" rotation-old-xx rotation-new-yy")
+	req, _ := ParseRequest([]byte("AUTH aes " + enc))
+
+	// Server only trusts the "new" token; the client sends both; should match.
+	if _, err := processAUTHRequest(req, serverID, []string{"rotation-new-yy"}); err != nil {
+		t.Fatalf("expected success on any-match, got %v", err)
 	}
 }

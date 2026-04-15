@@ -147,6 +147,19 @@ func WithEncryptMode(mode string) ClientOption {
 	})
 }
 
+func WithClientAuthTokens(tokens ...string) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		var out []string
+		for _, t := range tokens {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				out = append(out, t)
+			}
+		}
+		c.ClientAuthTokens = out
+	})
+}
+
 func normalizeComp(comp string) string {
 	switch strings.ToLower(strings.TrimSpace(comp)) {
 	case EncodingLz4:
@@ -176,6 +189,7 @@ type Client struct {
 	ClientAgePublicKey      string
 	ClientAgeIdentity       string
 	EncryptMode             string // "auto", "aes", or "chacha20" — selects post-AUTH stream cipher
+	ClientAuthTokens        []string // tokens presented in the encrypted AUTH blob
 
 	// Context dialer allows clients to setup custom connections
 	// For example injecting TLS

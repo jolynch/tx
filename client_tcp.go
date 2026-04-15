@@ -256,14 +256,19 @@ func (c *Client) sendTCPAuth(conn net.Conn, state tcpAuthState) error {
 	if err != nil {
 		return fmt.Errorf("parse server key: %w", err)
 	}
-	// Encrypt the client's public key to the server using AEAD.
+	// Encrypt the client's public key to the server using AEAD. If the
+	// client has auth tokens, append them space-delimited after the pubkey.
 	encrypted := c.acquireScratchBuffer(0)
 	defer c.releaseScratchBuffer(encrypted)
 	ew, encErr := aead.Encrypt(encrypted, recipient, aeadOptionsForMode(state.encMode))
 	if encErr != nil {
 		return encErr
 	}
-	if _, err := ew.Write([]byte(state.publicKey)); err != nil {
+	plain := state.publicKey
+	for _, tok := range c.ClientAuthTokens {
+		plain += " " + tok
+	}
+	if _, err := ew.Write([]byte(plain)); err != nil {
 		return err
 	}
 	if err := ew.Close(); err != nil {

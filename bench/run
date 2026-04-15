@@ -271,6 +271,14 @@ SERVER_PID=""
 SERVER_APP_PID=""
 SERVER_PERF_PID=""
 
+SERVER_TOKEN_FILE=""
+if [[ -n "${ENCRYPT_MODE}" ]]; then
+  SERVER_TOKEN_FILE="${SERVER_KEYS}/auth-token"
+  mkdir -p "${SERVER_KEYS}"
+  head -c 8 /dev/urandom | xxd -p > "${SERVER_TOKEN_FILE}"
+  echo "generated bench auth token at ${SERVER_TOKEN_FILE}"
+fi
+
 stop_server_perf() {
   if [[ -n "${SERVER_PERF_PID}" ]] && kill -0 "${SERVER_PERF_PID}" >/dev/null 2>&1; then
     sudo kill -INT "${SERVER_PERF_PID}" >/dev/null 2>&1 || true
@@ -326,6 +334,9 @@ start_server() {
   mkdir -p "${SERVER_IN}" "${SERVER_OUT}" "${SERVER_KEYS}"
   echo "Starting server in background..."
   local server_args=(send -l "${SERVER_URL}" -k "${SERVER_KEYS}")
+  if [[ -n "${SERVER_TOKEN_FILE}" ]]; then
+    server_args+=(--require-auth-token "$(<"${SERVER_TOKEN_FILE}")")
+  fi
   if [[ "${TRACE}" == "true" ]]; then
     server_args+=(--trace "${SERVER_TRACE}")
   fi
@@ -371,6 +382,9 @@ if [[ -n "${CONCURRENCY}" ]]; then
 fi
 if [[ -n "${ENCRYPT_MODE}" ]]; then
   COPY_CMD+=(--encrypt "${ENCRYPT_MODE}")
+fi
+if [[ -n "${SERVER_TOKEN_FILE}" ]]; then
+  COPY_CMD+=(--auth-token "$(<"${SERVER_TOKEN_FILE}")")
 fi
 if [[ -n "${COMPRESS_MODE}" ]]; then
   COPY_CMD+=(--compress "${COMPRESS_MODE}")

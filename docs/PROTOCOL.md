@@ -77,7 +77,27 @@ After `AUTH aes <blob>` or `AUTH chacha20 <blob>`:
 - Server treats the first AUTH token (`aes` or `chacha20`) as the session
   cipher.
 - Server decrypts `<blob>` using its identity and the selected AEAD algorithm
-  to recover the client's age public key.
+  to recover the client's identity material.
+- Decrypted plaintext is a space-delimited sequence:
+
+  ```
+  <client_age_public_key> [<token1> <token2> ...]
+  ```
+
+  The first field is the client's age X25519 recipient; remaining fields are
+  zero or more opaque identity tokens. A token is any printable string with
+  length > 8 bytes, no ASCII spaces, and no newlines (arbitrary encoding —
+  hex, base64, bech32, an `age1…` recipient, a UUID, etc.).
+- Authorization check (only if the server was started with
+  `--require-auth-token`):
+  - Build the presented set `{client_age_public_key} ∪ {token1, token2, ...}`.
+  - At least one presented value must exactly match an allowlisted token
+    configured on the server. The client's age public key counts as an
+    identity token, so an operator may allowlist the `age1…` string directly
+    without a shared secret.
+  - Comparison is constant-time (`crypto/subtle.ConstantTimeCompare`).
+- If the allowlist is empty, any decryptable client is accepted (any tokens
+  presented are ignored).
 - If valid:
   - subsequent command bytes from the client must be encrypted to the server's
     public key using that same AEAD algorithm.
