@@ -1279,6 +1279,7 @@ func TestStartTransferProbeReporterIncludesTransferTelemetry(t *testing.T) {
 	defer srv.Close()
 
 	client := tx.NewClient(srv.URL)
+	defer client.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	pr := startTransferProbeReporter(ctx, client, "txprobe", tx.LoadStrategyFast, 1024, 700)
 	defer pr.stop()
