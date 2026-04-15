@@ -9,7 +9,6 @@ import (
 	"io"
 	"math"
 	"math/rand"
-	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -27,8 +26,10 @@ import (
 	"filippo.io/age"
 	"github.com/jolynch/tx"
 	"github.com/jolynch/tx/internal/aead"
+	"github.com/jolynch/tx/internal/cliflags"
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/utils"
 	"github.com/zeebo/xxh3"
 )
 
@@ -371,7 +372,7 @@ func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		serverURL = defaultFileListener
 		cmdStart = 0
 	} else {
-		if err := validateServerURL(serverURL); err != nil {
+		if err := utils.ValidateHostPort(serverURL); err != nil {
 			fmt.Fprintf(stderr, "invalid server-url: %v\n", err)
 			printCLIUsage(stderr)
 			return 2
@@ -401,21 +402,6 @@ func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		printCLIUsage(stderr)
 		return 2
 	}
-}
-
-func validateServerURL(raw string) error {
-	errMsg := "first argument must be file-listener address, for example 127.0.0.1:3453"
-	if strings.TrimSpace(raw) == "" {
-		return errors.New(errMsg)
-	}
-	if strings.HasPrefix(raw, "-") {
-		return errors.New(errMsg)
-	}
-	host, port, splitErr := net.SplitHostPort(raw)
-	if splitErr != nil || strings.TrimSpace(host) == "" || strings.TrimSpace(port) == "" {
-		return errors.New(errMsg)
-	}
-	return nil
 }
 
 func printCLIUsage(w io.Writer) {
@@ -630,9 +616,9 @@ func printTransferErrors(stderr io.Writer, phase string, errs []error, verbosity
 }
 
 func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
-	cf := newCLIFlags("copy")
+	cf := cliflags.New("copy")
 	cf.SetOutput(stderr)
-	cf.fs.Usage = func() {
+	cf.FlagSet().Usage = func() {
 		fmt.Fprintln(stderr, "usage: tx recv [addr] copy [flags] REMOTE_SRC LOCAL_DST")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Copy REMOTE_SRC from the remote to LOCAL_DST on the local machine.")
@@ -741,7 +727,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintf(stderr, "invalid --progress-interval: %v\n", err)
 		return 2
 	}
-	progressTargets, err := filexfer.ResolveProgressTargets(cfg.progressFilePaths, cfg.progressFormats)
+	progressTargets, err := cliflags.ResolveProgressTargets(cfg.progressFilePaths, cfg.progressFormats)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --progress-path/--progress-format: %v\n", err)
 		return 2
@@ -1239,9 +1225,9 @@ func minInt64(a int64, b int64) int64 {
 }
 
 func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
-	cf := newCLIFlags("transfer")
+	cf := cliflags.New("transfer")
 	cf.SetOutput(stderr)
-	cf.fs.Usage = func() {
+	cf.FlagSet().Usage = func() {
 		fmt.Fprintln(stderr, "usage: tx recv transfer -s <dir> [flags] <target-dir>")
 		cf.PrintDefaults(stderr)
 	}
@@ -1406,9 +1392,9 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 }
 
 func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
-	cf := newCLIFlags("status")
+	cf := cliflags.New("status")
 	cf.SetOutput(stderr)
-	cf.fs.Usage = func() {
+	cf.FlagSet().Usage = func() {
 		fmt.Fprintln(stderr, "usage: tx recv [addr] status [--tid <id>] [LOCAL_DST]")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Query and monitor transfer progress.")
@@ -1647,9 +1633,9 @@ func pollTransferStatus(client *tx.Client, txferID string, manifest *tx.Manifest
 }
 
 func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
-	cf := newCLIFlags("get")
+	cf := cliflags.New("get")
 	cf.SetOutput(stderr)
-	cf.fs.Usage = func() {
+	cf.FlagSet().Usage = func() {
 		fmt.Fprintln(stderr, "usage: tx recv [addr] get [flags] REMOTE_PATH")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Download a single remote file. REMOTE_PATH must be an absolute path to a file")
@@ -1712,7 +1698,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintf(stderr, "invalid --progress-interval: %v\n", err)
 		return 2
 	}
-	progressTargets, err := filexfer.ResolveProgressTargets(progressFilePaths, progressFormats)
+	progressTargets, err := cliflags.ResolveProgressTargets(progressFilePaths, progressFormats)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --progress-path/--progress-format: %v\n", err)
 		return 2
@@ -1883,9 +1869,9 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 }
 
 func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
-	cf := newCLIFlags("sync")
+	cf := cliflags.New("sync")
 	cf.SetOutput(stderr)
-	cf.fs.Usage = func() {
+	cf.FlagSet().Usage = func() {
 		fmt.Fprintln(stderr, "usage: tx recv sync [-s <dir>] [flags] <target-dir>")
 		cf.PrintDefaults(stderr)
 	}
@@ -1939,7 +1925,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintf(stderr, "invalid --progress-interval: %v\n", err)
 		return 2
 	}
-	progressTargets, err := filexfer.ResolveProgressTargets(progressFilePaths, progressFormats)
+	progressTargets, err := cliflags.ResolveProgressTargets(progressFilePaths, progressFormats)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --progress-path/--progress-format: %v\n", err)
 		return 2
@@ -2344,7 +2330,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			encoding.HumanBytes(totalTransferred),
 			encoding.HumanRate(overallSpeed),
 			elapsedAll.Round(time.Millisecond),
-			client.SyncConnectionCount(),
+			client.MetricSnapshot().SyncConnectionCount,
 		)
 		if len(finalFailures) > 0 {
 			return 1
@@ -2359,9 +2345,9 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 }
 
 func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
-	cf := newCLIFlags("start")
+	cf := cliflags.New("start")
 	cf.SetOutput(stderr)
-	cf.fs.Usage = func() {
+	cf.FlagSet().Usage = func() {
 		fmt.Fprintln(stderr, "usage: tx recv start [flags] <target-dir>")
 		cf.PrintDefaults(stderr)
 	}
@@ -2413,7 +2399,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintf(stderr, "invalid --progress-interval: %v\n", err)
 		return 2
 	}
-	progressTargets, err := filexfer.ResolveProgressTargets(progressFilePaths, progressFormats)
+	progressTargets, err := cliflags.ResolveProgressTargets(progressFilePaths, progressFormats)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --progress-path/--progress-format: %v\n", err)
 		return 2
@@ -2742,7 +2728,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		encoding.HumanBytes(totalTransferred),
 		encoding.HumanRate(overallSpeed),
 		elapsedAll.Round(time.Millisecond),
-		client.SyncConnectionCount(),
+		client.MetricSnapshot().SyncConnectionCount,
 	)
 	if len(finalFailures) > 0 {
 		return 1

@@ -257,7 +257,7 @@ fi
 if [[ "$BUILD" == "true" ]]; then
   require_cmd go
   echo "Building local tx into ${TX_BIN}..."
-  go build -o "${TX_BIN}" ../cmd/tx
+  go build -o "${TX_BIN}" "${SCRIPT_DIR}/../cmd/tx"
 elif [[ ! -x "${TX_BIN}" ]]; then
   echo "missing local tx binary: ${TX_BIN} (run 'make -C .. build-bench' or omit --no-build)" >&2
   exit 1
@@ -333,7 +333,7 @@ start_server() {
   read -r host port < <(split_host_port "${SERVER_URL}")
   mkdir -p "${SERVER_IN}" "${SERVER_OUT}" "${SERVER_KEYS}"
   echo "Starting server in background..."
-  local server_args=(send -l "${SERVER_URL}" -k "${SERVER_KEYS}")
+  local server_args=(send "${SERVER_URL}" serve -k "${SERVER_KEYS}")
   if [[ -n "${SERVER_TOKEN_FILE}" ]]; then
     server_args+=(--require-auth-token "$(<"${SERVER_TOKEN_FILE}")")
   fi
@@ -343,6 +343,8 @@ start_server() {
   if [[ "${DISABLE_ZERO_COPY}" == "true" ]]; then
     server_args+=(--disable-zero-copy)
   fi
+  # Preserve the previous benchmark behavior where tx send exposed the full filesystem.
+  server_args+=("/")
   "${TX_BIN}" "${server_args[@]}" >"${SERVER_LOG}" 2>&1 &
   SERVER_PID=$!
   SERVER_APP_PID="${SERVER_PID}"

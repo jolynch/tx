@@ -2518,7 +2518,7 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	if code := RunCLI([]string{"--tid", "tx", "get"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for missing server address, got %d", code)
 	}
-	if !strings.Contains(stderr.String(), "file-listener address") {
+	if !strings.Contains(stderr.String(), "host:port address") {
 		t.Fatalf("expected explicit server address error, got: %s", stderr.String())
 	}
 	stderr.Reset()

@@ -1,4 +1,4 @@
-package filexfercli
+package cliflags
 
 import (
 	"flag"
@@ -7,8 +7,63 @@ import (
 	"strconv"
 	"strings"
 
-	filexfer "github.com/jolynch/tx/internal/filexfer"
+	"github.com/jolynch/tx/internal/filexfer"
 )
+
+// StringSliceFlag implements flag.Value for a repeatable string flag.
+type StringSliceFlag struct {
+	Values *[]string
+}
+
+func (f *StringSliceFlag) String() string {
+	if f.Values == nil || len(*f.Values) == 0 {
+		return ""
+	}
+	return strings.Join(*f.Values, ", ")
+}
+
+func (f *StringSliceFlag) Set(val string) error {
+	*f.Values = append(*f.Values, val)
+	return nil
+}
+
+// ResolveProgressTargets pairs progress paths with formats.
+//   - 0 formats: all paths default to json
+//   - 1 format: all paths share that format
+//   - N formats (== N paths): paired positionally
+//   - Mismatched counts: error
+func ResolveProgressTargets(paths, formats []string) ([]filexfer.ProgressTarget, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	switch len(formats) {
+	case 0:
+	case 1:
+	default:
+		if len(formats) != len(paths) {
+			return nil, fmt.Errorf("--progress-format count (%d) must be 1 or match --progress-path count (%d)", len(formats), len(paths))
+		}
+	}
+	targets := make([]filexfer.ProgressTarget, len(paths))
+	for i, p := range paths {
+		if p == "" {
+			return nil, fmt.Errorf("--progress-path must not be empty")
+		}
+		f := filexfer.ProgressFormatJSON
+		if len(formats) == 1 {
+			f = filexfer.ProgressFormat(formats[0])
+		} else if i < len(formats) {
+			f = filexfer.ProgressFormat(formats[i])
+		}
+		switch f {
+		case filexfer.ProgressFormatJSON, filexfer.ProgressFormatInt:
+		default:
+			return nil, fmt.Errorf("unsupported --progress-format %q (supported: json, int)", f)
+		}
+		targets[i] = filexfer.ProgressTarget{Path: p, Format: f}
+	}
+	return targets, nil
+}
 
 // flagEntry records one option for combined help rendering.
 type flagEntry struct {
@@ -19,29 +74,30 @@ type flagEntry struct {
 	def   string
 }
 
-// cliFlags wraps flag.FlagSet and tracks short/long pairs so they can be
-// printed combined ("-s, --source-directory string   description") rather than
-// as two separate lines.
-type cliFlags struct {
+// Flags wraps flag.FlagSet and tracks short/long pairs so they can be
+// printed combined ("-s, --source-directory string   description") rather
+// than as two separate lines.
+type Flags struct {
 	fs    *flag.FlagSet
 	pairs []flagEntry
 }
 
 const helpWrapWidth = 88
 
-func newCLIFlags(name string) *cliFlags {
-	return &cliFlags{fs: flag.NewFlagSet(name, flag.ContinueOnError)}
+func New(name string) *Flags {
+	return &Flags{fs: flag.NewFlagSet(name, flag.ContinueOnError)}
 }
 
-func (c *cliFlags) SetOutput(w io.Writer)     { c.fs.SetOutput(w) }
-func (c *cliFlags) Parse(args []string) error { return c.fs.Parse(args) }
-func (c *cliFlags) Arg(i int) string          { return c.fs.Arg(i) }
-func (c *cliFlags) Args() []string            { return c.fs.Args() }
-func (c *cliFlags) NArg() int                 { return c.fs.NArg() }
-func (c *cliFlags) Visit(fn func(*flag.Flag)) { c.fs.Visit(fn) }
+func (c *Flags) SetOutput(w io.Writer)     { c.fs.SetOutput(w) }
+func (c *Flags) Parse(args []string) error { return c.fs.Parse(args) }
+func (c *Flags) Arg(i int) string          { return c.fs.Arg(i) }
+func (c *Flags) Args() []string            { return c.fs.Args() }
+func (c *Flags) NArg() int                 { return c.fs.NArg() }
+func (c *Flags) Visit(fn func(*flag.Flag)) { c.fs.Visit(fn) }
+func (c *Flags) FlagSet() *flag.FlagSet    { return c.fs }
 
 // StringVar registers a string flag. Pass short="" for long-only, long="" for short-only.
-func (c *cliFlags) StringVar(p *string, short, long, defVal, usage string) {
+func (c *Flags) StringVar(p *string, short, long, defVal, usage string) {
 	if short != "" {
 		c.fs.StringVar(p, short, defVal, usage)
 	}
@@ -52,7 +108,7 @@ func (c *cliFlags) StringVar(p *string, short, long, defVal, usage string) {
 }
 
 // BoolVar registers a bool flag. Pass short="" for long-only, long="" for short-only.
-func (c *cliFlags) BoolVar(p *bool, short, long string, defVal bool, usage string) {
+func (c *Flags) BoolVar(p *bool, short, long string, defVal bool, usage string) {
 	if short != "" {
 		c.fs.BoolVar(p, short, defVal, usage)
 	}
@@ -63,7 +119,7 @@ func (c *cliFlags) BoolVar(p *bool, short, long string, defVal bool, usage strin
 }
 
 // IntVar registers an int flag. Pass short="" for long-only, long="" for short-only.
-func (c *cliFlags) IntVar(p *int, short, long string, defVal int, usage string) {
+func (c *Flags) IntVar(p *int, short, long string, defVal int, usage string) {
 	if short != "" {
 		c.fs.IntVar(p, short, defVal, usage)
 	}
@@ -75,8 +131,8 @@ func (c *cliFlags) IntVar(p *int, short, long string, defVal int, usage string) 
 
 // StringSliceVar registers a repeatable string flag. Each occurrence appends
 // to the slice. Pass short="" for long-only, long="" for short-only.
-func (c *cliFlags) StringSliceVar(p *[]string, short, long, usage string) {
-	f := &filexfer.StringSliceFlag{Values: p}
+func (c *Flags) StringSliceVar(p *[]string, short, long, usage string) {
+	f := &StringSliceFlag{Values: p}
 	if short != "" {
 		c.fs.Var(f, short, usage)
 	}
@@ -115,11 +171,10 @@ func (e flagEntry) leftCol() string {
 }
 
 // PrintDefaults writes age-style combined option help to w.
-func (c *cliFlags) PrintDefaults(w io.Writer) {
+func (c *Flags) PrintDefaults(w io.Writer) {
 	if len(c.pairs) == 0 {
 		return
 	}
-	// Compute max left-column width for alignment.
 	maxW := 0
 	for _, e := range c.pairs {
 		if n := len(e.leftCol()); n > maxW {
