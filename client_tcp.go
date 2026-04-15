@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"filippo.io/age"
@@ -44,6 +46,215 @@ type probeResponse struct {
 	ProbeBytes      int64
 	ServerWmemBytes int64
 	LimiterBps      int64
+}
+
+type tcpConnPool struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
+	authState tcpAuthState
+	target    int
+	ready     chan net.Conn
+
+	refilling atomic.Int64
+	stopped   atomic.Bool
+}
+
+type managedTCPConnCloser struct {
+	client *Client
+	conn   net.Conn
+	pool   *tcpConnPool
+
+	once sync.Once
+	err  error
+}
+
+func (c *managedTCPConnCloser) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.once.Do(func() {
+		c.err = c.client.releaseManagedTCPConn(c.conn, c.pool)
+	})
+	return c.err
+}
+
+func warmTCPPoolTarget(suggestedConcurrency int) int {
+	if suggestedConcurrency <= 0 {
+		return 0
+	}
+	// 25% extra connections
+	return max(1, (suggestedConcurrency*5+3)/4)
+}
+
+func newTCPConnPool(state tcpAuthState, target int) *tcpConnPool {
+	if target <= 0 {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &tcpConnPool{
+		ctx:       ctx,
+		cancel:    cancel,
+		authState: state,
+		target:    target,
+		ready:     make(chan net.Conn, target),
+	}
+}
+
+func (p *tcpConnPool) borrow() (net.Conn, bool) {
+	if p == nil {
+		return nil, false
+	}
+	if p.stopped.Load() {
+		return nil, false
+	}
+	// Non blocking, if there isn't one ready
+	// just proceed
+	select {
+	case conn := <-p.ready:
+		if conn == nil {
+			return nil, false
+		}
+		return conn, true
+	default:
+		return nil, false
+	}
+}
+
+func (p *tcpConnPool) enqueue(conn net.Conn) bool {
+	if p == nil || conn == nil {
+		return false
+	}
+	if p.stopped.Load() {
+		return false
+	}
+	select {
+	case p.ready <- conn:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *tcpConnPool) stop() {
+	if p == nil {
+		return
+	}
+	if p.stopped.Swap(true) {
+		return
+	}
+	p.cancel()
+	for {
+		select {
+		case conn := <-p.ready:
+			if conn != nil {
+				_ = conn.Close()
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (p *tcpConnPool) triggerRefill(c *Client) {
+	if p == nil || c == nil {
+		return
+	}
+	for {
+		if p.stopped.Load() {
+			return
+		}
+		inFlight := int(p.refilling.Add(1))
+		if len(p.ready)+inFlight > p.target {
+			remaining := int(p.refilling.Add(-1))
+			if p.stopped.Load() || len(p.ready)+remaining >= p.target {
+				return
+			}
+			continue
+		}
+		go c.fillTCPPoolConn(p, p.ctx, p.authState)
+	}
+}
+
+func (c *Client) fillTCPPoolConn(pool *tcpConnPool, ctx context.Context, state tcpAuthState) {
+	defer func() {
+		remaining := int(pool.refilling.Add(-1))
+		needMore := !pool.stopped.Load() && len(pool.ready)+remaining < pool.target
+		if needMore {
+			pool.triggerRefill(c)
+		}
+	}()
+
+	conn, err := c.dialAndAuthWithState(ctx, state)
+	if err != nil {
+		return
+	}
+	if !pool.enqueue(conn) {
+		_ = conn.Close()
+	}
+}
+
+func (c *Client) ensureTCPPool(state tcpAuthState, suggestedConcurrency int) int {
+	target := warmTCPPoolTarget(suggestedConcurrency)
+	if target <= 0 {
+		return 0
+	}
+	c.tcpPoolMu.Lock()
+	if c.tcpPool != nil {
+		target = c.tcpPool.target
+		c.tcpPoolMu.Unlock()
+		return target
+	}
+	pool := newTCPConnPool(state, target)
+	c.tcpPool = pool
+	c.tcpPoolMu.Unlock()
+	pool.triggerRefill(c)
+	return target
+}
+
+func (c *Client) acquireManagedTCPConn(ctx context.Context) (net.Conn, tcpAuthState, *tcpConnPool, error) {
+	c.tcpPoolMu.Lock()
+	pool := c.tcpPool
+	c.tcpPoolMu.Unlock()
+	if pool != nil {
+		if conn, ok := pool.borrow(); ok {
+			return conn, pool.authState, pool, nil
+		}
+		conn, err := c.dialAndAuthWithState(ctx, pool.authState)
+		if err != nil {
+			return nil, tcpAuthState{}, pool, err
+		}
+		return conn, pool.authState, pool, nil
+	}
+	conn, state, err := c.dialAndAuth(ctx)
+	if err != nil {
+		return nil, tcpAuthState{}, nil, err
+	}
+	return conn, state, nil, nil
+}
+
+func (c *Client) releaseManagedTCPConn(conn net.Conn, pool *tcpConnPool) error {
+	if conn == nil {
+		if pool != nil {
+			pool.triggerRefill(c)
+		}
+		return nil
+	}
+	err := conn.Close()
+	if pool != nil {
+		pool.triggerRefill(c)
+	}
+	return err
+}
+
+func (c *Client) newManagedTCPReadCloser(reader io.Reader, conn net.Conn, pool *tcpConnPool) io.ReadCloser {
+	return &readerWithCloser{
+		Reader: reader,
+		Closer: &managedTCPConnCloser{
+			client: c,
+			conn:   conn,
+			pool:   pool,
+		},
+	}
 }
 
 func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
@@ -323,6 +534,18 @@ func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Rea
 	return decReader, nil
 }
 
+func (c *Client) dialAndAuthWithState(ctx context.Context, state tcpAuthState) (net.Conn, error) {
+	conn, err := c.dialTCP(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("dial file listener: %w", err)
+	}
+	if err := c.sendTCPAuth(conn, state); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("send AUTH: %w", err)
+	}
+	return conn, nil
+}
+
 // dialAndAuth resolves auth state, dials a TCP connection, and sends the
 // AUTH handshake. The caller is responsible for closing the returned connection.
 func (c *Client) dialAndAuth(ctx context.Context) (net.Conn, tcpAuthState, error) {
@@ -330,13 +553,9 @@ func (c *Client) dialAndAuth(ctx context.Context) (net.Conn, tcpAuthState, error
 	if err != nil {
 		return nil, tcpAuthState{}, err
 	}
-	conn, err := c.dialTCP(ctx)
+	conn, err := c.dialAndAuthWithState(ctx, state)
 	if err != nil {
-		return nil, tcpAuthState{}, fmt.Errorf("dial file listener: %w", err)
-	}
-	if err := c.sendTCPAuth(conn, state); err != nil {
-		conn.Close()
-		return nil, tcpAuthState{}, fmt.Errorf("send AUTH: %w", err)
+		return nil, tcpAuthState{}, err
 	}
 	return conn, state, nil
 }
@@ -355,11 +574,11 @@ func (c *Client) sendAndReadTCP(conn net.Conn, state tcpAuthState, cmd string) (
 }
 
 func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {
-	conn, state, err := c.dialAndAuth(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
 	if err != nil {
 		return GetManifestResponse{}, err
 	}
-	defer conn.Close()
+	defer func() { _ = c.releaseManagedTCPConn(conn, pool) }()
 
 	cmd := "TXFER " + makeLenToken(request.Directory)
 	if request.Verbose {
@@ -403,11 +622,11 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 }
 
 func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestRequest) (SyncManifestResponse, error) {
-	conn, state, err := c.dialAndAuth(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
 	if err != nil {
 		return SyncManifestResponse{}, err
 	}
-	defer conn.Close()
+	defer func() { _ = c.releaseManagedTCPConn(conn, pool) }()
 
 	// Send SYNC command line.
 	cmd := "SYNC " + makeLenToken(request.Directory) +
@@ -501,7 +720,7 @@ func (c *Client) fetchFileWindowTCP(
 	if fullPath == "" {
 		return nil, nil, errors.New("missing full path")
 	}
-	conn, state, err := c.dialAndAuth(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -530,23 +749,23 @@ func (c *Client) fetchFileWindowTCP(
 	}
 	br, err := c.sendAndReadTCP(conn, state, cmd.String())
 	if err != nil {
-		conn.Close()
+		_ = c.releaseManagedTCPConn(conn, pool)
 		return nil, nil, fmt.Errorf("SEND: %w", err)
 	}
 	firstLine, err := readSENDFirstLine(br)
 	if err != nil {
-		conn.Close()
+		_ = c.releaseManagedTCPConn(conn, pool)
 		return nil, nil, err
 	}
 
 	prefixed := io.MultiReader(strings.NewReader(firstLine), br)
-	stream, meta, streamErr := c.newFileStream(&readerWithCloser{Reader: prefixed, Closer: conn}, "", effectiveSize)
+	stream, meta, streamErr := c.newFileStream(c.newManagedTCPReadCloser(prefixed, conn, pool), "", effectiveSize)
 	if streamErr != nil {
-		conn.Close()
+		_ = c.releaseManagedTCPConn(conn, pool)
 		return nil, nil, streamErr
 	}
 	if meta.FileID != fileID {
-		stream.Close()
+		_ = stream.Close()
 		return nil, nil, fmt.Errorf("file id mismatch: expected %d got %d", fileID, meta.FileID)
 	}
 	return stream, meta, nil
@@ -563,7 +782,7 @@ func (c *Client) fetchFileBatchTCP(
 	if len(targets) == 0 {
 		return nil, errors.New("missing file targets")
 	}
-	conn, state, err := c.dialAndAuth(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -574,7 +793,7 @@ func (c *Client) fetchFileBatchTCP(
 	b.WriteString(txferID)
 	for _, t := range targets {
 		if strings.TrimSpace(t.FullPath) == "" {
-			conn.Close()
+			_ = c.releaseManagedTCPConn(conn, pool)
 			return nil, errors.New("missing full path")
 		}
 		b.WriteString(" fd=")
@@ -598,15 +817,15 @@ func (c *Client) fetchFileBatchTCP(
 	}
 	br, err := c.sendAndReadTCP(conn, state, b.String())
 	if err != nil {
-		conn.Close()
+		_ = c.releaseManagedTCPConn(conn, pool)
 		return nil, fmt.Errorf("SEND batch: %w", err)
 	}
 	firstLine, err := readSENDFirstLine(br)
 	if err != nil {
-		conn.Close()
+		_ = c.releaseManagedTCPConn(conn, pool)
 		return nil, err
 	}
-	return &readerWithCloser{Reader: io.MultiReader(strings.NewReader(firstLine), br), Closer: conn}, nil
+	return c.newManagedTCPReadCloser(io.MultiReader(strings.NewReader(firstLine), br), conn, pool), nil
 }
 
 func readTCPStatus(br *bufio.Reader) (string, error) {
@@ -833,11 +1052,11 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 	if txferID == "" {
 		return AcknowledgeFileProgressResponse{}, errors.New("missing transfer id")
 	}
-	conn, state, err := c.dialAndAuth(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
 	if err != nil {
 		return AcknowledgeFileProgressResponse{}, err
 	}
-	defer conn.Close()
+	defer func() { _ = c.releaseManagedTCPConn(conn, pool) }()
 
 	var cmd strings.Builder
 	cmd.WriteString("ACK ")
@@ -873,11 +1092,11 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 }
 
 func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (GetStatusResponse, error) {
-	conn, state, err := c.dialAndAuth(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
 	if err != nil {
 		return GetStatusResponse{}, err
 	}
-	defer conn.Close()
+	defer func() { _ = c.releaseManagedTCPConn(conn, pool) }()
 
 	br, err := c.sendAndReadTCP(conn, state, "STATUS "+request.TransferID)
 	if err != nil {
@@ -898,11 +1117,11 @@ func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (Ge
 }
 
 func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesRequest) (ListStatusesResponse, error) {
-	conn, state, err := c.dialAndAuth(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
 	if err != nil {
 		return ListStatusesResponse{}, err
 	}
-	defer conn.Close()
+	defer func() { _ = c.releaseManagedTCPConn(conn, pool) }()
 
 	br, err := c.sendAndReadTCP(conn, state, "STATUS")
 	if err != nil {
@@ -932,7 +1151,7 @@ func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesReques
 }
 
 func (c *Client) getChecksumTCP(ctx context.Context, request GetChecksumRequest) (io.ReadCloser, error) {
-	conn, state, err := c.dialAndAuth(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -960,13 +1179,13 @@ func (c *Client) getChecksumTCP(ctx context.Context, request GetChecksumRequest)
 	}
 	br, err := c.sendAndReadTCP(conn, state, cmd.String())
 	if err != nil {
-		conn.Close()
+		_ = c.releaseManagedTCPConn(conn, pool)
 		return nil, fmt.Errorf("CXSUM: %w", err)
 	}
 	firstLine, err := readStreamFirstLine(br, "CXSUM")
 	if err != nil {
-		conn.Close()
+		_ = c.releaseManagedTCPConn(conn, pool)
 		return nil, err
 	}
-	return &readerWithCloser{Reader: io.MultiReader(strings.NewReader(firstLine), br), Closer: conn}, nil
+	return c.newManagedTCPReadCloser(io.MultiReader(strings.NewReader(firstLine), br), conn, pool), nil
 }

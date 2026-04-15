@@ -188,12 +188,15 @@ type Client struct {
 	Comp                    string // adapt|none|lz4|zstd; empty means server default (adapt)
 	ClientAgePublicKey      string
 	ClientAgeIdentity       string
-	EncryptMode             string // "auto", "aes", or "chacha20" — selects post-AUTH stream cipher
+	EncryptMode             string   // "auto", "aes", or "chacha20" — selects post-AUTH stream cipher
 	ClientAuthTokens        []string // tokens presented in the encrypted AUTH blob
 
 	// Context dialer allows clients to setup custom connections
 	// For example injecting TLS
 	contextDialer func(context.Context, string) (net.Conn, error)
+
+	tcpPoolMu sync.Mutex
+	tcpPool   *tcpConnPool
 
 	// bufferPool caches reusable frame-read buffers keyed by bucketed size.
 	bufferPool sync.Map // map[int]*sync.Pool
@@ -394,19 +397,20 @@ type ProbeRequest struct {
 }
 
 type ProbeResponse struct {
-	ServerCPU            int
-	ServerIODepth        int
-	GentleCPUPct         int
-	GentleBWPct          int
-	AvgLatencyMS         int64 // RTT from the 1-byte discovery probe
-	LinkMbps             int64 // primary link estimate (aggregate in fast, average in gentle)
-	PerConnMbps          int64 // median per-connection throughput
-	AggregateMbps        int64 // sum across parallel conns (== LinkMbps in fast, equal to PerConnMbps in gentle)
-	ParallelConns        int   // connections used in the throughput phase
-	SuggestedConcurrency int
-	ServerSendBufBytes   int64
-	SuggestedCipher      string // resolved cipher suggested for this connection (e.g. "aes", "chacha20", or "" if none)
-	ServerLimiterBps     int64  // server's current rate limiter in bytes/sec (0 = unlimited)
+	ServerCPU              int
+	ServerIODepth          int
+	GentleCPUPct           int
+	GentleBWPct            int
+	AvgLatencyMS           int64 // RTT from the 1-byte discovery probe
+	LinkMbps               int64 // primary link estimate (aggregate in fast, average in gentle)
+	PerConnMbps            int64 // median per-connection throughput
+	AggregateMbps          int64 // sum across parallel conns (== LinkMbps in fast, equal to PerConnMbps in gentle)
+	ParallelConns          int   // connections used in the throughput phase
+	SuggestedConcurrency   int
+	WarmConnectionPoolSize int // warmed client connection pool target opened after probe
+	ServerSendBufBytes     int64
+	SuggestedCipher        string // resolved cipher suggested for this connection (e.g. "aes", "chacha20", or "" if none)
+	ServerLimiterBps       int64  // server's current rate limiter in bytes/sec (0 = unlimited)
 }
 
 type GetManifestResponse struct {
@@ -550,6 +554,22 @@ func NewClient(fileAddr string, opts ...ClientOption) *Client {
 		},
 	}
 	return c
+}
+
+// Close releases any warmed TCP pool state owned by the client. It is safe to
+// call multiple times.
+func (c *Client) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.tcpPoolMu.Lock()
+	pool := c.tcpPool
+	c.tcpPool = nil
+	c.tcpPoolMu.Unlock()
+	if pool != nil {
+		pool.stop()
+	}
+	return nil
 }
 
 func (c *Client) GetManifest(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {
@@ -1941,8 +1961,11 @@ func (c *Client) ProbeLink(ctx context.Context, req ProbeRequest) (ProbeResponse
 	response.SuggestedConcurrency = clampConcurrency(
 		suggestedConcurrencyFromProbe(response.ServerCPU, response.ServerIODepth, loadStrategy, response.GentleCPUPct),
 	)
-	if authState, authErr := c.resolveTCPAuthState(ctx); authErr == nil && authState.hasAuth {
-		response.SuggestedCipher = authState.encMode
+	if authState, authErr := c.resolveTCPAuthState(ctx); authErr == nil {
+		if authState.hasAuth {
+			response.SuggestedCipher = authState.encMode
+		}
+		response.WarmConnectionPoolSize = c.ensureTCPPool(authState, response.SuggestedConcurrency)
 	}
 
 	// Mini-probe caller: discovery only.

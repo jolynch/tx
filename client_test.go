@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -136,6 +137,104 @@ func readCompatLine(br *bufio.Reader) (string, error) {
 		return "", err
 	}
 	return strings.TrimRight(line, "\r\n"), nil
+}
+
+type countingPipeDialer struct {
+	mu           sync.Mutex
+	successLimit int
+	successCount int
+	attemptCount int
+	handler      func(intftcp.Request, io.Writer) error
+}
+
+func newCountingPipeDialer(handler func(intftcp.Request, io.Writer) error) *countingPipeDialer {
+	return &countingPipeDialer{
+		successLimit: -1,
+		handler:      handler,
+	}
+}
+
+func (d *countingPipeDialer) DialContext(context.Context, string) (net.Conn, error) {
+	d.mu.Lock()
+	d.attemptCount++
+	if d.successLimit >= 0 && d.successCount >= d.successLimit {
+		d.mu.Unlock()
+		return nil, errors.New("dial blocked")
+	}
+	d.successCount++
+	handler := d.handler
+	d.mu.Unlock()
+
+	serverConn, clientConn := net.Pipe()
+	go func() {
+		defer serverConn.Close()
+		serveFTCPTestConn(serverConn, handler)
+	}()
+	return clientConn, nil
+}
+
+func (d *countingPipeDialer) SetSuccessLimit(limit int) {
+	d.mu.Lock()
+	d.successLimit = limit
+	d.mu.Unlock()
+}
+
+func (d *countingPipeDialer) SuccessCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.successCount
+}
+
+func waitForDialSuccessCount(t *testing.T, d *countingPipeDialer, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if d.SuccessCount() >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d successful dials, got %d", want, d.SuccessCount())
+}
+
+func waitForTCPPoolReady(t *testing.T, client *Client, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		client.tcpPoolMu.Lock()
+		pool := client.tcpPool
+		ready := 0
+		refilling := 0
+		if pool != nil {
+			ready = len(pool.ready)
+			refilling = int(pool.refilling.Load())
+		}
+		client.tcpPoolMu.Unlock()
+		if pool != nil && ready == want && refilling == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	client.tcpPoolMu.Lock()
+	pool := client.tcpPool
+	client.tcpPoolMu.Unlock()
+	if pool == nil {
+		t.Fatal("timed out waiting for tcp pool: pool was nil")
+	}
+	t.Fatalf("timed out waiting for tcp pool ready=%d refilling=%d target=%d, got ready=%d refilling=%d target=%d", want, 0, pool.target, len(pool.ready), int(pool.refilling.Load()), pool.target)
+}
+
+func writeProbeResponse(out io.Writer, cpu int, probeBytes int64) error {
+	if _, err := fmt.Fprintf(out, "PROBE cpu=%d io-depth=1 cts0=100 sts0=110 sts1=120 probe-bytes=%d wmem=4096\r\n", cpu, probeBytes); err != nil {
+		return err
+	}
+	if probeBytes > 0 {
+		if _, err := io.WriteString(out, strings.Repeat("x", int(probeBytes))); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(out, "OK\r\n")
+	return err
 }
 
 func TestNewClientOptions(t *testing.T) {
@@ -1844,6 +1943,354 @@ func TestClientUsesInjectedDialContext(t *testing.T) {
 	}
 	if resp.Status == nil || resp.Status.TransferID != "tx123" {
 		t.Fatalf("unexpected status response: %+v", resp.Status)
+	}
+}
+
+func TestProbeLinkWarmsTCPPool(t *testing.T) {
+	var probeCPU atomic.Int64
+	probeCPU.Store(2)
+	handler := func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			n, err := strconv.ParseInt(strings.TrimSpace(req.Params[0]["probe-bytes"]), 10, 64)
+			if err != nil {
+				return err
+			}
+			return writeProbeResponse(out, int(probeCPU.Load()), n)
+		case intftcp.VerbSTATUS:
+			_, err := io.WriteString(out, "OK {\"transfer_id\":\"tx123\"}\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	}
+	dialer := newCountingPipeDialer(handler)
+	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
+	defer client.Close()
+
+	probe, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1})
+	if err != nil {
+		t.Fatalf("ProbeLink failed: %v", err)
+	}
+	if probe.SuggestedConcurrency != 2 {
+		t.Fatalf("expected suggested concurrency 2, got %d", probe.SuggestedConcurrency)
+	}
+	if probe.WarmConnectionPoolSize != 3 {
+		t.Fatalf("expected warm connection pool size 3, got %d", probe.WarmConnectionPoolSize)
+	}
+
+	waitForDialSuccessCount(t, dialer, 4)
+	waitForTCPPoolReady(t, client, 3)
+
+	client.tcpPoolMu.Lock()
+	pool := client.tcpPool
+	client.tcpPoolMu.Unlock()
+	if pool == nil {
+		t.Fatal("expected tcp pool to be initialized")
+	}
+	if pool.target != 3 {
+		t.Fatalf("expected pool target 3, got %d", pool.target)
+	}
+}
+
+func TestTCPPoolUsesWarmedConnectionForStatus(t *testing.T) {
+	var probeCPU atomic.Int64
+	probeCPU.Store(2)
+	handler := func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			n, err := strconv.ParseInt(strings.TrimSpace(req.Params[0]["probe-bytes"]), 10, 64)
+			if err != nil {
+				return err
+			}
+			return writeProbeResponse(out, int(probeCPU.Load()), n)
+		case intftcp.VerbSTATUS:
+			_, err := io.WriteString(out, "OK {\"transfer_id\":\"tx123\"}\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	}
+	dialer := newCountingPipeDialer(handler)
+	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
+	defer client.Close()
+
+	if _, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
+		t.Fatalf("ProbeLink failed: %v", err)
+	}
+	waitForDialSuccessCount(t, dialer, 4)
+	waitForTCPPoolReady(t, client, 3)
+
+	dialer.SetSuccessLimit(4)
+	statusResp, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"})
+	if err != nil {
+		t.Fatalf("GetStatus failed using warmed connection: %v", err)
+	}
+	if statusResp.Status == nil || statusResp.Status.TransferID != "tx123" {
+		t.Fatalf("unexpected status response: %+v", statusResp.Status)
+	}
+	if got := dialer.SuccessCount(); got != 4 {
+		t.Fatalf("expected no new successful dial for warmed status request, got %d", got)
+	}
+}
+
+func TestTCPPoolRefillsAfterShortResponse(t *testing.T) {
+	var probeCPU atomic.Int64
+	probeCPU.Store(2)
+	handler := func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			n, err := strconv.ParseInt(strings.TrimSpace(req.Params[0]["probe-bytes"]), 10, 64)
+			if err != nil {
+				return err
+			}
+			return writeProbeResponse(out, int(probeCPU.Load()), n)
+		case intftcp.VerbSTATUS:
+			_, err := io.WriteString(out, "OK {\"transfer_id\":\"tx123\"}\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	}
+	dialer := newCountingPipeDialer(handler)
+	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
+	defer client.Close()
+
+	if _, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
+		t.Fatalf("ProbeLink failed: %v", err)
+	}
+	waitForDialSuccessCount(t, dialer, 4)
+	waitForTCPPoolReady(t, client, 3)
+
+	dialer.SetSuccessLimit(5)
+	if _, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"}); err != nil {
+		t.Fatalf("GetStatus failed: %v", err)
+	}
+	waitForDialSuccessCount(t, dialer, 5)
+	waitForTCPPoolReady(t, client, 3)
+}
+
+func TestTCPPoolFallsBackToSyncDialWhenEmpty(t *testing.T) {
+	var probeCPU atomic.Int64
+	probeCPU.Store(2)
+	handler := func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			n, err := strconv.ParseInt(strings.TrimSpace(req.Params[0]["probe-bytes"]), 10, 64)
+			if err != nil {
+				return err
+			}
+			return writeProbeResponse(out, int(probeCPU.Load()), n)
+		case intftcp.VerbSTATUS:
+			_, err := io.WriteString(out, "OK {\"transfer_id\":\"tx123\"}\r\n")
+			return err
+		case intftcp.VerbCXSUM:
+			_, err := io.WriteString(out, "CXSUM fid=1 algo=xxh128 token=deadbeef\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	}
+	dialer := newCountingPipeDialer(handler)
+	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
+	defer client.Close()
+
+	if _, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
+		t.Fatalf("ProbeLink failed: %v", err)
+	}
+	waitForDialSuccessCount(t, dialer, 4)
+	waitForTCPPoolReady(t, client, 3)
+
+	dialer.SetSuccessLimit(5)
+	readers := make([]io.ReadCloser, 0, 3)
+	for i := 0; i < 3; i++ {
+		resp, err := client.GetChecksum(context.Background(), GetChecksumRequest{
+			TransferID: "tx123",
+			Targets: []ChecksumTarget{{
+				FileID:   uint64(i + 1),
+				FullPath: "/tmp/file",
+			}},
+		})
+		if err != nil {
+			t.Fatalf("GetChecksum %d failed: %v", i+1, err)
+		}
+		readers = append(readers, resp.Reader)
+	}
+	statusResp, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"})
+	if err != nil {
+		t.Fatalf("GetStatus failed with empty pool fallback: %v", err)
+	}
+	if statusResp.Status == nil || statusResp.Status.TransferID != "tx123" {
+		t.Fatalf("unexpected status response: %+v", statusResp.Status)
+	}
+	if got := dialer.SuccessCount(); got != 5 {
+		t.Fatalf("expected one fallback sync dial after exhausting pool, got %d successful dials", got)
+	}
+	for _, reader := range readers {
+		_ = reader.Close()
+	}
+}
+
+func TestTCPPoolRefillsAfterStreamClose(t *testing.T) {
+	var probeCPU atomic.Int64
+	probeCPU.Store(2)
+	handler := func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			n, err := strconv.ParseInt(strings.TrimSpace(req.Params[0]["probe-bytes"]), 10, 64)
+			if err != nil {
+				return err
+			}
+			return writeProbeResponse(out, int(probeCPU.Load()), n)
+		case intftcp.VerbSTATUS:
+			_, err := io.WriteString(out, "OK {\"transfer_id\":\"tx123\"}\r\n")
+			return err
+		case intftcp.VerbCXSUM:
+			_, err := io.WriteString(out, "CXSUM fid=1 algo=xxh128 token=deadbeef\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	}
+	dialer := newCountingPipeDialer(handler)
+	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
+	defer client.Close()
+
+	if _, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
+		t.Fatalf("ProbeLink failed: %v", err)
+	}
+	waitForDialSuccessCount(t, dialer, 4)
+	waitForTCPPoolReady(t, client, 3)
+
+	dialer.SetSuccessLimit(5)
+	resp, err := client.GetChecksum(context.Background(), GetChecksumRequest{
+		TransferID: "tx123",
+		Targets: []ChecksumTarget{{
+			FileID:   1,
+			FullPath: "/tmp/file",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("GetChecksum failed: %v", err)
+	}
+	if err := resp.Reader.Close(); err != nil {
+		t.Fatalf("close checksum reader: %v", err)
+	}
+	waitForDialSuccessCount(t, dialer, 5)
+	waitForTCPPoolReady(t, client, 3)
+
+	dialer.SetSuccessLimit(5)
+	statusResp, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"})
+	if err != nil {
+		t.Fatalf("GetStatus failed using refilled pool: %v", err)
+	}
+	if statusResp.Status == nil || statusResp.Status.TransferID != "tx123" {
+		t.Fatalf("unexpected status response: %+v", statusResp.Status)
+	}
+}
+
+func TestProbeLinkDoesNotResizeTCPPoolOnLaterMiniProbe(t *testing.T) {
+	var probeCPU atomic.Int64
+	probeCPU.Store(2)
+	handler := func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			n, err := strconv.ParseInt(strings.TrimSpace(req.Params[0]["probe-bytes"]), 10, 64)
+			if err != nil {
+				return err
+			}
+			return writeProbeResponse(out, int(probeCPU.Load()), n)
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	}
+	dialer := newCountingPipeDialer(handler)
+	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
+	defer client.Close()
+
+	if _, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
+		t.Fatalf("ProbeLink failed: %v", err)
+	}
+	waitForDialSuccessCount(t, dialer, 4)
+	waitForTCPPoolReady(t, client, 3)
+
+	probeCPU.Store(4)
+	if _, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
+		t.Fatalf("second ProbeLink failed: %v", err)
+	}
+	waitForDialSuccessCount(t, dialer, 5)
+	time.Sleep(100 * time.Millisecond)
+
+	client.tcpPoolMu.Lock()
+	pool := client.tcpPool
+	client.tcpPoolMu.Unlock()
+	if pool == nil {
+		t.Fatal("expected tcp pool to remain initialized")
+	}
+	if pool.target != 3 {
+		t.Fatalf("expected one-shot pool target 3, got %d", pool.target)
+	}
+	if got := dialer.SuccessCount(); got != 5 {
+		t.Fatalf("expected only the second probe dial to be added, got %d successful dials", got)
+	}
+}
+
+func TestClientCloseStopsTCPPoolAndAllowsDirectDialLater(t *testing.T) {
+	var probeCPU atomic.Int64
+	probeCPU.Store(2)
+	handler := func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			n, err := strconv.ParseInt(strings.TrimSpace(req.Params[0]["probe-bytes"]), 10, 64)
+			if err != nil {
+				return err
+			}
+			return writeProbeResponse(out, int(probeCPU.Load()), n)
+		case intftcp.VerbSTATUS:
+			_, err := io.WriteString(out, "OK {\"transfer_id\":\"tx123\"}\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	}
+	dialer := newCountingPipeDialer(handler)
+	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
+	defer client.Close()
+
+	if _, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
+		t.Fatalf("ProbeLink failed: %v", err)
+	}
+	waitForDialSuccessCount(t, dialer, 4)
+	waitForTCPPoolReady(t, client, 3)
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("client.Close failed: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("second client.Close failed: %v", err)
+	}
+	client.tcpPoolMu.Lock()
+	pool := client.tcpPool
+	client.tcpPoolMu.Unlock()
+	if pool != nil {
+		t.Fatal("expected tcp pool to be cleared after Close")
+	}
+
+	dialer.SetSuccessLimit(4)
+	if _, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"}); err == nil {
+		t.Fatal("expected GetStatus to fail after Close when new dials are blocked")
+	}
+
+	dialer.SetSuccessLimit(5)
+	statusResp, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"})
+	if err != nil {
+		t.Fatalf("GetStatus failed after allowing one direct dial: %v", err)
+	}
+	if statusResp.Status == nil || statusResp.Status.TransferID != "tx123" {
+		t.Fatalf("unexpected status response: %+v", statusResp.Status)
+	}
+	if got := dialer.SuccessCount(); got != 5 {
+		t.Fatalf("expected one direct dial after client.Close, got %d successful dials", got)
 	}
 }
 

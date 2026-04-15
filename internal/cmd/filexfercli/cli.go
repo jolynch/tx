@@ -114,10 +114,14 @@ func formatStartBatchProbeLine(linkMiBPerSec int64, suggestedConcurrency int, pl
 // used inside existing status lines (sync-delta, start-plan). Fast mode expands
 // to "<agg>Mbps (<N>x<per-conn>)"; gentle/single collapses to "<link>Mbps".
 func formatProbeLinkSummary(probe tx.ProbeResponse) string {
-	if probe.ParallelConns > 1 {
-		return fmt.Sprintf("%dMbps (%dx%dMbps)", probe.AggregateMbps, probe.ParallelConns, probe.PerConnMbps)
+	poolSuffix := ""
+	if probe.WarmConnectionPoolSize > 0 {
+		poolSuffix = fmt.Sprintf(" pool=%d", probe.WarmConnectionPoolSize)
 	}
-	return fmt.Sprintf("%dMbps", probe.LinkMbps)
+	if probe.ParallelConns > 1 {
+		return fmt.Sprintf("%dMbps (%dx%dMbps)%s", probe.AggregateMbps, probe.ParallelConns, probe.PerConnMbps, poolSuffix)
+	}
+	return fmt.Sprintf("%dMbps%s", probe.LinkMbps, poolSuffix)
 }
 
 // formatProbeLinkLine renders the throughput phase of a probe. In fast mode a
@@ -127,19 +131,21 @@ func formatProbeLinkLine(probe tx.ProbeResponse, probeBytes int64) string {
 	linkMiBPerSec := probe.LinkMbps * 1_000_000 / 8 / (1 << 20)
 	if probe.ParallelConns > 1 {
 		return fmt.Sprintf(
-			"txfer-link    : %d×%s parallel -> agg=%dMbps (%d MiB/s) per-conn-median=%dMbps",
+			"txfer-link    : %d×%s parallel -> agg=%dMbps (%d MiB/s) per-conn-median=%dMbps pool=%d",
 			probe.ParallelConns,
 			encoding.HumanBytes(probeBytes),
 			probe.AggregateMbps,
 			linkMiBPerSec,
 			probe.PerConnMbps,
+			probe.WarmConnectionPoolSize,
 		)
 	}
 	return fmt.Sprintf(
-		"txfer-link    : 1x%s linear -> link=%dMbps (%d MiB/s)",
+		"txfer-link    : 1x%s linear -> link=%dMbps (%d MiB/s) pool=%d",
 		encoding.HumanBytes(probeBytes),
 		probe.LinkMbps,
 		linkMiBPerSec,
+		probe.WarmConnectionPoolSize,
 	)
 }
 
@@ -1056,6 +1062,7 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 		go func() {
 			defer wg.Done()
 			client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...))
+			defer client.Close()
 			for task := range taskCh {
 				if err := verifySampleTaskData(ctx, client, manifest.TransferID, task); err != nil {
 					select {
@@ -1333,6 +1340,7 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 	fmt.Fprintf(stderr, "transfer(addr=[%s], source=[%s])\n", serverURL, cfg.sourceDir)
 
 	client := tx.NewClient(serverURL, tx.WithLoadStrategy(cfg.loadStrategy), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...))
+	defer client.Close()
 	start := time.Now()
 	probeResult, err := client.ProbeLink(context.Background(), tx.ProbeRequest{
 		ProbeBytes:   cfg.probeBytes,
@@ -1348,11 +1356,12 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 	}
 	fmt.Fprintf(
 		stderr,
-		"txfer-probe   : strategy=%s cipher=%s rtt_ms=%d srv-conc=(%d cpu * %d io = %d)\n",
+		"txfer-probe   : strategy=%s cipher=%s rtt_ms=%d srv-conc=(%d cpu * %d io = %d) conn-pool=%d\n",
 		cfg.loadStrategy,
 		cipherDisplay,
 		probeResult.AvgLatencyMS,
 		probeResult.ServerCPU, probeResult.ServerIODepth, probeResult.SuggestedConcurrency,
+		probeResult.WarmConnectionPoolSize,
 	)
 	fmt.Fprintln(stderr, formatProbeLinkLine(probeResult, cfg.probeBytes))
 	manifestResp, err := client.GetManifest(context.Background(), tx.GetManifestRequest{
@@ -1440,6 +1449,7 @@ func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.W
 	}
 
 	client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(resolvedEncMode), tx.WithClientAuthTokens(authTokens...))
+	defer client.Close()
 
 	// Mode 1: LOCAL_DST given — discover transfer from .tx/ state.
 	if cf.NArg() == 1 {
@@ -1751,6 +1761,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	}
 
 	client := tx.NewClient(serverURL, tx.WithLoadStrategy(tx.LoadStrategyFast), tx.WithComp(compress), tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(resolvedEncMode), tx.WithClientAuthTokens(authTokens...))
+	defer client.Close()
 
 	// Fetch manifest for the single file (skip full probe).
 	fmt.Fprintf(stderr, "get(addr=[%s], path=[%s])\n", serverURL, remotePath)
@@ -2040,6 +2051,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 
 		// Probe link bandwidth.
 		client := tx.NewClient(serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...))
+		defer client.Close()
 		probeResult, err := client.ProbeLink(context.Background(), tx.ProbeRequest{
 			ProbeBytes:   cfg.probeBytes,
 			LoadStrategy: loadStrategy,
@@ -2549,6 +2561,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		}
 	}()
 	client := tx.NewClient(serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...))
+	defer client.Close()
 	startAll := time.Now()
 	var completed int64
 	var totalTransferred int64
@@ -2627,6 +2640,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		} else {
 			fmt.Fprintf(stderr, "  concurrency: %d\n", effectiveConcurrency)
 		}
+		fmt.Fprintf(stderr, "  conn-pool: %d\n", miniProbe.WarmConnectionPoolSize)
 		fmt.Fprintf(stderr, "    window: %d\n", batchPlan.EffectiveWinConc)
 		fmt.Fprintf(stderr, "    batch-per-window: %d\n", batchPlan.PerFileWorkers)
 		fmt.Fprintf(stderr, "  batch: %s (from %s)\n",
