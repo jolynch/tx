@@ -785,6 +785,9 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
+	if !strings.Contains(stdout.String(), "sync-fallbacks=") {
+		t.Fatalf("expected sync fallback count in start summary, got %q", stdout.String())
+	}
 	out := stderr.String()
 	if !strings.Contains(out, "mode: [fast]") ||
 		!strings.Contains(out, "concurrency: 5") ||
