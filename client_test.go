@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -19,6 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"filippo.io/age"
+	"github.com/jolynch/tx/internal/aead"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	"github.com/jolynch/tx/internal/utils"
@@ -2051,5 +2054,92 @@ func TestManifestSizeScales(t *testing.T) {
 	}
 	if disk != int64(len(raw)) {
 		t.Errorf("disk=%d, want %d", disk, len(raw))
+	}
+}
+
+func TestSendTCPAuthIncludesClientAuthTokens(t *testing.T) {
+	serverID, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("generate server id: %v", err)
+	}
+	clientID, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("generate client id: %v", err)
+	}
+
+	c := NewClient("ignored:0", WithClientAuthTokens("tok-alpha-12345", "tok-beta-67890"))
+	parsed, err := parseAgeIdentity(clientID.String())
+	if err != nil {
+		t.Fatalf("parse client id: %v", err)
+	}
+	state := tcpAuthState{
+		publicKey:      clientID.Recipient().String(),
+		identity:       clientID.String(),
+		parsedIdentity: parsed,
+		serverKey:      serverID.Recipient().String(),
+		hasAuth:        true,
+		encMode:        "aes",
+	}
+
+	serverConn, clientConn := net.Pipe()
+	errCh := make(chan error, 1)
+	lineCh := make(chan string, 1)
+	go func() {
+		defer serverConn.Close()
+		br := bufio.NewReader(serverConn)
+		line, rerr := readCompatLine(br)
+		if rerr != nil {
+			errCh <- rerr
+			return
+		}
+		lineCh <- line
+	}()
+
+	if err := c.sendTCPAuth(clientConn, state); err != nil {
+		t.Fatalf("sendTCPAuth: %v", err)
+	}
+	_ = clientConn.Close()
+
+	var line string
+	select {
+	case line = <-lineCh:
+	case rerr := <-errCh:
+		t.Fatalf("read AUTH line: %v", rerr)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout reading AUTH line")
+	}
+
+	req, err := intftcp.ParseRequest([]byte(line))
+	if err != nil {
+		t.Fatalf("parse AUTH request: %v", err)
+	}
+	if req.Verb != intftcp.VerbAUTH {
+		t.Fatalf("expected AUTH verb, got %v", req.Verb)
+	}
+	if req.Params[0]["protocol"] != "aes" {
+		t.Fatalf("expected aes protocol, got %q", req.Params[0]["protocol"])
+	}
+	blob := req.Params[0]["blob"]
+	raw, berr := base64.StdEncoding.DecodeString(strings.TrimSpace(blob))
+	if berr != nil {
+		t.Fatalf("base64 decode: %v", berr)
+	}
+	dec, derr := aead.DecryptWithOptions(bytes.NewReader(raw), serverID, aead.Options{Algorithm: aead.AlgorithmAES})
+	if derr != nil {
+		t.Fatalf("decrypt init: %v", derr)
+	}
+	plain, perr := io.ReadAll(dec)
+	if perr != nil {
+		t.Fatalf("decrypt: %v", perr)
+	}
+	fields := strings.Fields(string(plain))
+	if len(fields) != 3 {
+		t.Fatalf("expected 3 fields (<pubkey> <tok1> <tok2>), got %d: %q", len(fields), fields)
+	}
+	if fields[0] != clientID.Recipient().String() {
+		t.Fatalf("fields[0]: want client pubkey %q, got %q", clientID.Recipient().String(), fields[0])
+	}
+	if fields[1] != "tok-alpha-12345" || fields[2] != "tok-beta-67890" {
+		t.Fatalf("unexpected token fields: %q %q", fields[1], fields[2])
 	}
 }

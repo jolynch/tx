@@ -33,6 +33,7 @@ func gentleLimiterBurstBytes(limiter *limit.Limiter) int64 {
 
 type ServerOptions struct {
 	RequireAuth            bool
+	AllowedAuthTokens      []string // if non-empty, client AUTH must present a matching token
 	ServerIdentity         *age.X25519Identity
 	Deps                   Deps
 	Limiter                *limit.Limiter
@@ -115,6 +116,7 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 type connSession struct {
 	conn                   net.Conn
 	requireAuth            bool
+	allowedAuthTokens      []string
 	serverID               *age.X25519Identity
 	deps                   Deps
 	limiter                *limit.Limiter
@@ -135,6 +137,7 @@ func handleConn(conn net.Conn, opts ServerOptions, deps Deps, onTransferCreated 
 	s := &connSession{
 		conn:                   conn,
 		requireAuth:            opts.RequireAuth,
+		allowedAuthTokens:      opts.AllowedAuthTokens,
 		serverID:               opts.ServerIdentity,
 		deps:                   deps,
 		limiter:                opts.Limiter,
@@ -174,7 +177,7 @@ func (s *connSession) run() error {
 	cmdReq := firstReq
 	cmdReader := br
 	if firstReq.Verb == VerbAUTH {
-		authRes, authErr := processAUTHRequest(firstReq, s.serverID)
+		authRes, authErr := processAUTHRequest(firstReq, s.serverID, s.allowedAuthTokens)
 		if authErr != nil {
 			if errors.Is(authErr, errNotAuthorized) {
 				return protocolErr{code: "NOT_AUTHORIZED", message: "authorization failed"}

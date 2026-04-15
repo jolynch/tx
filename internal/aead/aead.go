@@ -67,7 +67,7 @@ func (o Options) HKDFInfo() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("pinch-%s-v%d", algorithmName, aeadVersion), nil
+	return fmt.Sprintf("tx-%s-v%d", algorithmName, aeadVersion), nil
 }
 
 const aeadMaxAADChunkCount = ^uint64(0) >> 1
@@ -79,8 +79,8 @@ var aeadBufferPools sync.Map // map[int]*sync.Pool
 // writes a binary key-exchange header to dst, then returns a WriteCloser that
 // encrypts data in fixed-size chunks.
 //
-// A zero ChunkSize uses the default. Values smaller than 1 KiB are clamped
-// upward. A zero Algorithm uses RecommendedCipher.
+// A zero ChunkSize uses the default of 64KiB. Values smaller than 1 KiB are clamped
+// upward. A zero Algorithm uses RecommendedCipher based on hardware capability.
 //
 // The caller must call Close to flush the final chunk. Not goroutine-safe.
 func Encrypt(dst io.Writer, recipient age.Recipient, opts Options) (io.WriteCloser, error) {

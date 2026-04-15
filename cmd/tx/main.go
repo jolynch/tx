@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"path"
 	"runtime/trace"
 	"strconv"
 	"strings"
@@ -14,6 +13,7 @@ import (
 
 	"filippo.io/age"
 
+	"github.com/jolynch/tx/internal/aead"
 	"github.com/jolynch/tx/internal/cmd/filexfercli"
 	filexfer "github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/ftcp"
@@ -44,78 +44,14 @@ func parsePercentFlag(raw string, name string) (int, error) {
 	return value, nil
 }
 
-// loadServerAgeIdentity loads an age identity from the key file in dir.
-// It returns the identity if found, or an error if the file exists but is unreadable/invalid.
-// If the key file does not exist, it returns (nil, nil).
-func loadServerAgeIdentity(dir string) (*age.X25519Identity, error) {
-	keyPath := path.Join(dir, "key")
-	raw, err := os.ReadFile(keyPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("read key file %s: %w", keyPath, err)
-	}
-	lines := strings.Split(string(raw), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		identity, parseErr := age.ParseX25519Identity(line)
-		if parseErr != nil {
-			return nil, fmt.Errorf("invalid existing key file %s: %w", keyPath, parseErr)
-		}
-		return identity, nil
-	}
-	return nil, fmt.Errorf("existing key file %s has no identity", keyPath)
-}
-
-// loadOrGenerateServerKey attempts to load a persistent key from dir.
-// If the directory exists and contains a valid key, it returns that key.
-// If the directory exists but the key is unreadable, it returns an error.
-// If the directory does not exist and isDefault is true, it generates an ephemeral in-memory key.
-// If the directory does not exist and isDefault is false (explicitly provided), it returns an error.
 func loadOrGenerateServerKey(dir string, isDefault bool) (*age.X25519Identity, error) {
-	if _, err := os.Stat(dir); err != nil {
-		if os.IsNotExist(err) {
-			if !isDefault {
-				return nil, fmt.Errorf("keys directory %s does not exist", dir)
-			}
-			// Default dir doesn't exist — generate ephemeral key.
-			identity, genErr := age.GenerateX25519Identity()
-			if genErr != nil {
-				return nil, fmt.Errorf("generate ephemeral identity: %w", genErr)
-			}
-			log.Printf("Keys directory not found, using ephemeral in-memory key")
-			return identity, nil
-		}
-		return nil, fmt.Errorf("stat keys directory %s: %w", dir, err)
-	}
-
-	// Directory exists — try to load.
-	identity, err := loadServerAgeIdentity(dir)
+	identity, ephemeral, err := aead.LoadOrGenerateAgeIdentity(dir, isDefault)
 	if err != nil {
 		return nil, err
 	}
-	if identity != nil {
-		return identity, nil
+	if ephemeral {
+		log.Printf("Keys directory not found, using ephemeral in-memory key")
 	}
-
-	// Directory exists but no key file — generate and persist.
-	identity, err = age.GenerateX25519Identity()
-	if err != nil {
-		return nil, fmt.Errorf("generate age identity: %w", err)
-	}
-	keyPath := path.Join(dir, "key")
-	out, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("open key file %s: %w", keyPath, err)
-	}
-	defer out.Close()
-	fmt.Fprintf(out, "# created: %s\n", time.Now().Format(time.RFC3339))
-	fmt.Fprintf(out, "# public key: %s\n", identity.Recipient())
-	fmt.Fprintf(out, "%s\n", identity)
 	return identity, nil
 }
 
@@ -166,6 +102,7 @@ Options:
   -c, --chroot string         server root directory (default "/")
   -k, --keys string           age keys directory (default "/var/lib/pinch/keys")
       --require-auth          require AUTH before commands
+      --require-auth-token string  allowlisted auth token (opaque string >8 bytes, repeatable); implies --require-auth
       --target-io-depth int   target IO depth per CPU advertised in PROBE (default 4)
       --trace string          write runtime/trace to this file
   -p, --progress-path string    progress output target; repeatable, use - for stdout
@@ -190,6 +127,9 @@ Options:
 	fs.StringVar(&keysDir, "keys", keysDir, "")
 	fs.StringVar(&keysDir, "k", keysDir, "")
 	requireAuth := fs.Bool("require-auth", false, "")
+	var authTokenVals []string
+	authTokens := filexfer.StringSliceFlag{Values: &authTokenVals}
+	fs.Var(&authTokens, "require-auth-token", "")
 	targetIODepth := fs.Int("target-io-depth", 4, "")
 	disableZeroCopy := fs.Bool("disable-zero-copy", false, "")
 	traceFile := fs.String("trace", "", "")
@@ -212,6 +152,26 @@ Options:
 	progressInterval, err := time.ParseDuration(progressIntervalRaw)
 	if err != nil {
 		log.Fatalf("Invalid --progress-interval: %v", err)
+	}
+
+	for _, tok := range authTokenVals {
+		if vErr := aead.ValidateAuthToken(tok); vErr != nil {
+			log.Fatalf("Invalid --require-auth-token: %v", vErr)
+		}
+	}
+	if len(authTokenVals) > 0 && !*requireAuth {
+		*requireAuth = true
+	}
+	if *requireAuth && len(authTokenVals) == 0 {
+		gen, tokErr := aead.NewAuthToken()
+		if tokErr != nil {
+			log.Fatalf("Generate auth token: %v", tokErr)
+		}
+		log.Printf("generated auth token: %s", gen)
+		authTokenVals = append(authTokenVals, gen)
+	}
+	if len(authTokenVals) > 0 {
+		log.Printf("auth required (%d identities/tokens allowlisted)", len(authTokenVals))
 	}
 	progressTargets, err := filexfer.ResolveProgressTargets(progressPathVals, progressFormatVals)
 	if err != nil {
@@ -264,6 +224,7 @@ Options:
 	log.Printf("File transfer listener at %s (root=%s)", fileListener, chroot)
 	if serveErr := ftcp.Serve(fileLn, ftcp.ServerOptions{
 		RequireAuth:            *requireAuth,
+		AllowedAuthTokens:      authTokenVals,
 		ServerIdentity:         serverKey,
 		Limiter:                fileStreamLimiter,
 		GentleCPUPct:           gentleCPUPct,

@@ -137,7 +137,12 @@ func serveFTCPConn(conn net.Conn, serverID *age.X25519Identity, handler func(int
 			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
 			return
 		}
-		recipient, parseErr := age.ParseX25519Recipient(strings.TrimSpace(string(plain)))
+		fields := strings.Fields(string(plain))
+		if len(fields) == 0 {
+			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
+			return
+		}
+		recipient, parseErr := age.ParseX25519Recipient(fields[0])
 		if parseErr != nil {
 			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
 			return
