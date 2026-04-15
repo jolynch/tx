@@ -24,6 +24,7 @@ import (
 	"filippo.io/age"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	intlimit "github.com/jolynch/tx/internal/filexfer/limit"
+	"github.com/jolynch/tx/internal/metrics"
 	"github.com/jolynch/tx/internal/utils"
 	"github.com/zeebo/xxh3"
 )
@@ -210,10 +211,9 @@ type Client struct {
 	// scratchBufferPool caches reusable temporary byte buffers.
 	scratchBufferPool sync.Pool
 
-	// syncConnFallbacks counts how often a warmed connection pool request had to
-	// fall back to a synchronous dial because no ready pooled connection was
-	// available.
-	syncConnFallbacks atomic.Int64
+	// clientMetrics owns all counters for this client. Mutate via its methods
+	// (e.g. IncSyncConnectionFallback) and read via MetricSnapshot.
+	clientMetrics metrics.ClientMetrics
 }
 
 type Manifest struct {
@@ -577,13 +577,16 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// SyncConnectionCount reports how many times this client fell back to a
-// synchronous connection dial after a warmed TCP pool was exhausted.
-func (c *Client) SyncConnectionCount() int64 {
+// ClientMetrics is a point-in-time snapshot of client-side counters. New
+// fields may be added without breaking callers.
+type ClientMetrics = metrics.ClientMetricsSnapshot
+
+// MetricSnapshot returns a copy of the client's current metric counters.
+func (c *Client) MetricSnapshot() ClientMetrics {
 	if c == nil {
-		return 0
+		return ClientMetrics{}
 	}
-	return c.syncConnFallbacks.Load()
+	return c.clientMetrics.Snapshot()
 }
 
 func (c *Client) GetManifest(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {

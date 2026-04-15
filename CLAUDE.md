@@ -6,8 +6,8 @@ This document covers the protocol, server, client library, and testing conventio
 
 ```
 ./                                 # Public client library (package tx)
-  client.go                        # Client type, options, request/response types
-  client_tcp.go                    # TCP transport implementation
+  client.go                        # Client type, options, request/response types, ClientMetrics
+  client_tcp.go                    # TCP transport + async-refilled connection pool
   client_test.go                   # Integration tests against a real server
   docs/
     PROTOCOL.md                    # FTCP line protocol (AUTH, TXFER, SEND, ACK, CXSUM, STATUS, PROBE)
@@ -17,13 +17,14 @@ This document covers the protocol, server, client library, and testing conventio
 
 cmd/tx/
   main.go                          # Binary entrypoint: send and recv subcommands
+  main_test.go                     # Binary-level smoke tests
 
 internal/filexfer/
   ftcp/                            # Server-side FTCP command handlers
     server.go                      # Listener loop and connection dispatch
     verb.go                        # Verb enum
     request.go                     # Protocol line parser (ParseRequest)
-    auth.go                        # AUTH handler + age encryption setup
+    auth.go                        # AUTH handler + age encryption + auth-token validation
     txfer.go                       # TXFER handler — manifest generation
     send.go                        # SEND handler — file streaming
     ack.go                         # ACK handler — progress acknowledgment
@@ -33,6 +34,7 @@ internal/filexfer/
     sync.go                        # SYNC handler
     deps.go                        # Deps interface + runtimeDeps (thin wrapper over store)
     errors.go                      # protocolErr, writeOKLine, writeErrFrame helpers
+    *_test.go                      # per-handler tests with mockDeps
   encoding/
     manifest.go                    # FM/1 marshal/parse (front-coded paths + mtimes)
     frame.go                       # FX/1 frame marshal/parse
@@ -45,13 +47,31 @@ internal/filexfer/
   limit/
     limit.go                       # Rate-limited io.Writer
   progress.go                      # Background progress-file writer
+  flag.go                          # StringSliceFlag + ResolveProgressTargets helper
 
 internal/cmd/filexfercli/
   cli.go                           # CLI commands: copy, get, status, verify
+  flags.go                         # cliFlags wrapper (combined short/long flag help)
   cli_test.go                      # End-to-end CLI tests with fake TCP servers
 
-internal/aead/                     # AEAD crypto primitives
-internal/utils/                    # Socket tuning, string helpers, timeouts
+internal/aead/
+  aead.go                          # Streaming AEAD (AES-GCM, ChaCha20-Poly1305)
+  token.go                         # Auth token generate/validate/redact/compare
+  keyfile.go                       # Age identity file load/persist
+
+internal/utils/
+  socket.go                        # Socket tuning (SO_SNDBUF, TCP_NODELAY, etc.)
+  strings.go                       # String helpers
+  timeout.go                       # Timeout helpers
+
+internal/metrics/
+  metrics.go                       # ClientMetrics holder + ClientMetricsSnapshot value type
+
+internal/bench/                    # Benchmark binary + regression benchmarks
+  main.go                          # Benchmark runner entrypoint
+  generate.go                      # Synthetic dataset generation
+  report.go                        # Result formatting
+  *_test.go                        # aead / codec pool / common-prefix / store benchmarks
 ```
 
 ## Protocol
@@ -60,7 +80,7 @@ Full specification lives in `docs/PROTOCOL.md`. Key points:
 
 - **Transport**: one TCP connection per command, server closes after completion.
 - **Line format**: `VERB args...\r\n` → optional streaming payload → `OK [msg]\r\n` or `ERR <code> <msg>\r\n`.
-- **AUTH**: optional first command; supports age encryption for both the command line and response stream.
+- **AUTH**: optional first command; supports age encryption for both the command line and response stream, and carries bearer tokens validated server-side inside the encrypted blob.
 - **Token encoding**: path/blob args are quoted (`"..."`) or length-prefixed (`<len>:<bytes>`).
 
 ### Command sequence for a typical download
@@ -129,10 +149,18 @@ State transitions per file: `Started → Running → Done` (or `Missing` for 404
 | `SyncManifest` | `SYNC` |
 | `StartFromManifest` | orchestrates `SEND` + `ACK` in batches |
 | `AcknowledgeFileProgress` | `ACK` |
+| `Close` | — (releases warmed TCP pool state) |
+| `MetricSnapshot` | — (returns a `ClientMetrics` snapshot) |
 
 The `Client` struct holds connection config (`ServerAddr`, `ServerAgePublicKey`) and client-side encryption keys (`ClientAgePublicKey`, `ClientAgeIdentity`). Age keys on the client struct are used automatically by all methods that need encryption, so request structs do not carry them.
 
-TCP helpers live in `client_tcp.go`. Each method dials a fresh connection (no persistent connection pool). `readTCPStatus` reads the `OK`/`ERR` terminal line; `readTCPLine` reads an arbitrary line up to `maxTCPLineBytes`.
+**Auth tokens.** `ClientAuthTokens []string` + `WithClientAuthTokens(...)` attach bearer tokens that are sent inside the encrypted AUTH blob. The server validates them using helpers in `internal/aead/token.go` (`NewAuthToken`, `ValidateAuthToken`, `MatchAuthToken`, `RedactAuthToken`).
+
+**Custom dialer.** `WithContextDialer` lets callers substitute the net.Conn source (e.g., for TLS or test harnesses). The Client also pools hot-path allocations via `bufferPool`, `lineReaderPool`, and `scratchBufferPool`.
+
+**TCP connection pool.** `client_tcp.go` maintains an async-refilled pool (`tcpConnPool`) sized to the configured concurrency plus a 25% headroom (`warmTCPPoolTarget`). Borrowed connections are wrapped in a `managedTCPConnCloser` that returns them to the pool on close. When the pool is empty the client falls back to a synchronous `dial` and calls `clientMetrics.IncSyncConnectionFallback()`, exposed via `MetricSnapshot().SyncConnectionCount`. `readTCPStatus` reads the `OK`/`ERR` terminal line; `readTCPLine` reads an arbitrary line up to `maxTCPLineBytes`.
+
+**Metrics.** All client-side counters live in `internal/metrics`. `metrics.ClientMetrics` is the holder (atomic counters, mutated via methods like `IncSyncConnectionFallback`); `metrics.ClientMetricsSnapshot` is the value type returned by its `Snapshot()` method. The exported `tx.ClientMetrics` is a type alias for `metrics.ClientMetricsSnapshot`, so callers see one name. `Client` embeds a `clientMetrics metrics.ClientMetrics` field; new counters are added by extending the metrics package, with no change to `Client` shape.
 
 `TransferStatus` in `client.go` mirrors the JSON schema returned by the server's STATUS command.
 
@@ -143,6 +171,8 @@ Three user-facing commands defined in `cli.go`:
 - **`copy`**: full directory download with probes, manifest fetch, parallel SEND batches, ACK, optional verify. Writes `.tx/` state (manifest + progress file) for resume.
 - **`get`**: single-file download. Skips probes and `.tx/` state.
 - **`status`**: monitors a transfer. With `LOCAL_DST` reads `.tx/manifest.server` for the transfer ID and polls with combined server+client progress. With `--tid` polls server only. With no args lists all active transfers.
+
+`copy`/`get` accept repeatable `--progress-path` and `--progress-format` flags (formats: `json`, `int`). Flags are paired via `ResolveProgressTargets` in `internal/filexfer/flag.go`: zero formats → all JSON; one format → applied to every path; N formats → positional pairing with N paths. `flags.go` provides the `cliFlags` wrapper that unifies short/long flag help output.
 
 ## Testing
 
@@ -168,6 +198,15 @@ RunCLI([]string{"copy", "--server", ln.Addr().String(), ...})
 
 When extending `Deps`, add the new method to `mockDeps` in `cli_test.go` (and any other test files that define their own mock) before running `go test ./...`.
 
+### Benchmarks (`internal/bench/`)
+
+Regression benchmarks for AEAD, codec pools, manifest common-prefix encoding, and store operations live alongside a small runner binary (`main.go`, `generate.go`, `report.go`) that generates synthetic datasets and formats results. Run with:
+
+```sh
+go test -bench=. ./internal/bench/
+go run ./internal/bench                                    # runner binary
+```
+
 ### Running tests
 
 ```sh
@@ -175,4 +214,5 @@ go test ./...                                              # all packages
 go test ./internal/filexfer/...                            # server packages only
 go test -run TestRunCLI ./internal/cmd/filexfercli/        # CLI tests
 go test -bench=. ./internal/filexfer/encoding/             # codec benchmarks
+go test -bench=. ./internal/bench/                         # regression benchmarks
 ```
