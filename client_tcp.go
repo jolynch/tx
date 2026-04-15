@@ -219,7 +219,7 @@ func (c *Client) acquireManagedTCPConn(ctx context.Context) (net.Conn, tcpAuthSt
 		if conn, ok := pool.borrow(); ok {
 			return conn, pool.authState, pool, nil
 		}
-		c.syncConnFallbacks.Add(1)
+		c.clientMetrics.IncSyncConnectionFallback()
 		conn, err := c.dialAndAuthWithState(ctx, pool.authState)
 		if err != nil {
 			return nil, tcpAuthState{}, pool, err
