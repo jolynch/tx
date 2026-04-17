@@ -47,11 +47,14 @@ internal/filexfer/
   limit/
     limit.go                       # Rate-limited io.Writer
   progress.go                      # Background progress-file writer
-  flag.go                          # StringSliceFlag + ResolveProgressTargets helper
+  progress.go                      # Background progress-file writer
+
+internal/cliflags/
+  cliflags.go                      # Shared CLI flag helpers: Flags (short/long builder),
+                                   # StringSliceFlag, ResolveProgressTargets
 
 internal/cmd/filexfercli/
   cli.go                           # CLI commands: copy, get, status, verify
-  flags.go                         # cliFlags wrapper (combined short/long flag help)
   cli_test.go                      # End-to-end CLI tests with fake TCP servers
 
 internal/aead/
@@ -60,6 +63,7 @@ internal/aead/
   keyfile.go                       # Age identity file load/persist
 
 internal/utils/
+  addr.go                          # Host:port validation (IsHostPort, ValidateHostPort)
   socket.go                        # Socket tuning (SO_SNDBUF, TCP_NODELAY, etc.)
   strings.go                       # String helpers
   timeout.go                       # Timeout helpers
@@ -164,15 +168,25 @@ The `Client` struct holds connection config (`ServerAddr`, `ServerAgePublicKey`)
 
 `TransferStatus` in `client.go` mirrors the JSON schema returned by the server's STATUS command.
 
-## CLI (`internal/cmd/filexfercli/`)
+## CLI
 
-Three user-facing commands defined in `cli.go`:
+Both `send` and `recv` follow the same shape: `tx <side> [<addr>] <command> [options]`.
+
+Full flag reference with `--help` output lives in `docs/CLI.md`. **Any time you change flags in either CLI or `internal/cliflags/cliflags.go`, update `docs/CLI.md` to match.**
+
+### `tx send` (`cmd/tx/main.go`)
+
+- **`serve`**: starts the file transfer TCP server. Takes an optional positional `CHROOT` (defaults to cwd).
+
+### `tx recv` (`internal/cmd/filexfercli/cli.go`)
 
 - **`copy`**: full directory download with probes, manifest fetch, parallel SEND batches, ACK, optional verify. Writes `.tx/` state (manifest + progress file) for resume.
 - **`get`**: single-file download. Skips probes and `.tx/` state.
 - **`status`**: monitors a transfer. With `LOCAL_DST` reads `.tx/manifest.server` for the transfer ID and polls with combined server+client progress. With `--tid` polls server only. With no args lists all active transfers.
 
-`copy`/`get` accept repeatable `--progress-path` and `--progress-format` flags (formats: `json`, `int`). Flags are paired via `ResolveProgressTargets` in `internal/filexfer/flag.go`: zero formats → all JSON; one format → applied to every path; N formats → positional pairing with N paths. `flags.go` provides the `cliFlags` wrapper that unifies short/long flag help output.
+### Shared flag helpers (`internal/cliflags/`)
+
+`cliflags.Flags` wraps `flag.FlagSet` to register short/long pairs and print combined help. `StringSliceFlag` implements repeatable string flags. `ResolveProgressTargets` pairs `--progress-path` with `--progress-format` values.
 
 ## Testing
 

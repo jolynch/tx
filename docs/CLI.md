@@ -1,40 +1,194 @@
 # File Transfer CLI
 
-This document describes the current `tx recv` command line, the
-high-level copy workflow, and the `fast` / `gentle` transfer strategies used by
-the transfer layer.
-
-## Overview
-
-The file transfer CLI currently exposes three public commands:
-
-- `copy`: copy a remote tree to a local destination
-- `status`: query transfer status by transfer id or local destination
-- `get`: download a single remote file by absolute path
-
-Top-level usage:
+## Quick Reference
 
 ```text
-tx recv [<addr>] <command> [options]
+$ tx --help
+usage: tx <command> [options]
+
+Commands:
+  send       File transfer server
+  recv       File transfer CLI client
+
+Run 'tx <command> --help' for command-specific options.
 ```
 
-- `<addr>` defaults to `127.0.0.1:3453`
-- state is stored in `<LOCAL_DST>/../.tx/`
-
-The state directory contains:
-
-- `manifest.server`: the last remote manifest snapshot
-- `manifest`: the local manifest after a successful write
-- `manifest.progress`: resumable progress state
-- `remote/`: start-phase staging directory
-
-## `copy`
-
-`copy` is the main entry point.
+### `tx send`
 
 ```text
-tx recv [<addr>] copy [flags] REMOTE_SRC LOCAL_DST
+$ tx send --help
+usage: tx send [<addr>] <command> [options]
+
+Commands:
+  serve      Start the file transfer TCP server
+
+Default listen address: 127.0.0.1:3453
+Run 'tx send <command> --help' for command-specific options.
 ```
+
+#### `tx send serve`
+
+```text
+$ tx send serve --help
+usage: tx send [addr] serve [options] [CHROOT]
+
+Start the file transfer TCP server.
+
+  addr      listen address (default "127.0.0.1:3453")
+  CHROOT    server root directory (default: current working directory)
+
+Options:
+  -b, --bwlimit string             Response rate limit for gentle transfers only; fast
+                                   transfers do not respect it (e.g. 100MiB, 1000mbps)
+      --bwlimit-burst string       Rate limit burst size (default "1MiB")
+      --gentle-cpu string          Percent of server CPUs advertised for gentle
+                                   concurrency (default "25%")
+      --gentle-bw string           Percent of observed link bandwidth used for gentle
+                                   limiting (default "25%")
+  -k, --keys string                Age keys directory (default "/var/lib/pinch/keys")
+      --require-auth               Require AUTH before commands
+      --require-auth-token string  Allowlisted auth token (opaque string >8 bytes,
+                                   repeatable); implies --require-auth
+      --target-io-depth int        Target IO depth per CPU advertised in PROBE (default 4)
+      --disable-zero-copy          Force buffered send path (for benchmarking)
+      --trace string               Write runtime/trace output to this file
+  -p, --progress-path string       Progress output target; repeatable, use - for stdout
+  -f, --progress-format string     Progress format: json|int; 1 applies to all targets,
+                                   or one per target (default json)
+      --progress-interval string   Progress write interval (e.g. 500ms, 10s) (default "1s")
+```
+
+### `tx recv`
+
+```text
+$ tx recv --help
+usage: tx recv [<addr>] <command> [options]
+
+Commands:
+  copy       Copy REMOTE_SRC to LOCAL_DST
+  status     Query and monitor transfer progress
+  get        Download a single remote file
+
+State is stored in <local-dst>/../.tx/ (manifest, progress, staging).
+Default server address: 127.0.0.1:3453
+Run 'tx recv <command> --help' for command-specific options.
+```
+
+#### `tx recv copy`
+
+```text
+$ tx recv copy --help
+usage: tx recv [addr] copy [flags] REMOTE_SRC LOCAL_DST
+
+Copy REMOTE_SRC from the remote to LOCAL_DST on the local machine.
+
+Behavior:
+  - If LOCAL_DST does not exist: full transfer
+  - If LOCAL_DST exists: diff remote and send deltas
+  - --clean removes LOCAL_DST first and forces a clean transfer
+  - --skip-fetch fetches and writes manifest state only; no start/sync
+  - --skip-write fetches bodies to a discard sink and never mutates LOCAL_DST
+  - --verify-meta reruns read-only metadata verification after copy
+  - --verify-data-sample=N implies --verify-meta and verifies N percent of data
+
+Options:
+      --clean                     Remove LOCAL_DST first, then force a clean transfer
+      --skip-fetch                Fetch and persist remote manifest state only; do not
+                                  start or sync files
+      --skip-write                Do not mutate LOCAL_DST; fetch file bodies to discard
+                                  instead of writing them
+      --skip-fsync                Acknowledge writes without fdatasync
+      --verify-meta               Run read-only metadata verification after copy; with
+                                  --skip-fetch this is allowed only if LOCAL_DST already
+                                  exists
+      --verify-data-sample int    Percent of frame slots to sample per file for data
+                                  verification (0-100); implies --verify-meta; not
+                                  allowed with --skip-fetch or --skip-write (default 0)
+      --mode string               Server read strategy: fast|gentle (default "fast")
+      --encrypt string            Encryption algorithm: none|auto|aes|chacha20
+                                  (default: none)
+  -k, --keys string               Persistent age keys directory (default: ephemeral)
+  -t, --auth-token string         Client auth token presented in encrypted AUTH blob;
+                                  repeatable
+      --compress string           Compression algorithm: adapt|none|lz4|zstd
+                                  (default: adapt)
+      --concurrency int           Parallel download / verification workers
+                                  (0=adapt from server) (default 0)
+      --progress                  Show transfer progress every 2s (default true)
+  -v, --verbose                   Per-file progress output
+  -p, --progress-path string      Progress output target; repeatable, use - for stdout
+  -f, --progress-format string    Progress format: json|int; 1 applies to all targets,
+                                  or one per target (default json)
+      --progress-interval string  Progress write interval (e.g. 500ms, 10s) (default "1s")
+  -y, --yes                       Skip confirmation prompt on sync paths
+  -a, --ack-every string          Bytes between progress acks; e.g. 1B, 4KiB, 8MiB
+                                  (default "128.00 MiB")
+      --probe-size string         Probe payload size; e.g. 1B, 4KiB, 8MiB
+                                  (default "1.00 MiB")
+      --deadline string           Transfer deadline (e.g. 60s, 5m)
+      --trace string              Write runtime/trace output to this file
+```
+
+#### `tx recv get`
+
+```text
+$ tx recv get --help
+usage: tx recv [addr] get [flags] REMOTE_PATH
+
+Download a single remote file. REMOTE_PATH must be an absolute path to a file
+on the server. Output defaults to the file's basename in the current directory.
+
+Options:
+  -o string                       Output file path, or '-' for stdout
+      --encrypt string            Encryption algorithm: none|auto|aes|chacha20
+                                  (default: none)
+  -k, --keys string               Persistent age keys directory (default: ephemeral)
+  -t, --auth-token string         Client auth token presented in encrypted AUTH blob;
+                                  repeatable
+      --compress string           Compression algorithm: adapt|none|lz4|zstd
+                                  (default: adapt)
+      --concurrency int           Parallel download workers (0=auto) (default 0)
+      --skip-write                Do not write the file; fetch to discard instead
+      --skip-fsync                Acknowledge writes without fdatasync
+      --progress                  Show transfer progress every 2s (default true)
+  -v, --verbose                   Per-file progress output
+  -p, --progress-path string      Progress output target; repeatable, use - for stdout
+  -f, --progress-format string    Progress format: json|int; 1 applies to all targets,
+                                  or one per target (default json)
+      --progress-interval string  Progress write interval (e.g. 500ms, 10s) (default "1s")
+  -a, --ack-every string          Bytes between progress acks; e.g. 1B, 4KiB, 8MiB
+                                  (default "128.00 MiB")
+      --deadline string           Transfer deadline (e.g. 60s, 5m)
+      --trace string              Write runtime/trace output to this file
+```
+
+#### `tx recv status`
+
+```text
+$ tx recv status --help
+usage: tx recv [addr] status [--tid <id>] [LOCAL_DST]
+
+Query and monitor transfer progress.
+
+Modes:
+  status LOCAL_DST       Discover transfer from .tx/ state and poll until complete
+  status --tid <id>      Poll a transfer by ID (server-side progress only)
+  status                 List all active transfers on the server
+
+Options:
+      --tid string         Transfer ID
+      --encrypt string     Encryption algorithm: none|auto|aes|chacha20 (default: none)
+  -k, --keys string        Persistent age keys directory (default: ephemeral)
+  -t, --auth-token string  Client auth token presented in encrypted AUTH blob; repeatable
+```
+
+---
+
+## Detailed Behavior
+
+### Copy Workflow
+
+`copy` is the main entry point for directory transfers.
 
 Behavior:
 
@@ -55,28 +209,7 @@ tx recv copy --verify-data-sample 5 /srv/data /var/lib/pinch/data
 tx recv copy --deadline 30m /srv/data /var/lib/pinch/data
 ```
 
-Important flags:
-
-- `--mode fast|gentle`: select the transfer strategy (default: fast)
-- `--clean`: remove `LOCAL_DST` first, then force a clean transfer
-- `--skip-fetch`: only refresh manifest state; do not write file contents
-- `--skip-write`: fetch data to a discard sink and avoid mutating `LOCAL_DST`
-- `--skip-fsync`: acknowledge writes without `fdatasync`
-- `--verify-meta`: run a read-only follow-up verification pass
-- `--verify-data-sample N`: sample file contents after a successful copy;
-  implies `--verify-meta`
-- `--encrypt none|auto|aes|chacha20`: encryption algorithm (default: none)
-- `--compress adapt|none|lz4|zstd`: compression algorithm (default: adapt)
-- `--concurrency N`: parallel download / verification workers (0=auto)
-- `--deadline`: cap a run to a fixed duration
-- `-a`, `--ack-every`: bytes between progress acks (e.g. `1B`, `4KiB`, `8MiB`)
-- `--probe-size`: probe payload size (e.g. `1B`, `4KiB`, `8MiB`)
-- `-y`, `--yes`: skip confirmation prompt on sync paths
-- `--progress`, `-v`/`--verbose`, `--progress-path`, `--progress-interval`:
-  control human and file-based progress output
-- `--trace`: write `runtime/trace` output to a file
-
-## Convergence Workflow
+### Convergence Workflow
 
 `copy` is designed so you can rerun the same command until the local tree is
 fully consistent with the remote tree.
@@ -111,62 +244,17 @@ Why this works:
 
 If you want an explicit final check, add `--verify-meta` to the last run.
 
-## `status`
-
-`status` queries transfer progress. It supports three modes:
-
-```text
-tx recv [<addr>] status [--tid <id>] [LOCAL_DST]
-```
-
-- **With `LOCAL_DST`**: reads `.tx/manifest.server` for the transfer ID and
-  polls with combined server + client progress.
-- **With `--tid <id>`**: polls server-side status only for that transfer.
-- **With no arguments**: lists all active transfers on the server.
-
-Examples:
+### Send Server Examples
 
 ```bash
-tx recv status /var/lib/pinch/data
-tx recv status --tid bc17bc4e
-tx recv status
+tx send serve                              # serve cwd on default addr
+tx send serve /srv/data                    # serve /srv/data
+tx send 0.0.0.0:4000 serve /srv/data      # custom addr + chroot
+tx send serve --require-auth /srv/data     # auto-generate token
+tx send serve --bwlimit 100MiB /srv/data   # rate limit gentle transfers
 ```
 
-## `get`
-
-`get` downloads a single remote file by its absolute server path.
-
-```text
-tx recv [<addr>] get [flags] REMOTE_PATH
-```
-
-- `REMOTE_PATH` must be an absolute path to a file on the server.
-- Output defaults to the file's basename in the current directory.
-
-Examples:
-
-```bash
-tx recv get /srv/data/file.bin
-tx recv get -o /tmp/out.bin /srv/data/file.bin
-tx recv get -o - /srv/data/file.bin          # write to stdout
-tx recv get --skip-write /srv/data/file.bin   # fetch without writing
-```
-
-Important flags:
-
-- `-o <path|->`: output file path, or `-` for stdout
-- `--encrypt none|auto|aes|chacha20`: encryption algorithm (default: none)
-- `--compress adapt|none|lz4|zstd`: compression algorithm (default: adapt)
-- `--concurrency N`: parallel download workers (0=auto)
-- `--skip-write`: fetch to discard without writing
-- `--skip-fsync`: acknowledge writes without `fdatasync`
-- `-a`, `--ack-every`: bytes between progress acks (e.g. `1B`, `4KiB`, `8MiB`)
-- `--deadline`: transfer deadline (e.g. 60s, 5m)
-- `--progress`, `-v`/`--verbose`, `--progress-path`, `--progress-interval`:
-  control human and file-based progress output
-- `--trace`: write `runtime/trace` output to a file
-
-## Transfer Strategies: `fast` and `gentle`
+### Transfer Strategies: `fast` and `gentle`
 
 The transfer layer supports two load strategies:
 
@@ -189,12 +277,20 @@ Use `gentle` when:
 Both `copy` (`--mode fast|gentle`) and the lower-level transfer phase support
 strategy selection.
 
+## State Directory
+
+State is stored in `<LOCAL_DST>/../.tx/`:
+
+- `manifest.server`: the last remote manifest snapshot
+- `manifest`: the local manifest after a successful write
+- `manifest.progress`: resumable progress state
+- `remote/`: start-phase staging directory
+
 ## Notes
 
 - `REMOTE_SRC` must be an absolute path on the remote server
 - `LOCAL_DST` is local filesystem state on the client machine
-- human-readable byte sizes are accepted for flags such as:
-  - `--ack-every`
-  - `--probe-size`
+- human-readable byte sizes are accepted for flags such as `--ack-every`,
+  `--probe-size`, `--bwlimit`
 - a successful sync prompt is skipped automatically when no local mutations are
   needed
