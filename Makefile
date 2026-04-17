@@ -1,7 +1,9 @@
 .PHONY: all acceptance build build-bench test unit bench
 
 FUZZTIME ?= 5s
-FUZZDEADLINE ?= 20s
+# Fuzzing often needs extra headroom beyond -fuzztime for baseline coverage,
+# worker shutdown, and slower race-enabled executions in CI.
+FUZZDEADLINE ?= 30s
 
 all: build build-bench test
 
