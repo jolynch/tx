@@ -228,20 +228,30 @@ func encodeSingleFileManifest(
 
 	updatesCh := make(chan TransferFileStateUpdate, 1)
 	done := deps.RegisterTransferFileState(transferID, updatesCh, TransferStateStarted)
-	defer func() {
+	closedUpdates := false
+	closeUpdates := func() {
+		if closedUpdates {
+			return
+		}
 		close(updatesCh)
 		<-done
+		closedUpdates = true
+	}
+	defer func() {
+		closeUpdates()
 	}()
 
 	updatesCh <- TransferFileStateUpdate{
-		FileID:   0,
-		PathHash: xxh3.Hash128([]byte(filepath.Clean(fullPath))),
-		FileSize: info.Size(),
+		FileID:    0,
+		EntryType: encoding.EntryTypeFile,
+		PathHash:  xxh3.Hash128([]byte(filepath.Clean(fullPath))),
+		FileSize:  info.Size(),
 	}
 
 	if _, err := io.WriteString(w, line); err != nil {
 		return err
 	}
+	closeUpdates()
 	deps.ClipTransfer(transferID)
 	return nil
 }
@@ -280,9 +290,17 @@ func encodeManifest(
 	prevMtime := ""
 	updatesCh := make(chan TransferFileStateUpdate, 1000)
 	done := deps.RegisterTransferFileState(transferID, updatesCh, TransferStateStarted)
-	defer func() {
+	closedUpdates := false
+	closeUpdates := func() {
+		if closedUpdates {
+			return
+		}
 		close(updatesCh)
 		<-done
+		closedUpdates = true
+	}
+	defer func() {
+		closeUpdates()
 	}()
 	fileID := 0
 
@@ -334,9 +352,10 @@ func encodeManifest(
 
 		fullPath := filepath.Clean(filepath.Join(root, entry.Path))
 		updatesCh <- TransferFileStateUpdate{
-			FileID:   uint64(fileID),
-			PathHash: xxh3.Hash128([]byte(fullPath)),
-			FileSize: entry.Size,
+			FileID:    uint64(fileID),
+			EntryType: entry.Type,
+			PathHash:  xxh3.Hash128([]byte(fullPath)),
+			FileSize:  entry.Size,
 		}
 		if _, err := io.WriteString(w, line); err != nil {
 			return err
@@ -354,6 +373,7 @@ func encodeManifest(
 	if err != nil {
 		return err
 	}
+	closeUpdates()
 	deps.ClipTransfer(transferID)
 	return nil
 }

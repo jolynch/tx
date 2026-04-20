@@ -1,13 +1,17 @@
 package store
 
 import (
+	"bytes"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/zeebo/xxh3"
 )
 
@@ -52,11 +56,17 @@ func TestNewTransferInitializesStateByFileID(t *testing.T) {
 	if len(stored.PathHash) != 3 {
 		t.Fatalf("expected hash len 3, got %d", len(stored.PathHash))
 	}
+	if len(stored.EntryType) != 3 {
+		t.Fatalf("expected entry-type len 3, got %d", len(stored.EntryType))
+	}
 	if len(stored.FileSize) != 3 {
 		t.Fatalf("expected file-size len 3, got %d", len(stored.FileSize))
 	}
 	if len(stored.AckedSize) != 3 {
 		t.Fatalf("expected acked-size len 3, got %d", len(stored.AckedSize))
+	}
+	if stored.NumEntries != 3 || stored.NumFiles != 3 {
+		t.Fatalf("expected numEntries=numFiles=3, got entries=%d files=%d", stored.NumEntries, stored.NumFiles)
 	}
 	if stored.Done != 0 {
 		t.Fatalf("expected done 0, got %d", stored.Done)
@@ -68,6 +78,30 @@ func TestNewTransferInitializesStateByFileID(t *testing.T) {
 		if state != TransferStateStarted {
 			t.Fatalf("expected file state %d to be started, got %d", i, state)
 		}
+	}
+}
+
+func TestRegisterTransferFileStateMixedEntriesTrackAckableFiles(t *testing.T) {
+	resetTransferStore()
+
+	transfer, err := NewTransfer("/tmp/x", 0, 0)
+	if err != nil {
+		t.Fatalf("NewTransfer returned error: %v", err)
+	}
+	RegisterTransferFileStates(transfer.ID, []TransferFileStateUpdate{
+		{FileID: 0, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/file")), FileSize: 10},
+		{FileID: 1, EntryType: encoding.EntryTypeDir, PathHash: xxh3.Hash128([]byte("/tmp/x/sub")), FileSize: 0},
+		{FileID: 2, EntryType: encoding.EntryTypeSymlink, PathHash: xxh3.Hash128([]byte("/tmp/x/link")), FileSize: 0},
+	}, TransferStateStarted)
+
+	stored := waitForTransferState(t, transfer.ID, func(stored Transfer) bool {
+		return stored.NumEntries == 3 && stored.NumFiles == 1
+	})
+	if stored.NumEntries != 3 || stored.NumFiles != 1 {
+		t.Fatalf("unexpected counts: entries=%d files=%d", stored.NumEntries, stored.NumFiles)
+	}
+	if stored.EntryType[0] != encoding.EntryTypeFile || stored.EntryType[1] != encoding.EntryTypeDir || stored.EntryType[2] != encoding.EntryTypeSymlink {
+		t.Fatalf("unexpected entry types: %q", string(stored.EntryType))
 	}
 }
 
@@ -351,6 +385,56 @@ func TestAcknowledgeTransferFile(t *testing.T) {
 	}
 }
 
+func TestMaybeLogTransferCompleteLogsForMixedEntries(t *testing.T) {
+	resetTransferStore()
+
+	transfer, err := NewTransfer("/tmp/x", 0, 0)
+	if err != nil {
+		t.Fatalf("NewTransfer returned error: %v", err)
+	}
+	RegisterTransferFileStates(transfer.ID, []TransferFileStateUpdate{
+		{FileID: 0, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/file")), FileSize: 10},
+		{FileID: 1, EntryType: encoding.EntryTypeDir, PathHash: xxh3.Hash128([]byte("/tmp/x/sub")), FileSize: 0},
+		{FileID: 2, EntryType: encoding.EntryTypeSymlink, PathHash: xxh3.Hash128([]byte("/tmp/x/link")), FileSize: 0},
+	}, TransferStateStarted)
+
+	var buf bytes.Buffer
+	oldFlags := log.Flags()
+	oldWriter := log.Writer()
+	log.SetFlags(0)
+	log.SetOutput(&buf)
+	defer func() {
+		log.SetFlags(oldFlags)
+		log.SetOutput(oldWriter)
+	}()
+
+	if ok := ClipTransfer(transfer.ID); !ok {
+		t.Fatalf("ClipTransfer returned false")
+	}
+	if ok := AcknowledgeTransferFile(transfer.ID, 0, 10); !ok {
+		t.Fatalf("AcknowledgeTransferFile returned false")
+	}
+	MaybeLogTransferComplete(transfer.ID)
+
+	stored, ok := GetTransfer(transfer.ID)
+	if !ok {
+		t.Fatalf("transfer %q not found", transfer.ID)
+	}
+	if stored.Done != 1 || stored.NumFiles != 1 || stored.NumEntries != 3 {
+		t.Fatalf("unexpected counts after completion: done=%d files=%d entries=%d", stored.Done, stored.NumFiles, stored.NumEntries)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "txfer-start: tid="+transfer.ID) {
+		t.Fatalf("expected txfer-start log, got %q", logged)
+	}
+	if count := strings.Count(logged, "txfer-complete: tid="+transfer.ID); count != 1 {
+		t.Fatalf("expected exactly one txfer-complete log, got %d in %q", count, logged)
+	}
+	if strings.Contains(logged, "files=3") {
+		t.Fatalf("expected file count to exclude metadata entries, got %q", logged)
+	}
+}
+
 func TestAcknowledgeTransferFileMissing(t *testing.T) {
 	resetTransferStore()
 	transfer, err := NewTransfer("/tmp/x", 1, 10)
@@ -430,7 +514,7 @@ func TestDeleteTransferInvalidatesManagedTransfer(t *testing.T) {
 		t.Fatalf("NewTransfer failed: %v", err)
 	}
 	RegisterTransferFileStates(transfer.ID, []TransferFileStateUpdate{
-		{FileID: 0, PathHash: xxh3.Hash128([]byte("/tmp/x/0")), FileSize: 10},
+		{FileID: 0, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/0")), FileSize: 10},
 	}, TransferStateRunning)
 
 	managed, ok := manager.getManagedTransfer(transfer.ID)
@@ -566,7 +650,7 @@ func TestGetTransferSnapshotsAreCopies(t *testing.T) {
 		t.Fatalf("NewTransfer failed: %v", err)
 	}
 	RegisterTransferFileStates(transfer.ID, []TransferFileStateUpdate{
-		{FileID: 0, PathHash: xxh3.Hash128([]byte("/tmp/x/0")), FileSize: 10},
+		{FileID: 0, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/0")), FileSize: 10},
 	}, TransferStateRunning)
 
 	stored, ok := GetTransfer(transfer.ID)
@@ -575,6 +659,7 @@ func TestGetTransferSnapshotsAreCopies(t *testing.T) {
 	}
 	stored.State[0] = TransferStateMissing
 	stored.PathHash[0] = xxh3.Hash128([]byte("mutated"))
+	stored.EntryType[0] = encoding.EntryTypeDir
 	stored.FileSize[0] = 999
 	stored.AckedSize[0] = 999
 
@@ -584,6 +669,9 @@ func TestGetTransferSnapshotsAreCopies(t *testing.T) {
 	}
 	if storedAgain.State[0] != TransferStateRunning {
 		t.Fatalf("expected original transfer state to remain running, got %d", storedAgain.State[0])
+	}
+	if storedAgain.EntryType[0] != encoding.EntryTypeFile {
+		t.Fatalf("expected original transfer entry type to remain file, got %q", storedAgain.EntryType[0])
 	}
 	if storedAgain.FileSize[0] != 10 || storedAgain.AckedSize[0] != 0 {
 		t.Fatalf("expected original transfer sizes to remain unchanged")
@@ -797,4 +885,3 @@ func TestReportTransferObservedLinkUpdatesEMAAndLimiter(t *testing.T) {
 		t.Fatalf("unexpected updated limiter rate: %d", cfg.RateBps)
 	}
 }
-

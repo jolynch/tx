@@ -249,11 +249,6 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 	}
 
 	cursor := item.Offset
-	windowStart := item.Offset
-	windowWireTotal := int64(0)
-	windowLogicalTotal := int64(0)
-	windowFrames := 0
-	windowTS0 := time.Now().UnixMilli()
 
 	firstFrameLogical := min(windowLen, defaultFileFrameLogicalSize)
 	maxWSizeHint, err := maxFrameWireHint(item.Comp, firstFrameLogical)
@@ -377,10 +372,6 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 					if item.Mode == loadStrategyFast {
 						tryAdviseSequential(fd, item.Offset, windowLen)
 					}
-					windowWireTotal = 0
-					windowLogicalTotal = 0
-					windowFrames = 0
-					windowTS0 = time.Now().UnixMilli()
 					firstFrame = true
 					currentMode = initialCompressionMode(item.Comp)
 					compressPolicy = policy.NewCompressionPolicy()
@@ -398,9 +389,6 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 		cursor = stats.NextOffset
 		remaining -= frameSize
 		firstFrame = false
-		windowFrames++
-		windowLogicalTotal += stats.LogicalSize
-		windowWireTotal += stats.WireSize
 
 		if isTerminal {
 			if stats.WindowHashToken == "" {
@@ -422,7 +410,7 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 				prevComp := policy.FrameCompTokenForMode(currentMode)
 				nextComp := policy.FrameCompTokenForMode(decision.Next)
 				log.Printf(
-					"filexfer frame tid=%s fid=%d switching compression %s->%s reason=%s ratio=%.3f read_over_write=%.3f",
+					"txfer-frame: tid=%s fid=%d switching compression %s->%s reason=%s ratio=%.3f read_over_write=%.3f",
 					txferID,
 					item.FileID,
 					prevComp,
@@ -436,29 +424,6 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 		}
 	}
 
-	windowTS1 := time.Now().UnixMilli()
-	windowMS := windowTS1 - windowTS0
-	logicalBps := 0.0
-	wireBps := 0.0
-	if windowMS > 0 {
-		seconds := float64(windowMS) / 1000.0
-		logicalBps = float64(windowLogicalTotal) / seconds
-		wireBps = float64(windowWireTotal) / seconds
-	}
-	log.Printf(
-		"filexfer window tid=%s fid=%d frames=%d offset=%d size=%d wsize=%d ts0=%d ts1=%d window_ms=%d logical=%s wire=%s",
-		txferID,
-		item.FileID,
-		windowFrames,
-		windowStart,
-		windowLogicalTotal,
-		windowWireTotal,
-		windowTS0,
-		windowTS1,
-		windowMS,
-		encoding.HumanRate(logicalBps),
-		encoding.HumanRate(wireBps),
-	)
 	return nil
 }
 

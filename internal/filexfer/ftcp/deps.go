@@ -49,6 +49,9 @@ type Deps interface {
 	RecordTransferFirstSend(txferID string) (time.Time, bool)
 	MarkTransferTooSlow(txferID string) bool
 
+	MaybeLogTransferProgress(txferID string)
+	MaybeLogTransferComplete(txferID string)
+
 	Root() string
 }
 
@@ -143,6 +146,14 @@ func (runtimeDeps) RecordTransferFirstSend(txferID string) (time.Time, bool) {
 
 func (runtimeDeps) MarkTransferTooSlow(txferID string) bool {
 	return intstore.MarkTransferTooSlow(txferID)
+}
+
+func (runtimeDeps) MaybeLogTransferProgress(txferID string) {
+	intstore.MaybeLogTransferProgress(txferID)
+}
+
+func (runtimeDeps) MaybeLogTransferComplete(txferID string) {
+	intstore.MaybeLogTransferComplete(txferID)
 }
 
 func mapLookupError(err error) error {

@@ -4,11 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"runtime/trace"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 )
@@ -127,41 +125,9 @@ func handleACK(ctx context.Context, req Request, out io.Writer, deps Deps) error
 			return protocolErr{code: "INTERNAL", message: "failed to acknowledge file progress"}
 		}
 		if v.ackBytes >= 0 {
-			nowTS := time.Now().UnixMilli()
-			lagMS := nowTS - v.ackTS
-			receiverMS := v.item.RecvMS + v.item.SyncMS
-			receiverBps := 0.0
-			recvBps := 0.0
-			syncBps := 0.0
-			if v.item.DeltaBytes > 0 {
-				if receiverMS > 0 {
-					receiverBps = float64(v.item.DeltaBytes) / (float64(receiverMS) / 1000.0)
-				}
-				if v.item.RecvMS > 0 {
-					recvBps = float64(v.item.DeltaBytes) / (float64(v.item.RecvMS) / 1000.0)
-				}
-				if v.item.SyncMS > 0 {
-					syncBps = float64(v.item.DeltaBytes) / (float64(v.item.SyncMS) / 1000.0)
-				}
-			}
-			log.Printf(
-				"filexfer ack tid=%s fid=%d ack_bytes=%d ack_hash=%s acked_server_ts=%d ack_recv_ts=%d lag_ms=%d delta_bytes=%d recv_ms=%d sync_ms=%d receiver_ms=%d receiver_throughput=%s recv_throughput=%s sync_throughput=%s",
-				v.item.TransferID,
-				v.item.FileID,
-				v.ackBytes,
-				encoding.AbbrevHashToken(v.ackHashToken),
-				v.ackTS,
-				nowTS,
-				lagMS,
-				v.item.DeltaBytes,
-				v.item.RecvMS,
-				v.item.SyncMS,
-				receiverMS,
-				encoding.HumanRate(receiverBps),
-				encoding.HumanRate(recvBps),
-				encoding.HumanRate(syncBps),
-			)
+			deps.MaybeLogTransferProgress(v.item.TransferID)
 		}
+		deps.MaybeLogTransferComplete(v.item.TransferID)
 		ackTask.End()
 	}
 	return writeOKLine(out, "")

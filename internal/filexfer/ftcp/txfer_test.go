@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,7 +76,9 @@ func (d *txferTestDeps) AcknowledgeTransferFile(string, uint64, int64) bool { re
 func (d *txferTestDeps) SetTransferDeadline(string, int64) bool           { return false }
 func (d *txferTestDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }
 func (d *txferTestDeps) MarkTransferTooSlow(string) bool                  { return false }
-func (d *txferTestDeps) GetTransferLimiterBps(string) int64                { return 0 }
+func (d *txferTestDeps) GetTransferLimiterBps(string) int64               { return 0 }
+func (d *txferTestDeps) MaybeLogTransferProgress(string)                  {}
+func (d *txferTestDeps) MaybeLogTransferComplete(string)                  {}
 func (d *txferTestDeps) Root() string                                     { return "/" }
 
 func TestParseTXFERRequestRequiresHints(t *testing.T) {
@@ -253,5 +256,109 @@ func TestEncodeManifestDirectories(t *testing.T) {
 	}
 	if fCount != 1 {
 		t.Fatalf("expected 1 F entry, got %d", fCount)
+	}
+}
+
+func TestHandleTXFERLogsStartWithSeparateEntryAndFileCounts(t *testing.T) {
+	root := t.TempDir()
+	subDir := filepath.Join(root, "sub")
+	if err := os.Mkdir(subDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeTestFile(t, root, "sub/data.txt", "hello")
+
+	deps := NewRuntimeDepsWithRoot("/")
+	var txferID string
+	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8`, root)
+	req, err := ParseRequest([]byte(reqRaw))
+	if err != nil {
+		t.Fatalf("ParseRequest failed: %v", err)
+	}
+
+	var logs bytes.Buffer
+	oldFlags := log.Flags()
+	oldWriter := log.Writer()
+	log.SetFlags(0)
+	log.SetOutput(&logs)
+	defer func() {
+		log.SetFlags(oldFlags)
+		log.SetOutput(oldWriter)
+		if txferID != "" {
+			deps.DeleteTransfer(txferID)
+		}
+	}()
+
+	var out bytes.Buffer
+	if err := handleTXFERWithCallback(context.Background(), req, &out, deps, func(id string) { txferID = id }); err != nil {
+		t.Fatalf("handleTXFERWithCallback failed: %v", err)
+	}
+	if txferID == "" {
+		t.Fatalf("expected transfer ID callback")
+	}
+	stored, ok := deps.GetTransfer(txferID)
+	if !ok {
+		t.Fatalf("expected stored transfer")
+	}
+	if stored.NumEntries != 2 || stored.NumFiles != 1 {
+		t.Fatalf("unexpected transfer counts: entries=%d files=%d", stored.NumEntries, stored.NumFiles)
+	}
+
+	logged := logs.String()
+	if !strings.Contains(logged, "txfer-start: tid="+txferID) {
+		t.Fatalf("expected txfer-start log, got %q", logged)
+	}
+	if !strings.Contains(logged, "entries=2 files=1") {
+		t.Fatalf("expected txfer-start to show separate entry and file counts, got %q", logged)
+	}
+}
+
+func TestHandleTXFERDirectoryOnlyLogsImmediateComplete(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	deps := NewRuntimeDepsWithRoot("/")
+	var txferID string
+	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8`, root)
+	req, err := ParseRequest([]byte(reqRaw))
+	if err != nil {
+		t.Fatalf("ParseRequest failed: %v", err)
+	}
+
+	var logs bytes.Buffer
+	oldFlags := log.Flags()
+	oldWriter := log.Writer()
+	log.SetFlags(0)
+	log.SetOutput(&logs)
+	defer func() {
+		log.SetFlags(oldFlags)
+		log.SetOutput(oldWriter)
+		if txferID != "" {
+			deps.DeleteTransfer(txferID)
+		}
+	}()
+
+	var out bytes.Buffer
+	if err := handleTXFERWithCallback(context.Background(), req, &out, deps, func(id string) { txferID = id }); err != nil {
+		t.Fatalf("handleTXFERWithCallback failed: %v", err)
+	}
+	stored, ok := deps.GetTransfer(txferID)
+	if !ok {
+		t.Fatalf("expected stored transfer")
+	}
+	if stored.NumEntries != 1 || stored.NumFiles != 0 {
+		t.Fatalf("unexpected transfer counts: entries=%d files=%d", stored.NumEntries, stored.NumFiles)
+	}
+
+	logged := logs.String()
+	if !strings.Contains(logged, "txfer-start: tid="+txferID) {
+		t.Fatalf("expected txfer-start log, got %q", logged)
+	}
+	if !strings.Contains(logged, "entries=1 files=0") {
+		t.Fatalf("expected txfer-start to show zero regular files, got %q", logged)
+	}
+	if !strings.Contains(logged, "txfer-complete: tid="+txferID+" files=0") {
+		t.Fatalf("expected immediate txfer-complete log, got %q", logged)
 	}
 }

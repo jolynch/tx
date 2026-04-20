@@ -159,9 +159,17 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	// Walk filesystem and emit manifest entries.
 	updatesCh := make(chan TransferFileStateUpdate, 1000)
 	done := deps.RegisterTransferFileState(transfer.ID, updatesCh, TransferStateStarted)
-	defer func() {
+	closedUpdates := false
+	closeUpdates := func() {
+		if closedUpdates {
+			return
+		}
 		close(updatesCh)
 		<-done
+		closedUpdates = true
+	}
+	defer func() {
+		closeUpdates()
 	}()
 	fileID := 0
 	prevPath := ""
@@ -182,9 +190,10 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 
 		fullPath := filepath.Clean(filepath.Join(root, entry.Path))
 		updatesCh <- TransferFileStateUpdate{
-			FileID:   uint64(fileID),
-			PathHash: xxh3.Hash128([]byte(fullPath)),
-			FileSize: entry.Size,
+			FileID:    uint64(fileID),
+			EntryType: entry.Type,
+			PathHash:  xxh3.Hash128([]byte(fullPath)),
+			FileSize:  entry.Size,
 		}
 		if _, err := io.WriteString(out, line); err != nil {
 			return err
@@ -220,6 +229,7 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 		}
 	}
 
+	closeUpdates()
 	deps.ClipTransfer(transfer.ID)
 	cleanupTransfer = false
 	return nil

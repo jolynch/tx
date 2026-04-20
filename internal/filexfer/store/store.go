@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"os"
@@ -39,24 +40,30 @@ const (
 )
 
 type Transfer struct {
-	ID          string
-	Directory   string
-	Mode        string
-	LinkMbps    int64
-	Concurrency int
-	NumFiles    int
-	TotalSize   int64
-	Done        uint64
-	DoneSize    int64
-	State       []uint8
-	PathHash    []xxh3.Uint128
-	FileSize    []int64
-	AckedSize   []int64
-	CreatedAt   time.Time
-	ExpiresAt   time.Time
-	DeadlineMS  int64     // 0 = no deadline
-	FirstSendAt time.Time // set on first gentle SEND
-	TooSlow     bool      // sticky flag set when deadline is exceeded
+	ID              string
+	Directory       string
+	Mode            string
+	LinkMbps        int64
+	Concurrency     int
+	NumEntries      int
+	NumFiles        int
+	TotalSize       int64
+	Done            uint64
+	DoneSize        int64
+	State           []uint8
+	EntryType       []byte
+	PathHash        []xxh3.Uint128
+	FileSize        []int64
+	AckedSize       []int64
+	CreatedAt       time.Time
+	ExpiresAt       time.Time
+	DeadlineMS      int64     // 0 = no deadline
+	FirstSendAt     time.Time // set on first gentle SEND
+	TooSlow         bool      // sticky flag set when deadline is exceeded
+	CompleteLogged  bool
+	LastLogPct      int       // last byte-percent bucket logged (0, 10, ...)
+	LastLogTime     time.Time // wall time of last progress log
+	LastLogDoneSize int64     // DoneSize at last log (detect stalled transfers)
 }
 
 type TransferFileState struct {
@@ -65,9 +72,10 @@ type TransferFileState struct {
 }
 
 type TransferFileStateUpdate struct {
-	FileID   uint64
-	PathHash xxh3.Uint128
-	FileSize int64
+	FileID    uint64
+	EntryType byte
+	PathHash  xxh3.Uint128
+	FileSize  int64
 }
 
 type FileRef struct {
@@ -172,10 +180,50 @@ func shouldAdvanceState(current uint8, next uint8) bool {
 func cloneTransfer(transfer Transfer) Transfer {
 	out := transfer
 	out.State = append([]uint8(nil), transfer.State...)
+	out.EntryType = append([]byte(nil), transfer.EntryType...)
 	out.PathHash = append([]xxh3.Uint128(nil), transfer.PathHash...)
 	out.FileSize = append([]int64(nil), transfer.FileSize...)
 	out.AckedSize = append([]int64(nil), transfer.AckedSize...)
 	return out
+}
+
+func isRegularFileEntryType(entryType byte) bool {
+	return entryType == 0 || entryType == intencoding.EntryTypeFile
+}
+
+func logTransferComplete(t *Transfer) {
+	elapsed := time.Since(t.CreatedAt)
+	speed := 0.0
+	if elapsed.Seconds() > 0 {
+		speed = float64(t.TotalSize) / elapsed.Seconds()
+	}
+	log.Printf(
+		"txfer-complete: tid=%s files=%d size=%s elapsed=%s speed=%s",
+		t.ID,
+		t.NumFiles,
+		intencoding.HumanBytes(t.TotalSize),
+		elapsed.Round(time.Millisecond),
+		intencoding.HumanRate(speed),
+	)
+}
+
+func (s *transferStore) maybeLogTransferComplete(txferID string) {
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return
+	}
+
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return
+	}
+	t := &managed.transfer
+	if t.CompleteLogged || t.NumFiles <= 0 || t.Done != uint64(t.NumFiles) {
+		return
+	}
+	t.CompleteLogged = true
+	logTransferComplete(t)
 }
 
 func (s *transferStore) getManagedTransfer(txferID string) (*managedTransfer, bool) {
@@ -417,6 +465,7 @@ func (s *transferStore) appendFileStates(txferID string, updates []TransferFileS
 		oldLen := len(managed.transfer.State)
 		growBy := n - oldLen
 		managed.transfer.State = append(managed.transfer.State, make([]uint8, growBy)...)
+		managed.transfer.EntryType = append(managed.transfer.EntryType, make([]byte, growBy)...)
 		managed.transfer.PathHash = append(managed.transfer.PathHash, make([]xxh3.Uint128, growBy)...)
 		managed.transfer.FileSize = append(managed.transfer.FileSize, make([]int64, growBy)...)
 		managed.transfer.AckedSize = append(managed.transfer.AckedSize, make([]int64, growBy)...)
@@ -429,8 +478,17 @@ func (s *transferStore) appendFileStates(txferID string, updates []TransferFileS
 		idx := int(update.FileID)
 		ensureLen(idx + 1)
 
-		if idx+1 > managed.transfer.NumFiles {
-			managed.transfer.NumFiles = idx + 1
+		wasRegularFile := idx < managed.transfer.NumEntries && isRegularFileEntryType(managed.transfer.EntryType[idx])
+		if idx+1 > managed.transfer.NumEntries {
+			managed.transfer.NumEntries = idx + 1
+		}
+		managed.transfer.EntryType[idx] = update.EntryType
+		isRegularFile := isRegularFileEntryType(update.EntryType)
+		if !wasRegularFile && isRegularFile {
+			managed.transfer.NumFiles++
+		}
+		if wasRegularFile && !isRegularFile {
+			managed.transfer.NumFiles--
 		}
 
 		managed.transfer.TotalSize += update.FileSize - managed.transfer.FileSize[idx]
@@ -840,6 +898,20 @@ func (s *transferStore) clipTransfer(txferID string) bool {
 	managed.transfer.PathHash = slices.Clip(managed.transfer.PathHash)
 	managed.transfer.FileSize = slices.Clip(managed.transfer.FileSize)
 	managed.transfer.AckedSize = slices.Clip(managed.transfer.AckedSize)
+
+	t := &managed.transfer
+	log.Printf(
+		"txfer-start: tid=%s dir=%s mode=%s entries=%d files=%d size=%s link=%dMbps concurrency=%d",
+		t.ID, t.Directory, t.Mode,
+		t.NumEntries,
+		t.NumFiles,
+		intencoding.HumanBytes(t.TotalSize),
+		t.LinkMbps, t.Concurrency,
+	)
+	if t.NumFiles == 0 {
+		t.CompleteLogged = true
+		logTransferComplete(t)
+	}
 	return true
 }
 
@@ -958,11 +1030,13 @@ func NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, err
 			Mode:        "",
 			LinkMbps:    0,
 			Concurrency: 0,
+			NumEntries:  numFiles,
 			NumFiles:    numFiles,
 			TotalSize:   totalSize,
 			Done:        0,
 			DoneSize:    0,
 			State:       make([]uint8, numFiles),
+			EntryType:   make([]byte, numFiles),
 			PathHash:    make([]xxh3.Uint128, numFiles),
 			FileSize:    make([]int64, numFiles),
 			AckedSize:   make([]int64, numFiles),
@@ -971,6 +1045,7 @@ func NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, err
 		}
 		for i := range transfer.State {
 			transfer.State[i] = TransferStateStarted
+			transfer.EntryType[i] = intencoding.EntryTypeFile
 		}
 		if manager.create(transfer) {
 			return transfer, nil
@@ -1118,6 +1193,68 @@ func SetTransferFileState(txferID string, fileID uint64, state uint8) bool {
 
 func ClipTransfer(txferID string) bool {
 	return manager.clipTransfer(txferID)
+}
+
+const progressLogPctInterval = 10
+const progressLogTimeInterval = 10 * time.Second
+
+func MaybeLogTransferProgress(txferID string) {
+	manager.maybeLogProgress(txferID)
+}
+
+func MaybeLogTransferComplete(txferID string) {
+	manager.maybeLogTransferComplete(txferID)
+}
+
+func (s *transferStore) maybeLogProgress(txferID string) {
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return
+	}
+
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return
+	}
+	t := &managed.transfer
+	if t.TotalSize <= 0 {
+		return
+	}
+
+	currentPct := int(t.DoneSize * 100 / t.TotalSize)
+	pctBucket := (currentPct / progressLogPctInterval) * progressLogPctInterval
+	now := time.Now()
+
+	pctCrossed := pctBucket > t.LastLogPct
+	timeCrossed := !t.LastLogTime.IsZero() && now.Sub(t.LastLogTime) >= progressLogTimeInterval && t.DoneSize > t.LastLogDoneSize
+	if !pctCrossed && !timeCrossed {
+		return
+	}
+
+	t.LastLogPct = pctBucket
+	t.LastLogTime = now
+	t.LastLogDoneSize = t.DoneSize
+
+	elapsed := now.Sub(t.CreatedAt)
+	rate := 0.0
+	if elapsed.Seconds() > 0 {
+		rate = float64(t.DoneSize) / elapsed.Seconds()
+	}
+	var filesPct, bytesPct float64
+	if t.NumFiles > 0 {
+		filesPct = float64(t.Done) * 100.0 / float64(t.NumFiles)
+	}
+	bytesPct = float64(t.DoneSize) * 100.0 / float64(t.TotalSize)
+
+	log.Printf(
+		"txfer-progress: tid=%s files=[%d/%d](%.1f%%) [%s/%s](%.1f%%) elapsed=%s rate=%s",
+		t.ID,
+		t.Done, t.NumFiles, filesPct,
+		intencoding.HumanBytes(t.DoneSize), intencoding.HumanBytes(t.TotalSize), bytesPct,
+		elapsed.Truncate(time.Second),
+		intencoding.HumanRate(rate),
+	)
 }
 
 func resetTransferStoreForTest() {

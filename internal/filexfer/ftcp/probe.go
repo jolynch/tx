@@ -96,7 +96,7 @@ func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.W
 	if deps != nil && parsed.TransferID != "" && parsed.ObservedLinkMbps > 0 {
 		if update, ok := deps.ReportTransferObservedLink(parsed.TransferID, parsed.ObservedLinkMbps, gentleBWPct, gentleBurstBytes, 0.2); ok && update.NewRateBps != update.OldRateBps {
 			log.Printf(
-				"filexfer probe tid=%s observed_link=%dMbps ema_link=%.1fMbps limiter=%s->%s",
+				"txfer-probe: tid=%s observed_link=%dMbps ema_link=%.1fMbps limiter=%s->%s",
 				parsed.TransferID,
 				update.ObservedLinkMbps,
 				update.EMALinkMbps,
