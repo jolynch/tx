@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+
+	"github.com/jolynch/tx/internal/filexfer/encoding"
 )
 
 type DownloadStatus struct {
@@ -17,6 +19,7 @@ type DownloadStatus struct {
 type TransferStatus struct {
 	TransferID     string         `json:"transfer_id"`
 	Directory      string         `json:"directory"`
+	NumEntries     int            `json:"num_entries"`
 	NumFiles       int            `json:"num_files"`
 	TotalSize      int64          `json:"total_size"`
 	Done           uint64         `json:"done"`
@@ -45,6 +48,7 @@ func transferToStatus(id string, transfer Transfer) TransferStatus {
 	status := TransferStatus{
 		TransferID: id,
 		Directory:  transfer.Directory,
+		NumEntries: transfer.NumEntries,
 		NumFiles:   transfer.NumFiles,
 		TotalSize:  transfer.TotalSize,
 		Done:       transfer.Done,
@@ -56,7 +60,14 @@ func transferToStatus(id string, transfer Transfer) TransferStatus {
 	if transfer.TotalSize > 0 {
 		status.PercentBytes = float64(transfer.DoneSize) * 100.0 / float64(transfer.TotalSize)
 	}
-	for _, s := range transfer.State {
+	for i, s := range transfer.State {
+		entryType := byte(0)
+		if i < len(transfer.EntryType) {
+			entryType = transfer.EntryType[i]
+		}
+		if i >= transfer.NumEntries || !isStatusFileEntryType(entryType) {
+			continue
+		}
 		switch s {
 		case TransferStateStarted:
 			status.DownloadStatus.Started++
@@ -69,6 +80,10 @@ func transferToStatus(id string, transfer Transfer) TransferStatus {
 		}
 	}
 	return status
+}
+
+func isStatusFileEntryType(entryType byte) bool {
+	return entryType == 0 || entryType == encoding.EntryTypeFile
 }
 
 func handleSTATUS(_ context.Context, req Request, out io.Writer, deps Deps) error {
