@@ -98,6 +98,8 @@ Options:
       --skip-write                Do not mutate LOCAL_DST; fetch file bodies to discard
                                   instead of writing them
       --skip-fsync                Acknowledge writes without fdatasync
+      --fsync-interval string     Background fsync batch threshold; 0=inline fdatasync,
+                                  -1=syncfs-only at exit (default "512MiB")
       --verify-meta               Run read-only metadata verification after copy; with
                                   --skip-fetch this is allowed only if LOCAL_DST already
                                   exists
@@ -150,6 +152,8 @@ Options:
       --concurrency int           Parallel download workers (0=auto) (default 0)
       --skip-write                Do not write the file; fetch to discard instead
       --skip-fsync                Acknowledge writes without fdatasync
+      --fsync-interval string     Background fsync batch threshold; 0=inline fdatasync,
+                                  -1=syncfs-only at exit (default "512MiB")
       --progress                  Show transfer progress every 2s (default true)
   -v, --verbose                   Per-file progress output
   -p, --progress-path string      Progress output target; repeatable, use - for stdout
