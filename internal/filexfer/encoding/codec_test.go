@@ -7,7 +7,7 @@ import (
 )
 
 func TestMaxEncodedFrameSizeBytesZstdStableAcrossCalls(t *testing.T) {
-	const logicalSize = int64(8 * 1024 * 1024)
+	const logicalSize = int64(4 * 1024 * 1024)
 	first, err := MaxEncodedFrameSizeBytes(EncodingZstd, logicalSize)
 	if err != nil {
 		t.Fatalf("first call failed: %v", err)

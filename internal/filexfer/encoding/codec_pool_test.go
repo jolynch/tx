@@ -69,4 +69,3 @@ func encodeForCodecPoolTest(t *testing.T, comp string, payload []byte) []byte {
 	}
 	return out.Bytes()
 }
-

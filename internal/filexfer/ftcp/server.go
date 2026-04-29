@@ -40,12 +40,12 @@ type ServerOptions struct {
 	GentleCPUPct           int
 	GentleBWPct            int
 	SocketWriteBufferBytes int
-	SyncTimeout            time.Duration // 0 = no timeout; bounds SYNC response write time
-	RootDir                string        // "/" or "" means unrestricted
+	SyncTimeout            time.Duration             // 0 = no timeout; bounds SYNC response write time
+	RootDir                string                    // "/" or "" means unrestricted
 	ProgressTargets        []filexfer.ProgressTarget // progress output targets
 	ProgressInterval       time.Duration             // tick interval for progress writes (default 1s)
-	DisableZeroCopy        bool          // force buffered send path even when zero-copy is available
-	TargetIODepth          int           // target IO depth per CPU advertised in PROBE (default 4)
+	DisableZeroCopy        bool                      // force buffered send path even when zero-copy is available
+	TargetIODepth          int                       // target IO depth per CPU advertised in PROBE (default 4)
 }
 
 type HandlerFunc func(context.Context, Request, io.Writer, Deps) error
@@ -90,10 +90,10 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 				}
 				return filexfer.ProgressStatus{
 					Source:     "server",
-					TxID:      id,
-					DoneFiles: t.Done,
+					TxID:       id,
+					DoneFiles:  t.Done,
 					TotalFiles: uint64(t.NumFiles),
-					DoneBytes: t.DoneSize,
+					DoneBytes:  t.DoneSize,
 					TotalBytes: t.TotalSize,
 				}
 			})

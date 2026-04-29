@@ -37,4 +37,3 @@ func FuzzCommonPrefixLen(f *testing.F) {
 		}
 	})
 }
-

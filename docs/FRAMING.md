@@ -211,7 +211,7 @@ Path/blob args are encoded as quoted strings or length-prefixed tokens (`<len>:<
 4. `OK` or `ERR ...` status line
 
 The server repeats these triplets until each requested window is complete.
-Default logical frame size cap is `8 MiB`.
+Default logical frame size cap is `4 MiB`.
 
 For `SEND` responses, header properties are emitted in this order:
 `offset`, `size`, `wsize`, `comp`, `hash`, optional `max-wsize`, then `ts`.

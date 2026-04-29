@@ -20,7 +20,7 @@ const (
 	EncodingLz4      = "lz4"
 )
 
-const defaultZstdFrameSize = 8 * 1024 * 1024
+const defaultZstdFrameSize = 4 * 1024 * 1024
 
 type zstdMaxEncodedSizeCache struct {
 	once           sync.Once
