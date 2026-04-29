@@ -16,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"runtime/trace"
@@ -29,6 +28,7 @@ import (
 	"github.com/jolynch/tx/internal/cliflags"
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/fsync"
 	"github.com/jolynch/tx/internal/utils"
 	"github.com/zeebo/xxh3"
 )
@@ -60,6 +60,7 @@ const defaultCLIProbeBytes int64 = 1 * 1024 * 1024
 const defaultVerifySampleFrameSize int64 = 4 * 1024 * 1024
 const verifySampleBytes int64 = 8
 const defaultTransferProbeRefreshInterval = 10 * time.Second
+const defaultSyncfsTimeout = 10 * time.Second
 const fixedWidthProgressBytesWidth = 10
 const fixedWidthProgressRateWidth = 13
 const maxTransferErrorLines = 5
@@ -509,6 +510,7 @@ type copyCLIConfig struct {
 	skipFetch           bool
 	skipWrite           bool
 	skipFsync           bool
+	fsyncIntervalRaw    string
 	verifyMeta          bool
 	verifyDataSamplePct int
 	verbose             bool
@@ -542,6 +544,7 @@ type syncArgs struct {
 	ackEvery            int64
 	compress            string
 	noSync              bool
+	fsyncInterval       int64
 	skipWrite           bool
 	verbosity           int
 	yes                 bool
@@ -563,6 +566,7 @@ type startArgs struct {
 	ackEvery            int64
 	compress            string
 	noSync              bool
+	fsyncInterval       int64
 	discard             bool
 	deadlineMS          int64
 	traceFile           string
@@ -638,12 +642,14 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		ackEveryRaw:         encoding.HumanBytes(defaultCLIAckEveryBytes),
 		probeSizeRaw:        encoding.HumanBytes(defaultCLIProbeBytes),
 		progressIntervalRaw: "1s",
+		fsyncIntervalRaw:    "512MiB",
 		progress:            true,
 	}
 	cf.BoolVar(&cfg.clean, "", "clean", false, "Remove LOCAL_DST first, then force a clean transfer")
 	cf.BoolVar(&cfg.skipFetch, "", "skip-fetch", false, "Fetch and persist remote manifest state only; do not start or sync files")
 	cf.BoolVar(&cfg.skipWrite, "", "skip-write", false, "Do not mutate LOCAL_DST; fetch file bodies to discard instead of writing them")
 	cf.BoolVar(&cfg.skipFsync, "", "skip-fsync", false, "Acknowledge writes without fdatasync")
+	cf.StringVar(&cfg.fsyncIntervalRaw, "", "fsync-interval", cfg.fsyncIntervalRaw, "Background fsync batch threshold; 0=inline fdatasync, -1=syncfs-only at exit")
 	cf.BoolVar(&cfg.verifyMeta, "", "verify-meta", false, "Run read-only metadata verification after copy; with --skip-fetch this is allowed only if LOCAL_DST already exists")
 	cf.IntVar(&cfg.verifyDataSamplePct, "", "verify-data-sample", 0, "Percent of frame slots to sample per file for data verification (0-100); implies --verify-meta; not allowed with --skip-fetch or --skip-write")
 	cf.StringVar(&cfg.modeRaw, "", "mode", tx.LoadStrategyFast, "Server read strategy: fast|gentle")
@@ -722,6 +728,20 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
 		return 2
 	}
+	var fsyncInterval int64
+	if cfg.fsyncIntervalRaw == "-1" {
+		fsyncInterval = -1
+	} else {
+		fsyncInterval, err = encoding.ParseByteSize(cfg.fsyncIntervalRaw)
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid --fsync-interval: %v\n", err)
+			return 2
+		}
+		if fsyncInterval < 0 {
+			fmt.Fprintln(stderr, "--fsync-interval must be >= 0 or -1")
+			return 2
+		}
+	}
 	progressInterval, err := time.ParseDuration(cfg.progressIntervalRaw)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --progress-interval: %v\n", err)
@@ -796,6 +816,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 			ackEvery:            ackEvery,
 			compress:            compress,
 			noSync:              cfg.skipFsync,
+			fsyncInterval:       fsyncInterval,
 			skipWrite:           cfg.skipWrite,
 			verbosity:           verbosityFromFlags(false, cfg.verbose),
 			yes:                 cfg.yes,
@@ -821,6 +842,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 			ackEvery:            ackEvery,
 			compress:            compress,
 			noSync:              cfg.skipFsync,
+			fsyncInterval:       fsyncInterval,
 			discard:             cfg.skipWrite,
 			deadlineMS:          deadlineMS,
 			traceFile:           cfg.traceFile,
@@ -1651,6 +1673,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var ackEveryRaw string
 	var skipWrite bool
 	var skipFsync bool
+	var fsyncIntervalRaw string
 	var concurrency int
 	var verbose bool
 	var progress bool
@@ -1667,6 +1690,8 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=auto)")
 	cf.BoolVar(&skipWrite, "", "skip-write", false, "Do not write the file; fetch to discard instead")
 	cf.BoolVar(&skipFsync, "", "skip-fsync", false, "Acknowledge writes without fdatasync")
+	fsyncIntervalRaw = "512MiB"
+	cf.StringVar(&fsyncIntervalRaw, "", "fsync-interval", fsyncIntervalRaw, "Background fsync batch threshold; 0=inline fdatasync, -1=syncfs-only at exit")
 	cf.BoolVar(&progress, "", "progress", true, "Show transfer progress every 2s")
 	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
 	cf.StringSliceVar(&progressFilePaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
@@ -1707,6 +1732,20 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	if err != nil || ackEvery <= 0 {
 		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
 		return 2
+	}
+	var fsyncInterval int64
+	if fsyncIntervalRaw == "-1" {
+		fsyncInterval = -1
+	} else {
+		fsyncInterval, err = encoding.ParseByteSize(fsyncIntervalRaw)
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid --fsync-interval: %v\n", err)
+			return 2
+		}
+		if fsyncInterval < 0 {
+			fmt.Fprintln(stderr, "--fsync-interval must be >= 0 or -1")
+			return 2
+		}
 	}
 	agePublicKey, ageIdentity, resolvedEncMode, err := resolveEncryptionOptionsWithKeys(encryptMode, keysDir)
 	if err != nil {
@@ -1807,6 +1846,16 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		}
 	}()
 
+	syncWorker, stopSync := fsync.StartSyncWorker(fsyncInterval, skipFsync, stderr)
+	defer func() {
+		stopSync()
+		if !skipFsync && outputPath != "-" && outputPath != os.DevNull {
+			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
+			defer cancel()
+			fsync.SyncfsDir(syncCtx, filepath.Dir(outputPath), stderr)
+		}
+	}()
+
 	var totalCopied atomic.Int64
 	var stopStatusPolling func()
 	if verbosityFromFlags(progress, verbose) >= 1 {
@@ -1814,7 +1863,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		defer stopStatusPolling()
 	}
 	outputWriter := func(me tx.ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
-		w, syncFn, wErr := openDownloadOutput(me, offset, outputPath, stdout, skipFsync)
+		w, syncFn, wErr := openDownloadOutput(me, offset, outputPath, stdout, syncWorker)
 		if wErr != nil {
 			return nil, nil, wErr
 		}
@@ -1883,6 +1932,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	var ackEveryRaw string
 	var compressRaw string
 	var noSync bool
+	var fsyncIntervalRaw string
 	var skipWrite bool
 	var verbose bool
 	var yes bool
@@ -1907,6 +1957,8 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf.BoolVar(&skipWrite, "", "skip-write", false, "Do not mutate the target directory; fetch bodies to discard instead of writing them")
 	cf.BoolVar(&noSync, "", "skip-fsync", false, "Ack without fdatasync")
 	cf.BoolVar(&noSync, "", "no-sync", false, "Ack without fdatasync")
+	fsyncIntervalRaw = "512MiB"
+	cf.StringVar(&fsyncIntervalRaw, "", "fsync-interval", fsyncIntervalRaw, "Background fsync batch threshold; 0=inline fdatasync, -1=syncfs-only at exit")
 	probeSizeRaw = encoding.HumanBytes(defaultCLIProbeBytes)
 	cf.StringVar(&probeSizeRaw, "", "probe-size", probeSizeRaw, "Probe payload size; 1B, 4KiB, 8MiB")
 	cf.StringVar(&traceFile, "", "trace", "", "Write runtime/trace output to this file")
@@ -1934,6 +1986,20 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	if err != nil || ackEvery <= 0 {
 		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
 		return 2
+	}
+	var fsyncInterval int64
+	if fsyncIntervalRaw == "-1" {
+		fsyncInterval = -1
+	} else {
+		fsyncInterval, err = encoding.ParseByteSize(fsyncIntervalRaw)
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid --fsync-interval: %v\n", err)
+			return 2
+		}
+		if fsyncInterval < 0 {
+			fmt.Fprintln(stderr, "--fsync-interval must be >= 0 or -1")
+			return 2
+		}
 	}
 	probeBytes, err := encoding.ParseByteSize(probeSizeRaw)
 	if err != nil || probeBytes <= 0 {
@@ -1977,6 +2043,7 @@ func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		ackEvery:            ackEvery,
 		compress:            compress,
 		noSync:              noSync,
+		fsyncInterval:       fsyncInterval,
 		skipWrite:           skipWrite,
 		verbosity:           verbosity,
 		yes:                 yes,
@@ -2001,6 +2068,16 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 	fmt.Fprintf(stderr, "sync-state: >(%s) <(%s)\n", ps.ManifestPath, ps.TargetDir)
 
 	outRoot := ps.TargetDir
+
+	syncWorker, stopSync := fsync.StartSyncWorker(cfg.fsyncInterval, cfg.noSync, stderr)
+	defer func() {
+		stopSync()
+		if !cfg.noSync {
+			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
+			defer cancel()
+			fsync.SyncfsDir(syncCtx, filepath.Dir(ps.TargetDir), stderr)
+		}
+	}()
 
 	// Load server manifest once for metadata (Root, Mode, Concurrency, etc.).
 	serverManifest, serverManifestErr := tx.LoadManifest(ps.ServerManifestPath)
@@ -2227,7 +2304,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			if cfg.skipWrite {
 				destPath = os.DevNull
 			}
-			w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, cfg.noSync)
+			w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, syncWorker)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -2358,6 +2435,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var ackEveryRaw string
 	var compressRaw string
 	var noSync bool
+	var fsyncIntervalRaw string
 	var verbose bool
 	var progress bool
 	var discard bool
@@ -2381,6 +2459,8 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	cf.BoolVar(&noSync, "", "skip-fsync", false, "Ack without fdatasync")
 	cf.BoolVar(&noSync, "", "no-sync", false, "Ack without fdatasync")
+	fsyncIntervalRaw = "512MiB"
+	cf.StringVar(&fsyncIntervalRaw, "", "fsync-interval", fsyncIntervalRaw, "Background fsync batch threshold; 0=inline fdatasync, -1=syncfs-only at exit")
 	cf.StringVar(&deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
 	var traceFile string
 	cf.StringVar(&traceFile, "", "trace", "", "Write runtime/trace output to this file")
@@ -2437,6 +2517,20 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintln(stderr, "--ack-every must be > 0")
 		return 2
 	}
+	var fsyncInterval int64
+	if fsyncIntervalRaw == "-1" {
+		fsyncInterval = -1
+	} else {
+		fsyncInterval, err = encoding.ParseByteSize(fsyncIntervalRaw)
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid --fsync-interval: %v\n", err)
+			return 2
+		}
+		if fsyncInterval < 0 {
+			fmt.Fprintln(stderr, "--fsync-interval must be >= 0 or -1")
+			return 2
+		}
+	}
 	agePublicKey, ageIdentity, resolvedEncMode, err := resolveEncryptionOptionsWithKeys(encryptMode, keysDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
@@ -2463,6 +2557,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		ackEvery:            ackEvery,
 		compress:            compress,
 		noSync:              noSync,
+		fsyncInterval:       fsyncInterval,
 		discard:             discard,
 		deadlineMS:          deadlineMS,
 		traceFile:           traceFile,
@@ -2576,6 +2671,16 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		recordFailure,
 	)
 	completed += completedNow
+	syncWorker, stopSync := fsync.StartSyncWorker(cfg.fsyncInterval, cfg.noSync, stderr)
+	defer func() {
+		stopSync()
+		if !cfg.noSync && !cfg.discard {
+			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
+			defer cancel()
+			fsync.SyncfsDir(syncCtx, filepath.Dir(ps.TargetDir), stderr)
+		}
+	}()
+
 	var totalCopied atomic.Int64
 	totalPendingBytes := totalEntrySize(pendingWork.files)
 
@@ -2639,7 +2744,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		}
 		outputWriter := func(entry tx.ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
 			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
-			w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, cfg.noSync)
+			w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, syncWorker)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -3135,7 +3240,7 @@ func resolveDownloadDestinationPath(entry tx.ManifestEntry, outRoot string, outF
 	return filepath.Clean(filepath.Join(outRoot, filepath.FromSlash(entry.Path)))
 }
 
-func openDownloadOutput(entry tx.ManifestEntry, offset int64, destPath string, stdout io.Writer, noSync bool) (io.WriteCloser, func() error, error) {
+func openDownloadOutput(entry tx.ManifestEntry, offset int64, destPath string, stdout io.Writer, syncWorker *fsync.SyncWorker) (io.WriteCloser, func() error, error) {
 	if destPath == "-" {
 		if offset > 0 {
 			return nil, nil, errors.New("cannot resume when output is stdout")
@@ -3193,12 +3298,7 @@ func openDownloadOutput(entry tx.ManifestEntry, offset int64, destPath string, s
 			return nil, nil, fmt.Errorf("seek output file for resume: %w", err)
 		}
 	}
-	syncOutput := func() error {
-		if noSync {
-			return nil
-		}
-		return syscall.Fdatasync(int(fd.Fd()))
-	}
+	syncOutput := syncWorker.SyncOutput(fd, offset)
 	return fd, syncOutput, nil
 }
 
