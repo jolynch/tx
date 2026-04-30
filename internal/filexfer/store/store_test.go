@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -432,6 +433,69 @@ func TestMaybeLogTransferCompleteLogsForMixedEntries(t *testing.T) {
 	}
 	if strings.Contains(logged, "files=3") {
 		t.Fatalf("expected file count to exclude metadata entries, got %q", logged)
+	}
+}
+
+func TestMaybeLogTransferProgressUsesClientStyleFixedWidthLayout(t *testing.T) {
+	resetTransferStore()
+
+	transfer, err := NewTransfer("/tmp/x", 0, 0)
+	if err != nil {
+		t.Fatalf("NewTransfer returned error: %v", err)
+	}
+	managed, ok := manager.getManagedTransfer(transfer.ID)
+	if !ok {
+		t.Fatalf("transfer %q not found", transfer.ID)
+	}
+	now := time.Now()
+	managed.mu.Lock()
+	managed.transfer.TotalSize = 20_174_499_881
+	managed.transfer.DoneSize = 18_350_000_000
+	managed.transfer.NumFiles = 10127
+	managed.transfer.Done = 9121
+	managed.transfer.CreatedAt = now.Add(-7 * time.Second)
+	managed.transfer.LastLogPct = 80
+	managed.mu.Unlock()
+
+	var buf bytes.Buffer
+	oldFlags := log.Flags()
+	oldWriter := log.Writer()
+	log.SetFlags(0)
+	log.SetOutput(&buf)
+	defer func() {
+		log.SetFlags(oldFlags)
+		log.SetOutput(oldWriter)
+	}()
+
+	MaybeLogTransferProgress(transfer.ID)
+
+	logged := strings.TrimSpace(buf.String())
+	if !strings.Contains(logged, "txfer-progress:["+transfer.ID+"]") {
+		t.Fatalf("expected txfer-progress prefix with bracketed tid, got %q", logged)
+	}
+	if strings.Contains(logged, "tid=") {
+		t.Fatalf("progress line should not include tid= header, got %q", logged)
+	}
+	if strings.Contains(logged, "files=") {
+		t.Fatalf("progress line should not include files= header, got %q", logged)
+	}
+
+	wantFiles := "[" + encoding.HumanCount(9121, progressLogCountWidth) + "/" + encoding.HumanCount(10127, progressLogCountWidth) + "]( 90.1%)"
+	if !strings.Contains(logged, wantFiles) {
+		t.Fatalf("progress line missing fixed-width file section %q in %q", wantFiles, logged)
+	}
+	bytesPct := float64(18_350_000_000) * 100.0 / float64(20_174_499_881)
+	wantBytes := "[" + encoding.HumanBytesFixedWidth(18_350_000_000, progressLogBytesWidth) + "/" + encoding.HumanBytesFixedWidth(20_174_499_881, progressLogBytesWidth) + "](" + fmt.Sprintf("%5.1f%%", bytesPct) + ")"
+	if !strings.Contains(logged, wantBytes) {
+		t.Fatalf("progress line missing fixed-width byte section %q in %q", wantBytes, logged)
+	}
+	rateIdx := strings.LastIndex(logged, "rate=")
+	if rateIdx < 0 {
+		t.Fatalf("progress line missing rate field in %q", logged)
+	}
+	rateField := logged[rateIdx+len("rate="):]
+	if len(rateField) != progressLogRateWidth {
+		t.Fatalf("expected fixed-width rate field length %d, got %d in %q", progressLogRateWidth, len(rateField), logged)
 	}
 }
 

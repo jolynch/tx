@@ -93,7 +93,7 @@ func SyncfsDir(ctx context.Context, dir string, stderr io.Writer) {
 	}
 	fd, err := unix.Open(dir, unix.O_RDONLY, 0)
 	if err != nil {
-		fmt.Fprintf(stderr, "syncfs: [%s] open failed: %v\n", displayPath, err)
+		fmt.Fprintf(stderr, "final-syncfs: [%s] open failed: %v\n", displayPath, err)
 		return
 	}
 	start := time.Now()
@@ -106,18 +106,18 @@ func SyncfsDir(ctx context.Context, dir string, stderr io.Writer) {
 		unix.Close(fd)
 		elapsed := time.Since(start)
 		if err != nil {
-			fmt.Fprintf(stderr, "syncfs: [%s] filesystem sync failed after %s: %v\n", displayPath, elapsed.Round(time.Millisecond), err)
+			fmt.Fprintf(stderr, "final-syncfs: [%s] filesystem sync failed after %s: %v\n", displayPath, elapsed.Round(time.Millisecond), err)
 		} else {
-			fmt.Fprintf(stderr, "syncfs: [%s] filesystem sync completed in %s\n", displayPath, elapsed.Round(time.Millisecond))
+			fmt.Fprintf(stderr, "final-syncfs: [%s] filesystem sync completed in %s\n", displayPath, elapsed.Round(time.Millisecond))
 		}
 	case <-ctx.Done():
 		unix.Close(fd)
 		elapsed := time.Since(start)
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			fmt.Fprintf(stderr, "WARNING: syncfs: [%s] filesystem sync timed out after %s. Data may not yet be durable on disk\n", displayPath, elapsed.Round(time.Millisecond))
+			fmt.Fprintf(stderr, "WARNING: final-syncfs: [%s] filesystem sync timed out after %s. Data may not yet be durable on disk\n", displayPath, elapsed.Round(time.Millisecond))
 			return
 		}
-		fmt.Fprintf(stderr, "WARNING: syncfs: [%s] filesystem sync canceled after %s: %v\n", displayPath, elapsed.Round(time.Millisecond), ctx.Err())
+		fmt.Fprintf(stderr, "WARNING: final-syncfs: [%s] filesystem sync canceled after %s: %v\n", displayPath, elapsed.Round(time.Millisecond), ctx.Err())
 	}
 }
 
@@ -205,7 +205,7 @@ func (bs *backgroundSyncer) stop(stderr io.Writer) {
 	start := time.Now()
 	<-bs.done
 	elapsed := time.Since(start)
-	fmt.Fprintf(stderr, "background-sync: drained in %s, synced=%s pending=%s\n",
+	fmt.Fprintf(stderr, "background-fsync: drained in %s, synced=%s pending=%s\n",
 		elapsed.Round(time.Millisecond),
 		encoding.HumanBytes(bs.synced.Load()),
 		encoding.HumanBytes(bs.pending.Load()))

@@ -8,7 +8,7 @@ FUZZDEADLINE ?= 30s
 all: build build-bench test
 
 build:
-	CGO_ENABLED=0 go build -a -tags netgo -ldflags='-s -w -extldflags "-static"' -o tx ./cmd/tx
+	CGO_ENABLED=0 go build -tags netgo -ldflags='-s -w -extldflags "-static"' -o tx ./cmd/tx
 
 build-bench: build
 	@mkdir -p bench

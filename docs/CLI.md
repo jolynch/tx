@@ -88,8 +88,7 @@ Behavior:
   - --clean removes LOCAL_DST first and forces a clean transfer
   - --skip-fetch fetches and writes manifest state only; no start/sync
   - --skip-write fetches bodies to a discard sink and never mutates LOCAL_DST
-  - --verify-meta reruns read-only metadata verification after copy
-  - --verify-data-sample=N implies --verify-meta and verifies N percent of data
+  - --verify=MODE verification after copy: none|meta|N%data|full|<duration> (default meta)
 
 Options:
       --clean                     Remove LOCAL_DST first, then force a clean transfer
@@ -100,12 +99,9 @@ Options:
       --skip-fsync                Acknowledge writes without fdatasync
       --fsync-interval string     Background fsync batch threshold; 0=inline fdatasync,
                                   -1=syncfs-only at exit (default "512MiB")
-      --verify-meta               Run read-only metadata verification after copy; with
-                                  --skip-fetch this is allowed only if LOCAL_DST already
-                                  exists
-      --verify-data-sample int    Percent of frame slots to sample per file for data
-                                  verification (0-100); implies --verify-meta; not
-                                  allowed with --skip-fetch or --skip-write (default 0)
+      --verify string              Verification after copy:
+                                  none|meta|N%data|full|<duration>
+                                  (default "meta")
       --mode string               Server read strategy: fast|gentle (default "fast")
       --encrypt string            Encryption algorithm: none|auto|aes|chacha20
                                   (default: none)
@@ -208,8 +204,9 @@ Common examples:
 tx recv copy /srv/data /var/lib/pinch/data
 tx recv copy --clean /srv/data /var/lib/pinch/data
 tx recv copy --mode gentle /srv/data /var/lib/pinch/data
-tx recv copy --verify-meta /srv/data /var/lib/pinch/data
-tx recv copy --verify-data-sample 5 /srv/data /var/lib/pinch/data
+tx recv copy --verify meta /srv/data /var/lib/pinch/data
+tx recv copy --verify 5%data /srv/data /var/lib/pinch/data
+tx recv copy --verify 30s /srv/data /var/lib/pinch/data
 tx recv copy --deadline 30m /srv/data /var/lib/pinch/data
 ```
 
@@ -246,7 +243,10 @@ Why this works:
 - sync only downloads new or stale files and removes remote-missing files when
   needed
 
-If you want an explicit final check, add `--verify-meta` to the last run.
+Metadata verification runs by default after every copy. To also sample data,
+add `--verify 5%data`, use `--verify full` to check every byte, or pass a
+duration such as `--verify 30s` to run full data verification under a time
+budget.
 
 ### Send Server Examples
 

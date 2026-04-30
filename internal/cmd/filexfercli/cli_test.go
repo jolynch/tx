@@ -785,7 +785,7 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "sync-fallbacks=") {
+	if !strings.Contains(stdout.String(), "sync-conn-fallbacks=") {
 		t.Fatalf("expected sync fallback count in start summary, got %q", stdout.String())
 	}
 	out := stderr.String()
@@ -1484,6 +1484,24 @@ func TestFixedWidthETANA(t *testing.T) {
 	if len(fixedWidthETANA()) != 5 {
 		t.Fatalf("expected 5-char n/a eta field, got %d", len(fixedWidthETANA()))
 	}
+}
+
+func TestFormatVerifyDataSummaryLine(t *testing.T) {
+	t.Run("budgeted", func(t *testing.T) {
+		got := formatVerifyDataSummaryLine(10011, 14224, 100, 10*time.Second, 9876*time.Millisecond)
+		want := "copy-verify-data: ok files=10011 samples=14224 budget=10s elapsed=9.876s"
+		if got != want {
+			t.Fatalf("formatVerifyDataSummaryLine() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("sampled-percent", func(t *testing.T) {
+		got := formatVerifyDataSummaryLine(42, 84, 5, 0, 1500*time.Microsecond)
+		want := "copy-verify-data: ok files=42 samples=84 pct=5 elapsed=2ms"
+		if got != want {
+			t.Fatalf("formatVerifyDataSummaryLine() = %q, want %q", got, want)
+		}
+	})
 }
 
 func TestCompactETAUsesFractionalUnitsEarly(t *testing.T) {
@@ -2230,7 +2248,7 @@ func TestRunCLICopySkipFetchVerifyMeta(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "--skip-fetch", "--verify-meta", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{srv.URL, "copy", "--skip-fetch", "--verify", "meta", "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy skip-fetch verify-meta: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -2297,7 +2315,7 @@ func TestRunCLICopyMixedManifestTypesConverges(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify-meta", "/remote", targetDir}, &stdout, &stderr)
+	code = RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify", "meta", "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy mixed second run: expected 0, got %d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
 	}
@@ -2448,22 +2466,8 @@ func TestRunCLIUsageErrors(t *testing.T) {
 			t.Fatalf("expected copy help to wrap at 88 chars, got %d: %q", len(line), line)
 		}
 	}
-	wrappedVerifySample := false
-	for i, line := range lines {
-		if !strings.Contains(line, "--verify-data-sample int") {
-			continue
-		}
-		if i+1 >= len(lines) {
-			break
-		}
-		next := lines[i+1]
-		if len(next) > 0 && next[0] == ' ' && strings.Contains(next, "verification") {
-			wrappedVerifySample = true
-		}
-		break
-	}
-	if !wrappedVerifySample {
-		t.Fatalf("expected wrapped help indentation for verify-data-sample, got: %s", copyHelp)
+	if !strings.Contains(copyHelp, "--verify string") {
+		t.Fatalf("expected --verify string in copy help, got: %s", copyHelp)
 	}
 	stderr.Reset()
 	if code := runCopyCLI("127.0.0.1:1", []string{"--compress", "bogus", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
@@ -2508,11 +2512,25 @@ func TestRunCLIUsageErrors(t *testing.T) {
 		t.Fatalf("expected invalid --progress-interval error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--verify-data-sample", "5", "--skip-fetch", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI("127.0.0.1:1", []string{"--verify", "5%data", "--skip-fetch", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for invalid verify/skip-fetch combo, got %d", code)
 	}
-	if !strings.Contains(stderr.String(), "--verify-data-sample cannot be used with --skip-fetch or --skip-write") {
-		t.Fatalf("expected invalid verify-data-sample error, got: %s", stderr.String())
+	if !strings.Contains(stderr.String(), "--verify N%data/full cannot be used with --skip-fetch or --skip-write") {
+		t.Fatalf("expected invalid verify data error, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--verify", "0s", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for zero duration verify, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid --verify") {
+		t.Fatalf("expected invalid --verify error for 0s, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--verify", "30s", "--skip-fetch", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for verify duration with skip-fetch, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "--verify N%data/full cannot be used with --skip-fetch or --skip-write") {
+		t.Fatalf("expected invalid verify/skip-fetch combo error, got: %s", stderr.String())
 	}
 	stderr.Reset()
 	if code := RunCLI([]string{"--tid", "tx", "get"}, &stdout, &stderr); code != 2 {

@@ -69,7 +69,7 @@ func TestSyncOutputBackgroundStopDrains(t *testing.T) {
 
 	stop()
 
-	if !strings.Contains(stderr.String(), "background-sync: drained") {
+	if !strings.Contains(stderr.String(), "background-fsync: drained") {
 		t.Fatalf("stop output = %q, want background drain summary", stderr.String())
 	}
 }

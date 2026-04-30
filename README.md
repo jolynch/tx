@@ -18,10 +18,10 @@ Three capabilities make this possible:
   exceed line rate; incompressible files (media, archives) stream with zero CPU
   overhead.
 
-- **Lightweight verification.** Metadata checks (size, mtime, permissions) are
-  fast and free. Sampled data verification (`--verify-data-sample=5`) reads 5%
-  of bytes and catches corruption without a full re-read — practical on
-  expensive cloud storage.
+- **Lightweight verification.** Metadata checks (size, mtime, permissions) run
+  by default after every copy. Sampled data verification (`--verify 5%data`)
+  reads 5% of bytes and catches corruption without a full re-read — practical
+  on expensive cloud storage.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a deeper dive.
 
@@ -45,8 +45,8 @@ tx recv 10.0.0.1:3453 copy /srv/data /var/lib/data
 ```
 
 Rerun the same command to sync deltas — `copy` detects an existing destination
-and only transfers new or changed files. Add `--verify-meta` to the run
-for a post-copy sanity check.
+and only transfers new or changed files. Metadata verification runs by default;
+add `--verify 5%data` for sampled data checks.
 
 ### With encryption
 
@@ -83,7 +83,7 @@ the wire. The server validates them with constant-time comparison.
 ## Full CLI reference
 
 See [docs/CLI.md](docs/CLI.md) for the complete flag reference including
-`--mode gentle`, `--verify-data-sample`, `--deadline`, progress reporting, and
+`--mode gentle`, `--verify`, `--deadline`, progress reporting, and
 the `get` / `status` subcommands.
 
 ## Building and testing
