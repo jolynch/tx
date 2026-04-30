@@ -490,6 +490,40 @@ func resolveCompress(raw string) (string, error) {
 	}
 }
 
+// parseVerifyFlag parses the --verify flag value into (verifyMeta, dataSamplePct, budget, error).
+//
+//	none    → false, 0,   0
+//	meta    → true,  0,   0
+//	N%data  → true,  N,   0     (1-100)
+//	full    → true,  100, 0
+//	<dur>   → true,  100, dur   (e.g. 30s, 5m — meta + 100% data with time budget)
+func parseVerifyFlag(raw string) (bool, int, time.Duration, error) {
+	s := strings.TrimSpace(raw)
+	switch s {
+	case "none":
+		return false, 0, 0, nil
+	case "meta":
+		return true, 0, 0, nil
+	case "full":
+		return true, 100, 0, nil
+	}
+	if strings.HasSuffix(s, "%data") {
+		numStr := strings.TrimSuffix(s, "%data")
+		n, err := strconv.Atoi(numStr)
+		if err != nil || n < 1 || n > 100 {
+			return false, 0, 0, fmt.Errorf("invalid data sample percent %q; must be 1-100", numStr)
+		}
+		return true, n, 0, nil
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		if d <= 0 {
+			return false, 0, 0, fmt.Errorf("--verify duration must be > 0")
+		}
+		return true, 100, d, nil
+	}
+	return false, 0, 0, fmt.Errorf("unsupported --verify value %q (supported: none, meta, N%%data, full, <duration>)", s)
+}
+
 type copyCLIConfig struct {
 	remoteSrc           string
 	localDst            string
@@ -511,8 +545,10 @@ type copyCLIConfig struct {
 	skipWrite           bool
 	skipFsync           bool
 	fsyncIntervalRaw    string
+	verifyRaw           string
 	verifyMeta          bool
 	verifyDataSamplePct int
+	verifyBudget        time.Duration
 	verbose             bool
 	progress            bool
 	yes                 bool
@@ -633,8 +669,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintln(stderr, "  - --clean removes LOCAL_DST first and forces a clean transfer")
 		fmt.Fprintln(stderr, "  - --skip-fetch fetches and writes manifest state only; no start/sync")
 		fmt.Fprintln(stderr, "  - --skip-write fetches bodies to a discard sink and never mutates LOCAL_DST")
-		fmt.Fprintln(stderr, "  - --verify-meta reruns read-only metadata verification after copy")
-		fmt.Fprintln(stderr, "  - --verify-data-sample=N implies --verify-meta and verifies N percent of data")
+		fmt.Fprintf(stderr, "  - --verify=MODE post-copy verification: none|meta|N%%data|full|<dur>\n")
 		fmt.Fprintln(stderr)
 		cf.PrintDefaults(stderr)
 	}
@@ -650,8 +685,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf.BoolVar(&cfg.skipWrite, "", "skip-write", false, "Do not mutate LOCAL_DST; fetch file bodies to discard instead of writing them")
 	cf.BoolVar(&cfg.skipFsync, "", "skip-fsync", false, "Acknowledge writes without fdatasync")
 	cf.StringVar(&cfg.fsyncIntervalRaw, "", "fsync-interval", cfg.fsyncIntervalRaw, "Background fsync batch threshold; 0=inline fdatasync, -1=syncfs-only at exit")
-	cf.BoolVar(&cfg.verifyMeta, "", "verify-meta", false, "Run read-only metadata verification after copy; with --skip-fetch this is allowed only if LOCAL_DST already exists")
-	cf.IntVar(&cfg.verifyDataSamplePct, "", "verify-data-sample", 0, "Percent of frame slots to sample per file for data verification (0-100); implies --verify-meta; not allowed with --skip-fetch or --skip-write")
+	cf.StringVar(&cfg.verifyRaw, "", "verify", "meta", "Verification after copy: none|meta|N%data|full|<duration> (default meta)")
 	cf.StringVar(&cfg.modeRaw, "", "mode", tx.LoadStrategyFast, "Server read strategy: fast|gentle")
 	cf.StringVar(&cfg.encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&cfg.keysDir, "k", "keys", "", "Persistent age keys directory (default: ephemeral)")
@@ -684,19 +718,22 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintln(stderr, "copy requires REMOTE_SRC to be an absolute server path")
 		return 2
 	}
-	if cfg.verifyDataSamplePct < 0 || cfg.verifyDataSamplePct > 100 {
-		fmt.Fprintln(stderr, "--verify-data-sample must be between 0 and 100")
-		return 2
-	}
-	if cfg.verifyDataSamplePct > 0 {
-		cfg.verifyMeta = true
+	{
+		meta, dataPct, budget, err := parseVerifyFlag(cfg.verifyRaw)
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid --verify: %v\n", err)
+			return 2
+		}
+		cfg.verifyMeta = meta
+		cfg.verifyDataSamplePct = dataPct
+		cfg.verifyBudget = budget
 	}
 	if cfg.verifyDataSamplePct > 0 && (cfg.skipFetch || cfg.skipWrite) {
-		fmt.Fprintln(stderr, "--verify-data-sample cannot be used with --skip-fetch or --skip-write")
+		fmt.Fprintf(stderr, "--verify N%%data/full cannot be used with --skip-fetch or --skip-write\n")
 		return 2
 	}
 	if cfg.verifyMeta && cfg.skipWrite {
-		fmt.Fprintln(stderr, "--verify-meta cannot be used with --skip-write")
+		fmt.Fprintln(stderr, "--verify meta cannot be used with --skip-write")
 		return 2
 	}
 	agePublicKey, ageIdentity, encMode, err := resolveEncryptionOptionsWithKeys(cfg.encryptMode, cfg.keysDir)
@@ -768,7 +805,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 
 	localExists := pathExists(cfg.localDst)
 	if cfg.verifyMeta && cfg.skipFetch && !localExists {
-		fmt.Fprintln(stderr, "--verify-meta with --skip-fetch requires an existing LOCAL_DST")
+		fmt.Fprintln(stderr, "--verify with --skip-fetch requires an existing LOCAL_DST")
 		return 2
 	}
 	if cfg.clean && !cfg.skipFetch {
@@ -932,13 +969,21 @@ func verifyCopy(serverURL string, cfg copyCLIConfig, stdout io.Writer, stderr io
 	if cfg.verifyDataSamplePct <= 0 {
 		return 0
 	}
-	sampledFiles, sampledRanges, err := verifyCopyDataSamples(serverURL, cfg, serverManifest, stderr)
+	sampledFiles, sampledRanges, elapsed, err := verifyCopyDataSamples(serverURL, cfg, serverManifest, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "copy-verify-data: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stderr, "copy-verify-data: ok files=%d samples=%d pct=%d\n", sampledFiles, sampledRanges, cfg.verifyDataSamplePct)
+	fmt.Fprintln(stderr, formatVerifyDataSummaryLine(sampledFiles, sampledRanges, cfg.verifyDataSamplePct, cfg.verifyBudget, elapsed))
 	return 0
+}
+
+func formatVerifyDataSummaryLine(files int, samples int, pct int, budget time.Duration, elapsed time.Duration) string {
+	elapsed = elapsed.Round(time.Millisecond)
+	if budget > 0 {
+		return fmt.Sprintf("copy-verify-data: ok files=%d samples=%d budget=%s elapsed=%s", files, samples, budget, elapsed)
+	}
+	return fmt.Sprintf("copy-verify-data: ok files=%d samples=%d pct=%d elapsed=%s", files, samples, pct, elapsed)
 }
 
 func compareManifestEntries(localManifest *tx.Manifest, serverManifest *tx.Manifest) manifestDelta {
@@ -1007,13 +1052,14 @@ type verifySampleTask struct {
 	samples    []verifySample
 }
 
-func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Manifest, stderr io.Writer) (int, int, error) {
+func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Manifest, stderr io.Writer) (int, int, time.Duration, error) {
+	start := time.Now()
 	if manifest == nil {
-		return 0, 0, errors.New("missing manifest")
+		return 0, 0, 0, errors.New("missing manifest")
 	}
 	agePublicKey, ageIdentity, encMode, err := resolveEncryptionOptionsWithKeys(cfg.encryptMode, cfg.keysDir)
 	if err != nil {
-		return 0, 0, fmt.Errorf("invalid --encrypt: %w", err)
+		return 0, 0, 0, fmt.Errorf("invalid --encrypt: %w", err)
 	}
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	tasks := make([]verifySampleTask, 0, len(manifest.Entries))
@@ -1032,7 +1078,7 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 		totalRanges += len(samples)
 	}
 	if len(tasks) == 0 {
-		return 0, 0, nil
+		return 0, 0, time.Since(start), nil
 	}
 	workers := cfg.concurrency
 	if workers <= 0 {
@@ -1043,10 +1089,20 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 	}
 	taskCh := make(chan verifySampleTask, workers)
 	errCh := make(chan error, 1)
-	ctx, cancel := context.WithCancel(context.Background())
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if cfg.verifyBudget > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), cfg.verifyBudget)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+	}
 	defer cancel()
+	budgetExpired := func() bool {
+		return cfg.verifyBudget > 0 && ctx.Err() == context.DeadlineExceeded
+	}
 	var wg sync.WaitGroup
 	var completed atomic.Int64
+	var completedRanges atomic.Int64
 	var progressDone chan struct{}
 	if stderr != nil {
 		progressDone = make(chan struct{})
@@ -1073,6 +1129,9 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 			defer client.Close()
 			for task := range taskCh {
 				if err := verifySampleTaskData(ctx, client, manifest.TransferID, task); err != nil {
+					if budgetExpired() {
+						return
+					}
 					select {
 					case errCh <- err:
 					default:
@@ -1081,6 +1140,7 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 					return
 				}
 				completed.Add(1)
+				completedRanges.Add(int64(len(task.samples)))
 			}
 		}()
 	}
@@ -1094,9 +1154,12 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 			}
 			select {
 			case err := <-errCh:
-				return 0, 0, err
+				return 0, 0, time.Since(start), err
 			default:
-				return 0, 0, context.Canceled
+				if budgetExpired() {
+					return int(completed.Load()), int(completedRanges.Load()), time.Since(start), nil
+				}
+				return 0, 0, time.Since(start), context.Canceled
 			}
 		case err := <-errCh:
 			cancel()
@@ -1105,7 +1168,7 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 			if progressDone != nil {
 				<-progressDone
 			}
-			return 0, 0, err
+			return 0, 0, time.Since(start), err
 		case taskCh <- task:
 		}
 	}
@@ -1117,10 +1180,10 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 	}
 	select {
 	case err := <-errCh:
-		return 0, 0, err
+		return 0, 0, time.Since(start), err
 	default:
 	}
-	return len(tasks), totalRanges, nil
+	return len(tasks), totalRanges, time.Since(start), nil
 }
 
 func buildVerifySamples(fileSize int64, pct int, rng *rand.Rand) []verifySample {
@@ -1137,6 +1200,7 @@ func buildVerifySamples(fileSize int64, pct int, rng *rand.Rand) []verifySample 
 	}
 	slotIndexes := make([]int, 0, sampleCount)
 	if sampleCount >= frameSlots {
+		// 100% (and any rounded-up equivalent) verifies every frame slot in the file.
 		for i := 0; i < frameSlots; i++ {
 			slotIndexes = append(slotIndexes, i)
 		}
@@ -2399,7 +2463,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			overallSpeed = float64(totalTransferred) / elapsedAll.Seconds()
 		}
 		fmt.Fprintf(stderr,
-			"sync complete[%d]: tid=%s downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s sync-fallbacks=%d\n",
+			"sync complete[%d]: tid=%s downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s sync-conn-fallbacks=%d\n",
 			round,
 			mergedManifest.TransferID,
 			completed,
@@ -2825,7 +2889,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 	}
 	fmt.Fprintf(
 		stdout,
-		"start-complete: tid=%s requested=%d downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s sync-fallbacks=%d\n",
+		"start-complete: tid=%s requested=%d downloaded=%d failed=%d transferred=%s speed=%s elapsed=%s sync-conn-fallbacks=%d\n",
 		txferID,
 		len(manifest.Entries),
 		completed,

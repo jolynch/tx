@@ -1197,6 +1197,9 @@ func ClipTransfer(txferID string) bool {
 
 const progressLogPctInterval = 10
 const progressLogTimeInterval = 10 * time.Second
+const progressLogCountWidth = 6
+const progressLogBytesWidth = 10
+const progressLogRateWidth = 13
 
 func MaybeLogTransferProgress(txferID string) {
 	manager.maybeLogProgress(txferID)
@@ -1248,12 +1251,16 @@ func (s *transferStore) maybeLogProgress(txferID string) {
 	bytesPct = float64(t.DoneSize) * 100.0 / float64(t.TotalSize)
 
 	log.Printf(
-		"txfer-progress: tid=%s files=[%d/%d](%.1f%%) [%s/%s](%.1f%%) elapsed=%s rate=%s",
+		"txfer-progress:[%s] [%s/%s](%5.1f%%) [%s/%s](%5.1f%%) elapsed=%4s rate=%s",
 		t.ID,
-		t.Done, t.NumFiles, filesPct,
-		intencoding.HumanBytes(t.DoneSize), intencoding.HumanBytes(t.TotalSize), bytesPct,
+		intencoding.HumanCount(t.Done, progressLogCountWidth),
+		intencoding.HumanCount(uint64(t.NumFiles), progressLogCountWidth),
+		filesPct,
+		intencoding.HumanBytesFixedWidth(t.DoneSize, progressLogBytesWidth),
+		intencoding.HumanBytesFixedWidth(t.TotalSize, progressLogBytesWidth),
+		bytesPct,
 		elapsed.Truncate(time.Second),
-		intencoding.HumanRate(rate),
+		intencoding.HumanRateFixedWidth(rate, progressLogRateWidth),
 	)
 }
 

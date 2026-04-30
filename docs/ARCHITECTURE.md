@@ -163,9 +163,9 @@ truncation, or interrupted writes. `tx` provides two levels of post-transfer
 verification, designed to be practical on large datasets stored on slow cloud
 drives where full re-reads are expensive.
 
-### Metadata verification (default when requested)
+### Metadata verification (default)
 
-`--verify-meta` compares every file in the local copy against the server
+`--verify meta` compares every file in the local copy against the server
 manifest by checking three properties:
 
 - **Size** — byte count must match exactly.
@@ -178,7 +178,7 @@ targets instead of size/mtime.
 
 ### Sampled data verification
 
-`--verify-data-sample=N` extends metadata verification with a randomized data
+`--verify N%data` extends metadata verification with a randomized data
 check. The client:
 
 1. Divides each file into 4 MiB frame slots (matching the transfer frame size).
@@ -187,17 +187,20 @@ check. The client:
 4. Reads the same byte ranges from the local copy and computes xxh128 checksums.
 5. Compares local and remote checksums.
 
-This approach is designed for the reality of cloud storage pricing:
+This approach is designed for the reality of cloud drive performance:
 
 - A 10 TB dataset verified at 5% reads ~500 GB instead of 10 TB — an order of
-  magnitude less IO and egress cost.
+  magnitude less IO required.
 - The random sampling distribution means that a systematic corruption affecting
   even a small fraction of files is likely to be caught.
 - Because the frame size matches the transfer frame size, checksum ranges align
   with what the server already knows how to read efficiently.
 
-For environments where full verification is acceptable, `--verify-data-sample=100`
-checks every byte.
+For environments where full verification is acceptable, `--verify full`
+checks every byte. `--verify <duration>` (e.g. `--verify 30s`) runs full
+data verification under a time budget: it verifies all metadata and as many
+data frames across as many files as possible within the allotted time, then
+reports partial results as success.
 
 ### In-flight integrity
 

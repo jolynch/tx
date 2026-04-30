@@ -64,7 +64,7 @@ func TestHandleACKLogsCompleteAfterFinalProgress(t *testing.T) {
 	}
 
 	logged := logs.String()
-	progressIdx := strings.LastIndex(logged, "txfer-progress: tid="+txferID)
+	progressIdx := strings.LastIndex(logged, "txfer-progress:["+txferID+"]")
 	completeIdx := strings.LastIndex(logged, "txfer-complete: tid="+txferID)
 	if progressIdx < 0 {
 		t.Fatalf("expected final progress log, got %q", logged)
