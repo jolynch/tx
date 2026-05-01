@@ -16,6 +16,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const (
+	backgroundSyncMemoryCapPercent       = 80
+	backgroundSyncMaxBatchFiles          = 4096
+	backgroundSyncFallbackCapBytes int64 = 8 << 30
+)
+
 // SyncWorker manages per-file durability work after writes complete.
 type SyncWorker struct {
 	background *backgroundSyncer
@@ -122,16 +128,25 @@ func SyncfsDir(ctx context.Context, dir string, stderr io.Writer) {
 }
 
 // backgroundSyncer moves fdatasync off the download→ack critical path. A single
-// reader goroutine drains a channel of dup'd file descriptors and accumulated
-// write sizes. When the accumulated size reaches the configured threshold, a
-// worker goroutine is spawned to fdatasync the batch (deduplicating by inode).
+// reader goroutine drains dup'd file descriptors, forms batches, and dispatches
+// those batches to worker goroutines. The byte threshold expands with backlog
+// pressure up to a fraction of system memory (or an 8 GiB fallback cap when
+// memory size is unavailable), and a file-count cap bounds the number of
+// outstanding dup'd descriptors.
 type backgroundSyncer struct {
-	ch        chan syncRequest
-	done      chan struct{}
-	wg        sync.WaitGroup
-	threshold int64
-	synced    atomic.Int64
-	pending   atomic.Int64
+	ch            chan syncRequest
+	done          chan struct{}
+	wg            sync.WaitGroup
+	baseThreshold int64
+	maxThreshold  int64
+	maxBatchFiles int
+	synced        atomic.Int64
+	pendingBytes  atomic.Int64
+	pendingFiles  atomic.Int64
+	peakBytes     atomic.Int64
+	peakFiles     atomic.Int64
+	currentBatch  atomic.Int64
+	peakBatch     atomic.Int64
 }
 
 type syncRequest struct {
@@ -141,10 +156,14 @@ type syncRequest struct {
 
 func newBackgroundSyncer(threshold int64, stderr io.Writer) *backgroundSyncer {
 	bs := &backgroundSyncer{
-		ch:        make(chan syncRequest, 1024),
-		done:      make(chan struct{}),
-		threshold: threshold,
+		ch:            make(chan syncRequest, 1024),
+		done:          make(chan struct{}),
+		baseThreshold: threshold,
+		maxThreshold:  maxAdaptiveThreshold(threshold),
+		maxBatchFiles: backgroundSyncMaxBatchFiles,
 	}
+	bs.currentBatch.Store(threshold)
+	bs.peakBatch.Store(threshold)
 	go bs.run(stderr)
 	return bs
 }
@@ -156,23 +175,30 @@ func (bs *backgroundSyncer) run(stderr io.Writer) {
 	for req := range bs.ch {
 		batch = append(batch, req)
 		batchBytes += req.size
-		if batchBytes >= bs.threshold {
-			// Alias needed to ensure wg.Go gets the expected batch
+		threshold := adaptiveThreshold(bs.baseThreshold, bs.pendingBytes.Load(), bs.maxThreshold)
+		bs.updateBatchThreshold(threshold, stderr)
+		if batchBytes >= threshold || len(batch) >= bs.maxBatchFiles {
+			// Alias to prevent closure
 			batchToSync := batch
 			bs.wg.Go(func() {
 				bs.syncBatch(batchToSync, stderr)
 			})
+			bs.updateBatchThreshold(adaptiveThreshold(bs.baseThreshold, bs.pendingBytes.Load(), bs.maxThreshold), nil)
 			batch = nil
 			batchBytes = 0
 		}
 	}
 	if len(batch) > 0 {
+		// Alias to prevent closure
 		batchToSync := batch
 		bs.wg.Go(func() {
 			bs.syncBatch(batchToSync, stderr)
 		})
 	}
 	bs.wg.Wait()
+	// Reset currentBatch after all async workers drain so stop() reports the
+	// steady-state threshold rather than the last backlog-inflated value.
+	bs.updateBatchThreshold(adaptiveThreshold(bs.baseThreshold, bs.pendingBytes.Load(), bs.maxThreshold), nil)
 }
 
 func (bs *backgroundSyncer) syncBatch(batch []syncRequest, stderr io.Writer) {
@@ -190,13 +216,17 @@ func (bs *backgroundSyncer) syncBatch(batch []syncRequest, stderr io.Writer) {
 			}
 		}
 		syscall.Close(req.fd)
-		bs.pending.Add(-req.size)
+		bs.pendingBytes.Add(-req.size)
+		bs.pendingFiles.Add(-1)
 		bs.synced.Add(req.size)
 	}
 }
 
 func (bs *backgroundSyncer) enqueue(fd int, size int64) {
-	bs.pending.Add(size)
+	pendingBytes := bs.pendingBytes.Add(size)
+	pendingFiles := bs.pendingFiles.Add(1)
+	updateMaxAtomic(&bs.peakBytes, pendingBytes)
+	updateMaxAtomic(&bs.peakFiles, pendingFiles)
 	bs.ch <- syncRequest{fd: fd, size: size}
 }
 
@@ -205,8 +235,89 @@ func (bs *backgroundSyncer) stop(stderr io.Writer) {
 	start := time.Now()
 	<-bs.done
 	elapsed := time.Since(start)
-	fmt.Fprintf(stderr, "background-fsync: drained in %s, synced=%s pending=%s\n",
+	fmt.Fprintf(stderr, "background-fsync: drained in %s, synced=%s pending=%s/%d files peak=%s/%d files batch=%s peak-batch=%s cap=%s\n",
 		elapsed.Round(time.Millisecond),
 		encoding.HumanBytes(bs.synced.Load()),
-		encoding.HumanBytes(bs.pending.Load()))
+		encoding.HumanBytes(bs.pendingBytes.Load()),
+		bs.pendingFiles.Load(),
+		encoding.HumanBytes(bs.peakBytes.Load()),
+		bs.peakFiles.Load(),
+		encoding.HumanBytes(bs.currentBatch.Load()),
+		encoding.HumanBytes(bs.peakBatch.Load()),
+		encoding.HumanBytes(bs.maxThreshold))
+}
+
+func (bs *backgroundSyncer) updateBatchThreshold(threshold int64, stderr io.Writer) {
+	current := bs.currentBatch.Load()
+	if threshold > current && stderr != nil {
+		fmt.Fprintf(stderr, "background-fsync: disk falling behind, growing batch threshold %s -> %s pending=%s cap=%s\n",
+			encoding.HumanBytes(current),
+			encoding.HumanBytes(threshold),
+			encoding.HumanBytes(bs.pendingBytes.Load()),
+			encoding.HumanBytes(bs.maxThreshold))
+	}
+	bs.currentBatch.Store(threshold)
+	updateMaxAtomic(&bs.peakBatch, threshold)
+}
+
+// adaptiveThreshold returns the smallest power-of-two multiple of
+// baseThreshold that is at least as large as pendingBytes, capped at
+// maxThreshold and never below baseThreshold.
+func adaptiveThreshold(baseThreshold int64, pendingBytes int64, maxThreshold int64) int64 {
+	if baseThreshold <= 0 {
+		return 0
+	}
+	if maxThreshold < baseThreshold {
+		maxThreshold = baseThreshold
+	}
+	threshold := baseThreshold
+	for threshold < pendingBytes && threshold < maxThreshold {
+		if threshold > maxThreshold/2 {
+			return maxThreshold
+		}
+		threshold *= 2
+	}
+	if threshold > maxThreshold {
+		return maxThreshold
+	}
+	return threshold
+}
+
+func maxAdaptiveThreshold(baseThreshold int64) int64 {
+	return maxAdaptiveThresholdForMemory(baseThreshold, systemMemoryBytes())
+}
+
+func maxAdaptiveThresholdForMemory(baseThreshold int64, mem int64) int64 {
+	capBytes := backgroundSyncFallbackCapBytes
+	if mem > 0 {
+		capBytes = mem * backgroundSyncMemoryCapPercent / 100
+	}
+	if capBytes < baseThreshold {
+		return baseThreshold
+	}
+	return capBytes
+}
+
+func systemMemoryBytes() int64 {
+	var info unix.Sysinfo_t
+	if err := unix.Sysinfo(&info); err != nil {
+		return 0
+	}
+	total := uint64(info.Totalram) * uint64(info.Unit)
+	if total == 0 || total > uint64(^uint(0)>>1) {
+		return 0
+	}
+	return int64(total)
+}
+
+func updateMaxAtomic(dst *atomic.Int64, candidate int64) {
+	for {
+		current := dst.Load()
+		if candidate <= current {
+			return
+		}
+		if dst.CompareAndSwap(current, candidate) {
+			return
+		}
+	}
 }

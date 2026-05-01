@@ -72,6 +72,9 @@ func TestSyncOutputBackgroundStopDrains(t *testing.T) {
 	if !strings.Contains(stderr.String(), "background-fsync: drained") {
 		t.Fatalf("stop output = %q, want background drain summary", stderr.String())
 	}
+	if !strings.Contains(stderr.String(), "peak=") {
+		t.Fatalf("stop output = %q, want backlog telemetry", stderr.String())
+	}
 }
 
 func TestSyncOutputBackgroundDupFallbackReturnsError(t *testing.T) {
@@ -106,6 +109,68 @@ func TestSyncfsDirCanceledContextReturnsPromptly(t *testing.T) {
 	}
 	if got := stderr.String(); !strings.Contains(got, "syncfs:") && !strings.Contains(got, "WARNING: syncfs") {
 		t.Fatalf("SyncfsDir log = %q, want syncfs log output", got)
+	}
+}
+
+func TestAdaptiveThresholdDoublesWithBacklog(t *testing.T) {
+	const base = 512
+	const capBytes = 4096
+
+	tests := []struct {
+		name    string
+		pending int64
+		want    int64
+	}{
+		{name: "below base", pending: 511, want: 512},
+		{name: "just above base", pending: 513, want: 1024},
+		{name: "midway", pending: 2500, want: 4096},
+		{name: "above cap", pending: 20000, want: 4096},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := adaptiveThreshold(base, tt.pending, capBytes); got != tt.want {
+				t.Fatalf("adaptiveThreshold(%d, %d, %d) = %d, want %d", base, tt.pending, capBytes, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAdaptiveThresholdNeverDropsBelowBase(t *testing.T) {
+	if got := adaptiveThreshold(1024, 10<<20, 512); got != 1024 {
+		t.Fatalf("adaptiveThreshold should clamp to base threshold, got %d", got)
+	}
+}
+
+func TestMaxAdaptiveThresholdForMemoryFallbackCap(t *testing.T) {
+	const fallbackCap = 8 << 30
+
+	if got := maxAdaptiveThresholdForMemory(512, 0); got != fallbackCap {
+		t.Fatalf("maxAdaptiveThresholdForMemory fallback = %d, want %d", got, fallbackCap)
+	}
+	if got := maxAdaptiveThresholdForMemory(9<<30, 0); got != 9<<30 {
+		t.Fatalf("maxAdaptiveThresholdForMemory should never shrink below base threshold, got %d", got)
+	}
+}
+
+func TestUpdateBatchThresholdLogsGrowthOnly(t *testing.T) {
+	bs := &backgroundSyncer{
+		baseThreshold: 1024,
+		maxThreshold:  8192,
+	}
+	bs.currentBatch.Store(1024)
+	bs.pendingBytes.Store(4096)
+
+	var stderr bytes.Buffer
+	bs.updateBatchThreshold(2048, &stderr)
+	if got := stderr.String(); !strings.Contains(got, "growing batch threshold 1.00 KiB -> 2.00 KiB") {
+		t.Fatalf("growth log = %q, want threshold growth message", got)
+	}
+
+	stderr.Reset()
+	bs.updateBatchThreshold(1024, &stderr)
+	if got := stderr.String(); got != "" {
+		t.Fatalf("shrink log = %q, want no output", got)
 	}
 }
 
