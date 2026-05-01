@@ -176,6 +176,7 @@ func runSendServeCLI(addr string, args []string, _ io.Writer, stderr io.Writer) 
 		targetIODepth     int
 		disableZeroCopy   bool
 		traceFile         string
+		exitAfterRaw      string
 		progressPaths     []string
 		progressFormats   []string
 		progressIntervalR string
@@ -190,6 +191,7 @@ func runSendServeCLI(addr string, args []string, _ io.Writer, stderr io.Writer) 
 	cf.StringSliceVar(&authTokenVals, "", "require-auth-token", "Allowlisted auth token (opaque string >8 bytes, repeatable); implies --require-auth")
 	cf.IntVar(&targetIODepth, "", "target-io-depth", 4, "Target IO depth per CPU advertised in PROBE")
 	cf.BoolVar(&disableZeroCopy, "", "disable-zero-copy", false, "Force buffered send path (for benchmarking)")
+	cf.StringVar(&exitAfterRaw, "", "exit-after", "60s", "Exit duration after transfer completes; 'never' to run forever (e.g. 5s, 1m)")
 	cf.StringVar(&traceFile, "", "trace", "", "Write runtime/trace output to this file")
 	cf.StringSliceVar(&progressPaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
 	cf.StringSliceVar(&progressFormats, "f", "progress-format", "Progress format: json|int; 1 applies to all targets, or one per target (default json)")
@@ -229,6 +231,15 @@ func runSendServeCLI(addr string, args []string, _ io.Writer, stderr io.Writer) 
 			log.Fatalf("Failed to determine current working directory for default chroot: %v", cwdErr)
 		}
 		chroot = cwd
+	}
+
+	var exitAfter time.Duration
+	if exitAfterRaw != "never" {
+		var parseErr error
+		exitAfter, parseErr = time.ParseDuration(exitAfterRaw)
+		if parseErr != nil {
+			log.Fatalf("Invalid --exit-after: %v", parseErr)
+		}
 	}
 
 	progressInterval, err := time.ParseDuration(progressIntervalR)
@@ -320,6 +331,7 @@ func runSendServeCLI(addr string, args []string, _ io.Writer, stderr io.Writer) 
 		ProgressInterval:       progressInterval,
 		DisableZeroCopy:        disableZeroCopy,
 		TargetIODepth:          targetIODepth,
+		ExitAfter:              exitAfter,
 	}); serveErr != nil {
 		log.Fatalf("File transfer listener stopped: %v", serveErr)
 	}

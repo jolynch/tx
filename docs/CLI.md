@@ -51,6 +51,8 @@ Options:
                                    repeatable); implies --require-auth
       --target-io-depth int        Target IO depth per CPU advertised in PROBE (default 4)
       --disable-zero-copy          Force buffered send path (for benchmarking)
+      --exit-after string          Exit duration after transfer completes; 'never'
+                                   to run forever (e.g. 5s, 1m) (default "60s")
       --trace string               Write runtime/trace output to this file
   -p, --progress-path string       Progress output target; repeatable, use - for stdout
   -f, --progress-format string     Progress format: json|int; 1 applies to all targets,

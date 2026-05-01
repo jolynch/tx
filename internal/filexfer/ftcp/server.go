@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"runtime/trace"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -46,6 +48,7 @@ type ServerOptions struct {
 	ProgressInterval       time.Duration             // tick interval for progress writes (default 1s)
 	DisableZeroCopy        bool                      // force buffered send path even when zero-copy is available
 	TargetIODepth          int                       // target IO depth per CPU advertised in PROBE (default 4)
+	ExitAfter              time.Duration             // 0 = disabled; exit this long after last transfer completes
 }
 
 type HandlerFunc func(context.Context, Request, io.Writer, Deps) error
@@ -100,16 +103,83 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 		defer stopProgress(true)
 	}
 
+	var onClientActivity func()
+	if opts.ExitAfter > 0 {
+		log.Printf("exit-after: server will exit %s after the last activity", opts.ExitAfter)
+		var (
+			timerMu   sync.Mutex
+			exitTimer *time.Timer
+		)
+		resetExitTimer := func() {
+			timerMu.Lock()
+			defer timerMu.Unlock()
+			if exitTimer != nil {
+				exitTimer.Stop()
+				exitTimer = time.AfterFunc(opts.ExitAfter, func() {
+					log.Printf("exit-after: %s elapsed since last transfer completed, shutting down", opts.ExitAfter)
+					listener.Close()
+				})
+			}
+		}
+		cancelExitTimer := func() {
+			timerMu.Lock()
+			defer timerMu.Unlock()
+			if exitTimer != nil {
+				exitTimer.Stop()
+				exitTimer = nil
+			}
+		}
+		startExitTimer := func(string) {
+			timerMu.Lock()
+			defer timerMu.Unlock()
+			if exitTimer != nil {
+				exitTimer.Stop()
+			}
+			exitTimer = time.AfterFunc(opts.ExitAfter, func() {
+				log.Printf("exit-after: %s elapsed since last transfer completed, shutting down", opts.ExitAfter)
+				listener.Close()
+			})
+			log.Printf("exit-after: transfer complete, will exit in %s unless new activity", opts.ExitAfter)
+		}
+		onClientActivity = resetExitTimer
+		origOnCreated := onTransferCreated
+		onTransferCreated = func(id string) {
+			if origOnCreated != nil {
+				origOnCreated(id)
+			}
+			cancelExitTimer()
+		}
+		deps = &exitAfterDeps{Deps: deps, onComplete: startExitTimer}
+	}
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
 			if _, ok := err.(net.Error); ok {
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
 			return err
 		}
-		go handleConn(conn, opts, deps, onTransferCreated)
+		go handleConn(conn, opts, deps, onTransferCreated, onClientActivity)
+	}
+}
+
+type exitAfterDeps struct {
+	Deps
+	onComplete func(string)
+	notified   sync.Map
+}
+
+func (d *exitAfterDeps) MaybeLogTransferComplete(txferID string) {
+	d.Deps.MaybeLogTransferComplete(txferID)
+	if t, ok := d.Deps.GetTransfer(txferID); ok && t.CompleteLogged {
+		if _, loaded := d.notified.LoadOrStore(txferID, struct{}{}); !loaded {
+			d.onComplete(txferID)
+		}
 	}
 }
 
@@ -118,6 +188,7 @@ type connSession struct {
 	requireAuth            bool
 	allowedAuthTokens      []string
 	serverID               *age.X25519Identity
+	matchedAuthToken       string
 	deps                   Deps
 	limiter                *limit.Limiter
 	gentleCPUPct           int
@@ -132,8 +203,11 @@ type connSession struct {
 	onTransferCreated      func(string)
 }
 
-func handleConn(conn net.Conn, opts ServerOptions, deps Deps, onTransferCreated func(string)) {
+func handleConn(conn net.Conn, opts ServerOptions, deps Deps, onTransferCreated func(string), onClientActivity func()) {
 	defer conn.Close()
+	if onClientActivity != nil {
+		onClientActivity()
+	}
 	s := &connSession{
 		conn:                   conn,
 		requireAuth:            opts.RequireAuth,
@@ -184,6 +258,7 @@ func (s *connSession) run() error {
 			}
 			return authErr
 		}
+		s.matchedAuthToken = authRes.matchedToken
 		if authRes.keyExchange {
 			// AUTH key — return the server's recommended cipher and public key.
 			return writeOKLine(s.respOut, string(aead.RecommendedCipher())+" "+s.serverID.Recipient().String())
@@ -250,6 +325,9 @@ func (s *connSession) handleCommand(ctx context.Context, req Request, in io.Read
 		return handleSYNCWithInput(ctx, req, in, out, s.deps, s.onTransferCreated)
 	}
 	if req.Verb == VerbTXFER {
+		if len(s.matchedAuthToken) >= 2 {
+			log.Printf("txfer: auth token %s...", s.matchedAuthToken[:2])
+		}
 		return handleTXFERWithCallback(ctx, req, out, s.deps, s.onTransferCreated)
 	}
 	handler, ok := handlers[req.Verb]
