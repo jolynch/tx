@@ -19,9 +19,11 @@ Four capabilities make this possible:
   overhead.
 
 - **Background durability.** Per-file `fdatasync` is moved off the download
-  critical path into a background batcher that deduplicates by inode and
-  flushes every 512 MiB. A final `syncfs` ensures the entire filesystem is
-  durable before the transfer reports success.
+  critical path into a bounded background batcher that deduplicates by inode.
+  It starts with a 512 MiB flush target, grows the batch size under backlog
+  pressure, and never lets fsync work fan out into unbounded goroutines. A
+  final `syncfs` ensures the entire filesystem is durable before the transfer
+  reports success.
 
 - **Lightweight verification.** Metadata checks (size, mtime, permissions) run
   by default after every copy. Sampled data verification (`--verify 5%data`)
