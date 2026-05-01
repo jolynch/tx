@@ -20,6 +20,7 @@ type authResult struct {
 	encryptedRequests bool
 	keyExchange       bool // true for AUTH key — server should return its public key
 	responseCipher    aead.Algorithm
+	matchedToken      string
 }
 
 func processAUTHRequest(req Request, serverID *age.X25519Identity, allowedTokens []string) (authResult, error) {
@@ -80,10 +81,8 @@ func processAUTHRequest(req Request, serverID *age.X25519Identity, allowedTokens
 			log.Printf("auth: no match; presented %d identity/token(s)", len(presented))
 			return authResult{}, errNotAuthorized
 		}
-		if len(allowedTokens) > 0 {
-			log.Printf("auth: matched %s", aead.RedactAuthToken(matched))
-		}
 		return authResult{
+			matchedToken:      matched,
 			recipient:         recipient,
 			encryptedRequests: true,
 			responseCipher:    cipherAlgorithm,

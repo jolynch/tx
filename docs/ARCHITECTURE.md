@@ -1,8 +1,9 @@
 # Architecture
 
 `tx` is designed to fully saturate modern cloud hardware - SSD, network, and CPU
-- during file transfers. Three capabilities make this possible: adaptive
-concurrency, adaptive compression, and lightweight verification.
+- during file transfers. Four capabilities make this possible: adaptive
+concurrency, adaptive compression, background durability, and lightweight
+verification.
 
 ## Concurrency
 
@@ -211,3 +212,46 @@ hash token — the server validates it against its stored value, confirming
 that the bytes the client received match what the server sent. This catches
 corruption introduced by the network or by bugs in the compression/
 decompression path, without requiring a separate verification pass.
+
+## Durability
+
+Naive transfer tools call `fdatasync` inline after every file write, which
+serializes disk flushes and stalls the download pipeline. On cloud NVMe,
+inline fdatasync per file costs 1–5 ms; for a million small files that adds
+15–80 minutes of pure sync overhead. Skipping fsync entirely risks data loss
+on crash. `tx` solves this with a three-layer durability strategy controlled
+by `--fsync-interval` (default 512 MiB).
+
+### Background batch fdatasync (default)
+
+After each file's writes complete, the file descriptor is `dup()`'d and
+enqueued to a background channel along with its written byte count. A reader
+goroutine accumulates requests; when the accumulated bytes reach the
+threshold (512 MiB by default), it spawns a worker goroutine that:
+
+1. Groups requests by `(dev, ino)` via `fstat` — hardlinked files are synced
+   once.
+2. Calls `fdatasync` on each unique inode.
+3. Closes the dup'd file descriptors.
+
+Because the sync callback returns immediately after enqueue, the download and
+ACK path is never blocked by disk flushes.
+
+### Inline fdatasync
+
+`--fsync-interval 0` switches to inline mode: each file blocks on `fdatasync`
+immediately after its writes complete. This gives per-file durability
+guarantees at the cost of throughput.
+
+### Syncfs-only
+
+`--fsync-interval -1` skips per-file fdatasync entirely and relies on the
+final filesystem sync.
+
+### Final syncfs
+
+After all downloads complete and the background batcher drains, `tx` calls
+`syncfs` on the target filesystem with a 10-second timeout. This catches any
+writes the OS hasn't flushed yet and ensures the entire transfer is durable
+before reporting success. `--skip-fsync` disables both per-file and final
+syncing.

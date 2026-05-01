@@ -4,7 +4,7 @@
 hardware - SSD, network, and CPU - simultaneously. On large servers it achieves
 up to 10x the throughput of a simple `rsync`.
 
-Three capabilities make this possible:
+Four capabilities make this possible:
 
 - **Adaptive concurrency.** A probe measures link speed and server capacity,
   then opens a pool of pre-authenticated TCP connections sized to keep every
@@ -18,10 +18,15 @@ Three capabilities make this possible:
   exceed line rate; incompressible files (media, archives) stream with zero CPU
   overhead.
 
+- **Background durability.** Per-file `fdatasync` is moved off the download
+  critical path into a background batcher that deduplicates by inode and
+  flushes every 512 MiB. A final `syncfs` ensures the entire filesystem is
+  durable before the transfer reports success.
+
 - **Lightweight verification.** Metadata checks (size, mtime, permissions) run
   by default after every copy. Sampled data verification (`--verify 5%data`)
-  reads 5% of bytes and catches corruption without a full re-read — practical
-  on expensive cloud storage.
+  reads 5% of bytes and catches corruption without a full re-read - practical
+  on slow network attached drives.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a deeper dive.
 
