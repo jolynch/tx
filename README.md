@@ -30,7 +30,8 @@ Four capabilities make this possible:
   reads 5% of bytes and catches corruption without a full re-read - practical
   on slow network attached drives.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a deeper dive.
+See [docs/README.md](docs/README.md) for the documentation index and
+[docs/arch/OVERVIEW.md](docs/arch/OVERVIEW.md) for a deeper dive.
 
 ## Quick start
 
@@ -89,9 +90,10 @@ the wire. The server validates them with constant-time comparison.
 
 ## Full CLI reference
 
-See [docs/CLI.md](docs/CLI.md) for the complete flag reference including
-`--mode gentle`, `--verify`, `--deadline`, progress reporting, and
-the `get` / `status` subcommands.
+See [docs/pub/CLI.md](docs/pub/CLI.md) for the complete flag reference
+including `--mode gentle`, `--verify`, `--deadline`, progress reporting, and
+the `get` / `status` subcommands. FTCP wire-format details live in
+[docs/ftcp/OVERVIEW.md](docs/ftcp/OVERVIEW.md).
 
 ## Building and testing
 
