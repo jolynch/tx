@@ -10,10 +10,16 @@ This document covers the protocol, server, client library, and testing conventio
   client_tcp.go                    # TCP transport + async-refilled connection pool
   client_test.go                   # Integration tests against a real server
   docs/
-    PROTOCOL.md                    # FTCP line protocol (AUTH, TXFER, SEND, ACK, CXSUM, STATUS, PROBE)
-    MANIFEST.md                    # FM/1 manifest wire format
-    FRAMING.md                     # FX/1 frame wire format
-    CLI.md                         # CLI usage reference
+    README.md                      # Docs index
+    arch/
+      OVERVIEW.md                  # High-level system architecture
+      VERIFICATION.md              # Integrity model and deterministic sampling
+    ftcp/
+      OVERVIEW.md                  # FTCP line protocol (AUTH, TXFER, SEND, ACK, CXSUM, STATUS, PROBE)
+      MANIFEST.md                  # FM/1 manifest wire format
+      FRAMING.md                   # FX/1 frame wire format
+    pub/
+      CLI.md                       # CLI usage reference
 
 cmd/tx/
   main.go                          # Binary entrypoint: send and recv subcommands
@@ -80,7 +86,7 @@ internal/bench/                    # Benchmark binary + regression benchmarks
 
 ## Protocol
 
-Full specification lives in `docs/PROTOCOL.md`. Key points:
+Full specification lives in `docs/ftcp/OVERVIEW.md`. Key points:
 
 - **Transport**: one TCP connection per command, server closes after completion.
 - **Line format**: `VERB args...\r\n` → optional streaming payload → `OK [msg]\r\n` or `ERR <code> <msg>\r\n`.
@@ -172,7 +178,7 @@ The `Client` struct holds connection config (`ServerAddr`, `ServerAgePublicKey`)
 
 Both `send` and `recv` follow the same shape: `tx <side> [<addr>] <command> [options]`.
 
-Full flag reference with `--help` output lives in `docs/CLI.md`. **Any time you change flags in either CLI or `internal/cliflags/cliflags.go`, update `docs/CLI.md` to match.**
+Full flag reference with `--help` output lives in `docs/pub/CLI.md`. **Any time you change flags in either CLI or `internal/cliflags/cliflags.go`, update `docs/pub/CLI.md` to match.**
 
 ### `tx send` (`cmd/tx/main.go`)
 
