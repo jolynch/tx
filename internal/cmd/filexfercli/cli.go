@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"slices"
@@ -29,6 +28,7 @@ import (
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/fsync"
+	"github.com/jolynch/tx/internal/sampler"
 	"github.com/jolynch/tx/internal/utils"
 	"github.com/zeebo/xxh3"
 )
@@ -59,6 +59,8 @@ const defaultVerboseProgressInterval = 2 * time.Second
 const defaultCLIProbeBytes int64 = 1 * 1024 * 1024
 const defaultVerifySampleFrameSize int64 = 4 * 1024 * 1024
 const verifySampleBytes int64 = 8
+const verifyChecksumCommandBudgetBytes = 3 * 1024 * 1024
+const verifyChecksumRequestTimeout = 30 * time.Second
 const defaultTransferProbeRefreshInterval = 10 * time.Second
 const defaultSyncfsTimeout = 10 * time.Second
 const fixedWidthProgressBytesWidth = 10
@@ -948,7 +950,7 @@ func verifyCopy(serverURL string, cfg copyCLIConfig, stdout io.Writer, stderr io
 	if len(delta.newFiles) > 0 || len(delta.staleFiles) > 0 || len(delta.removedPaths) > 0 {
 		fmt.Fprintf(
 			stderr,
-			"copy-verify-meta: mismatch new=%d (%s) stale=%d (%s) rm=%d\n",
+			"copy-verify-meta: [fail] mismatch new=%d (%s) stale=%d (%s) rm=%d\n",
 			len(delta.newFiles),
 			encoding.HumanBytes(delta.newBytes),
 			len(delta.staleFiles),
@@ -960,7 +962,7 @@ func verifyCopy(serverURL string, cfg copyCLIConfig, stdout io.Writer, stderr io
 	files, hardlinks, symlinks, dirs := countManifestEntryTypes(serverManifest.Entries)
 	fmt.Fprintf(
 		stderr,
-		"copy-verify-meta: ok total=%d files=%d hardlinks=%d symlinks=%d dirs=%d\n",
+		"copy-verify-meta: [ok] total=%d files=%d hardlinks=%d symlinks=%d dirs=%d\n",
 		len(serverManifest.Entries),
 		files,
 		hardlinks,
@@ -970,21 +972,25 @@ func verifyCopy(serverURL string, cfg copyCLIConfig, stdout io.Writer, stderr io
 	if cfg.verifyDataSamplePct <= 0 {
 		return 0
 	}
-	sampledFiles, sampledRanges, elapsed, err := verifyCopyDataSamples(serverURL, cfg, serverManifest, stderr)
+	sampledFiles, sampledRanges, elapsed, partial, err := verifyCopyDataSamples(serverURL, cfg, serverManifest, stderr)
 	if err != nil {
-		fmt.Fprintf(stderr, "copy-verify-data: %v\n", err)
+		fmt.Fprintf(stderr, "copy-verify-data: [fail] %v\n", err)
 		return 1
 	}
-	fmt.Fprintln(stderr, formatVerifyDataSummaryLine(sampledFiles, sampledRanges, cfg.verifyDataSamplePct, cfg.verifyBudget, elapsed))
+	fmt.Fprintln(stderr, formatVerifyDataSummaryLine(sampledFiles, sampledRanges, cfg.verifyDataSamplePct, cfg.verifyBudget, elapsed, partial))
 	return 0
 }
 
-func formatVerifyDataSummaryLine(files int, samples int, pct int, budget time.Duration, elapsed time.Duration) string {
+func formatVerifyDataSummaryLine(files int, samples int, pct int, budget time.Duration, elapsed time.Duration, partial bool) string {
 	elapsed = elapsed.Round(time.Millisecond)
-	if budget > 0 {
-		return fmt.Sprintf("copy-verify-data: ok files=%d samples=%d budget=%s elapsed=%s", files, samples, budget, elapsed)
+	status := "[ok]"
+	if partial {
+		status = "[partial-ok]"
 	}
-	return fmt.Sprintf("copy-verify-data: ok files=%d samples=%d pct=%d elapsed=%s", files, samples, pct, elapsed)
+	if budget > 0 {
+		return fmt.Sprintf("copy-verify-data: %s files=%d samples=%d budget=%s elapsed=%s", status, files, samples, budget, elapsed)
+	}
+	return fmt.Sprintf("copy-verify-data: %s files=%d samples=%d pct=%d elapsed=%s", status, files, samples, pct, elapsed)
 }
 
 func compareManifestEntries(localManifest *tx.Manifest, serverManifest *tx.Manifest) manifestDelta {
@@ -1041,45 +1047,39 @@ func manifestEntryMatches(local tx.ManifestEntry, remote tx.ManifestEntry) bool 
 	}
 }
 
-type verifySample struct {
-	Offset int64
-	Size   int64
-}
-
 type verifySampleTask struct {
 	entry      tx.ManifestEntry
 	serverPath string
 	localPath  string
-	samples    []verifySample
+	sampleGen  sampler.Generator
 }
 
-func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Manifest, stderr io.Writer) (int, int, time.Duration, error) {
+func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Manifest, stderr io.Writer) (int, int, time.Duration, bool, error) {
 	start := time.Now()
 	if manifest == nil {
-		return 0, 0, 0, errors.New("missing manifest")
+		return 0, 0, 0, false, errors.New("missing manifest")
 	}
 	agePublicKey, ageIdentity, encMode, err := resolveEncryptionOptionsWithKeys(cfg.encryptMode, cfg.keysDir)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("invalid --encrypt: %w", err)
+		return 0, 0, 0, false, fmt.Errorf("invalid --encrypt: %w", err)
 	}
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	tasks := make([]verifySampleTask, 0, len(manifest.Entries))
-	totalRanges := 0
+	var totalRanges int64
 	for _, entry := range manifest.Entries {
-		samples := buildVerifySamples(entry.Size, cfg.verifyDataSamplePct, rng)
-		if len(samples) == 0 {
+		sampleGen, ok := sampler.New(manifest.Root, entry.Path, entry.ID, entry.Size, cfg.verifyDataSamplePct, defaultVerifySampleFrameSize, verifySampleBytes)
+		if !ok {
 			continue
 		}
 		tasks = append(tasks, verifySampleTask{
 			entry:      entry,
 			serverPath: filepath.Clean(filepath.Join(manifest.Root, filepath.FromSlash(entry.Path))),
 			localPath:  filepath.Join(cfg.localDst, filepath.FromSlash(entry.Path)),
-			samples:    samples,
+			sampleGen:  sampleGen,
 		})
-		totalRanges += len(samples)
+		totalRanges += sampleGen.TotalSamples()
 	}
 	if len(tasks) == 0 {
-		return 0, 0, time.Since(start), nil
+		return 0, 0, time.Since(start), false, nil
 	}
 	workers := cfg.concurrency
 	if workers <= 0 {
@@ -1138,7 +1138,9 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 			client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...))
 			defer client.Close()
 			for task := range taskCh {
-				if err := verifySampleTaskData(workerCtx, client, manifest.TransferID, task); err != nil {
+				if err := verifySampleTaskData(workerCtx, client, manifest.TransferID, task, func(done int64) {
+					completedRanges.Add(done)
+				}); err != nil {
 					if workerCtx.Err() != nil {
 						return
 					}
@@ -1150,7 +1152,6 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 					return
 				}
 				completed.Add(1)
-				completedRanges.Add(int64(len(task.samples)))
 			}
 		}()
 	}
@@ -1168,6 +1169,8 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 		select {
 		case <-workersDone:
 		case <-timer.C:
+			workerCancel()
+			<-workersDone
 		}
 		workerCancel()
 		if progressDone != nil {
@@ -1182,16 +1185,16 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 			waitWorkersWithGrace()
 			select {
 			case err := <-errCh:
-				return 0, 0, time.Since(start), err
+				return 0, 0, time.Since(start), false, err
 			default:
 				if budgetExpired() {
 					if stderr != nil {
 						fmt.Fprintf(stderr, "copy-verify-data: budget expired, verified %d/%d files %d samples in %s\n",
 							completed.Load(), int64(len(tasks)), completedRanges.Load(), time.Since(start).Round(time.Millisecond))
 					}
-					return int(completed.Load()), int(completedRanges.Load()), time.Since(start), nil
+					return int(completed.Load()), int(completedRanges.Load()), time.Since(start), true, nil
 				}
-				return 0, 0, time.Since(start), context.Canceled
+				return 0, 0, time.Since(start), false, context.Canceled
 			}
 		case err := <-errCh:
 			workerCancel()
@@ -1200,7 +1203,7 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 			if progressDone != nil {
 				<-progressDone
 			}
-			return 0, 0, time.Since(start), err
+			return 0, 0, time.Since(start), false, err
 		case taskCh <- task:
 		}
 	}
@@ -1212,7 +1215,7 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 		if progressDone != nil {
 			<-progressDone
 		}
-		return 0, 0, time.Since(start), err
+		return 0, 0, time.Since(start), false, err
 	case <-workersDone:
 		workerCancel()
 		if progressDone != nil {
@@ -1220,119 +1223,143 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 		}
 		select {
 		case err := <-errCh:
-			return 0, 0, time.Since(start), err
+			return 0, 0, time.Since(start), false, err
 		default:
 		}
-		return len(tasks), totalRanges, time.Since(start), nil
+		return len(tasks), int(totalRanges), time.Since(start), false, nil
 	case <-budgetCtx.Done():
 		waitWorkersWithGrace()
 		select {
 		case err := <-errCh:
-			return 0, 0, time.Since(start), err
+			return 0, 0, time.Since(start), false, err
 		default:
 			if budgetExpired() {
 				if stderr != nil {
 					fmt.Fprintf(stderr, "copy-verify-data: budget expired, verified %d/%d files %d samples in %s\n",
 						completed.Load(), int64(len(tasks)), completedRanges.Load(), time.Since(start).Round(time.Millisecond))
 				}
-				return int(completed.Load()), int(completedRanges.Load()), time.Since(start), nil
+				return int(completed.Load()), int(completedRanges.Load()), time.Since(start), true, nil
 			}
-			return 0, 0, time.Since(start), context.Canceled
+			return 0, 0, time.Since(start), false, context.Canceled
 		}
 	}
 }
 
-func buildVerifySamples(fileSize int64, pct int, rng *rand.Rand) []verifySample {
-	if fileSize <= 0 || pct <= 0 {
-		return nil
+func estimateChecksumRequestCommandBytes(transferID string, targets []tx.ChecksumTarget) int {
+	total := len("CXSUM ") + len(transferID)
+	for _, target := range targets {
+		total += estimateChecksumTargetCommandBytes(target)
 	}
-	frameSlots := int((fileSize + defaultVerifySampleFrameSize - 1) / defaultVerifySampleFrameSize)
-	if frameSlots <= 0 {
-		return nil
-	}
-	sampleCount := (frameSlots*pct + 99) / 100
-	if sampleCount <= 0 {
-		sampleCount = 1
-	}
-	slotIndexes := make([]int, 0, sampleCount)
-	if sampleCount >= frameSlots {
-		// 100% (and any rounded-up equivalent) verifies every frame slot in the file.
-		for i := 0; i < frameSlots; i++ {
-			slotIndexes = append(slotIndexes, i)
-		}
-	} else {
-		perm := rng.Perm(frameSlots)
-		slotIndexes = append(slotIndexes, perm[:sampleCount]...)
-		sort.Ints(slotIndexes)
-	}
-	samples := make([]verifySample, 0, len(slotIndexes))
-	for _, slotIndex := range slotIndexes {
-		slotStart := int64(slotIndex) * defaultVerifySampleFrameSize
-		slotLen := minInt64(defaultVerifySampleFrameSize, fileSize-slotStart)
-		size := minInt64(verifySampleBytes, slotLen)
-		offset := slotStart
-		maxJitter := slotLen - size
-		if maxJitter > 0 {
-			offset += rng.Int63n(maxJitter + 1)
-		}
-		samples = append(samples, verifySample{Offset: offset, Size: size})
-	}
-	return samples
+	return total
 }
 
-func verifySampleTaskData(ctx context.Context, client *tx.Client, transferID string, task verifySampleTask) error {
+func estimateChecksumTargetCommandBytes(target tx.ChecksumTarget) int {
+	total := len(" fd=") + digitsBase10Uint64(target.FileID) + 1 + len(strconv.Itoa(len(target.FullPath))) + 1 + len(target.FullPath)
+	if target.Offset > 0 {
+		total += len(" offset=") + digitsBase10Int64(target.Offset)
+	}
+	if target.Size > 0 {
+		total += len(" size=") + digitsBase10Int64(target.Size)
+	}
+	if algo := strings.TrimSpace(target.Algo); algo != "" {
+		total += len(" algo=") + len(algo)
+	}
+	return total
+}
+
+func digitsBase10Uint64(v uint64) int {
+	if v == 0 {
+		return 1
+	}
+	return len(strconv.FormatUint(v, 10))
+}
+
+func digitsBase10Int64(v int64) int {
+	if v == 0 {
+		return 1
+	}
+	if v < 0 {
+		return digitsBase10Uint64(uint64(-v)) + 1
+	}
+	return digitsBase10Uint64(uint64(v))
+}
+
+func verifySampleTaskData(ctx context.Context, client *tx.Client, transferID string, task verifySampleTask, onBatchVerified func(int64)) error {
 	fd, err := os.Open(task.localPath)
 	if err != nil {
 		return fmt.Errorf("open local sample path %s: %w", task.localPath, err)
 	}
 	defer fd.Close()
 
-	targets := make([]tx.ChecksumTarget, 0, len(task.samples))
-	wantHashes := make([]string, 0, len(task.samples))
 	buf := make([]byte, verifySampleBytes)
-	for _, sample := range task.samples {
-		targets = append(targets, tx.ChecksumTarget{
-			FileID:   task.entry.ID,
-			FullPath: task.serverPath,
-			Offset:   sample.Offset,
-			Size:     sample.Size,
-			Algo:     "xxh128",
+	for task.sampleGen.Remaining() > 0 {
+		batchCap := minInt64(task.sampleGen.Remaining(), 1024)
+		targets := make([]tx.ChecksumTarget, 0, int(batchCap))
+		samples := make([]sampler.Sample, 0, int(batchCap))
+		wantHashes := make([]string, 0, int(batchCap))
+		cmdBytes := len("CXSUM ") + len(transferID)
+		for task.sampleGen.Remaining() > 0 {
+			sample, ok := task.sampleGen.Peek()
+			if !ok {
+				break
+			}
+			target := tx.ChecksumTarget{
+				FileID:   task.entry.ID,
+				FullPath: task.serverPath,
+				Offset:   sample.Offset,
+				Size:     sample.Size,
+				Algo:     "xxh128",
+			}
+			targetBytes := estimateChecksumTargetCommandBytes(target)
+			if len(targets) > 0 && cmdBytes+targetBytes > verifyChecksumCommandBudgetBytes {
+				break
+			}
+			want, err := computeLocalSampleHash(fd, sample.Offset, sample.Size, buf)
+			if err != nil {
+				return fmt.Errorf("hash local sample %s@%d: %w", task.localPath, sample.Offset, err)
+			}
+			targets = append(targets, target)
+			samples = append(samples, sample)
+			wantHashes = append(wantHashes, want)
+			cmdBytes += targetBytes
+			task.sampleGen.Advance()
+		}
+		if len(targets) == 0 {
+			return fmt.Errorf("checksum batching failed for %s", task.serverPath)
+		}
+
+		verifyCtx, cancel := context.WithTimeout(ctx, verifyChecksumRequestTimeout)
+		resp, err := client.GetChecksum(verifyCtx, tx.GetChecksumRequest{
+			TransferID: transferID,
+			Targets:    targets,
 		})
-		want, err := computeLocalSampleHash(fd, sample.Offset, sample.Size, buf)
 		if err != nil {
-			return fmt.Errorf("hash local sample %s@%d: %w", task.localPath, sample.Offset, err)
+			cancel()
+			return fmt.Errorf("checksum request failed for %s: %w", task.serverPath, err)
 		}
-		wantHashes = append(wantHashes, want)
-	}
-
-	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	resp, err := client.GetChecksum(verifyCtx, tx.GetChecksumRequest{
-		TransferID: transferID,
-		Targets:    targets,
-	})
-	if err != nil {
-		return fmt.Errorf("checksum request failed for %s: %w", task.serverPath, err)
-	}
-	defer resp.Reader.Close()
-
-	results, err := readChecksumResults(resp.Reader)
-	if err != nil {
-		return fmt.Errorf("read checksum response for %s: %w", task.serverPath, err)
-	}
-	if len(results) != len(task.samples) {
-		return fmt.Errorf("checksum response count mismatch for %s: got %d want %d", task.serverPath, len(results), len(task.samples))
-	}
-	for i, result := range results {
-		sample := task.samples[i]
-		if result.FileID != task.entry.ID {
-			return fmt.Errorf("checksum file id mismatch for %s: got %d want %d", task.serverPath, result.FileID, task.entry.ID)
+		results, err := readChecksumResults(resp.Reader)
+		_ = resp.Reader.Close()
+		cancel()
+		if err != nil {
+			return fmt.Errorf("read checksum response for %s: %w", task.serverPath, err)
 		}
-		if result.Offset != sample.Offset || result.Size != sample.Size {
-			return fmt.Errorf("checksum range mismatch for %s: got offset=%d size=%d want offset=%d size=%d", task.serverPath, result.Offset, result.Size, sample.Offset, sample.Size)
+		if len(results) != len(samples) {
+			return fmt.Errorf("checksum response count mismatch for %s: got %d want %d", task.serverPath, len(results), len(samples))
 		}
-		if !strings.EqualFold(result.FileHashToken, wantHashes[i]) {
-			return fmt.Errorf("checksum mismatch for %s at offset=%d size=%d", task.localPath, sample.Offset, sample.Size)
+		for i, result := range results {
+			sample := samples[i]
+			if result.FileID != task.entry.ID {
+				return fmt.Errorf("checksum file id mismatch for %s: got %d want %d", task.serverPath, result.FileID, task.entry.ID)
+			}
+			if result.Offset != sample.Offset || result.Size != sample.Size {
+				return fmt.Errorf("checksum range mismatch for %s: got offset=%d size=%d want offset=%d size=%d", task.serverPath, result.Offset, result.Size, sample.Offset, sample.Size)
+			}
+			if !strings.EqualFold(result.FileHashToken, wantHashes[i]) {
+				return fmt.Errorf("checksum mismatch for %s at offset=%d size=%d", task.localPath, sample.Offset, sample.Size)
+			}
+		}
+		if onBatchVerified != nil {
+			onBatchVerified(int64(len(samples)))
 		}
 	}
 	return nil
