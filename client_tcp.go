@@ -68,6 +68,14 @@ type managedTCPConnCloser struct {
 	err  error
 }
 
+type contextManagedTCPReadCloser struct {
+	io.ReadCloser
+	stopWatch func()
+
+	once sync.Once
+	err  error
+}
+
 func (c *managedTCPConnCloser) Close() error {
 	if c == nil {
 		return nil
@@ -76,6 +84,21 @@ func (c *managedTCPConnCloser) Close() error {
 		c.err = c.client.releaseManagedTCPConn(c.conn, c.pool)
 	})
 	return c.err
+}
+
+func (r *contextManagedTCPReadCloser) Close() error {
+	if r == nil {
+		return nil
+	}
+	r.once.Do(func() {
+		if r.stopWatch != nil {
+			r.stopWatch()
+		}
+		if r.ReadCloser != nil {
+			r.err = r.ReadCloser.Close()
+		}
+	})
+	return r.err
 }
 
 func warmTCPPoolTarget(suggestedConcurrency int) int {
@@ -255,6 +278,27 @@ func (c *Client) newManagedTCPReadCloser(reader io.Reader, conn net.Conn, pool *
 			conn:   conn,
 			pool:   pool,
 		},
+	}
+}
+
+func watchManagedTCPConnContext(ctx context.Context, conn net.Conn) func() {
+	if ctx == nil || conn == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	return func() {
+		once.Do(func() {
+			close(done)
+		})
 	}
 }
 
@@ -1156,6 +1200,7 @@ func (c *Client) getChecksumTCP(ctx context.Context, request GetChecksumRequest)
 	if err != nil {
 		return nil, err
 	}
+	stopWatch := watchManagedTCPConnContext(ctx, conn)
 
 	var cmd strings.Builder
 	cmd.WriteString("CXSUM ")
@@ -1180,13 +1225,18 @@ func (c *Client) getChecksumTCP(ctx context.Context, request GetChecksumRequest)
 	}
 	br, err := c.sendAndReadTCP(conn, state, cmd.String())
 	if err != nil {
+		stopWatch()
 		_ = c.releaseManagedTCPConn(conn, pool)
 		return nil, fmt.Errorf("CXSUM: %w", err)
 	}
 	firstLine, err := readStreamFirstLine(br, "CXSUM")
 	if err != nil {
+		stopWatch()
 		_ = c.releaseManagedTCPConn(conn, pool)
 		return nil, err
 	}
-	return c.newManagedTCPReadCloser(io.MultiReader(strings.NewReader(firstLine), br), conn, pool), nil
+	return &contextManagedTCPReadCloser{
+		ReadCloser: c.newManagedTCPReadCloser(io.MultiReader(strings.NewReader(firstLine), br), conn, pool),
+		stopWatch:  stopWatch,
+	}, nil
 }
