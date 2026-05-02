@@ -301,6 +301,41 @@ func checksumTokenForRange(data []byte, offset int64, size int64) string {
 	return encoding.FormatXXH128HashToken(xxh3.Hash128(data[offset : offset+size]))
 }
 
+func parseOptionalInt64(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	return strconv.ParseInt(raw, 10, 64)
+}
+
+func checksumTargetsFromRequest(t *testing.T, req intftcp.Request) []tx.ChecksumTarget {
+	t.Helper()
+	targets := make([]tx.ChecksumTarget, 0, len(req.Params)-1)
+	for _, item := range req.Params[1:] {
+		fileID, err := strconv.ParseUint(item["fid"], 10, 64)
+		if err != nil {
+			t.Fatalf("parse fid: %v", err)
+		}
+		offset, err := parseOptionalInt64(item["offset"])
+		if err != nil {
+			t.Fatalf("parse offset: %v", err)
+		}
+		size, err := parseOptionalInt64(item["size"])
+		if err != nil {
+			t.Fatalf("parse size: %v", err)
+		}
+		targets = append(targets, tx.ChecksumTarget{
+			FileID:   fileID,
+			FullPath: item["path"],
+			Offset:   offset,
+			Size:     size,
+			Algo:     item["algo"],
+		})
+	}
+	return targets
+}
+
 // setupPinchState creates the .tx directory structure for tests and writes
 // a manifest (and optional progress) file. Returns the target directory path.
 func setupPinchState(t *testing.T, tmp string, manifestRaw string, progressRaw string) string {
@@ -1517,20 +1552,109 @@ func TestFixedWidthETANA(t *testing.T) {
 
 func TestFormatVerifyDataSummaryLine(t *testing.T) {
 	t.Run("budgeted", func(t *testing.T) {
-		got := formatVerifyDataSummaryLine(10011, 14224, 100, 10*time.Second, 9876*time.Millisecond)
-		want := "copy-verify-data: ok files=10011 samples=14224 budget=10s elapsed=9.876s"
+		got := formatVerifyDataSummaryLine(10011, 14224, 100, 10*time.Second, 9876*time.Millisecond, false)
+		want := "copy-verify-data: [ok] files=10011 samples=14224 budget=10s elapsed=9.876s"
 		if got != want {
 			t.Fatalf("formatVerifyDataSummaryLine() = %q, want %q", got, want)
 		}
 	})
 
 	t.Run("sampled-percent", func(t *testing.T) {
-		got := formatVerifyDataSummaryLine(42, 84, 5, 0, 1500*time.Microsecond)
-		want := "copy-verify-data: ok files=42 samples=84 pct=5 elapsed=2ms"
+		got := formatVerifyDataSummaryLine(42, 84, 5, 0, 1500*time.Microsecond, false)
+		want := "copy-verify-data: [ok] files=42 samples=84 pct=5 elapsed=2ms"
 		if got != want {
 			t.Fatalf("formatVerifyDataSummaryLine() = %q, want %q", got, want)
 		}
 	})
+
+	t.Run("partial-budgeted", func(t *testing.T) {
+		got := formatVerifyDataSummaryLine(12, 34, 100, 10*time.Second, 1500*time.Millisecond, true)
+		want := "copy-verify-data: [partial-ok] files=12 samples=34 budget=10s elapsed=1.5s"
+		if got != want {
+			t.Fatalf("formatVerifyDataSummaryLine() = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestVerifyCopyDataSamplesBatchesChecksumRequests(t *testing.T) {
+	tmp := t.TempDir()
+	localPath := filepath.Join(tmp, "huge.bin")
+	fd, err := os.Create(localPath)
+	if err != nil {
+		t.Fatalf("create local file: %v", err)
+	}
+	fileSize := int64(1200) * defaultVerifySampleFrameSize
+	if err := fd.Truncate(fileSize); err != nil {
+		_ = fd.Close()
+		t.Fatalf("truncate local file: %v", err)
+	}
+	if err := fd.Close(); err != nil {
+		t.Fatalf("close local file: %v", err)
+	}
+
+	manifest := &tx.Manifest{
+		TransferID:  "txverify-batch",
+		Root:        "/" + strings.Repeat("r", 3000),
+		Concurrency: 1,
+		Entries: []tx.ManifestEntry{
+			{ID: 1, Size: fileSize, Path: "huge.bin"},
+		},
+	}
+	cfg := copyCLIConfig{
+		localDst:            tmp,
+		verifyDataSamplePct: 100,
+		concurrency:         1,
+	}
+
+	var reqCount atomic.Int64
+	var maxCmdBytes atomic.Int64
+	var zero [verifySampleBytes]byte
+	zeroHash := encoding.FormatXXH128HashToken(xxh3.Hash128(zero[:]))
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		if req.Verb != intftcp.VerbCXSUM {
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+		targets := checksumTargetsFromRequest(t, req)
+		cmdBytes := estimateChecksumRequestCommandBytes(req.Params[0]["txferid"], targets)
+		reqCount.Add(1)
+		for {
+			current := maxCmdBytes.Load()
+			if int64(cmdBytes) <= current || maxCmdBytes.CompareAndSwap(current, int64(cmdBytes)) {
+				break
+			}
+		}
+		for _, target := range targets {
+			hash := zeroHash
+			if target.Size > 0 && target.Size < verifySampleBytes {
+				hash = encoding.FormatXXH128HashToken(xxh3.Hash128(zero[:target.Size]))
+			}
+			if err := writeChecksumFrame(out, target.FileID, target.Offset, target.Size, hash); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	defer srv.Close()
+
+	files, samples, _, partial, err := verifyCopyDataSamples(srv.URL, cfg, manifest, io.Discard)
+	if err != nil {
+		t.Fatalf("verifyCopyDataSamples() err = %v", err)
+	}
+	if partial {
+		t.Fatal("expected partial=false")
+	}
+	if files != 1 || samples != 1200 {
+		t.Fatalf("verifyCopyDataSamples() = files=%d samples=%d, want 1/1200", files, samples)
+	}
+	if got := reqCount.Load(); got <= 1 {
+		t.Fatalf("expected multiple checksum requests, got %d", got)
+	}
+	if got := maxCmdBytes.Load(); got > verifyChecksumCommandBudgetBytes {
+		t.Fatalf("expected cmd bytes <= %d, got %d", verifyChecksumCommandBudgetBytes, got)
+	}
+	if got := maxCmdBytes.Load(); got >= 4*1024*1024 {
+		t.Fatalf("expected cmd bytes below protocol limit, got %d", got)
+	}
 }
 
 func TestVerifyCopyDataSamplesStopsDispatchAfterBudget(t *testing.T) {
@@ -1578,7 +1702,7 @@ func TestVerifyCopyDataSamplesStopsDispatchAfterBudget(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		offset, err := strconv.ParseInt(item["offset"], 10, 64)
+		offset, err := parseOptionalInt64(item["offset"])
 		if err != nil {
 			return err
 		}
@@ -1591,9 +1715,12 @@ func TestVerifyCopyDataSamplesStopsDispatchAfterBudget(t *testing.T) {
 	})
 	defer srv.Close()
 
-	files, samples, _, err := verifyCopyDataSamples(srv.URL, cfg, manifest, &stderr)
+	files, samples, _, partial, err := verifyCopyDataSamples(srv.URL, cfg, manifest, &stderr)
 	if err != nil {
 		t.Fatalf("verifyCopyDataSamples() err = %v", err)
+	}
+	if !partial {
+		t.Fatal("expected partial=true")
 	}
 	if files != 1 || samples != 1 {
 		t.Fatalf("verifyCopyDataSamples() = files=%d samples=%d, want 1/1", files, samples)
@@ -1642,7 +1769,7 @@ func TestVerifyCopyDataSamplesReturnsMismatchDuringGrace(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		offset, err := strconv.ParseInt(item["offset"], 10, 64)
+		offset, err := parseOptionalInt64(item["offset"])
 		if err != nil {
 			return err
 		}
@@ -1654,9 +1781,12 @@ func TestVerifyCopyDataSamplesReturnsMismatchDuringGrace(t *testing.T) {
 	})
 	defer srv.Close()
 
-	_, _, _, err := verifyCopyDataSamples(srv.URL, cfg, manifest, io.Discard)
+	_, _, _, partial, err := verifyCopyDataSamples(srv.URL, cfg, manifest, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
 		t.Fatalf("verifyCopyDataSamples() err = %v, want checksum mismatch", err)
+	}
+	if partial {
+		t.Fatal("expected partial=false on mismatch")
 	}
 	if got := started.Load(); got != 1 {
 		t.Fatalf("expected one checksum request, got %d", got)
@@ -1702,18 +1832,22 @@ func TestVerifyCopyDataSamplesForcedStopReturnsSuccess(t *testing.T) {
 	type result struct {
 		files   int
 		samples int
+		partial bool
 		err     error
 	}
 	done := make(chan result, 1)
 	go func() {
-		files, samples, _, err := verifyCopyDataSamples(srv.URL, cfg, manifest, &stderr)
-		done <- result{files: files, samples: samples, err: err}
+		files, samples, _, partial, err := verifyCopyDataSamples(srv.URL, cfg, manifest, &stderr)
+		done <- result{files: files, samples: samples, partial: partial, err: err}
 	}()
 
 	select {
 	case got := <-done:
 		if got.err != nil {
 			t.Fatalf("verifyCopyDataSamples() err = %v", got.err)
+		}
+		if !got.partial {
+			t.Fatal("expected partial=true")
 		}
 		if got.files != 0 || got.samples != 0 {
 			t.Fatalf("verifyCopyDataSamples() = files=%d samples=%d, want 0/0", got.files, got.samples)
@@ -2478,7 +2612,7 @@ func TestRunCLICopySkipFetchVerifyMeta(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("copy skip-fetch verify-meta: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "copy-verify-meta: ok total=2 files=1 hardlinks=0 symlinks=0 dirs=1") {
+	if !strings.Contains(stderr.String(), "copy-verify-meta: [ok] total=2 files=1 hardlinks=0 symlinks=0 dirs=1") {
 		t.Fatalf("expected verify output, got stdout=%s stderr=%s", stdout.String(), stderr.String())
 	}
 	if _, err := os.Stat(filepath.Join(tmp, ".tx", "dst")); err != nil {
@@ -2548,7 +2682,7 @@ func TestRunCLICopyMixedManifestTypesConverges(t *testing.T) {
 	if got := sendCount.Load(); got != 1 {
 		t.Fatalf("expected exactly one SEND across both runs, got %d", got)
 	}
-	if !strings.Contains(stderr.String(), "copy-verify-meta: ok total=4 files=1 hardlinks=1 symlinks=1 dirs=1") {
+	if !strings.Contains(stderr.String(), "copy-verify-meta: [ok] total=4 files=1 hardlinks=1 symlinks=1 dirs=1") {
 		t.Fatalf("expected verify-meta output, got stdout=%s stderr=%s", stdout.String(), stderr.String())
 	}
 

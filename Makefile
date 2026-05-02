@@ -23,6 +23,7 @@ unit:
 acceptance:
 	go test -race ./internal/filexfer/encoding -run=^$$ -fuzz=FuzzRoundTrip -fuzztime=$(FUZZTIME) -timeout=$(FUZZDEADLINE)
 	go test -race ./internal/filexfer/ftcp     -run=^$$ -fuzz=FuzzSync      -fuzztime=$(FUZZTIME) -timeout=$(FUZZDEADLINE)
+	go test -race ./internal/sampler           -run=^$$ -fuzz=FuzzGeneratorFullCoverageNoRepeats -fuzztime=$(FUZZTIME) -timeout=$(FUZZDEADLINE)
 	go test -race ./internal/utils             -run=^$$ -fuzz=FuzzCommonPrefixLen -fuzztime=$(FUZZTIME) -timeout=$(FUZZDEADLINE)
 	go test -race .                            -run=^$$ -fuzz=FuzzSuggestBatchMaxBytes -fuzztime=$(FUZZTIME) -timeout=$(FUZZDEADLINE)
 
