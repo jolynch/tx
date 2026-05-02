@@ -66,6 +66,7 @@ const fixedWidthProgressRateWidth = 13
 const maxTransferErrorLines = 5
 
 var transferProbeRefreshInterval = defaultTransferProbeRefreshInterval
+var verifyBudgetGracePeriod = 10 * time.Second
 
 var syncPromptInput io.Reader = os.Stdin
 
@@ -1087,18 +1088,27 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 	if workers <= 0 {
 		workers = 1
 	}
-	taskCh := make(chan verifySampleTask, workers)
+	taskCh := make(chan verifySampleTask)
 	errCh := make(chan error, 1)
-	var ctx context.Context
-	var cancel context.CancelFunc
+
+	// budgetCtx controls when we stop dispatching new verification tasks.
+	var budgetCtx context.Context
+	var budgetCancel context.CancelFunc
 	if cfg.verifyBudget > 0 {
-		ctx, cancel = context.WithTimeout(context.Background(), cfg.verifyBudget)
+		budgetCtx, budgetCancel = context.WithTimeout(context.Background(), cfg.verifyBudget)
 	} else {
-		ctx, cancel = context.WithCancel(context.Background())
+		budgetCtx, budgetCancel = context.WithCancel(context.Background())
 	}
-	defer cancel()
+	defer budgetCancel()
+
+	// workerCtx controls in-flight checksum requests. It is kept separate
+	// so that requests mid-flight when the budget expires can finish
+	// cleanly instead of being killed mid-TCP-connection.
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	defer workerCancel()
+
 	budgetExpired := func() bool {
-		return cfg.verifyBudget > 0 && ctx.Err() == context.DeadlineExceeded
+		return cfg.verifyBudget > 0 && budgetCtx.Err() == context.DeadlineExceeded
 	}
 	var wg sync.WaitGroup
 	var completed atomic.Int64
@@ -1112,7 +1122,7 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 			defer ticker.Stop()
 			for {
 				select {
-				case <-ctx.Done():
+				case <-workerCtx.Done():
 					return
 				case <-ticker.C:
 					done := completed.Load()
@@ -1128,15 +1138,15 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 			client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...))
 			defer client.Close()
 			for task := range taskCh {
-				if err := verifySampleTaskData(ctx, client, manifest.TransferID, task); err != nil {
-					if budgetExpired() {
+				if err := verifySampleTaskData(workerCtx, client, manifest.TransferID, task); err != nil {
+					if workerCtx.Err() != nil {
 						return
 					}
 					select {
 					case errCh <- err:
 					default:
 					}
-					cancel()
+					workerCancel()
 					return
 				}
 				completed.Add(1)
@@ -1144,27 +1154,49 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 			}
 		}()
 	}
+	workersDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(workersDone)
+	}()
+
+	// waitWorkersWithGrace gives in-flight workers up to
+	// verifyBudgetGracePeriod to finish, then cancels workerCtx.
+	waitWorkersWithGrace := func() {
+		timer := time.NewTimer(verifyBudgetGracePeriod)
+		defer timer.Stop()
+		select {
+		case <-workersDone:
+		case <-timer.C:
+		}
+		workerCancel()
+		if progressDone != nil {
+			<-progressDone
+		}
+	}
+
 	for _, task := range tasks {
 		select {
-		case <-ctx.Done():
+		case <-budgetCtx.Done():
 			close(taskCh)
-			wg.Wait()
-			if progressDone != nil {
-				<-progressDone
-			}
+			waitWorkersWithGrace()
 			select {
 			case err := <-errCh:
 				return 0, 0, time.Since(start), err
 			default:
 				if budgetExpired() {
+					if stderr != nil {
+						fmt.Fprintf(stderr, "copy-verify-data: budget expired, verified %d/%d files %d samples in %s\n",
+							completed.Load(), int64(len(tasks)), completedRanges.Load(), time.Since(start).Round(time.Millisecond))
+					}
 					return int(completed.Load()), int(completedRanges.Load()), time.Since(start), nil
 				}
 				return 0, 0, time.Since(start), context.Canceled
 			}
 		case err := <-errCh:
-			cancel()
+			workerCancel()
 			close(taskCh)
-			wg.Wait()
+			<-workersDone
 			if progressDone != nil {
 				<-progressDone
 			}
@@ -1173,17 +1205,41 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 		}
 	}
 	close(taskCh)
-	wg.Wait()
-	cancel()
-	if progressDone != nil {
-		<-progressDone
-	}
 	select {
 	case err := <-errCh:
+		workerCancel()
+		<-workersDone
+		if progressDone != nil {
+			<-progressDone
+		}
 		return 0, 0, time.Since(start), err
-	default:
+	case <-workersDone:
+		workerCancel()
+		if progressDone != nil {
+			<-progressDone
+		}
+		select {
+		case err := <-errCh:
+			return 0, 0, time.Since(start), err
+		default:
+		}
+		return len(tasks), totalRanges, time.Since(start), nil
+	case <-budgetCtx.Done():
+		waitWorkersWithGrace()
+		select {
+		case err := <-errCh:
+			return 0, 0, time.Since(start), err
+		default:
+			if budgetExpired() {
+				if stderr != nil {
+					fmt.Fprintf(stderr, "copy-verify-data: budget expired, verified %d/%d files %d samples in %s\n",
+						completed.Load(), int64(len(tasks)), completedRanges.Load(), time.Since(start).Round(time.Millisecond))
+				}
+				return int(completed.Load()), int(completedRanges.Load()), time.Since(start), nil
+			}
+			return 0, 0, time.Since(start), context.Canceled
+		}
 	}
-	return len(tasks), totalRanges, time.Since(start), nil
 }
 
 func buildVerifySamples(fileSize int64, pct int, rng *rand.Rand) []verifySample {
