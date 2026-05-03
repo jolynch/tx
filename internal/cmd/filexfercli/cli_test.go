@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 	intfilexfer "github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
+	"github.com/jolynch/tx/internal/fsync"
 	"github.com/zeebo/xxh3"
 )
 
@@ -352,7 +354,18 @@ func setupPinchState(t *testing.T, tmp string, manifestRaw string, progressRaw s
 		}
 	}
 	if progressRaw != "" {
-		if err := os.WriteFile(filepath.Join(pinchDir, "manifest.progress"), []byte(progressRaw), 0o644); err != nil {
+		// If the test seeded a non-fingerprinted progress body and a manifest
+		// is present, automatically prepend the correct fingerprint header so
+		// the runStart/runResumeRefresh validation accepts the progress.
+		body := progressRaw
+		if manifestRaw != "" && !strings.Contains(progressRaw, progressFingerprintHeaderPrefix) {
+			m, err := tx.LoadManifest(filepath.Join(pinchDir, "manifest.server"))
+			if err != nil {
+				t.Fatalf("load seeded manifest: %v", err)
+			}
+			body = fmt.Sprintf("%s%s\n%s", progressFingerprintHeaderPrefix, tx.ManifestFingerprint(m), progressRaw)
+		}
+		if err := os.WriteFile(filepath.Join(pinchDir, "manifest.progress"), []byte(body), 0o644); err != nil {
 			t.Fatalf("write progress: %v", err)
 		}
 	}
@@ -809,6 +822,267 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(targetDir, p)); err != nil {
 			t.Fatalf("missing output %s: %v", p, err)
 		}
+	}
+}
+
+func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T) {
+	tmp := t.TempDir()
+	outRoot := filepath.Join(tmp, "dst")
+	progressPath := filepath.Join(tmp, ".tx", "dst", "manifest.progress")
+	payload := []byte("abcdefghijklmno")
+	manifest := &tx.Manifest{
+		TransferID:  "txpartialresume",
+		Root:        "/remote",
+		Mode:        tx.LoadStrategyFast,
+		LinkMbps:    1000,
+		Concurrency: 1,
+		Entries: []tx.ManifestEntry{
+			{ID: 0, Size: int64(len(payload)), Path: "big.bin"},
+		},
+	}
+	destPath := filepath.Join(outRoot, "big.bin")
+
+	runDownload := func(t *testing.T, srvURL string, state map[uint64]tx.ManifestProgress) error {
+		t.Helper()
+		applyProgressStateToManifest(manifest, state)
+		progressUpdates := make(chan tx.DownloadProgressUpdate, 32)
+		stopProgress, persistProgressAck, markMetadataDone := startProgressWriter(progressPath, tx.ManifestFingerprint(manifest), state, progressUpdates, nil, io.Discard)
+		defer stopProgress()
+		syncWorker, stopSync := fsync.StartSyncWorker(-1, true, io.Discard)
+		defer stopSync()
+		client := tx.NewClient(srvURL, tx.WithFileRequestWindowBytes(10))
+		defer client.Close()
+		resp, err := downloadManifestFiles(manifestDownloadConfig{
+			Client:             client,
+			Manifest:           manifest,
+			Entries:            manifest.Entries,
+			Concurrency:        1,
+			BatchMaxBytes:      5,
+			SplitWindowWorkers: 1,
+			ProgressUpdates:    progressUpdates,
+			OutputWriter: func(entry tx.ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
+				w, syncFn, err := openDownloadOutput(entry, offset, resolveDownloadDestinationPath(entry, outRoot, ""), nil, syncWorker)
+				if err != nil {
+					return nil, nil, err
+				}
+				return w, syncFn, nil
+			},
+			OnFileDone: func(evt tx.StartFileDoneEvent) {
+				persistProgressAck(evt.File.Meta.FileID, manifest.Entries[0].Size)
+				markMetadataDone(evt.File.Meta.FileID)
+			},
+		})
+		if err == nil && len(resp.Errors) > 0 {
+			err = resp.Errors[0]
+		}
+		return err
+	}
+
+	var firstAckTokens []string
+	firstSrv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			target := req.Params[len(req.Params)-1]
+			offset, err := parseOptionalInt64(target["offset"])
+			if err != nil {
+				return fmt.Errorf("parse offset: %w", err)
+			}
+			if offset == 0 {
+				_, err := io.WriteString(out, buildCLIFrame(0, payload[:5], 0)+"OK\r\n")
+				return err
+			}
+			time.Sleep(100 * time.Millisecond)
+			return fmt.Errorf("intentional interruption at offset %d", offset)
+		case intftcp.VerbACK:
+			firstAckTokens = append(firstAckTokens, req.Params[0]["ack-token"])
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	err := runDownload(t, firstSrv.URL, map[uint64]tx.ManifestProgress{})
+	firstSrv.Close()
+	if err == nil {
+		t.Fatal("expected first download to fail after the first persisted split window")
+	}
+	if len(firstAckTokens) != 1 || !strings.HasPrefix(firstAckTokens[0], "5@") {
+		t.Fatalf("expected one ACK at byte 5 before interruption, got %v (err=%v)", firstAckTokens, err)
+	}
+	state, err := loadProgressState(progressPath)
+	if err != nil {
+		t.Fatalf("load progress after interruption: %v", err)
+	}
+	if got := state[0].AckBytes; got != 5 {
+		t.Fatalf("expected persisted resume offset 5, got %d", got)
+	}
+	partial, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("read partial output: %v", err)
+	}
+	if string(partial) != "abcde" {
+		t.Fatalf("unexpected partial output: %q", partial)
+	}
+
+	var resumedOffsets []int64
+	secondSrv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbSEND:
+			target := req.Params[len(req.Params)-1]
+			offset, err := parseOptionalInt64(target["offset"])
+			if err != nil {
+				return fmt.Errorf("parse offset: %w", err)
+			}
+			resumedOffsets = append(resumedOffsets, offset)
+			if offset == 0 {
+				return fmt.Errorf("resume re-requested already persisted bytes")
+			}
+			size, err := parseOptionalInt64(target["size"])
+			if err != nil {
+				return fmt.Errorf("parse size: %w", err)
+			}
+			_, err = io.WriteString(out, buildCLIFrame(0, payload[offset:offset+size], offset)+"OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer secondSrv.Close()
+	err = runDownload(t, secondSrv.URL, state)
+	if err != nil {
+		t.Fatalf("resume download failed: %v", err)
+	}
+	sort.Slice(resumedOffsets, func(i, j int) bool { return resumedOffsets[i] < resumedOffsets[j] })
+	if got, want := fmt.Sprint(resumedOffsets), "[5 10]"; got != want {
+		t.Fatalf("unexpected resumed SEND offsets: got=%s want=%s", got, want)
+	}
+	complete, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("read resumed output: %v", err)
+	}
+	if string(complete) != string(payload) {
+		t.Fatalf("unexpected resumed output: %q", complete)
+	}
+}
+
+func TestRunCLIStartPrintsResumeProgress(t *testing.T) {
+	tmp := t.TempDir()
+	manifestRaw := strings.Join([]string{
+		"FM/1 txstartresume 7:/remote mode=fast link-mbps=700 concurrency=1",
+		"F0 10 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+	targetDir := setupPinchState(t, tmp, manifestRaw, "0 5 0\n")
+	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingDir, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write partial staging file: %v", err)
+	}
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbSEND:
+			target := req.Params[len(req.Params)-1]
+			if got := target["offset"]; got != "5" {
+				return fmt.Errorf("expected resume offset 5, got %q", got)
+			}
+			if got := target["size"]; got != "5" {
+				return fmt.Errorf("expected resume size 5, got %q", got)
+			}
+			_, err := io.WriteString(out, buildCLIFrame(0, []byte("world"), 5)+"OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runStartCLI(srv.URL, []string{"--progress=false", "--skip-fsync", "--concurrency", "1", "--ack-every", "1KiB", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("start resume: expected 0, got %d\nstdout=%s\nstderr=%s", code, stdout.String(), stderr.String())
+	}
+	errText := stderr.String()
+	if !strings.Contains(errText, "copy-resume: resuming 1 file(s), 5 B/10 B already copied") ||
+		!strings.Contains(errText, "copy-resume:   id=0 done=5 B/10 B (50.0%)") ||
+		strings.Contains(errText, "copy-resume: skipping") ||
+		strings.Contains(errText, "path=a.txt") {
+		t.Fatalf("missing resume progress output: %s", errText)
+	}
+	got, err := os.ReadFile(filepath.Join(targetDir, "a.txt"))
+	if err != nil {
+		t.Fatalf("read resumed file: %v", err)
+	}
+	if string(got) != "helloworld" {
+		t.Fatalf("unexpected resumed file contents: %q", got)
+	}
+}
+
+func TestRunCLIStartPrintsSkippedResumeProgress(t *testing.T) {
+	tmp := t.TempDir()
+	manifestRaw := strings.Join([]string{
+		"FM/1 txstartskipresume 7:/remote mode=fast link-mbps=700 concurrency=1",
+		"F0 5 0:100 0644 0:5:a.txt",
+		"1 10 0:101 0644 0:5:b.txt",
+		"",
+	}, "\n")
+	targetDir := setupPinchState(t, tmp, manifestRaw, "0 5 1\n1 5 0\n")
+	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingDir, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write complete staging file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingDir, "b.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write partial staging file: %v", err)
+	}
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbSEND:
+			target := req.Params[len(req.Params)-1]
+			if got := target["fid"]; got != "1" {
+				return fmt.Errorf("expected SEND for fid=1 only, got %q", got)
+			}
+			if got := target["offset"]; got != "5" {
+				return fmt.Errorf("expected resume offset 5, got %q", got)
+			}
+			_, err := io.WriteString(out, buildCLIFrame(1, []byte("world"), 5)+"OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runStartCLI(srv.URL, []string{"--progress=false", "--skip-fsync", "--concurrency", "1", "--ack-every", "1KiB", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("start skip resume: expected 0, got %d\nstdout=%s\nstderr=%s", code, stdout.String(), stderr.String())
+	}
+	errText := stderr.String()
+	if !strings.Contains(errText, "copy-resume: skipping 1 file(s), 5 B already copied") ||
+		!strings.Contains(errText, "copy-resume: resuming 1 file(s), 5 B/10 B already copied") ||
+		!strings.Contains(errText, "copy-resume:   id=1 done=5 B/10 B (50.0%)") {
+		t.Fatalf("missing skip/resume progress output: %s", errText)
 	}
 }
 
@@ -2557,6 +2831,388 @@ func TestRunCLICopySyncPath(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(tmp, ".tx", "dst")); !os.IsNotExist(err) {
 		t.Fatalf("expected copy to remove state dir, stat err=%v", err)
+	}
+}
+
+// TestRunCLICopyResumeFromPriorStateUnchanged verifies that when an
+// interrupted copy left a populated .tx/<dst>/ but no LOCAL_DST, a
+// subsequent `tx recv copy` invocation refreshes the manifest via SYNC,
+// preserves the saved progress, and resumes downloads at the persisted
+// per-file offsets instead of starting from zero.
+func TestRunCLICopyResumeFromPriorStateUnchanged(t *testing.T) {
+	tmp := t.TempDir()
+	payload := []byte("helloworld")
+	const partial = 5
+	entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "a.txt")
+	manifestRaw := buildTestManifestRaw("txcopy-resume", []string{entry})
+	// Seed prior state: manifest.server, manifest.progress (auto-fingerprinted
+	// by setupPinchState), and a partially-written staging file.
+	targetDir := setupPinchState(t, tmp, manifestRaw, "0 5 0\n")
+	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingDir, "a.txt"), payload[:partial], 0o644); err != nil {
+		t.Fatalf("write partial staging file: %v", err)
+	}
+	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
+
+	var sawTXFER bool
+	var sawSYNC bool
+	var sendOffset int64 = -1
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbTXFER:
+			sawTXFER = true
+			return fmt.Errorf("resume path must not call TXFER")
+		case intftcp.VerbSYNC:
+			sawSYNC = true
+			return writeSyncResponse(out, "txcopy-resume2", []string{entry}, nil)
+		case intftcp.VerbSEND:
+			target := req.Params[len(req.Params)-1]
+			off, err := parseOptionalInt64(target["offset"])
+			if err != nil {
+				return fmt.Errorf("parse offset: %w", err)
+			}
+			sendOffset = off
+			_, err = io.WriteString(out, buildCLIFrameWithMetadata(0, payload[off:], off, meta))
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "/remote", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("copy resume: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if sawTXFER {
+		t.Fatalf("resume path called TXFER, expected SYNC only")
+	}
+	if !sawSYNC {
+		t.Fatalf("resume path did not call SYNC")
+	}
+	if sendOffset != partial {
+		t.Fatalf("expected SEND offset=%d, got %d", partial, sendOffset)
+	}
+	got, err := os.ReadFile(filepath.Join(targetDir, "a.txt"))
+	if err != nil {
+		t.Fatalf("read resumed file: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("unexpected resumed file: %q", got)
+	}
+	if !strings.Contains(stderr.String(), "copy-resume-delta:") ||
+		!strings.Contains(stderr.String(), "copy-resume-state:") {
+		t.Fatalf("missing copy-resume summary lines: %s", stderr.String())
+	}
+}
+
+// TestRunCLICopyResumeFromPriorStateChangedFile verifies that when the
+// server reports a file with a different mtime than what we saved progress
+// for, the saved progress is dropped and the file restarts from offset 0.
+func TestRunCLICopyResumeFromPriorStateChangedFile(t *testing.T) {
+	tmp := t.TempDir()
+	payload := []byte("helloworld!!")
+	priorEntry := buildTestManifestEntry(0, 10, 100, 0o644, "a.txt")
+	priorManifestRaw := buildTestManifestRaw("txcopy-resume", []string{priorEntry})
+	targetDir := setupPinchState(t, tmp, priorManifestRaw, "0 5 0\n")
+	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingDir, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write partial staging file: %v", err)
+	}
+
+	// SYNC response advertises a different size+mtime, so the prior progress
+	// entry should not be carried forward.
+	newEntry := buildTestManifestEntry(0, int64(len(payload)), 200, 0o644, "a.txt")
+	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 200, Mode: "0644"}
+
+	var sendOffset int64 = -1
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbSYNC:
+			return writeSyncResponse(out, "txcopy-resume2", []string{newEntry}, nil)
+		case intftcp.VerbSEND:
+			target := req.Params[len(req.Params)-1]
+			off, err := parseOptionalInt64(target["offset"])
+			if err != nil {
+				return fmt.Errorf("parse offset: %w", err)
+			}
+			sendOffset = off
+			_, err = io.WriteString(out, buildCLIFrameWithMetadata(0, payload[off:], off, meta))
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "/remote", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("copy resume changed: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if sendOffset != 0 {
+		t.Fatalf("expected SEND offset=0 for changed file, got %d", sendOffset)
+	}
+	if !strings.Contains(stderr.String(), "stale[     1") {
+		t.Fatalf("expected copy-resume to report one stale file, got: %s", stderr.String())
+	}
+}
+
+// TestRunCLICopyResumeRemovedPathDropsStaging verifies that when the
+// server's SYNC response includes RM lines, any partial staging bytes
+// for those paths are removed and no SEND is issued for them.
+func TestRunCLICopyResumeRemovedPathDropsStaging(t *testing.T) {
+	tmp := t.TempDir()
+	keptPayload := []byte("kept!")
+	keepEntry := buildTestManifestEntry(0, int64(len(keptPayload)), 100, 0o644, "keep.txt")
+	rmEntry := buildTestManifestEntry(1, 5, 100, 0o644, "gone.txt")
+	priorManifestRaw := buildTestManifestRaw("txcopy-rm", []string{keepEntry, rmEntry})
+	// Seed progress for both files.
+	targetDir := setupPinchState(t, tmp, priorManifestRaw, "0 5 1\n1 3 0\n")
+	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingDir, "keep.txt"), keptPayload, 0o644); err != nil {
+		t.Fatalf("write keep staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingDir, "gone.txt"), []byte("xxx"), 0o644); err != nil {
+		t.Fatalf("write gone staging: %v", err)
+	}
+
+	keepMeta := &tx.FileTrailerMetadata{Size: int64(len(keptPayload)), MtimeNS: 100, Mode: "0644"}
+
+	var sentPaths []string
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbSYNC:
+			// New manifest: only keep.txt remains; gone.txt is removed (RM 1).
+			return writeSyncResponse(out, "txcopy-rm2", []string{keepEntry}, []uint64{1})
+		case intftcp.VerbSEND:
+			target := req.Params[len(req.Params)-1]
+			path := target["path"]
+			sentPaths = append(sentPaths, path)
+			_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, keptPayload, 0, keepMeta))
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify=none", "/remote", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("copy resume rm: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	for _, p := range sentPaths {
+		if strings.Contains(p, "gone.txt") {
+			t.Fatalf("server received SEND for removed path: %v", sentPaths)
+		}
+	}
+	if !strings.Contains(stderr.String(), "rm[     1]") {
+		t.Fatalf("expected copy-resume to report rm[1], got: %s", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(stagingDir, "gone.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected staging gone.txt to be removed, stat err=%v", err)
+	}
+}
+
+// TestRunCLICopyCleanWipesStateDir verifies that --clean removes the
+// .tx/<dst>/ state directory in addition to LOCAL_DST, forcing a full
+// transfer via TXFER (not SYNC) even when a prior interrupted run left
+// state behind.
+func TestRunCLICopyCleanWipesStateDir(t *testing.T) {
+	tmp := t.TempDir()
+	payload := []byte("hello")
+	entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "new.txt")
+	priorManifestRaw := buildTestManifestRaw("txcopy-prior", []string{entry})
+	targetDir := setupPinchState(t, tmp, priorManifestRaw, "0 3 0\n")
+	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingDir, "new.txt"), []byte("xxx"), 0o644); err != nil {
+		t.Fatalf("write staging: %v", err)
+	}
+
+	freshManifestRaw := buildTestManifestRaw("txcopy-fresh", []string{entry})
+	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
+
+	var sawTXFER, sawSYNC bool
+	var sendOffset int64 = -1
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbTXFER:
+			sawTXFER = true
+			if _, err := io.WriteString(out, freshManifestRaw); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbSYNC:
+			sawSYNC = true
+			return fmt.Errorf("--clean must not call SYNC")
+		case intftcp.VerbSEND:
+			target := req.Params[len(req.Params)-1]
+			off, err := parseOptionalInt64(target["offset"])
+			if err != nil {
+				return fmt.Errorf("parse offset: %w", err)
+			}
+			sendOffset = off
+			_, err = io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--clean", "/remote", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("copy --clean: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if sawSYNC {
+		t.Fatalf("--clean should bypass SYNC")
+	}
+	if !sawTXFER {
+		t.Fatalf("--clean should call TXFER")
+	}
+	if sendOffset != 0 {
+		t.Fatalf("expected SEND offset=0 after --clean, got %d", sendOffset)
+	}
+}
+
+// TestRunCLICopyResumeFingerprintMismatch verifies that a manifest.progress
+// file with a fingerprint that does not match the prior manifest is
+// discarded with a warning, and downloads restart from offset 0.
+func TestRunCLICopyResumeFingerprintMismatch(t *testing.T) {
+	tmp := t.TempDir()
+	payload := []byte("helloworld")
+	entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "a.txt")
+	priorManifestRaw := buildTestManifestRaw("txcopy-fpmismatch", []string{entry})
+	// Hand-craft a progress file with a clearly-wrong fingerprint header so
+	// setupPinchState's auto-fingerprint logic does not overwrite it.
+	rawProgress := progressFingerprintHeaderPrefix + "deadbeefdeadbeefdeadbeefdeadbeef\n0 5 0\n"
+	targetDir := setupPinchState(t, tmp, priorManifestRaw, rawProgress)
+	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingDir, "a.txt"), payload[:5], 0o644); err != nil {
+		t.Fatalf("write staging: %v", err)
+	}
+	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
+
+	var sendOffset int64 = -1
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbSYNC:
+			return writeSyncResponse(out, "txcopy-fpmismatch2", []string{entry}, nil)
+		case intftcp.VerbSEND:
+			target := req.Params[len(req.Params)-1]
+			off, err := parseOptionalInt64(target["offset"])
+			if err != nil {
+				return fmt.Errorf("parse offset: %w", err)
+			}
+			sendOffset = off
+			_, err = io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "/remote", targetDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("copy fingerprint mismatch: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if sendOffset != 0 {
+		t.Fatalf("expected SEND offset=0 after fingerprint mismatch, got %d", sendOffset)
+	}
+	if !strings.Contains(stderr.String(), "fingerprint mismatch") {
+		t.Fatalf("expected fingerprint-mismatch warning, got: %s", stderr.String())
+	}
+}
+
+// TestManifestFingerprintIgnoresHeader verifies that ManifestFingerprint
+// hashes only entries — header fields (TransferID, LinkMbps, etc.) that
+// vary per protocol call do not affect the fingerprint.
+func TestManifestFingerprintIgnoresHeader(t *testing.T) {
+	base := &tx.Manifest{
+		TransferID:  "tid-A",
+		Root:        "/remote",
+		Mode:        tx.LoadStrategyFast,
+		LinkMbps:    1000,
+		Concurrency: 4,
+		Entries: []tx.ManifestEntry{
+			{ID: 0, Size: 10, Mtime: 100, Mode: 0o644, Path: "a.txt"},
+			{ID: 1, Size: 20, Mtime: 200, Mode: 0o644, Path: "b.txt"},
+			{Type: encoding.EntryTypeHard, ID: 2, Mode: 0o644, Path: "a-hard.txt", LinkTarget: 0},
+		},
+	}
+	mutated := &tx.Manifest{
+		TransferID:  "tid-B-different",
+		Root:        "/remote",
+		Mode:        tx.LoadStrategyGentle,
+		LinkMbps:    9999,
+		Concurrency: 1,
+		DeadlineMS:  5000,
+		Entries: []tx.ManifestEntry{
+			// Same entries with different IDs (SYNC reassigns IDs).
+			{ID: 42, Size: 10, Mtime: 100, Mode: 0o644, Path: "a.txt"},
+			{ID: 43, Size: 20, Mtime: 200, Mode: 0o644, Path: "b.txt"},
+			{Type: encoding.EntryTypeHard, ID: 44, Mode: 0o644, Path: "a-hard.txt", LinkTarget: 42},
+		},
+	}
+	if got := tx.ManifestFingerprint(base); got != tx.ManifestFingerprint(mutated) {
+		t.Fatalf("fingerprint should be stable across header / ID changes\n base=%s\n  mut=%s", got, tx.ManifestFingerprint(mutated))
+	}
+	// Mutating an entry changes the fingerprint.
+	changed := &tx.Manifest{
+		TransferID: "tid-A",
+		Entries: []tx.ManifestEntry{
+			{ID: 0, Size: 11, Mtime: 100, Mode: 0o644, Path: "a.txt"},
+			{ID: 1, Size: 20, Mtime: 200, Mode: 0o644, Path: "b.txt"},
+		},
+	}
+	if tx.ManifestFingerprint(base) == tx.ManifestFingerprint(changed) {
+		t.Fatalf("fingerprint should change when an entry's size changes")
 	}
 }
 

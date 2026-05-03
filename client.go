@@ -670,8 +670,13 @@ func SaveManifest(path string, manifest *Manifest) error {
 			return fmt.Errorf("create manifest parent directory: %w", err)
 		}
 	}
-	if err := os.WriteFile(path, raw, 0o644); err != nil {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename manifest: %w", err)
 	}
 	return nil
 }
@@ -689,6 +694,66 @@ func LoadManifest(path string) (*Manifest, error) {
 		return nil, fmt.Errorf("read manifest: %w", err)
 	}
 	return parseManifest(raw)
+}
+
+// ManifestFingerprint returns a stable hex-encoded xxh3-128 hash of the
+// manifest's entry list. Header fields (TransferID, Mode, LinkMbps,
+// Concurrency, DeadlineMS, Root) are excluded because they change per
+// protocol call. Entry IDs are also excluded because SYNC reassigns them
+// from filesystem walk order.
+func ManifestFingerprint(m *Manifest) string {
+	if m == nil || len(m.Entries) == 0 {
+		var zero xxh3.Uint128
+		return fmt.Sprintf("%016x%016x", zero.Hi, zero.Lo)
+	}
+	indices := make([]int, len(m.Entries))
+	for i := range m.Entries {
+		indices[i] = i
+	}
+	sort.Slice(indices, func(i, j int) bool {
+		return m.Entries[indices[i]].Path < m.Entries[indices[j]].Path
+	})
+	pathByID := make(map[uint64]string, len(m.Entries))
+	for _, entry := range m.Entries {
+		pathByID[entry.ID] = entry.Path
+	}
+	h := xxh3.New()
+	var scratch [8]byte
+	writeUint64 := func(v uint64) {
+		scratch[0] = byte(v)
+		scratch[1] = byte(v >> 8)
+		scratch[2] = byte(v >> 16)
+		scratch[3] = byte(v >> 24)
+		scratch[4] = byte(v >> 32)
+		scratch[5] = byte(v >> 40)
+		scratch[6] = byte(v >> 48)
+		scratch[7] = byte(v >> 56)
+		_, _ = h.Write(scratch[:])
+	}
+	writeString := func(s string) {
+		writeUint64(uint64(len(s)))
+		_, _ = h.WriteString(s)
+	}
+	for _, idx := range indices {
+		e := m.Entries[idx]
+		entryType := e.Type
+		if entryType == 0 {
+			entryType = intencoding.EntryTypeFile
+		}
+		_, _ = h.Write([]byte{entryType})
+		writeString(e.Path)
+		writeUint64(uint64(e.Size))
+		writeUint64(uint64(e.Mtime))
+		writeUint64(uint64(e.Mode))
+		switch entryType {
+		case intencoding.EntryTypeHard:
+			writeString(pathByID[uint64(e.LinkTarget)])
+		case intencoding.EntryTypeSymlink:
+			writeString(e.LinkPath)
+		}
+	}
+	sum := h.Sum128()
+	return fmt.Sprintf("%016x%016x", sum.Hi, sum.Lo)
 }
 
 func (m *Manifest) EntryByID(id uint64) (ManifestEntry, bool) {
