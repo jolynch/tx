@@ -266,7 +266,7 @@ func parseHeaderInt(raw string, key string) (int64, error) {
 }
 
 func ParseFXTrailer(line string) (FrameTrailer, error) {
-	prefix, hashToken, err := splitTrailerPrefixAndHash(line)
+	prefix, hashToken, err := SplitTrailerPrefixAndHash(line)
 	if err != nil {
 		return FrameTrailer{}, err
 	}
@@ -325,7 +325,7 @@ func ParseFXTrailer(line string) (FrameTrailer, error) {
 	}, nil
 }
 
-func splitTrailerPrefixAndHash(line string) (string, string, error) {
+func SplitTrailerPrefixAndHash(line string) (string, string, error) {
 	idx := strings.LastIndex(line, " hash=")
 	if idx <= 0 {
 		return strings.TrimSpace(line), "", nil

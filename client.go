@@ -47,24 +47,9 @@ func NormalizeGentleCPUPct(v int) int { return intlimit.NormalizeGentleCPUPct(v)
 
 func NormalizeGentleBWPct(v int) int { return intlimit.NormalizeGentleBWPct(v) }
 
-type DownloadStatus struct {
-	Started int `json:"started"`
-	Running int `json:"running"`
-	Done    int `json:"done"`
-	Missing int `json:"missing"`
-}
+type DownloadStatus = intencoding.DownloadStatus
 
-type TransferStatus struct {
-	TransferID     string         `json:"transfer_id"`
-	Directory      string         `json:"directory"`
-	NumFiles       int            `json:"num_files"`
-	TotalSize      int64          `json:"total_size"`
-	Done           uint64         `json:"done"`
-	DoneSize       int64          `json:"done_size"`
-	PercentFiles   float64        `json:"percent_files"`
-	PercentBytes   float64        `json:"percent_bytes"`
-	DownloadStatus DownloadStatus `json:"download_status"`
-}
+type TransferStatus = intencoding.TransferStatus
 
 type ClientOption interface {
 	apply(*Client)
@@ -2294,7 +2279,7 @@ func buildAckToken(ackBytes int64, serverTS int64, hashToken string) (string, er
 	}
 	token := fmt.Sprintf("%d@%d", ackBytes, serverTS)
 	if hashToken != "" {
-		if !validHashToken(hashToken) {
+		if !intencoding.ValidHashToken(hashToken) {
 			return "", errors.New("invalid ack hash token")
 		}
 		token += "@" + hashToken
@@ -3087,7 +3072,7 @@ type frameTrailer struct {
 }
 
 func parseFXTrailer(line string) (frameTrailer, error) {
-	prefix, hashToken, err := splitTrailerPrefixAndHash(line)
+	prefix, hashToken, err := intencoding.SplitTrailerPrefixAndHash(line)
 	if err != nil {
 		return frameTrailer{}, err
 	}
@@ -3172,7 +3157,7 @@ func parseFXTrailer(line string) (frameTrailer, error) {
 	if ts < 0 {
 		return frameTrailer{}, errors.New("trailer missing ts")
 	}
-	if fileHashToken != "" && !validHashToken(fileHashToken) {
+	if fileHashToken != "" && !intencoding.ValidHashToken(fileHashToken) {
 		return frameTrailer{}, errors.New("trailer invalid file hash token")
 	}
 	var metaPtr *FileTrailerMetadata
@@ -3196,19 +3181,6 @@ func parseFXTrailer(line string) (frameTrailer, error) {
 	}, nil
 }
 
-func splitTrailerPrefixAndHash(line string) (string, string, error) {
-	idx := strings.LastIndex(line, " hash=")
-	if idx <= 0 {
-		return strings.TrimSpace(line), "", nil
-	}
-	prefix := line[:idx]
-	hashToken := strings.TrimSpace(line[idx+len(" hash="):])
-	if !validHashToken(hashToken) {
-		return "", "", errors.New("trailer missing or invalid hash token")
-	}
-	return prefix, hashToken, nil
-}
-
 func parseAgeIdentity(raw string) (age.Identity, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -3219,14 +3191,6 @@ func parseAgeIdentity(raw string) (age.Identity, error) {
 		return nil, fmt.Errorf("invalid age identity: %w", err)
 	}
 	return identity, nil
-}
-
-func validHashToken(raw string) bool {
-	if raw == "" {
-		return false
-	}
-	parts := strings.SplitN(raw, ":", 2)
-	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
 }
 
 func decodePayloadReader(payload io.Reader, comp string) (io.ReadCloser, error) {
