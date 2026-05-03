@@ -667,9 +667,10 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintln(stderr, "Copy REMOTE_SRC from the remote to LOCAL_DST on the local machine.")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Behavior:")
-		fmt.Fprintln(stderr, "  - If LOCAL_DST does not exist: full transfer")
+		fmt.Fprintln(stderr, "  - If LOCAL_DST does not exist and no prior .tx/<dst>/ state: full transfer")
+		fmt.Fprintln(stderr, "  - If LOCAL_DST does not exist but .tx/<dst>/ exists: resume via SYNC")
 		fmt.Fprintln(stderr, "  - If LOCAL_DST exists: diff remote and send deltas")
-		fmt.Fprintln(stderr, "  - --clean removes LOCAL_DST first and forces a clean transfer")
+		fmt.Fprintln(stderr, "  - --clean removes LOCAL_DST and .tx/<dst>/, then forces a clean transfer")
 		fmt.Fprintln(stderr, "  - --skip-fetch fetches and writes manifest state only; no start/sync")
 		fmt.Fprintln(stderr, "  - --skip-write fetches bodies to a discard sink and never mutates LOCAL_DST")
 		fmt.Fprintf(stderr, "  - --verify=MODE post-copy verification: none|meta|N%%data|full|<dur>\n")
@@ -811,13 +812,24 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintln(stderr, "--verify with --skip-fetch requires an existing LOCAL_DST")
 		return 2
 	}
+	ps, err := newPinchState(cfg.localDst)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid local destination: %v\n", err)
+		return 2
+	}
 	if cfg.clean && !cfg.skipFetch {
 		if err := os.RemoveAll(cfg.localDst); err != nil && !os.IsNotExist(err) {
 			fmt.Fprintf(stderr, "remove local destination failed: %v\n", err)
 			return 1
 		}
+		if err := os.RemoveAll(ps.StateDir); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(stderr, "remove state directory failed: %v\n", err)
+			return 1
+		}
+		_ = os.Remove(filepath.Dir(ps.StateDir))
 		localExists = false
 	}
+	hasPriorState := pathExists(ps.ServerManifestPath)
 
 	transferCfg := transferArgs{
 		sourceDir:    cfg.remoteSrc,
@@ -832,8 +844,18 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		maxChunk:     0,
 		deadlineMS:   deadlineMS,
 	}
-	if code := runTransfer(serverURL, transferCfg, stdout, stderr); code != 0 {
-		return code
+	// Resume path: prior .tx/<dst>/manifest.server exists from an interrupted
+	// run, and the user has not re-created LOCAL_DST. Refresh via SYNC and
+	// carry progress forward instead of re-fetching the whole manifest.
+	useResume := hasPriorState && !localExists && !cfg.skipFetch
+	if useResume {
+		if code := runResumeRefresh(serverURL, transferCfg, stderr); code != 0 {
+			return code
+		}
+	} else {
+		if code := runTransfer(serverURL, transferCfg, stdout, stderr); code != 0 {
+			return code
+		}
 	}
 
 	if cfg.skipFetch {
@@ -1485,12 +1507,6 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
 		return 2
 	}
-	// Wipe all previous state so every transfer starts clean.
-	if err := os.RemoveAll(ps.StateDir); err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(stderr, "remove state directory failed: %v\n", err)
-		return 1
-	}
-	_ = os.Remove(filepath.Dir(ps.StateDir))
 
 	fmt.Fprintf(stderr, "transfer(addr=[%s], source=[%s])\n", serverURL, cfg.sourceDir)
 
@@ -1557,6 +1573,231 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 	)
 	fmt.Fprintf(stderr, "txfer-state   : >(%s)\n", ps.ServerManifestPath)
 
+	return 0
+}
+
+// stableEntryKey is the identity used to carry progress across a SYNC
+// refresh that reassigns file IDs. Two entries with the same key are
+// treated as the same file's bytes.
+type stableEntryKey struct {
+	Path     string
+	Type     byte
+	Size     int64
+	Mtime    int64
+	Mode     os.FileMode
+	LinkPath string
+}
+
+func makeStableEntryKey(e tx.ManifestEntry) stableEntryKey {
+	t := e.Type
+	if t == 0 {
+		t = encoding.EntryTypeFile
+	}
+	return stableEntryKey{
+		Path:     e.Path,
+		Type:     t,
+		Size:     e.Size,
+		Mtime:    e.Mtime,
+		Mode:     e.Mode,
+		LinkPath: e.LinkPath,
+	}
+}
+
+// runResumeRefresh refreshes manifest.server via SYNC (sending the prior
+// server manifest to the server), remaps any saved progress to the new
+// manifest's file IDs by stable identity, drops progress for changed or
+// removed files, and persists the new manifest + remapped progress (with
+// fingerprint header) atomically. Used by `copy` when a prior .tx/<dst>/
+// state exists but LOCAL_DST is not yet in place.
+func runResumeRefresh(serverURL string, cfg transferArgs, stderr io.Writer) int {
+	ps, err := newPinchState(cfg.targetDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
+		return 2
+	}
+	priorManifest, err := tx.LoadManifest(ps.ServerManifestPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "load prior manifest failed: %v\n", err)
+		return 1
+	}
+	priorFingerprint := tx.ManifestFingerprint(priorManifest)
+
+	fmt.Fprintf(stderr, "resume(addr=[%s], source=[%s])\n", serverURL, cfg.sourceDir)
+
+	client := tx.NewClient(serverURL,
+		tx.WithLoadStrategy(cfg.loadStrategy),
+		tx.WithClientAgePublicKey(cfg.agePublicKey),
+		tx.WithClientAgeIdentity(cfg.ageIdentity),
+		tx.WithEncryptMode(cfg.encMode),
+		tx.WithClientAuthTokens(cfg.authTokens...),
+	)
+	defer client.Close()
+
+	start := time.Now()
+	probeResult, err := client.ProbeLink(context.Background(), tx.ProbeRequest{
+		ProbeBytes:   cfg.probeBytes,
+		LoadStrategy: cfg.loadStrategy,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "probe failed: %v\n", err)
+		return 1
+	}
+	cipherDisplay := "none"
+	if probeResult.SuggestedCipher != "" {
+		cipherDisplay = probeResult.SuggestedCipher
+	}
+	fmt.Fprintf(
+		stderr,
+		"resume-probe  : strategy=%s cipher=%s rtt_ms=%d srv-conc=(%d cpu * %d io = %d) conn-pool=%d\n",
+		cfg.loadStrategy,
+		cipherDisplay,
+		probeResult.AvgLatencyMS,
+		probeResult.ServerCPU, probeResult.ServerIODepth, probeResult.SuggestedConcurrency,
+		probeResult.WarmConnectionPoolSize,
+	)
+	fmt.Fprintln(stderr, formatProbeLinkLine(probeResult, cfg.probeBytes))
+	batchPlan := tx.ExplainBatchMaxBytes(
+		probeResult.SuggestedConcurrency,
+		client.WindowConcurrency,
+		client.FileRequestWindowBytes,
+		probeResult.ServerSendBufBytes,
+		effectiveModeLinkMbps(cfg.loadStrategy, probeResult.LinkMbps, probeResult.GentleBWPct),
+	)
+
+	syncResp, err := client.SyncManifest(context.Background(), tx.SyncManifestRequest{
+		Directory:   cfg.sourceDir,
+		OldManifest: priorManifest,
+		Mode:        cfg.loadStrategy,
+		LinkMbps:    probeResult.LinkMbps,
+		Concurrency: probeResult.SuggestedConcurrency,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "resume sync failed: %v\n", err)
+		return 1
+	}
+	newManifest := syncResp.Manifest
+	if cfg.deadlineMS > 0 {
+		newManifest.DeadlineMS = cfg.deadlineMS
+	}
+	newFingerprint := tx.ManifestFingerprint(newManifest)
+	delta := compareManifestEntries(priorManifest, newManifest)
+	delta.removedPaths = syncResp.RemovedPaths
+
+	// Validate the on-disk progress fingerprint against the *prior* manifest:
+	// if they don't match, the progress file is stale (came from a different
+	// manifest version) and we drop it wholesale.
+	progressFingerprint, fpErr := loadProgressFingerprint(ps.ProgressPath)
+	if fpErr != nil {
+		fmt.Fprintf(stderr, "load progress fingerprint failed: %v\n", fpErr)
+		return 1
+	}
+	priorProgress, err := loadProgressState(ps.ProgressPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "load progress failed: %v\n", err)
+		return 1
+	}
+	dropped := 0
+	if len(priorProgress) > 0 && progressFingerprint != priorFingerprint {
+		if progressFingerprint == "" {
+			fmt.Fprintf(stderr, "copy-resume: progress file has no manifest fingerprint; discarding %d entries\n", len(priorProgress))
+		} else {
+			fmt.Fprintf(stderr, "copy-resume: progress fingerprint mismatch (prior-manifest=%s progress=%s); discarding %d entries\n", priorFingerprint, progressFingerprint, len(priorProgress))
+		}
+		dropped = len(priorProgress)
+		priorProgress = make(map[uint64]tx.ManifestProgress)
+	}
+
+	// Build oldID -> stableEntryKey from the prior manifest, and
+	// path -> entry for the new manifest, then remap by stable identity.
+	oldKeyByID := make(map[uint64]stableEntryKey, len(priorManifest.Entries))
+	for _, e := range priorManifest.Entries {
+		oldKeyByID[e.ID] = makeStableEntryKey(e)
+	}
+	newByPath := make(map[string]tx.ManifestEntry, len(newManifest.Entries))
+	for _, e := range newManifest.Entries {
+		newByPath[e.Path] = e
+	}
+	remappedProgress := make(map[uint64]tx.ManifestProgress, len(priorProgress))
+	carriedFiles := 0
+	carriedBytes := int64(0)
+	for oldID, prog := range priorProgress {
+		oldKey, ok := oldKeyByID[oldID]
+		if !ok {
+			continue
+		}
+		newEntry, ok := newByPath[oldKey.Path]
+		if !ok {
+			// Server no longer has this path — handled by RemovedPaths cleanup below.
+			continue
+		}
+		if makeStableEntryKey(newEntry) != oldKey {
+			continue
+		}
+		ack := prog.AckBytes
+		if ack > newEntry.Size {
+			ack = newEntry.Size
+		}
+		remappedProgress[newEntry.ID] = tx.ManifestProgress{
+			AckBytes:     ack,
+			MetadataDone: prog.MetadataDone,
+		}
+		carriedFiles++
+		carriedBytes += ack
+	}
+
+	// Drop any partial staging bytes for paths the server says are gone.
+	removedPaths := syncResp.RemovedPaths
+	for _, rmPath := range removedPaths {
+		stagingPath := filepath.Join(ps.StagingDir, filepath.FromSlash(rmPath))
+		if err := os.Remove(stagingPath); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(stderr, "copy-resume: rm staging %s: %v\n", stagingPath, err)
+		}
+	}
+
+	if err := ps.ensureStateDir(); err != nil {
+		fmt.Fprintf(stderr, "create state directory failed: %v\n", err)
+		return 1
+	}
+	if err := tx.SaveManifest(ps.ServerManifestPath, newManifest); err != nil {
+		fmt.Fprintf(stderr, "save manifest failed: %v\n", err)
+		return 1
+	}
+	if err := saveProgressState(ps.ProgressPath, newFingerprint, remappedProgress); err != nil {
+		fmt.Fprintf(stderr, "save progress failed: %v\n", err)
+		return 1
+	}
+
+	var totalBytes int64
+	for _, e := range newManifest.Entries {
+		totalBytes += e.Size
+	}
+	fmt.Fprintf(
+		stderr,
+		"resume-loaded : tid[%s] %d files (%s) from [%s] elapsed=%s\n",
+		newManifest.TransferID,
+		len(newManifest.Entries),
+		encoding.HumanBytes(totalBytes),
+		newManifest.Root,
+		time.Since(start).Round(time.Millisecond),
+	)
+	fmt.Fprintf(
+		stderr,
+		"copy-resume-delta: new[%s (%s)] stale[%s (%s)] same[%s] rm[%s] link=%s srv-conc=(%d cpu * %d io = %d) batch=%s\n",
+		encoding.HumanCount(uint64(len(delta.newFiles)), 6),
+		encoding.HumanBytes(delta.newBytes),
+		encoding.HumanCount(uint64(len(delta.staleFiles)), 6),
+		encoding.HumanBytes(delta.staleBytes),
+		encoding.HumanCount(uint64(len(delta.unchangedFiles)), 6),
+		encoding.HumanCount(uint64(len(delta.removedPaths)), 6),
+		formatProbeLinkSummary(probeResult),
+		probeResult.ServerCPU, probeResult.ServerIODepth, probeResult.SuggestedConcurrency,
+		encoding.HumanBytes(batchPlan.BatchMaxBytes),
+	)
+	fmt.Fprintf(
+		stderr,
+		"copy-resume-state: prior=%s carried=%d (%s) dropped=%d\n",
+		ps.ProgressPath, carriedFiles, encoding.HumanBytes(carriedBytes), dropped,
+	)
 	return 0
 }
 
@@ -2402,6 +2643,8 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 				mergedProgress[e.ID] = e.Progress
 			}
 		}
+		applyProgressStateToManifest(mergedManifest, mergedProgress)
+		printResumeProgress(stderr, "copy-resume", mergedManifest.Entries)
 
 		markCompleted := func(entry tx.ManifestEntry) {
 			mergedProgress[entry.ID] = tx.ManifestProgress{
@@ -2437,7 +2680,8 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 				onProgressUpdate(update)
 			}
 		}
-		stopProgress, persistProgressAck, markMetadataDonePersisted := startProgressWriter(ps.ProgressPath, mergedProgress, progressUpdates, forwardProgress, stderr)
+		mergedFingerprint := tx.ManifestFingerprint(mergedManifest)
+		stopProgress, persistProgressAck, markMetadataDonePersisted := startProgressWriter(ps.ProgressPath, mergedFingerprint, mergedProgress, progressUpdates, forwardProgress, stderr)
 		persistFileDone := func(fileID uint64, ackBytes int64) {
 			persistProgressAck(fileID, ackBytes)
 		}
@@ -2755,12 +2999,28 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 			return 1
 		}
 	}
+	manifestFingerprint := tx.ManifestFingerprint(manifest)
+	progressFingerprint, fpErr := loadProgressFingerprint(ps.ProgressPath)
+	if fpErr != nil {
+		fmt.Fprintf(stderr, "load progress fingerprint failed: %v\n", fpErr)
+		return 1
+	}
 	progressState, err := loadProgressState(ps.ProgressPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "load progress failed: %v\n", err)
 		return 1
 	}
+	if len(progressState) > 0 && progressFingerprint != manifestFingerprint {
+		if progressFingerprint == "" {
+			fmt.Fprintf(stderr, "copy-resume: progress file has no manifest fingerprint; discarding %d entries\n", len(progressState))
+		} else {
+			fmt.Fprintf(stderr, "copy-resume: manifest fingerprint mismatch (manifest=%s progress=%s); discarding %d progress entries\n", manifestFingerprint, progressFingerprint, len(progressState))
+		}
+		progressState = make(map[uint64]tx.ManifestProgress)
+		_ = os.Remove(ps.ProgressPath)
+	}
 	applyProgressStateToManifest(manifest, progressState)
+	printResumeProgress(stderr, "copy-resume", manifest.Entries)
 	if cfg.deadlineMS > 0 {
 		manifest.DeadlineMS = cfg.deadlineMS
 	}
@@ -2776,7 +3036,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 			onStartProgressUpdate(update)
 		}
 	}
-	stopProgress, persistProgressAck, markMetadataDonePersisted := startProgressWriter(ps.ProgressPath, progressState, progressUpdates, forwardProgress, stderr)
+	stopProgress, persistProgressAck, markMetadataDonePersisted := startProgressWriter(ps.ProgressPath, manifestFingerprint, progressState, progressUpdates, forwardProgress, stderr)
 	persistFileDone := func(fileID uint64, ackBytes int64) {
 		persistProgressAck(fileID, ackBytes)
 	}
@@ -2950,7 +3210,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 	stopProgress()
 	progressStopped = true
 	applyProgressStateToManifest(manifest, progressState)
-	if err := saveProgressState(ps.ProgressPath, progressState); err != nil {
+	if err := saveProgressState(ps.ProgressPath, manifestFingerprint, progressState); err != nil {
 		fmt.Fprintf(stderr, "save progress state failed: %v\n", err)
 		return 1
 	}
@@ -3470,6 +3730,73 @@ func applyProgressStateToManifest(manifest *tx.Manifest, state map[uint64]tx.Man
 	}
 }
 
+func printResumeProgress(stderr io.Writer, prefix string, entries []tx.ManifestEntry) {
+	if stderr == nil {
+		return
+	}
+	type resumeEntry struct {
+		entry tx.ManifestEntry
+		ack   int64
+	}
+	resumed := make([]resumeEntry, 0)
+	var resumedBytes int64
+	var resumedTotal int64
+	var skippedFiles int
+	var skippedBytes int64
+	for _, entry := range entries {
+		if entry.Type != 0 && entry.Type != encoding.EntryTypeFile {
+			continue
+		}
+		ack := entry.Progress.AckBytes
+		if ack <= 0 || entry.Size <= 0 {
+			continue
+		}
+		if ack >= entry.Size {
+			skippedFiles++
+			skippedBytes += entry.Size
+			continue
+		}
+		resumed = append(resumed, resumeEntry{entry: entry, ack: ack})
+		resumedBytes += ack
+		resumedTotal += entry.Size
+	}
+	if skippedFiles == 0 && len(resumed) == 0 {
+		return
+	}
+	if skippedFiles > 0 {
+		fmt.Fprintf(
+			stderr,
+			"%s: skipping %d file(s), %s already copied\n",
+			prefix,
+			skippedFiles,
+			encoding.HumanBytes(skippedBytes),
+		)
+	}
+	if len(resumed) == 0 {
+		return
+	}
+	fmt.Fprintf(
+		stderr,
+		"%s: resuming %d file(s), %s/%s already copied\n",
+		prefix,
+		len(resumed),
+		encoding.HumanBytes(resumedBytes),
+		encoding.HumanBytes(resumedTotal),
+	)
+	for _, item := range resumed {
+		pct := 100 * float64(item.ack) / float64(item.entry.Size)
+		fmt.Fprintf(
+			stderr,
+			"%s:   id=%d done=%s/%s (%.1f%%)\n",
+			prefix,
+			item.entry.ID,
+			encoding.HumanBytes(item.ack),
+			encoding.HumanBytes(item.entry.Size),
+			pct,
+		)
+	}
+}
+
 func manifestEntriesByID(manifest *tx.Manifest) map[uint64]tx.ManifestEntry {
 	if manifest == nil || len(manifest.Entries) == 0 {
 		return nil
@@ -3479,6 +3806,40 @@ func manifestEntriesByID(manifest *tx.Manifest) map[uint64]tx.ManifestEntry {
 		entries[entry.ID] = entry
 	}
 	return entries
+}
+
+const progressFingerprintHeaderPrefix = "# manifest-fingerprint xxh128:"
+
+// loadProgressFingerprint returns the fingerprint recorded as a comment
+// header in the progress file, or "" if the file is missing or the
+// header is absent. Errors only when the file exists but cannot be read.
+func loadProgressFingerprint(progressPath string) (string, error) {
+	fd, err := os.Open(progressPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+	defer fd.Close()
+	scanner := bufio.NewScanner(fd)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, progressFingerprintHeaderPrefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, progressFingerprintHeaderPrefix)), nil
+		}
+		// Stop at first non-comment, non-blank line.
+		if !strings.HasPrefix(line, "#") {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return "", nil
 }
 
 func loadProgressState(progressPath string) (map[uint64]tx.ManifestProgress, error) {
@@ -3535,7 +3896,7 @@ func loadProgressState(progressPath string) (map[uint64]tx.ManifestProgress, err
 	return state, nil
 }
 
-func saveProgressState(progressPath string, state map[uint64]tx.ManifestProgress) error {
+func saveProgressState(progressPath string, fingerprint string, state map[uint64]tx.ManifestProgress) error {
 	if len(state) == 0 {
 		if err := os.Remove(progressPath); err != nil && !os.IsNotExist(err) {
 			return err
@@ -3552,6 +3913,12 @@ func saveProgressState(progressPath string, state map[uint64]tx.ManifestProgress
 	fd, err := os.Create(tmpPath)
 	if err != nil {
 		return err
+	}
+	if fingerprint != "" {
+		if _, err := fmt.Fprintf(fd, "%s%s\n", progressFingerprintHeaderPrefix, fingerprint); err != nil {
+			_ = fd.Close()
+			return err
+		}
 	}
 	ids := make([]uint64, 0, len(state))
 	for fileID := range state {
@@ -3584,7 +3951,7 @@ type persistedProgressUpdate struct {
 	AckBytes int64
 }
 
-func startProgressWriter(progressPath string, initial map[uint64]tx.ManifestProgress, updates <-chan tx.DownloadProgressUpdate, onUpdate func(tx.DownloadProgressUpdate), stderr io.Writer) (func(), func(uint64, int64), func(uint64)) {
+func startProgressWriter(progressPath string, fingerprint string, initial map[uint64]tx.ManifestProgress, updates <-chan tx.DownloadProgressUpdate, onUpdate func(tx.DownloadProgressUpdate), stderr io.Writer) (func(), func(uint64, int64), func(uint64)) {
 	state := initial
 	if state == nil {
 		state = make(map[uint64]tx.ManifestProgress)
@@ -3595,7 +3962,7 @@ func startProgressWriter(progressPath string, initial map[uint64]tx.ManifestProg
 	metadataDoneCh := make(chan metadataProgressUpdate, 1024)
 
 	writeSnapshot := func() error {
-		return saveProgressState(progressPath, state)
+		return saveProgressState(progressPath, fingerprint, state)
 	}
 
 	go func() {

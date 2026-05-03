@@ -85,15 +85,17 @@ usage: tx recv [addr] copy [flags] REMOTE_SRC LOCAL_DST
 Copy REMOTE_SRC from the remote to LOCAL_DST on the local machine.
 
 Behavior:
-  - If LOCAL_DST does not exist: full transfer
+  - If LOCAL_DST does not exist and no prior `.tx/<dst>/` state exists: full transfer
+  - If LOCAL_DST does not exist but `.tx/<dst>/` is present from an interrupted run:
+    refresh the manifest via SYNC and resume from the saved progress
   - If LOCAL_DST exists: diff remote and send deltas
-  - --clean removes LOCAL_DST first and forces a clean transfer
+  - --clean removes both LOCAL_DST and `.tx/<dst>/` first and forces a clean transfer
   - --skip-fetch fetches and writes manifest state only; no start/sync
   - --skip-write fetches bodies to a discard sink and never mutates LOCAL_DST
   - --verify=MODE verification after copy: none|meta|N%data|full|<duration> (default meta)
 
 Options:
-      --clean                     Remove LOCAL_DST first, then force a clean transfer
+      --clean                     Remove LOCAL_DST and `.tx/<dst>/` first, then force a clean transfer
       --skip-fetch                Fetch and persist remote manifest state only; do not
                                   start or sync files
       --skip-write                Do not mutate LOCAL_DST; fetch file bodies to discard
@@ -194,11 +196,25 @@ Options:
 
 Behavior:
 
-- if `LOCAL_DST` does not exist, `copy` performs a full transfer into a staging
-  directory and then renames it into place
+- if `LOCAL_DST` does not exist and no prior `.tx/<dst>/` state is present,
+  `copy` performs a full transfer into a staging directory and then renames it
+  into place
+- if `LOCAL_DST` does not exist but `.tx/<dst>/` is present from a previous
+  interrupted run, `copy` resumes: it refreshes the manifest from the server via
+  `SYNC` (sending the prior `manifest.server` as the old manifest), carries any
+  saved progress forward by stable file identity (path + size + mtime + mode +
+  link target) for unchanged files, and resumes downloads from their last
+  acknowledged offsets
 - if `LOCAL_DST` already exists, `copy` switches to sync mode and applies the
   delta needed to converge the local tree to the remote tree
+- `--clean` removes both `LOCAL_DST` and the `.tx/<dst>/` state directory before
+  starting, forcing a fresh transfer with no resume
 - successful non-`--skip-fetch` runs clean up `.tx` after they finish
+
+`copy` validates a `manifest.progress` file against the manifest it was written
+for via an `xxh3-128` fingerprint header; if the on-disk progress does not match
+the current manifest fingerprint, the saved progress is discarded with a warning
+and files restart from offset zero.
 
 Common examples:
 
