@@ -850,7 +850,7 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 		defer stopProgress()
 		syncWorker, stopSync := fsync.StartSyncWorker(-1, true, io.Discard)
 		defer stopSync()
-		client := tx.NewClient(srvURL, tx.WithFileRequestWindowBytes(10))
+		client := tx.NewClient(srvURL, tx.WithFileRequestWindowBytes(15))
 		defer client.Close()
 		resp, err := downloadManifestFiles(manifestDownloadConfig{
 			Client:             client,
@@ -858,7 +858,7 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 			Entries:            manifest.Entries,
 			Concurrency:        1,
 			BatchMaxBytes:      5,
-			SplitWindowWorkers: 1,
+			SplitWindowWorkers: 3,
 			ProgressUpdates:    progressUpdates,
 			OutputWriter: func(entry tx.ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
 				w, syncFn, err := openDownloadOutput(entry, offset, resolveDownloadDestinationPath(entry, outRoot, ""), nil, syncWorker)
@@ -878,6 +878,9 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 		return err
 	}
 
+	firstAcked := make(chan struct{})
+	var firstAckOnce sync.Once
+	var firstAckMu sync.Mutex
 	var firstAckTokens []string
 	firstSrv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
@@ -891,10 +894,17 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 				_, err := io.WriteString(out, buildCLIFrame(0, payload[:5], 0)+"OK\r\n")
 				return err
 			}
-			time.Sleep(100 * time.Millisecond)
+			select {
+			case <-firstAcked:
+			case <-time.After(5 * time.Second):
+				return fmt.Errorf("timed out waiting for first split-window ACK before offset %d interruption", offset)
+			}
 			return fmt.Errorf("intentional interruption at offset %d", offset)
 		case intftcp.VerbACK:
+			firstAckMu.Lock()
 			firstAckTokens = append(firstAckTokens, req.Params[0]["ack-token"])
+			firstAckMu.Unlock()
+			firstAckOnce.Do(func() { close(firstAcked) })
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
 		default:
@@ -906,8 +916,11 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 	if err == nil {
 		t.Fatal("expected first download to fail after the first persisted split window")
 	}
-	if len(firstAckTokens) != 1 || !strings.HasPrefix(firstAckTokens[0], "5@") {
-		t.Fatalf("expected one ACK at byte 5 before interruption, got %v (err=%v)", firstAckTokens, err)
+	firstAckMu.Lock()
+	gotFirstAckTokens := append([]string(nil), firstAckTokens...)
+	firstAckMu.Unlock()
+	if len(gotFirstAckTokens) != 1 || !strings.HasPrefix(gotFirstAckTokens[0], "5@") {
+		t.Fatalf("expected one ACK at byte 5 before interruption, got %v (err=%v)", gotFirstAckTokens, err)
 	}
 	state, err := loadProgressState(progressPath)
 	if err != nil {
@@ -924,6 +937,7 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 		t.Fatalf("unexpected partial output: %q", partial)
 	}
 
+	var resumedOffsetsMu sync.Mutex
 	var resumedOffsets []int64
 	secondSrv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
@@ -933,7 +947,9 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 			if err != nil {
 				return fmt.Errorf("parse offset: %w", err)
 			}
+			resumedOffsetsMu.Lock()
 			resumedOffsets = append(resumedOffsets, offset)
+			resumedOffsetsMu.Unlock()
 			if offset == 0 {
 				return fmt.Errorf("resume re-requested already persisted bytes")
 			}
@@ -955,6 +971,9 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 	if err != nil {
 		t.Fatalf("resume download failed: %v", err)
 	}
+	resumedOffsetsMu.Lock()
+	resumedOffsets = append([]int64(nil), resumedOffsets...)
+	resumedOffsetsMu.Unlock()
 	sort.Slice(resumedOffsets, func(i, j int) bool { return resumedOffsets[i] < resumedOffsets[j] })
 	if got, want := fmt.Sprint(resumedOffsets), "[5 10]"; got != want {
 		t.Fatalf("unexpected resumed SEND offsets: got=%s want=%s", got, want)
