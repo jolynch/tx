@@ -20,7 +20,7 @@ func TestHandleACKLogsCompleteAfterFinalProgress(t *testing.T) {
 
 	deps := NewRuntimeDepsWithRoot("/")
 	var txferID string
-	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8`, root)
+	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8 comp=none`, root)
 	req, err := ParseRequest([]byte(reqRaw))
 	if err != nil {
 		t.Fatalf("ParseRequest failed: %v", err)

@@ -220,15 +220,15 @@ const maxSyncRounds = 3
 // Given targetDir="/var/lib/pinch/dst", state lives in a per-target subdir
 // of the parent's .tx directory so sibling transfers don't collide:
 //
-//	/var/lib/pinch/.tx/dst/manifest         ← client state: what's on disk (written by start/sync)
-//	/var/lib/pinch/.tx/dst/manifest.server  ← server state: written by transfer, read by start/get
+//	/var/lib/pinch/.tx/dst/manifest.zst         ← client state: what's on disk (written by start/sync)
+//	/var/lib/pinch/.tx/dst/manifest.server.zst  ← server state: written by transfer, read by start/get
 //	/var/lib/pinch/.tx/dst/manifest.progress
-//	/var/lib/pinch/.tx/dst/remote/          (staging for start)
+//	/var/lib/pinch/.tx/dst/remote/              (staging for start)
 type pinchState struct {
 	TargetDir          string // the user-facing output directory
 	StateDir           string // parent/.tx/<basename>
-	ManifestPath       string // StateDir/manifest        (client state: what's on disk)
-	ServerManifestPath string // StateDir/manifest.server (server state: from transfer)
+	ManifestPath       string // StateDir/manifest.zst        (client state: what's on disk)
+	ServerManifestPath string // StateDir/manifest.server.zst (server state: from transfer)
 	ProgressPath       string // StateDir/manifest.progress
 	StagingDir         string // StateDir/remote
 }
@@ -243,8 +243,8 @@ func newPinchState(targetDir string) (*pinchState, error) {
 	return &pinchState{
 		TargetDir:          targetDir,
 		StateDir:           stateDir,
-		ManifestPath:       filepath.Join(stateDir, "manifest"),
-		ServerManifestPath: filepath.Join(stateDir, "manifest.server"),
+		ManifestPath:       filepath.Join(stateDir, "manifest.zst"),
+		ServerManifestPath: filepath.Join(stateDir, "manifest.server.zst"),
 		ProgressPath:       filepath.Join(stateDir, "manifest.progress"),
 		StagingDir:         filepath.Join(stateDir, "remote"),
 	}, nil

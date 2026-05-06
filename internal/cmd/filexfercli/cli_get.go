@@ -46,6 +46,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var progressFilePaths []string
 	var progressFormats []string
 	var progressIntervalRaw string
+	var withPageCache bool
 	cf.StringVar(&outFile, "o", "", "", "Output file path, or '-' for stdout")
 	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&keysDir, "k", "keys", "", "Persistent age keys directory (default: ephemeral)")
@@ -64,6 +65,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
 	cf.StringVar(&deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
+	cf.BoolVar(&withPageCache, "", "with-cache-map", false, "Request page-cache residency hint per file (Linux only)")
 	cf.StringVar(&traceFile, "", "trace", "", "Write runtime/trace output to this file")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -155,11 +157,12 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	// Fetch manifest for the single file (skip full probe).
 	fmt.Fprintf(stderr, "get(addr=[%s], path=[%s])\n", serverURL, remotePath)
 	manifestResp, err := client.GetManifest(context.Background(), tx.GetManifestRequest{
-		Directory:   remotePath,
-		Mode:        tx.LoadStrategyFast,
-		LinkMbps:    0,
-		Concurrency: effectiveConcurrency,
-		DeadlineMS:  deadlineMS,
+		Directory:     remotePath,
+		Mode:          tx.LoadStrategyFast,
+		LinkMbps:      0,
+		Concurrency:   effectiveConcurrency,
+		DeadlineMS:    deadlineMS,
+		WithPageCache: withPageCache,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "get failed: %v\n", err)

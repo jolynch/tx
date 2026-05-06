@@ -195,7 +195,7 @@ The command protocol is line-based:
 Commands:
 
 - `AUTH [<blob>]` (optional unless server requires auth)
-- `TXFER <path> [verbose=<0|1>] [max-manifest-chunk-size=<n>]`
+- `TXFER <path> [verbose=<0|1>] [comp=none|zstd]`
 - `SEND <txferid> [comp=<mode>] <fid> <offset> <size> <path> ...`
 - `ACK <txferid> <fid> <ack-token> <delta-bytes> <recv-ms> <sync-ms> <path>`
 - `CXSUM <txferid> fd=<fid> <path> [offset=<n>] [size=<n>] [algo=xxh128|xxh64] ...`
@@ -241,6 +241,18 @@ The final trailer uses `next=0` as a terminal marker.
 `file-hash` is emitted on final trailer as the checksum token for the served request window.
 The final trailer also includes file metadata tokens:
 `meta:size`, `meta:mtime_ns`, `meta:mode`, `meta:uid`, `meta:gid`, `meta:user`, `meta:group`.
+
+`TXFER` returns the manifest body as a sequence of `FX/1` + `FXT/1` frames
+that reuse the same wire grammar as `SEND`, with `file_id=0` reserved as a
+sentinel meaning "the manifest byte stream". `wsize`-bounded payload bytes
+(decompressed when `comp=zstd`) concatenate to form the FM/1 manifest.
+The terminal trailer carries `next=0`; the final verb-level `OK\r\n`
+follows it. Manifest trailers do not carry `meta:*` tokens (no analog).
+Manifest clients validate the FX/1 `hash=xxh128:<chunk>` over each decoded
+logical chunk, the FXT/1 `hash=xxh64:<frame>` over header + wire payload +
+trailer prefix, and the terminal `file-hash=xxh128:<manifest>` over the full
+decoded FM/1 stream. This is intentionally stricter than SEND file-frame
+validation because the manifest is transfer control data.
 Clients may use `meta:mode`, `meta:uid`, and `meta:gid` to mirror ownership/permissions
 only after payload integrity verification succeeds.
 

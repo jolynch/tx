@@ -5,6 +5,12 @@ This document defines the strict manifest format emitted by `TXFER` and consumed
 When requesting a manifest via `TXFER`, clients may first issue `AUTH`.
 If `AUTH` provides a client recipient, the manifest stream is age-encrypted for that recipient.
 
+The FM/1 byte stream is identical regardless of the TXFER wire compression
+(`comp=none` or `comp=zstd`). The TXFER response wraps it in a sequence of
+FX/1 + FXT/1 frames carrying `file_id=0` (see [OVERVIEW](./OVERVIEW.md));
+the concatenated frame payloads — decompressed when `comp=zstd` — form the
+single FM/1 byte stream described here.
+
 ## Structure
 
 Manifest is line-oriented UTF-8 text:
@@ -38,16 +44,24 @@ Any unknown header option is invalid.
 Format:
 
 ```text
-<id> <size> <mtime> <mode> <path>
+<id> <size> <mtime> <mode> <path> [trailing tokens...]
 ```
 
-- `<id>`: unsigned file id.
+- `<id>`: unsigned file id, optionally prefixed by an entry-type byte (`F`/`H`/`D`/`S`); a leading digit is treated as `F`.
 - `<size>`: file size bytes (unsigned integer).
-- `<mtime>`: front-coded mtime token: `<prefix_len>:<suffix_data>`.
+- `<mtime>`: front-coded mtime token: `<prefix_len>:<suffix_data>`. For `H` entries this field carries the link-target file id instead of an mtime.
 - `<mode>`: octal unix mode bits (`0000`-`7777`).
 - `<path>`: front-coded path token: `<prefix_len>:<suffix_len>:<suffix_data>`.
 
-Fields are separated by one ASCII space.
+Fields are separated by one ASCII space. The path token is self-delimiting via its `<suffix_len>` prefix, so additional trailing tokens may follow on the same line.
+
+### Trailing tokens
+
+`S` (symlink) entries always append a length-prefixed link target (`<n>:<target>`) immediately after the path token. After that, any entry type may carry zero or more optional trailing tokens, separated by single spaces. Currently defined tokens:
+
+- `pc:<hex>` (regular files only) — encoded page-cache residency hint produced by `EncodePageCacheEntry`. The hex bytes decode to `[1 byte: padding (0..7)][zstd(packed_bitmap_LE)]`, where the bitmap covers `ceil(size/page_size)` pages with low-bit-first ordering and the padding header is the number of unused trailing bits in the final byte.
+
+Unknown trailing tokens are rejected so the wire stays explicit.
 
 ## Root Entry
 
@@ -104,8 +118,9 @@ Path constraints:
 - `size` must be unsigned and fit `int64`.
 - `mtime` token must decode to decimal digits and fit `int64`.
 - `mode` must be octal and `<= 07777`.
-- Each entry must have exactly 5 fields.
+- Each entry must have at least 5 space-separated fields; trailing tokens are optional except for `S` entries which require a link target.
 - Path token must parse and remain traversal-safe after decode.
+- `pc:` tokens are valid only on regular-file entries; they may appear at most once per entry.
 
 ## Example
 

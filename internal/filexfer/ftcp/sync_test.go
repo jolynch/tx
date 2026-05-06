@@ -163,9 +163,11 @@ func writeTestFile(t *testing.T, root, rel, content string) {
 }
 
 // runTXFERTest runs TXFER and returns the raw FM/1 manifest output.
+// The wire response is a sequence of FX/1 frames (file_id=0); this
+// helper unframes them and concatenates the decoded payloads.
 func runTXFERTest(t *testing.T, root string) string {
 	t.Helper()
-	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8`, root)
+	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8 comp=none`, root)
 	req, err := ParseRequest([]byte(reqRaw))
 	if err != nil {
 		t.Fatalf("ParseRequest: %v", err)
@@ -174,6 +176,28 @@ func runTXFERTest(t *testing.T, root string) string {
 	var out bytes.Buffer
 	if err := handleTXFER(context.Background(), req, &out, deps); err != nil {
 		t.Fatalf("handleTXFER: %v", err)
+	}
+	return unframeManifestWire(t, out.Bytes())
+}
+
+// unframeManifestWire parses a sequence of FX/1 manifest frames
+// (file_id=0) and returns the concatenated logical payloads.
+func unframeManifestWire(t *testing.T, wire []byte) string {
+	t.Helper()
+	var out bytes.Buffer
+	for _, frame := range parseManifestFrames(t, wire) {
+		switch frame.Meta.Comp {
+		case encoding.EncodingZstd:
+			decoded, err := encoding.DecompressZstd(frame.Payload)
+			if err != nil {
+				t.Fatalf("DecompressZstd: %v", err)
+			}
+			out.Write(decoded)
+		case "none":
+			out.Write(frame.Payload)
+		default:
+			t.Fatalf("unsupported manifest frame comp %q", frame.Meta.Comp)
+		}
 	}
 	return out.String()
 }

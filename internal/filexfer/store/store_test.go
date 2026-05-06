@@ -133,6 +133,32 @@ func TestRegisterTransferFileState(t *testing.T) {
 	}
 }
 
+func TestRegisterTransferFileStatePreservesPrestoredPageCacheLength(t *testing.T) {
+	resetTransferStore()
+
+	transfer, err := NewTransfer("/tmp/x", 0, 0)
+	if err != nil {
+		t.Fatalf("NewTransfer returned error: %v", err)
+	}
+	blob := []byte{0x01, 0x02}
+	if !SetTransferPageCache(transfer.ID, 0, blob) {
+		t.Fatalf("SetTransferPageCache returned false")
+	}
+	RegisterTransferFileStates(transfer.ID, []TransferFileStateUpdate{
+		{FileID: 0, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/1")), FileSize: 42},
+	}, TransferStateStarted)
+
+	stored := waitForTransferState(t, transfer.ID, func(stored Transfer) bool {
+		return stored.NumEntries == 1 && len(stored.PageCache) == 1
+	})
+	if len(stored.PageCache) != len(stored.State) {
+		t.Fatalf("PageCache len = %d, State len = %d", len(stored.PageCache), len(stored.State))
+	}
+	if !bytes.Equal(stored.PageCache[0], blob) {
+		t.Fatalf("PageCache[0] = %x, want %x", stored.PageCache[0], blob)
+	}
+}
+
 func TestRegisterTransferFileStateMultipleIDs(t *testing.T) {
 	resetTransferStore()
 

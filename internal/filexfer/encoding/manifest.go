@@ -34,6 +34,11 @@ type ManifestEntry struct {
 	Path       string
 	LinkTarget int64  // H: target file ID; -1 otherwise
 	LinkPath   string // S: symlink target path; "" otherwise
+	// PageCache is the optional encoded page-cache residency hint. When
+	// non-empty, MarshalManifestEntry appends a "pc:<hex>" trailing
+	// token. Decode via DecodePageCacheEntry to recover a pagecache.CacheEntry.
+	// Set only on EntryTypeFile entries.
+	PageCache []byte
 }
 
 // ManifestHeader is the parsed FM/1 header line.
@@ -266,29 +271,32 @@ func ParseManifestEntry(line string, prevPath string, prevMtime string) (Manifes
 		return ManifestEntry{}, "", "", err
 	}
 
-	// For S entries, use DecodePathTokenPrefix (path token is self-delimiting,
-	// trailing content is the symlink target). For other types, consume all.
-	var pathResolved string
+	// Path token is always self-delimiting via DecodePathTokenPrefix; the
+	// remainder may carry an entry-type-specific payload (S: symlink target)
+	// followed by optional trailing key=value tokens.
+	pathResolved, consumed, err := DecodePathTokenPrefix(prevPath, pathAndTrailing)
+	if err != nil {
+		return ManifestEntry{}, "", "", err
+	}
+	trailing := pathAndTrailing[consumed:]
+
 	var linkPath string
 	if entryType == EntryTypeSymlink {
-		consumed := 0
-		pathResolved, consumed, err = DecodePathTokenPrefix(prevPath, pathAndTrailing)
-		if err != nil {
-			return ManifestEntry{}, "", "", err
-		}
-		trailing := strings.TrimSpace(pathAndTrailing[consumed:])
-		if trailing == "" {
+		ts := strings.TrimLeft(trailing, " \t")
+		if ts == "" {
 			return ManifestEntry{}, "", "", errors.New("S entry missing symlink target")
 		}
-		linkPath, _, err = ParseLenPrefixedPrefix(trailing)
+		var linkConsumed int
+		linkPath, linkConsumed, err = ParseLenPrefixedPrefix(ts)
 		if err != nil {
 			return ManifestEntry{}, "", "", fmt.Errorf("invalid symlink target: %w", err)
 		}
-	} else {
-		pathResolved, err = DecodePathToken(prevPath, pathAndTrailing)
-		if err != nil {
-			return ManifestEntry{}, "", "", err
-		}
+		trailing = ts[linkConsumed:]
+	}
+
+	pageCache, err := parseTrailingTokens(entryType, trailing)
+	if err != nil {
+		return ManifestEntry{}, "", "", err
 	}
 
 	if strings.Contains(pathResolved, `\`) {
@@ -311,6 +319,7 @@ func ParseManifestEntry(line string, prevPath string, prevMtime string) (Manifes
 		Path:       pathResolved,
 		LinkTarget: -1,
 		LinkPath:   linkPath,
+		PageCache:  pageCache,
 	}
 
 	// Interpret mtime field based on type.
@@ -461,6 +470,11 @@ func MarshalManifestEntry(entry ManifestEntry, prevPath string, prevMtime string
 		line += fmt.Sprintf(" %d:%s", len(entry.LinkPath), entry.LinkPath)
 	}
 
+	// Optional trailing pagecache token, only meaningful for regular files.
+	if entryType == EntryTypeFile && len(entry.PageCache) > 0 {
+		line += " " + EncodePageCacheToken(entry.PageCache)
+	}
+
 	return line, entry.Path, mtimeRaw, nil
 }
 
@@ -548,6 +562,32 @@ func FormatManifestHeader(hdr ManifestHeader) string {
 		s += fmt.Sprintf(" deadline-ms=%d", hdr.DeadlineMS)
 	}
 	return s
+}
+
+// parseTrailingTokens consumes optional trailing tokens that may follow
+// the path (and, for S entries, the symlink target) on a manifest line.
+// Currently only "pc:<hex>" is recognized; unknown trailing tokens are
+// rejected so the wire format stays explicit.
+//
+// Returns the decoded pagecache blob (nil when absent) and any parse error.
+func parseTrailingTokens(entryType byte, raw string) ([]byte, error) {
+	var pageCache []byte
+	rest := strings.TrimLeft(raw, " \t")
+	for rest != "" {
+		if blob, used, ok := ParsePageCacheToken(rest); ok {
+			if entryType != EntryTypeFile {
+				return nil, errors.New("pagecache token only valid on F entries")
+			}
+			if pageCache != nil {
+				return nil, errors.New("duplicate pagecache token")
+			}
+			pageCache = blob
+			rest = strings.TrimLeft(rest[used:], " \t")
+			continue
+		}
+		return nil, fmt.Errorf("unknown trailing token: %q", rest)
+	}
+	return pageCache, nil
 }
 
 // ParseLenPrefixedPrefix parses a "len:value" token at the start of raw.

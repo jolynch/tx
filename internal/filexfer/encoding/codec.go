@@ -1,6 +1,7 @@
 package encoding
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -33,6 +34,7 @@ type zstdMaxEncodedSizeCache struct {
 
 var zstdMaxSizer zstdMaxEncodedSizeCache
 var zstdDecoderPool sync.Pool
+var zstdEncoderPool sync.Pool
 var lz4ReaderPool sync.Pool
 
 func (c *zstdMaxEncodedSizeCache) maxEncodedSize(n int) (int, error) {
@@ -244,6 +246,61 @@ func releasePooledZstdDecoder(decoder *zstd.Decoder) {
 		return
 	}
 	zstdDecoderPool.Put(decoder)
+}
+
+func acquirePooledZstdEncoder(dst io.Writer) (*zstd.Encoder, error) {
+	if raw := zstdEncoderPool.Get(); raw != nil {
+		if encoder, ok := raw.(*zstd.Encoder); ok && encoder != nil {
+			encoder.Reset(dst)
+			return encoder, nil
+		}
+	}
+	return zstd.NewWriter(dst, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
+}
+
+func releasePooledZstdEncoder(encoder *zstd.Encoder) {
+	if encoder == nil {
+		return
+	}
+	encoder.Reset(io.Discard)
+	zstdEncoderPool.Put(encoder)
+}
+
+// CompressZstd returns src compressed as a single zstd frame.
+func CompressZstd(src []byte) ([]byte, error) {
+	hint, err := MaxEncodedFrameSizeBytes(EncodingZstd, int64(len(src)))
+	if err != nil || hint <= 0 {
+		hint = int64(len(src)) + 64
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, hint))
+	enc, err := acquirePooledZstdEncoder(buf)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := enc.Write(src); err != nil {
+		releasePooledZstdEncoder(enc)
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		releasePooledZstdEncoder(enc)
+		return nil, err
+	}
+	releasePooledZstdEncoder(enc)
+	return buf.Bytes(), nil
+}
+
+// DecompressZstd returns the decompressed bytes of a single zstd frame.
+func DecompressZstd(src []byte) ([]byte, error) {
+	dec, err := acquirePooledZstdDecoder(bytes.NewReader(src))
+	if err != nil {
+		return nil, err
+	}
+	out, err := io.ReadAll(dec)
+	releasePooledZstdDecoder(dec)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func acquirePooledLZ4Reader(src io.Reader) *lz4.Reader {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/jolynch/tx"
@@ -15,17 +16,17 @@ import (
 )
 
 type transferArgs struct {
-	sourceDir    string
-	targetDir    string
-	agePublicKey string
-	ageIdentity  string
-	encMode      string
-	authTokens   []string
-	loadStrategy string
-	probeBytes   int64
-	verbosity    int
-	maxChunk     int
-	deadlineMS   int64
+	sourceDir     string
+	targetDir     string
+	agePublicKey  string
+	ageIdentity   string
+	encMode       string
+	authTokens    []string
+	loadStrategy  string
+	probeBytes    int64
+	verbosity     int
+	deadlineMS    int64
+	withPageCache bool
 }
 
 func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -40,16 +41,16 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	var loadStrategyRaw string
 	var probeSizeRaw string
 	var verbose bool
-	var maxChunk int
 	var deadlineRaw string
+	var withPageCache bool
 	cf.StringVar(&sourceDir, "s", "source-directory", "", "Absolute source directory to transfer")
 	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&loadStrategyRaw, "", "load-strategy", tx.LoadStrategyFast, "Server load strategy (fast|gentle)")
 	probeSizeRaw = encoding.HumanBytes(defaultCLIProbeBytes)
 	cf.StringVar(&probeSizeRaw, "", "probe-size", probeSizeRaw, "Probe payload size for transfer metadata; 1B, 4KiB, 8MiB")
 	cf.BoolVar(&verbose, "v", "verbose", false, "Disable front-coding")
-	cf.IntVar(&maxChunk, "", "max-manifest-chunk-size", 0, "Max chunk bytes for manifest stream")
 	cf.StringVar(&deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
+	cf.BoolVar(&withPageCache, "", "with-cache-map", false, "Request page-cache residency hint per file (Linux only)")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -62,10 +63,6 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	}
 	if cf.NArg() != 1 {
 		fmt.Fprintln(stderr, "transfer requires exactly one positional argument: <target-dir>")
-		return 2
-	}
-	if maxChunk < 0 {
-		fmt.Fprintln(stderr, "--max-manifest-chunk-size must be >= 0")
 		return 2
 	}
 	probeBytes, err := encoding.ParseByteSize(probeSizeRaw)
@@ -101,16 +98,16 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		deadlineMS = d.Milliseconds()
 	}
 	return runTransfer(serverURL, transferArgs{
-		sourceDir:    sourceDir,
-		targetDir:    cf.Arg(0),
-		agePublicKey: agePublicKey,
-		ageIdentity:  ageIdentity,
-		encMode:      resolvedEncMode,
-		loadStrategy: loadStrategy,
-		probeBytes:   probeBytes,
-		verbosity:    verbosityFromFlags(false, verbose),
-		maxChunk:     maxChunk,
-		deadlineMS:   deadlineMS,
+		sourceDir:     sourceDir,
+		targetDir:     cf.Arg(0),
+		agePublicKey:  agePublicKey,
+		ageIdentity:   ageIdentity,
+		encMode:       resolvedEncMode,
+		loadStrategy:  loadStrategy,
+		probeBytes:    probeBytes,
+		verbosity:     verbosityFromFlags(false, verbose),
+		deadlineMS:    deadlineMS,
+		withPageCache: withPageCache,
 	}, stdout, stderr)
 }
 
@@ -148,17 +145,53 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 		probeResult.WarmConnectionPoolSize,
 	)
 	fmt.Fprintln(stderr, formatProbeLinkLine(probeResult, cfg.probeBytes))
-	manifestResp, err := client.GetManifest(context.Background(), tx.GetManifestRequest{
-		Directory:    cfg.sourceDir,
-		Verbose:      cfg.verbosity >= 2,
-		MaxChunkSize: cfg.maxChunk,
-		Mode:         cfg.loadStrategy,
-		LinkMbps:     probeResult.LinkMbps,
-		Concurrency:  probeResult.SuggestedConcurrency,
-		DeadlineMS:   cfg.deadlineMS,
-	})
+	if err := ps.ensureStateDir(); err != nil {
+		fmt.Fprintf(stderr, "create state directory failed: %v\n", err)
+		return 1
+	}
+	tmpManifestPath := ps.ServerManifestPath + ".tmp"
+	tmpFile, err := os.Create(tmpManifestPath)
 	if err != nil {
+		fmt.Fprintf(stderr, "create manifest tmp failed: %v\n", err)
+		return 1
+	}
+	var manifestWireBytes atomic.Int64
+	rawSink := &countingWriter{Writer: tmpFile, total: &manifestWireBytes}
+	progressCh := make(chan tx.ManifestProgressUpdate, 64)
+	progressDone := make(chan struct{})
+	go func() {
+		defer close(progressDone)
+		for upd := range progressCh {
+			fmt.Fprintf(stderr,
+				"txfer-manifest: [%d][%s → %s] total=[%s → %s]\n",
+				upd.FrameIndex,
+				encoding.HumanBytes(upd.WireBytes), encoding.HumanBytes(upd.LogicalBytes),
+				encoding.HumanBytes(upd.TotalWire), encoding.HumanBytes(upd.TotalLogical),
+			)
+		}
+	}()
+	manifestResp, err := client.GetManifest(context.Background(), tx.GetManifestRequest{
+		Directory:        cfg.sourceDir,
+		Verbose:          cfg.verbosity >= 2,
+		Mode:             cfg.loadStrategy,
+		LinkMbps:         probeResult.LinkMbps,
+		Concurrency:      probeResult.SuggestedConcurrency,
+		DeadlineMS:       cfg.deadlineMS,
+		WithPageCache:    cfg.withPageCache,
+		RawSink:          rawSink,
+		ManifestProgress: progressCh,
+	})
+	close(progressCh)
+	<-progressDone
+	closeErr := tmpFile.Close()
+	if err != nil {
+		_ = os.Remove(tmpManifestPath)
 		fmt.Fprintf(stderr, "transfer failed: %v\n", err)
+		return 1
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpManifestPath)
+		fmt.Fprintf(stderr, "close manifest tmp: %v\n", closeErr)
 		return 1
 	}
 	manifest := manifestResp.Manifest
@@ -167,13 +200,18 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 	for _, e := range manifest.Entries {
 		total += e.Size
 	}
-	if err := ps.ensureStateDir(); err != nil {
-		fmt.Fprintf(stderr, "create state directory failed: %v\n", err)
-		return 1
-	}
-	if err := tx.SaveManifest(ps.ServerManifestPath, manifest); err != nil {
-		fmt.Fprintf(stderr, "save manifest failed: %v\n", err)
-		return 1
+	if manifestWireBytes.Load() > 0 {
+		if err := os.Rename(tmpManifestPath, ps.ServerManifestPath); err != nil {
+			_ = os.Remove(tmpManifestPath)
+			fmt.Fprintf(stderr, "rename manifest: %v\n", err)
+			return 1
+		}
+	} else {
+		_ = os.Remove(tmpManifestPath)
+		if err := tx.SaveManifest(ps.ServerManifestPath, manifest); err != nil {
+			fmt.Fprintf(stderr, "save manifest failed: %v\n", err)
+			return 1
+		}
 	}
 	fmt.Fprintf(
 		stderr,

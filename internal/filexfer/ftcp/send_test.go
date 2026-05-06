@@ -104,6 +104,8 @@ func (d *sendTestDeps) VerifyTransferFileWindowHash(string, uint64, int64, strin
 
 func (d *sendTestDeps) AcknowledgeTransferFile(string, uint64, int64) bool { return false }
 
+func (d *sendTestDeps) SetTransferPageCache(string, uint64, []byte) bool { return false }
+
 func (d *sendTestDeps) SetTransferDeadline(string, int64) bool           { return false }
 func (d *sendTestDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }
 func (d *sendTestDeps) MarkTransferTooSlow(string) bool                  { return false }

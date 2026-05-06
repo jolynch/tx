@@ -50,6 +50,7 @@ func (f fakeDeps) VerifyTransferFileWindowHash(string, uint64, int64, string) bo
 	return true
 }
 func (f fakeDeps) AcknowledgeTransferFile(string, uint64, int64) bool { return true }
+func (f fakeDeps) SetTransferPageCache(string, uint64, []byte) bool   { return true }
 
 func (f fakeDeps) SetTransferDeadline(string, int64) bool           { return false }
 func (f fakeDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }

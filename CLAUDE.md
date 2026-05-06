@@ -188,7 +188,7 @@ Full flag reference with `--help` output lives in `docs/pub/CLI.md`. **Any time 
 
 - **`copy`**: full directory download with probes, manifest fetch, parallel SEND batches, ACK, optional verify. Writes `.tx/` state (manifest + progress file) for resume.
 - **`get`**: single-file download. Skips probes and `.tx/` state.
-- **`status`**: monitors a transfer. With `LOCAL_DST` reads `.tx/manifest.server` for the transfer ID and polls with combined server+client progress. With `--tid` polls server only. With no args lists all active transfers.
+- **`status`**: monitors a transfer. With `LOCAL_DST` reads `.tx/manifest.server.zst` for the transfer ID and polls with combined server+client progress. With `--tid` polls server only. With no args lists all active transfers.
 
 ### Shared flag helpers (`internal/cliflags/`)
 

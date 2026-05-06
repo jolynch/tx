@@ -1,8 +1,10 @@
 package encoding
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -51,6 +53,57 @@ func TestMarshalParseManifestEntryFile(t *testing.T) {
 	}
 	if parsed.LinkTarget != -1 {
 		t.Errorf("link target: got %d, want -1", parsed.LinkTarget)
+	}
+}
+
+func TestMarshalParseManifestEntryFileWithPageCache(t *testing.T) {
+	pageCache := []byte{0xde, 0xad, 0xbe, 0xef}
+	entry := ManifestEntry{
+		Type:       EntryTypeFile,
+		ID:         3,
+		Size:       4096,
+		Mtime:      1736000000000000000,
+		Mode:       0o644,
+		Path:       "data/x.bin",
+		LinkTarget: -1,
+		PageCache:  pageCache,
+	}
+	line, _, _, err := MarshalManifestEntry(entry, "", "")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(line, " pc:deadbeef") {
+		t.Fatalf("expected pagecache token in line, got %q", line)
+	}
+
+	parsed, _, _, err := ParseManifestEntry(line, "", "")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !bytes.Equal(parsed.PageCache, pageCache) {
+		t.Fatalf("PageCache = %x, want %x", parsed.PageCache, pageCache)
+	}
+	if parsed.Path != "data/x.bin" {
+		t.Fatalf("path = %q, want data/x.bin", parsed.Path)
+	}
+}
+
+func TestMarshalManifestEntryFileWithoutPageCacheOmitsToken(t *testing.T) {
+	entry := ManifestEntry{
+		Type:       EntryTypeFile,
+		ID:         0,
+		Size:       4096,
+		Mtime:      1736000000000000000,
+		Mode:       0o644,
+		Path:       "data/x.bin",
+		LinkTarget: -1,
+	}
+	line, _, _, err := MarshalManifestEntry(entry, "", "")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(line, "pc:") {
+		t.Fatalf("did not expect pagecache token in line, got %q", line)
 	}
 }
 
@@ -119,6 +172,26 @@ func TestMarshalParseManifestEntryDir(t *testing.T) {
 	}
 	if parsed.Mode != 0o750 {
 		t.Errorf("mode: got %o, want 0750", parsed.Mode)
+	}
+}
+
+func TestMarshalManifestEntrySkipsPageCacheForNonFile(t *testing.T) {
+	entry := ManifestEntry{
+		Type:       EntryTypeDir,
+		ID:         0,
+		Size:       0,
+		Mtime:      1736000000000000000,
+		Mode:       0o755,
+		Path:       "logs",
+		LinkTarget: -1,
+		PageCache:  []byte{0x01, 0x02},
+	}
+	line, _, _, err := MarshalManifestEntry(entry, "", "")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(line, "pc:") {
+		t.Fatalf("D entry should not carry pagecache token, got %q", line)
 	}
 }
 
@@ -195,6 +268,20 @@ func TestDecodePathTokenRejectsTrailing(t *testing.T) {
 	}
 }
 
+func TestParseManifestEntryRejectsPageCacheOnNonFile(t *testing.T) {
+	line := "D0 0 0:1736000000000000000 0755 0:4:logs pc:ab"
+	if _, _, _, err := ParseManifestEntry(line, "", ""); err == nil {
+		t.Fatalf("expected parse error for pagecache token on D entry")
+	}
+}
+
+func TestParseManifestEntryRejectsUnknownTrailingToken(t *testing.T) {
+	line := "0 4096 0:1736000000000000000 0644 0:5:a.txt foo=bar"
+	if _, _, _, err := ParseManifestEntry(line, "", ""); err == nil {
+		t.Fatalf("expected parse error for unknown trailing token")
+	}
+}
+
 func TestMarshalParseManifestEntryFrontCodingAcrossTypes(t *testing.T) {
 	// Verify front-coding works across D, F, H, S entries.
 	entries := []ManifestEntry{
@@ -242,6 +329,36 @@ func TestMarshalParseManifestEntryFrontCodingAcrossTypes(t *testing.T) {
 		}
 		prevPath = p
 		prevMtime = m
+	}
+}
+
+func TestMarshalParseManifestEntryFrontCodingWithPageCache(t *testing.T) {
+	prevPath := ""
+	prevMtime := ""
+	entries := []ManifestEntry{
+		{Type: EntryTypeFile, ID: 0, Size: 4096, Mtime: 1736000000000000000, Mode: 0o644, Path: "a.bin", LinkTarget: -1, PageCache: []byte{0x11, 0x22}},
+		{Type: EntryTypeFile, ID: 1, Size: 8192, Mtime: 1736000000000000001, Mode: 0o644, Path: "a.txt", LinkTarget: -1},
+		{Type: EntryTypeFile, ID: 2, Size: 16384, Mtime: 1736000000000000002, Mode: 0o644, Path: "b.txt", LinkTarget: -1, PageCache: []byte{0x33}},
+	}
+	for i, entry := range entries {
+		line, p, m, err := MarshalManifestEntry(entry, prevPath, prevMtime)
+		if err != nil {
+			t.Fatalf("marshal[%d]: %v", i, err)
+		}
+		parsed, pp, pm, err := ParseManifestEntry(line, prevPath, prevMtime)
+		if err != nil {
+			t.Fatalf("parse[%d]: %v (line=%q prev=%q)", i, err, line, prevPath)
+		}
+		if parsed.Path != entry.Path {
+			t.Fatalf("entry %d path mismatch: got %q want %q", i, parsed.Path, entry.Path)
+		}
+		if !bytes.Equal(parsed.PageCache, entry.PageCache) {
+			t.Fatalf("entry %d pagecache mismatch: got %x want %x", i, parsed.PageCache, entry.PageCache)
+		}
+		prevPath = p
+		prevMtime = m
+		_ = pp
+		_ = pm
 	}
 }
 

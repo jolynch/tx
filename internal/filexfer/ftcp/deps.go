@@ -44,6 +44,7 @@ type Deps interface {
 	SetTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool
 	VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool
 	AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool
+	SetTransferPageCache(txferID string, fileID uint64, blob []byte) bool
 
 	SetTransferDeadline(txferID string, deadlineMS int64) bool
 	RecordTransferFirstSend(txferID string) (time.Time, bool)
@@ -134,6 +135,10 @@ func (runtimeDeps) VerifyTransferFileWindowHash(txferID string, fileID uint64, e
 
 func (runtimeDeps) AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool {
 	return intstore.AcknowledgeTransferFile(txferID, fileID, ackBytes)
+}
+
+func (runtimeDeps) SetTransferPageCache(txferID string, fileID uint64, blob []byte) bool {
+	return intstore.SetTransferPageCache(txferID, fileID, blob)
 }
 
 func (runtimeDeps) SetTransferDeadline(txferID string, deadlineMS int64) bool {

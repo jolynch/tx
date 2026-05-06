@@ -256,6 +256,11 @@ type ManifestEntry struct {
 	Progress   ManifestProgress
 	LinkTarget int64  // H: target file ID; -1 otherwise
 	LinkPath   string // S: symlink target path; "" otherwise
+	// PageCache is the optional encoded page-cache residency hint emitted
+	// by the server when WithPageCache was set on the manifest request.
+	// Decode via internal/filexfer/encoding.DecodePageCacheEntry to recover a
+	// pagecache.CacheEntry usable for Touch.
+	PageCache []byte
 }
 
 type ManifestProgress struct {
@@ -365,13 +370,43 @@ type StartFromManifestResponse struct {
 }
 
 type GetManifestRequest struct {
-	Directory    string
-	Verbose      bool
-	MaxChunkSize int
-	Mode         string
-	LinkMbps     int64
-	Concurrency  int
-	DeadlineMS   int64
+	Directory   string
+	Verbose     bool
+	Mode        string
+	LinkMbps    int64
+	Concurrency int
+	DeadlineMS  int64
+	// WithPageCache, when true, asks the server to attach a per-file
+	// page-cache residency hint to each manifest entry. Decode via
+	// encoding.DecodePageCacheEntry to recover a pagecache.CacheEntry.
+	WithPageCache bool
+	// Comp selects the wire compression for the manifest stream. Empty
+	// defaults to "zstd". Use "none" for an uncompressed FM/1 response.
+	Comp string
+	// RawSink, when non-nil and Comp=="zstd", receives compressed wire
+	// payload bytes (concatenated FX/1 payloads, one per frame) as they are
+	// read. The resulting bytes form a multi-frame zstd archive suitable for
+	// writing directly to a .zst file, avoiding a second in-memory copy of the
+	// compressed manifest while the decoded FM/1 is parsed.
+	RawSink io.Writer
+	// ManifestProgress, if non-nil, receives one update per FX/1 chunk as
+	// the manifest streams in. Sends are non-blocking — if the channel is
+	// full, updates are dropped. The caller owns the channel's lifecycle
+	// (the client never closes it). Mirrors the SEND-side ProgressUpdates
+	// pattern.
+	ManifestProgress chan<- ManifestProgressUpdate
+}
+
+// ManifestProgressUpdate carries per-FX/1-chunk progress for a streaming
+// TXFER response. Sent to GetManifestRequest.ManifestProgress as each
+// chunk is received.
+type ManifestProgressUpdate struct {
+	FrameIndex   int   // 0-based chunk index
+	WireBytes    int64 // wire bytes in this chunk (compressed length for comp=zstd)
+	LogicalBytes int64 // uncompressed bytes in this chunk
+	TotalWire    int64 // cumulative wire bytes received
+	TotalLogical int64 // cumulative logical bytes accumulated
+	Terminal     bool  // true on the final chunk (FXT/1 next=0)
 }
 
 type ProbeRequest struct {
@@ -654,6 +689,12 @@ func SaveManifest(path string, manifest *Manifest) error {
 	if err != nil {
 		return err
 	}
+	if strings.HasSuffix(path, ".zst") {
+		raw, err = intencoding.CompressZstd(raw)
+		if err != nil {
+			return fmt.Errorf("compress manifest: %w", err)
+		}
+	}
 	parent := filepath.Dir(path)
 	if parent != "." && parent != "" {
 		if err := os.MkdirAll(parent, 0o755); err != nil {
@@ -675,6 +716,10 @@ func MarshalManifest(manifest *Manifest) ([]byte, error) {
 	return marshalManifest(manifest)
 }
 
+func ParseManifest(raw []byte) (*Manifest, error) {
+	return parseManifest(raw)
+}
+
 func LoadManifest(path string) (*Manifest, error) {
 	if path == "" {
 		return nil, errors.New("missing path")
@@ -682,6 +727,12 @@ func LoadManifest(path string) (*Manifest, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read manifest: %w", err)
+	}
+	if strings.HasSuffix(path, ".zst") {
+		raw, err = intencoding.DecompressZstd(raw)
+		if err != nil {
+			return nil, fmt.Errorf("decompress manifest: %w", err)
+		}
 	}
 	return parseManifest(raw)
 }
@@ -2638,6 +2689,7 @@ func parseManifest(raw []byte) (*Manifest, error) {
 					Path:       raw.Path,
 					LinkTarget: raw.LinkTarget,
 					LinkPath:   raw.LinkPath,
+					PageCache:  raw.PageCache,
 				}
 				if entry.ID == intencoding.RootFileID && entry.Type == intencoding.EntryTypeDir && filepath.IsAbs(entry.Path) {
 					if _, exists := seenIDs[entry.ID]; exists {
@@ -2775,6 +2827,7 @@ func marshalManifest(manifest *Manifest) ([]byte, error) {
 			Path:       entry.Path,
 			LinkTarget: entry.LinkTarget,
 			LinkPath:   entry.LinkPath,
+			PageCache:  entry.PageCache,
 		}, prevPath, prevMtime)
 		if err != nil {
 			return nil, err
