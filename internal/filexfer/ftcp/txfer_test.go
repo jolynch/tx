@@ -8,10 +8,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
 )
 
@@ -73,6 +75,8 @@ func (d *txferTestDeps) VerifyTransferFileWindowHash(string, uint64, int64, stri
 
 func (d *txferTestDeps) AcknowledgeTransferFile(string, uint64, int64) bool { return true }
 
+func (d *txferTestDeps) SetTransferPageCache(string, uint64, []byte) bool { return true }
+
 func (d *txferTestDeps) SetTransferDeadline(string, int64) bool           { return false }
 func (d *txferTestDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }
 func (d *txferTestDeps) MarkTransferTooSlow(string) bool                  { return false }
@@ -120,7 +124,7 @@ func TestHandleTXFERStoresHintsAndEmitsFM2(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("hello"), 0o644); err != nil {
 		t.Fatalf("write test file: %v", err)
 	}
-	reqRaw := fmt.Sprintf(`TXFER %q mode=gentle link-mbps=700 concurrency=6`, root)
+	reqRaw := fmt.Sprintf(`TXFER %q mode=gentle link-mbps=700 concurrency=6 comp=none`, root)
 	req, err := ParseRequest([]byte(reqRaw))
 	if err != nil {
 		t.Fatalf("ParseRequest failed: %v", err)
@@ -136,7 +140,7 @@ func TestHandleTXFERStoresHintsAndEmitsFM2(t *testing.T) {
 	if deps.setHintsTxID != "tx123" || deps.setHintsMode != "gentle" || deps.setHintsMbps != 700 || deps.setHintsConc != 6 {
 		t.Fatalf("unexpected SetTransferHints values: tx=%s mode=%s mbps=%d conc=%d", deps.setHintsTxID, deps.setHintsMode, deps.setHintsMbps, deps.setHintsConc)
 	}
-	manifest := out.String()
+	manifest := unframeManifestWire(t, out.Bytes())
 	if !strings.HasPrefix(manifest, "FM/1 tx123 ") {
 		t.Fatalf("expected FM/1 header, got: %q", manifest)
 	}
@@ -380,5 +384,233 @@ func TestHandleTXFERDirectoryOnlyLogsImmediateComplete(t *testing.T) {
 	}
 	if !strings.Contains(logged, "txfer-complete: tid="+txferID+" files=0") {
 		t.Fatalf("expected immediate txfer-complete log, got %q", logged)
+	}
+}
+
+func TestHandleTXFEROmitsPageCacheByDefault(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.bin"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=900 concurrency=4`, root)
+	req, err := ParseRequest([]byte(reqRaw))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	var out bytes.Buffer
+	if err := handleTXFER(context.Background(), req, &out, &txferTestDeps{}); err != nil {
+		t.Fatalf("handleTXFER: %v", err)
+	}
+	if strings.Contains(out.String(), "pc:") {
+		t.Fatalf("manifest should not include pagecache token without cache-map flag, got %q", out.String())
+	}
+}
+
+func TestHandleTXFEREmitsPageCacheWhenRequested(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("cache-map emission requires Linux mincore")
+	}
+	root := t.TempDir()
+	path := filepath.Join(root, "warm.bin")
+	if err := os.WriteFile(path, make([]byte, 4096), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Force the file into the page cache so mincore reports residency.
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := io.ReadAll(f); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	f.Close()
+
+	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=900 concurrency=4 cache-map=1`, root)
+	req, err := ParseRequest([]byte(reqRaw))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	var out bytes.Buffer
+	if err := handleTXFER(context.Background(), req, &out, &txferTestDeps{}); err != nil {
+		t.Fatalf("handleTXFER: %v", err)
+	}
+	if !strings.Contains(out.String(), " pc:") {
+		t.Fatalf("expected pagecache token in manifest, got %q", out.String())
+	}
+}
+
+func TestParseTXFERRequestAcceptsPageCache(t *testing.T) {
+	req, err := ParseRequest([]byte(`TXFER "/tmp" mode=fast link-mbps=900 concurrency=4 cache-map=1`))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	parsed, err := parseTXFERRequest(req)
+	if err != nil {
+		t.Fatalf("parseTXFERRequest: %v", err)
+	}
+	if !parsed.PageCache {
+		t.Fatalf("expected PageCache=true")
+	}
+}
+
+func TestHandleTXFERCompZstdEmitsStreamingFrames(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "a.txt", "hello world")
+
+	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8 comp=zstd`, root)
+	req, err := ParseRequest([]byte(reqRaw))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	var out bytes.Buffer
+	if err := handleTXFER(context.Background(), req, &out, &syncTestDeps{}); err != nil {
+		t.Fatalf("handleTXFER: %v", err)
+	}
+
+	frames := parseManifestFrames(t, out.Bytes())
+	if len(frames) == 0 {
+		t.Fatalf("expected at least one FX/1 manifest frame, got 0")
+	}
+	var decoded bytes.Buffer
+	var sawFileHash bool
+	for i, fr := range frames {
+		if fr.Meta.FileID != encoding.ManifestFrameFileID {
+			t.Fatalf("frame %d: unexpected file_id %d", i, fr.Meta.FileID)
+		}
+		if fr.Meta.Comp != encoding.EncodingZstd {
+			t.Fatalf("frame %d: comp=%q, want zstd", i, fr.Meta.Comp)
+		}
+		dec, err := encoding.DecompressZstd(fr.Payload)
+		if err != nil {
+			t.Fatalf("frame %d: DecompressZstd: %v", i, err)
+		}
+		decoded.Write(dec)
+		if fr.Trailer.FileHashToken != "" {
+			sawFileHash = true
+			if i != len(frames)-1 {
+				t.Fatalf("file-hash on non-terminal frame %d", i)
+			}
+		}
+	}
+	if !sawFileHash {
+		t.Fatalf("expected terminal frame to carry file-hash")
+	}
+	if !bytes.HasPrefix(decoded.Bytes(), []byte("FM/1 ")) {
+		t.Fatalf("decompressed payload missing FM/1 header: %q", decoded.String())
+	}
+	if !bytes.Contains(decoded.Bytes(), []byte("a.txt")) {
+		t.Fatalf("decompressed payload missing a.txt entry: %q", decoded.String())
+	}
+}
+
+func TestHandleTXFERCompNoneEmitsStreamingFrames(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "a.txt", "hello world")
+
+	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8 comp=none`, root)
+	req, err := ParseRequest([]byte(reqRaw))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	var out bytes.Buffer
+	if err := handleTXFER(context.Background(), req, &out, &syncTestDeps{}); err != nil {
+		t.Fatalf("handleTXFER: %v", err)
+	}
+	frames := parseManifestFrames(t, out.Bytes())
+	if len(frames) == 0 {
+		t.Fatalf("expected at least one frame")
+	}
+	var fm bytes.Buffer
+	for i, fr := range frames {
+		if fr.Meta.Comp != "none" {
+			t.Fatalf("frame %d: comp=%q, want none", i, fr.Meta.Comp)
+		}
+		if fr.Meta.WireSize != fr.Meta.Size {
+			t.Fatalf("frame %d: comp=none should have wsize==size, got wsize=%d size=%d", i, fr.Meta.WireSize, fr.Meta.Size)
+		}
+		fm.Write(fr.Payload)
+	}
+	if !bytes.HasPrefix(fm.Bytes(), []byte("FM/1 ")) {
+		t.Fatalf("missing FM/1 prefix: %q", fm.String())
+	}
+	if !bytes.Contains(fm.Bytes(), []byte("a.txt")) {
+		t.Fatalf("missing entry: %q", fm.String())
+	}
+	// Terminal trailer must carry file-hash; intermediates must not.
+	for i, fr := range frames {
+		hasFile := fr.Trailer.FileHashToken != ""
+		if i == len(frames)-1 && !hasFile {
+			t.Fatalf("terminal frame missing file-hash")
+		}
+		if i != len(frames)-1 && hasFile {
+			t.Fatalf("non-terminal frame %d has unexpected file-hash", i)
+		}
+	}
+}
+
+type parsedManifestFrame struct {
+	Meta    encoding.FileFrameMeta
+	Payload []byte
+	Trailer encoding.FrameTrailer
+}
+
+func parseManifestFrames(t *testing.T, wire []byte) []parsedManifestFrame {
+	t.Helper()
+	var frames []parsedManifestFrame
+	for len(wire) > 0 {
+		nl := bytes.IndexByte(wire, '\n')
+		if nl < 0 {
+			t.Fatalf("missing FX/1 header newline; rem=%q", wire)
+		}
+		meta, err := encoding.ParseFXHeader(string(wire[:nl]))
+		if err != nil {
+			t.Fatalf("ParseFXHeader: %v", err)
+		}
+		wire = wire[nl+1:]
+		if int64(len(wire)) < meta.WireSize {
+			t.Fatalf("wire short: have=%d need=%d", len(wire), meta.WireSize)
+		}
+		payload := wire[:meta.WireSize]
+		wire = wire[meta.WireSize:]
+		nl = bytes.IndexByte(wire, '\n')
+		if nl < 0 {
+			t.Fatalf("missing FXT/1 trailer newline; rem=%q", wire)
+		}
+		trailerLine := string(wire[:nl])
+		trailer, err := encoding.ParseFXTrailer(trailerLine)
+		if err != nil {
+			t.Fatalf("ParseFXTrailer(%q): %v", trailerLine, err)
+		}
+		wire = wire[nl+1:]
+		frames = append(frames, parsedManifestFrame{Meta: meta, Payload: append([]byte(nil), payload...), Trailer: trailer})
+	}
+	return frames
+}
+
+func TestParseTXFERRequestRejectsUnsupportedComp(t *testing.T) {
+	req, err := ParseRequest([]byte(`TXFER "/tmp" mode=fast link-mbps=900 concurrency=4 comp=lz4`))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	_, err = parseTXFERRequest(req)
+	if err == nil {
+		t.Fatalf("expected UNSUPPORTED_COMP error")
+	}
+	if pe, ok := err.(protocolErr); !ok || pe.code != "UNSUPPORTED_COMP" {
+		t.Fatalf("expected protocolErr UNSUPPORTED_COMP, got %v", err)
+	}
+}
+
+func TestParseTXFERRequestRejectsMaxChunkSize(t *testing.T) {
+	req, err := ParseRequest([]byte(`TXFER "/tmp" mode=fast link-mbps=900 concurrency=4 max-manifest-chunk-size=1024`))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	_, err = parseTXFERRequest(req)
+	if err == nil {
+		t.Fatalf("expected BAD_REQUEST for removed max-manifest-chunk-size arg")
+	}
+	if pe, ok := err.(protocolErr); !ok || pe.code != "BAD_REQUEST" {
+		t.Fatalf("expected protocolErr BAD_REQUEST, got %v", err)
 	}
 }

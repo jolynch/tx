@@ -55,6 +55,7 @@ type Transfer struct {
 	PathHash        []xxh3.Uint128
 	FileSize        []int64
 	AckedSize       []int64
+	PageCache       [][]byte // optional per-file page-cache hint blob; nil if not requested
 	CreatedAt       time.Time
 	ExpiresAt       time.Time
 	DeadlineMS      int64     // 0 = no deadline
@@ -185,6 +186,9 @@ func cloneTransfer(transfer Transfer) Transfer {
 	out.PathHash = append([]xxh3.Uint128(nil), transfer.PathHash...)
 	out.FileSize = append([]int64(nil), transfer.FileSize...)
 	out.AckedSize = append([]int64(nil), transfer.AckedSize...)
+	if transfer.PageCache != nil {
+		out.PageCache = append([][]byte(nil), transfer.PageCache...)
+	}
 	return out
 }
 
@@ -470,6 +474,11 @@ func (s *transferStore) appendFileStates(txferID string, updates []TransferFileS
 		managed.transfer.PathHash = append(managed.transfer.PathHash, make([]xxh3.Uint128, growBy)...)
 		managed.transfer.FileSize = append(managed.transfer.FileSize, make([]int64, growBy)...)
 		managed.transfer.AckedSize = append(managed.transfer.AckedSize, make([]int64, growBy)...)
+		if managed.transfer.PageCache != nil {
+			for len(managed.transfer.PageCache) < n {
+				managed.transfer.PageCache = append(managed.transfer.PageCache, nil)
+			}
+		}
 		for i := oldLen; i < n; i++ {
 			managed.transfer.State[i] = TransferStateStarted
 		}
@@ -791,6 +800,46 @@ func (s *transferStore) listForTest() []Transfer {
 	return out
 }
 
+func (s *transferStore) setPageCache(txferID string, fileID uint64, blob []byte) bool {
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return false
+	}
+
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.deleted {
+		return false
+	}
+	idx := int(fileID)
+	if managed.transfer.PageCache == nil {
+		managed.transfer.PageCache = make([][]byte, len(managed.transfer.State))
+	}
+	for len(managed.transfer.PageCache) <= idx {
+		managed.transfer.PageCache = append(managed.transfer.PageCache, nil)
+	}
+	managed.transfer.PageCache[idx] = blob
+	return true
+}
+
+func (s *transferStore) getPageCache(txferID string, fileID uint64) ([]byte, bool) {
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return nil, false
+	}
+
+	managed.mu.RLock()
+	defer managed.mu.RUnlock()
+	if managed.deleted {
+		return nil, false
+	}
+	idx := int(fileID)
+	if idx >= len(managed.transfer.PageCache) {
+		return nil, false
+	}
+	return managed.transfer.PageCache[idx], managed.transfer.PageCache[idx] != nil
+}
+
 func (s *transferStore) setFileState(txferID string, fileID uint64, state uint8) bool {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
@@ -919,6 +968,9 @@ func (s *transferStore) clipTransfer(txferID string) bool {
 	managed.transfer.PathHash = slices.Clip(managed.transfer.PathHash)
 	managed.transfer.FileSize = slices.Clip(managed.transfer.FileSize)
 	managed.transfer.AckedSize = slices.Clip(managed.transfer.AckedSize)
+	if managed.transfer.PageCache != nil {
+		managed.transfer.PageCache = slices.Clip(managed.transfer.PageCache)
+	}
 
 	t := &managed.transfer
 	log.Printf(
@@ -1210,6 +1262,14 @@ func SetTransferFileCompressionMode(txferID string, fileID uint64, mode Compress
 
 func SetTransferFileState(txferID string, fileID uint64, state uint8) bool {
 	return manager.setFileState(txferID, fileID, state)
+}
+
+func SetTransferPageCache(txferID string, fileID uint64, blob []byte) bool {
+	return manager.setPageCache(txferID, fileID, blob)
+}
+
+func GetTransferPageCache(txferID string, fileID uint64) ([]byte, bool) {
+	return manager.getPageCache(txferID, fileID)
 }
 
 func ClipTransfer(txferID string) bool {

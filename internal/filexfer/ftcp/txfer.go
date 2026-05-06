@@ -12,17 +12,19 @@ import (
 	"syscall"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/pagecache"
 	"github.com/zeebo/xxh3"
 )
 
 type txferRequest struct {
-	Directory    string
-	Verbose      bool
-	MaxChunkSize int
-	Mode         string
-	LinkMbps     int64
-	Concurrency  int
-	DeadlineMS   int64
+	Directory   string
+	Verbose     bool
+	Mode        string
+	LinkMbps    int64
+	Concurrency int
+	DeadlineMS  int64
+	PageCache   bool
+	Comp        string
 }
 
 func parseTXFERRequest(req Request) (txferRequest, error) {
@@ -35,7 +37,7 @@ func parseTXFERRequest(req Request) (txferRequest, error) {
 	p := req.Params[0]
 	for key := range p {
 		switch key {
-		case "directory", "verbose", "max-manifest-chunk-size", "mode", "link-mbps", "concurrency", "deadline-ms":
+		case "directory", "verbose", "mode", "link-mbps", "concurrency", "deadline-ms", "cache-map", "comp":
 		default:
 			return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "unknown TXFER option"}
 		}
@@ -50,13 +52,11 @@ func parseTXFERRequest(req Request) (txferRequest, error) {
 			verbose = true
 		}
 	}
-	maxChunkSize := 0
-	if raw := p["max-manifest-chunk-size"]; raw != "" {
-		v, err := strconv.Atoi(raw)
-		if err != nil || v <= 0 {
-			return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "max-manifest-chunk-size must be a positive integer"}
+	pageCache := false
+	if raw := p["cache-map"]; raw != "" {
+		if raw == "1" || strings.EqualFold(raw, "true") {
+			pageCache = true
 		}
-		maxChunkSize = v
 	}
 	mode := strings.ToLower(strings.TrimSpace(p["mode"]))
 	if mode != "fast" && mode != "gentle" {
@@ -77,14 +77,24 @@ func parseTXFERRequest(req Request) (txferRequest, error) {
 			return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "deadline-ms must be >= 0"}
 		}
 	}
+	comp := strings.ToLower(strings.TrimSpace(p["comp"]))
+	if comp == "" {
+		comp = encoding.EncodingZstd
+	}
+	switch comp {
+	case "none", encoding.EncodingZstd:
+	default:
+		return txferRequest{}, protocolErr{code: "UNSUPPORTED_COMP", message: "supported comp values: none, zstd"}
+	}
 	return txferRequest{
-		Directory:    directory,
-		Verbose:      verbose,
-		MaxChunkSize: maxChunkSize,
-		Mode:         mode,
-		LinkMbps:     linkMbps,
-		Concurrency:  concurrency,
-		DeadlineMS:   deadlineMS,
+		Directory:   directory,
+		Verbose:     verbose,
+		Mode:        mode,
+		LinkMbps:    linkMbps,
+		Concurrency: concurrency,
+		DeadlineMS:  deadlineMS,
+		PageCache:   pageCache,
+		Comp:        comp,
 	}, nil
 }
 
@@ -139,17 +149,24 @@ func handleTXFERWithCallback(ctx context.Context, req Request, out io.Writer, de
 		}
 	}()
 
+	cw := encoding.NewChunkedManifestWriter(out, parsed.Comp, encoding.DefaultManifestChunkSize, encoding.DefaultManifestFlushInterval)
 	var encodeErr error
 	if singleFileName != "" {
-		encodeErr = encodeSingleFileManifest(out, transfer.ID, root, singleFileName, manifestMode, manifestLinkMbps, manifestConcurrency, parsed.DeadlineMS, deps)
+		encodeErr = encodeSingleFileManifest(cw, transfer.ID, root, singleFileName, manifestMode, manifestLinkMbps, manifestConcurrency, parsed.DeadlineMS, parsed.PageCache, deps)
 	} else {
-		encodeErr = encodeManifest(out, transfer.ID, root, manifestMode, manifestLinkMbps, manifestConcurrency, parsed.DeadlineMS, parsed.MaxChunkSize, parsed.Verbose, deps)
+		encodeErr = encodeManifest(cw, transfer.ID, root, manifestMode, manifestLinkMbps, manifestConcurrency, parsed.DeadlineMS, parsed.Verbose, parsed.PageCache, deps)
 	}
 	if encodeErr != nil {
 		if isBrokenPipe(encodeErr) {
 			return nil
 		}
 		return protocolErr{code: "BAD_REQUEST", message: encodeErr.Error()}
+	}
+	if err := cw.Close(); err != nil {
+		if isBrokenPipe(err) {
+			return nil
+		}
+		return protocolErr{code: "INTERNAL", message: "flush manifest frames: " + err.Error()}
 	}
 	cleanupTransfer = false
 	return nil
@@ -193,6 +210,7 @@ func encodeSingleFileManifest(
 	linkMbps int64,
 	concurrency int,
 	deadlineMS int64,
+	pageCache bool,
 	deps Deps,
 ) error {
 	fullPath := filepath.Join(root, filename)
@@ -244,6 +262,15 @@ func encodeSingleFileManifest(
 		Path:       filename,
 		LinkTarget: -1,
 	}
+	if pageCache && info.Size() > 0 {
+		var ce pagecache.CacheEntry
+		if loadErr := ce.Load(fullPath); loadErr == nil && !ce.Empty() {
+			if blob, mErr := encoding.EncodePageCacheEntry(&ce); mErr == nil && len(blob) > 0 {
+				entry.PageCache = blob
+				deps.SetTransferPageCache(transferID, 1, blob)
+			}
+		}
+	}
 	line, _, _, err := encoding.MarshalManifestEntry(entry, prevPath, prevMtime)
 	if err != nil {
 		return err
@@ -294,8 +321,8 @@ func encodeManifest(
 	linkMbps int64,
 	concurrency int,
 	deadlineMS int64,
-	maxChunkSize int,
 	verbose bool,
+	pageCache bool,
 	deps Deps,
 ) error {
 	header := encoding.FormatManifestHeader(encoding.ManifestHeader{
@@ -306,11 +333,7 @@ func encodeManifest(
 		DeadlineMS:  deadlineMS,
 	})
 	header += "\n"
-	if maxChunkSize > 0 && len(header) > maxChunkSize {
-		return errors.New("max-manifest-chunk-size is too small for header")
-	}
 
-	chunkBytes := 0
 	prevPath := ""
 	prevMtime := ""
 	updatesCh := make(chan TransferFileStateUpdate, 1000)
@@ -333,16 +356,7 @@ func encodeManifest(
 		return err
 	}
 
-	startChunk := func() error {
-		if _, err := io.WriteString(w, header); err != nil {
-			return err
-		}
-		chunkBytes = len(header)
-		prevPath = ""
-		prevMtime = ""
-		return nil
-	}
-	if err := startChunk(); err != nil {
+	if _, err := io.WriteString(w, header); err != nil {
 		return err
 	}
 
@@ -360,9 +374,6 @@ func encodeManifest(
 		return err
 	}
 	rootLine += "\n"
-	if maxChunkSize > 0 && chunkBytes+len(rootLine) > maxChunkSize {
-		return errors.New("max-manifest-chunk-size is too small for root manifest entry")
-	}
 	updatesCh <- TransferFileStateUpdate{
 		FileID:    encoding.RootFileID,
 		EntryType: encoding.EntryTypeDir,
@@ -372,7 +383,6 @@ func encodeManifest(
 	if _, err := io.WriteString(w, rootLine); err != nil {
 		return err
 	}
-	chunkBytes += len(rootLine)
 	prevPath = nextPath
 	prevMtime = nextMtime
 
@@ -390,26 +400,6 @@ func encodeManifest(
 		}
 		line += "\n"
 
-		if maxChunkSize > 0 && chunkBytes+len(line) > maxChunkSize {
-			if chunkBytes == len(header) {
-				return errors.New("max-manifest-chunk-size is too small for manifest entry")
-			}
-			if _, err := io.WriteString(w, "\n"); err != nil {
-				return err
-			}
-			if err := startChunk(); err != nil {
-				return err
-			}
-			line, _, mtimeRaw, err = encoding.MarshalManifestEntry(entry, "", "")
-			if err != nil {
-				return err
-			}
-			line += "\n"
-			if chunkBytes+len(line) > maxChunkSize {
-				return errors.New("max-manifest-chunk-size is too small for manifest entry")
-			}
-		}
-
 		fullPath := filepath.Clean(filepath.Join(root, entry.Path))
 		updatesCh <- TransferFileStateUpdate{
 			FileID:    entry.ID,
@@ -420,15 +410,28 @@ func encodeManifest(
 		if _, err := io.WriteString(w, line); err != nil {
 			return err
 		}
-		chunkBytes += len(line)
 		prevPath = entry.Path
 		prevMtime = mtimeRaw
 		fileID++
 		return nil
 	}
 
+	var loadedFilePages map[string]*pagecache.CacheEntry
+	if pageCache {
+		loadedFilePages, _ = pagecache.LoadDirectory(root, 0)
+	}
+
 	err = encoding.WalkManifestEntries(root, func(result encoding.WalkResult) error {
-		return emitEntry(result.Entry)
+		entry := result.Entry
+		if loadedFilePages != nil && entry.Type == encoding.EntryTypeFile && entry.Size > 0 {
+			if ce, ok := loadedFilePages[result.FullPath]; ok && !ce.Empty() {
+				if blob, mErr := encoding.EncodePageCacheEntry(ce); mErr == nil && len(blob) > 0 {
+					entry.PageCache = blob
+					deps.SetTransferPageCache(transferID, uint64(fileID), blob)
+				}
+			}
+		}
+		return emitEntry(entry)
 	})
 	if err != nil {
 		return err

@@ -116,18 +116,73 @@ Creates a transfer and streams a manifest.
 
 ### Request
 
-`TXFER <path> mode=<fast|gentle> link-mbps=<int> concurrency=<int> [verbose=<0|1|true|false>] [max-manifest-chunk-size=<n>]`
+`TXFER <path> mode=<fast|gentle> link-mbps=<int> concurrency=<int> [verbose=<0|1|true|false>] [deadline-ms=<int>] [cache-map=<0|1|true|false>] [comp=none|zstd]`
 
 - `<path>` must be quoted or length-prefixed.
 - directory must be absolute, existing, and readable.
 - `mode`, `link-mbps`, and `concurrency` are required.
 - `link-mbps` must be `>= 0`.
 - `concurrency` must be `> 0`.
+- `cache-map=1` asks the server to attach a per-file page-cache residency hint
+  (`pc:<hex>` trailing token) to each FM/1 entry; see
+  [MANIFEST.md](./MANIFEST.md). Linux-only on the server; on other platforms
+  the flag is honored but no pagecache tokens are emitted.
+- `comp` selects the per-frame wire compression. Supported values are `none`
+  (literal FM/1 bytes per frame) and `zstd` (each frame is an independent
+  zstd frame). Default is `zstd`. The framing is unconditional — `comp` only
+  affects per-frame compression, not whether framing is present.
 
 ### Response
 
-- Stream bytes in `FM/1` format (see [MANIFEST.md](./MANIFEST.md)).
-- Terminal status line after manifest stream: `OK` or `ERR ...`.
+The response is **always** a sequence of paired FX/1 + FXT/1 frames carrying
+`file_id=0` (a reserved sentinel meaning "the manifest stream"), terminated
+by the verb-level `OK\r\n` line. Each `FX/1` header is followed by exactly
+`wsize` bytes of payload, then the matching `FXT/1` trailer.
+
+```
+FX/1 0 offset=<chunk-start> size=<logical> wsize=<wire> comp=<none|zstd> hash=xxh128:<chunk-content> ts=<ms>\n
+<wire bytes>
+FXT/1 0 status=ok ts=<ms> [file-hash=xxh128:<full-manifest>] next=<next-offset|0> hash=xxh64:<frame-line>\n
+... repeat ...
+OK\r\n
+```
+
+Per-chunk details:
+
+- `offset` — cumulative logical bytes of FM/1 emitted before this chunk.
+- `size` — logical (uncompressed) bytes in this chunk.
+- `wsize` — wire bytes following the header newline. For `comp=none`,
+  `wsize == size`. For `comp=zstd`, `wsize` is the compressed-frame length.
+- `comp` — `none` or `zstd`. Each `zstd` frame is independent and
+  self-contained; concatenated wire payloads form a multi-frame zstd
+  archive that decodes to the full FM/1.
+- `hash` in the header — xxh128 of this chunk's logical bytes.
+- `hash` at the end of the trailer — xxh64 of the line (header + payload
+  + trailer prefix), for wire/control corruption detection.
+- `file-hash` on the trailer — cumulative xxh128 of the entire manifest's
+  logical bytes; **present only on the terminal trailer** (the one with
+  `next=0`). Clients validate this once at end-of-stream.
+
+Manifest clients validate all three integrity layers: the per-chunk logical
+hash, the full frame/control checksum, and the terminal cumulative logical
+hash. This is intentionally stricter than SEND file-frame validation because
+the manifest is control data for the rest of the transfer.
+
+Chunks are produced by the server on a streaming basis: a frame flushes
+when either ~4 MiB of logical bytes have accumulated or ~1 s has passed
+since the last frame, whichever comes first. This lets clients display
+real-time progress even when walking large directory trees.
+
+A successful empty-manifest response still contains exactly one terminal
+FX/1+FXT/1 pair (`size=0 next=0`; `wsize` follows `comp`), so the protocol
+is uniformly self-delimiting via the `OK\r\n` line.
+
+The wire payloads (concatenated, without the FX/1/FXT/1 headers) form a
+standalone multi-frame zstd archive when `comp=zstd` — clients may tee
+those bytes directly to a `.zst` file on disk while a parallel decoder
+parses the manifest in memory. This `RawSink` path is the compressed
+persistence path; clients do not need to retain both compressed and decoded
+manifest copies in memory.
 
 ## SEND
 

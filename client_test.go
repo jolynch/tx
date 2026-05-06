@@ -2704,3 +2704,551 @@ func TestSendTCPAuthIncludesClientAuthTokens(t *testing.T) {
 		t.Fatalf("unexpected token fields: %q %q", fields[1], fields[2])
 	}
 }
+
+func TestSaveLoadManifestZstRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	m := &Manifest{
+		TransferID:  "tx-zst",
+		Root:        "/remote",
+		Mode:        "fast",
+		LinkMbps:    1000,
+		Concurrency: 4,
+		Entries: []ManifestEntry{
+			{Type: 'F', ID: 1, Size: 5, Mtime: 1000, Mode: 0o644, Path: "a.txt", LinkTarget: -1},
+		},
+	}
+
+	zstPath := filepath.Join(dir, "manifest.server.zst")
+	if err := SaveManifest(zstPath, m); err != nil {
+		t.Fatalf("SaveManifest(.zst): %v", err)
+	}
+	onDisk, err := os.ReadFile(zstPath)
+	if err != nil {
+		t.Fatalf("read .zst: %v", err)
+	}
+	if !bytes.HasPrefix(onDisk, []byte{0x28, 0xb5, 0x2f, 0xfd}) {
+		t.Fatalf("expected zstd magic bytes on disk, got %x", onDisk[:4])
+	}
+	loaded, err := LoadManifest(zstPath)
+	if err != nil {
+		t.Fatalf("LoadManifest(.zst): %v", err)
+	}
+	if ManifestFingerprint(loaded) != ManifestFingerprint(m) {
+		t.Fatalf("fingerprints differ after zst round-trip")
+	}
+
+	plainPath := filepath.Join(dir, "manifest.server")
+	if err := SaveManifest(plainPath, m); err != nil {
+		t.Fatalf("SaveManifest(plain): %v", err)
+	}
+	plain, err := os.ReadFile(plainPath)
+	if err != nil {
+		t.Fatalf("read plain: %v", err)
+	}
+	if !bytes.HasPrefix(plain, []byte("FM/1 ")) {
+		t.Fatalf("plain manifest should retain FM/1 prefix, got %q", plain[:8])
+	}
+	loadedPlain, err := LoadManifest(plainPath)
+	if err != nil {
+		t.Fatalf("LoadManifest(plain): %v", err)
+	}
+	if ManifestFingerprint(loadedPlain) != ManifestFingerprint(m) {
+		t.Fatalf("plain round-trip fingerprint mismatch")
+	}
+}
+
+func TestLoadManifestHandlesMultiFrameZstd(t *testing.T) {
+	dir := t.TempDir()
+	m := &Manifest{
+		TransferID:  "tx-mf",
+		Root:        "/remote",
+		Mode:        "fast",
+		LinkMbps:    1000,
+		Concurrency: 4,
+		Entries: []ManifestEntry{
+			{Type: 'F', ID: 1, Size: 5, Mtime: 1000, Mode: 0o644, Path: "a.txt", LinkTarget: -1},
+			{Type: 'F', ID: 2, Size: 7, Mtime: 2000, Mode: 0o644, Path: "b.txt", LinkTarget: -1},
+		},
+	}
+	raw, err := MarshalManifest(m)
+	if err != nil {
+		t.Fatalf("MarshalManifest: %v", err)
+	}
+	half := len(raw) / 2
+	part1, err := intencoding.CompressZstd(raw[:half])
+	if err != nil {
+		t.Fatalf("CompressZstd part1: %v", err)
+	}
+	part2, err := intencoding.CompressZstd(raw[half:])
+	if err != nil {
+		t.Fatalf("CompressZstd part2: %v", err)
+	}
+	multiFrame := append([]byte(nil), part1...)
+	multiFrame = append(multiFrame, part2...)
+	zstPath := filepath.Join(dir, "manifest.server.zst")
+	if err := os.WriteFile(zstPath, multiFrame, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	loaded, err := LoadManifest(zstPath)
+	if err != nil {
+		t.Fatalf("LoadManifest multi-frame: %v", err)
+	}
+	if ManifestFingerprint(loaded) != ManifestFingerprint(m) {
+		t.Fatalf("multi-frame round-trip fingerprint mismatch")
+	}
+}
+
+// writeStreamingManifest emits manifestRaw as a sequence of FX/1+FXT/1
+// frames split into approximately chunkSize logical chunks (file_id=0).
+// Used by client tests to simulate the streaming TXFER response.
+func writeStreamingManifest(t *testing.T, out io.Writer, manifestRaw []byte, comp string, chunkSize int) {
+	t.Helper()
+	cw := intencoding.NewChunkedManifestWriter(out, comp, int64(chunkSize), 0)
+	if _, err := cw.Write(manifestRaw); err != nil {
+		t.Fatalf("ChunkedManifestWriter.Write: %v", err)
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatalf("ChunkedManifestWriter.Close: %v", err)
+	}
+}
+
+func TestGetManifestCompZstdStreamingFrames(t *testing.T) {
+	m := &Manifest{
+		TransferID:  "tx-zst",
+		Root:        "/remote",
+		Mode:        "fast",
+		LinkMbps:    1000,
+		Concurrency: 4,
+		Entries: []ManifestEntry{
+			{Type: 'F', ID: 1, Size: 5, Mtime: 1000, Mode: 0o644, Path: "a.txt", LinkTarget: -1},
+			{Type: 'F', ID: 2, Size: 7, Mtime: 2000, Mode: 0o644, Path: "b.txt", LinkTarget: -1},
+		},
+	}
+	rawBody, err := MarshalManifest(m)
+	if err != nil {
+		t.Fatalf("MarshalManifest: %v", err)
+	}
+	// Force at least 2 frames by setting chunk size below the manifest length.
+	chunkSize := len(rawBody)/2 + 1
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		if req.Verb != intftcp.VerbTXFER {
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+		writeStreamingManifest(t, out, rawBody, intencoding.EncodingZstd, chunkSize)
+		_, err := io.WriteString(out, "OK\r\n")
+		return err
+	})
+	defer srv.Close()
+
+	progress := make(chan ManifestProgressUpdate, 16)
+	client := NewClient(srv.URL)
+	defer client.Close()
+	var sink bytes.Buffer
+	resp, err := client.GetManifest(context.Background(), GetManifestRequest{
+		Directory:        "/remote",
+		Mode:             "fast",
+		LinkMbps:         1000,
+		Concurrency:      4,
+		RawSink:          &sink,
+		ManifestProgress: progress,
+	})
+	close(progress)
+	if err != nil {
+		t.Fatalf("GetManifest: %v", err)
+	}
+	if resp.Manifest == nil || len(resp.Manifest.Entries) != 2 {
+		t.Fatalf("expected 2 entries, got %v", resp.Manifest)
+	}
+
+	var updates []ManifestProgressUpdate
+	for upd := range progress {
+		updates = append(updates, upd)
+	}
+	if len(updates) < 2 {
+		t.Fatalf("expected at least 2 progress updates, got %d", len(updates))
+	}
+	last := updates[len(updates)-1]
+	if !last.Terminal {
+		t.Fatalf("expected last update to be Terminal=true")
+	}
+	if last.TotalLogical != int64(len(rawBody)) {
+		t.Fatalf("expected TotalLogical=%d, got %d", len(rawBody), last.TotalLogical)
+	}
+
+	if sink.Len() == 0 {
+		t.Fatalf("RawSink got 0 bytes")
+	}
+	decoded, err := intencoding.DecompressZstd(sink.Bytes())
+	if err != nil {
+		t.Fatalf("DecompressZstd(RawSink): %v", err)
+	}
+	if !bytes.Equal(decoded, rawBody) {
+		t.Fatalf("decompressed RawSink does not equal MarshalManifest output")
+	}
+}
+
+func TestGetManifestCompNoneStreamingFrames(t *testing.T) {
+	m := &Manifest{
+		TransferID:  "tx-none",
+		Root:        "/remote",
+		Mode:        "fast",
+		LinkMbps:    1000,
+		Concurrency: 4,
+		Entries: []ManifestEntry{
+			{Type: 'F', ID: 1, Size: 5, Mtime: 1000, Mode: 0o644, Path: "a.txt", LinkTarget: -1},
+		},
+	}
+	rawBody, err := MarshalManifest(m)
+	if err != nil {
+		t.Fatalf("MarshalManifest: %v", err)
+	}
+	chunkSize := len(rawBody)/2 + 1
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		if req.Verb != intftcp.VerbTXFER {
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+		writeStreamingManifest(t, out, rawBody, "none", chunkSize)
+		_, err := io.WriteString(out, "OK\r\n")
+		return err
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	defer client.Close()
+	resp, err := client.GetManifest(context.Background(), GetManifestRequest{
+		Directory:   "/remote",
+		Mode:        "fast",
+		LinkMbps:    1000,
+		Concurrency: 4,
+		Comp:        "none",
+	})
+	if err != nil {
+		t.Fatalf("GetManifest: %v", err)
+	}
+	if resp.Manifest == nil || len(resp.Manifest.Entries) != 1 {
+		t.Fatalf("expected 1 entry, got %v", resp.Manifest)
+	}
+}
+
+func TestGetManifestRejectsCorruptedFileHash(t *testing.T) {
+	m := &Manifest{
+		TransferID:  "tx-corrupt",
+		Root:        "/remote",
+		Mode:        "fast",
+		LinkMbps:    1000,
+		Concurrency: 4,
+		Entries: []ManifestEntry{
+			{Type: 'F', ID: 1, Size: 5, Mtime: 1000, Mode: 0o644, Path: "a.txt", LinkTarget: -1},
+		},
+	}
+	rawBody, err := MarshalManifest(m)
+	if err != nil {
+		t.Fatalf("MarshalManifest: %v", err)
+	}
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		if req.Verb != intftcp.VerbTXFER {
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+		var buf bytes.Buffer
+		writeStreamingManifest(t, &buf, rawBody, intencoding.EncodingZstd, len(rawBody)*2)
+		corrupted := rewriteManifestTrailer(t, buf.Bytes(), true, func(prefix string) string {
+			idx := strings.Index(prefix, "file-hash=xxh128:")
+			if idx < 0 {
+				t.Fatalf("terminal trailer missing file-hash: %q", prefix)
+			}
+			start := idx + len("file-hash=xxh128:")
+			return prefix[:start] + "00000000000000000000000000000000" + prefix[start+32:]
+		})
+		if _, err := out.Write(corrupted); err != nil {
+			return err
+		}
+		_, err := io.WriteString(out, "OK\r\n")
+		return err
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	defer client.Close()
+	_, err = client.GetManifest(context.Background(), GetManifestRequest{
+		Directory:   "/remote",
+		Mode:        "fast",
+		LinkMbps:    1000,
+		Concurrency: 4,
+	})
+	if err == nil {
+		t.Fatalf("expected file-hash mismatch error, got nil")
+	}
+	if !strings.Contains(err.Error(), "file-hash mismatch") {
+		t.Fatalf("expected file-hash mismatch in error, got %v", err)
+	}
+}
+
+func TestGetManifestRejectsCorruptedHeaderHash(t *testing.T) {
+	err := getManifestFromCorruptedStreamingResponse(t, intencoding.EncodingZstd, func(wire []byte) []byte {
+		return replaceFirstBytes(t, wire, []byte("hash=xxh128:"), []byte("hash=xxh128:00000000000000000000000000000000 bad="))
+	})
+	if err == nil || !strings.Contains(err.Error(), "header hash mismatch") {
+		t.Fatalf("expected header hash mismatch, got %v", err)
+	}
+}
+
+func TestGetManifestRejectsCorruptedTrailerHash(t *testing.T) {
+	err := getManifestFromCorruptedStreamingResponse(t, intencoding.EncodingZstd, func(wire []byte) []byte {
+		return replaceFirstBytes(t, wire, []byte("hash=xxh64:"), []byte("hash=xxh64:0000000000000000 bad="))
+	})
+	if err == nil || !strings.Contains(err.Error(), "trailer hash mismatch") {
+		t.Fatalf("expected trailer hash mismatch, got %v", err)
+	}
+}
+
+func TestGetManifestRejectsMissingTrailerHash(t *testing.T) {
+	err := getManifestFromCorruptedStreamingResponse(t, intencoding.EncodingZstd, func(wire []byte) []byte {
+		return removeManifestTrailerHash(t, wire, false)
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing trailer hash") {
+		t.Fatalf("expected missing trailer hash, got %v", err)
+	}
+}
+
+func TestGetManifestRejectsMissingTerminalFileHash(t *testing.T) {
+	err := getManifestFromCorruptedStreamingResponse(t, intencoding.EncodingZstd, func(wire []byte) []byte {
+		return rewriteManifestTrailer(t, wire, true, func(prefix string) string {
+			return removeTokenWithPrefix(prefix, "file-hash=")
+		})
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing file-hash") {
+		t.Fatalf("expected missing file-hash, got %v", err)
+	}
+}
+
+func TestGetManifestRejectsNonTerminalFileHash(t *testing.T) {
+	err := getManifestFromCorruptedStreamingResponse(t, intencoding.EncodingZstd, func(wire []byte) []byte {
+		return rewriteManifestTrailer(t, wire, false, func(prefix string) string {
+			return prefix + " file-hash=xxh128:00000000000000000000000000000000"
+		})
+	})
+	if err == nil || !strings.Contains(err.Error(), "non-terminal manifest frame") {
+		t.Fatalf("expected non-terminal file-hash rejection, got %v", err)
+	}
+}
+
+func TestGetManifestRejectsBadOffset(t *testing.T) {
+	err := getManifestFromCorruptedStreamingResponse(t, intencoding.EncodingZstd, func(wire []byte) []byte {
+		return replaceFirstBytes(t, wire, []byte("offset=0"), []byte("offset=1"))
+	})
+	if err == nil || !strings.Contains(err.Error(), "offset mismatch") {
+		t.Fatalf("expected offset mismatch, got %v", err)
+	}
+}
+
+func TestGetManifestRejectsBadNext(t *testing.T) {
+	err := getManifestFromCorruptedStreamingResponse(t, intencoding.EncodingZstd, func(wire []byte) []byte {
+		return rewriteManifestTrailer(t, wire, false, func(prefix string) string {
+			fields := strings.Fields(prefix)
+			for i, field := range fields {
+				if strings.HasPrefix(field, "next=") {
+					next, parseErr := strconv.ParseInt(strings.TrimPrefix(field, "next="), 10, 64)
+					if parseErr != nil {
+						t.Fatalf("parse next: %v", parseErr)
+					}
+					fields[i] = fmt.Sprintf("next=%d", next+1)
+					return strings.Join(fields, " ")
+				}
+			}
+			t.Fatalf("missing next in %q", prefix)
+			return prefix
+		})
+	})
+	if err == nil || !strings.Contains(err.Error(), "next mismatch") {
+		t.Fatalf("expected next mismatch, got %v", err)
+	}
+}
+
+func TestGetManifestRejectsNegativeFrameSize(t *testing.T) {
+	err := getManifestFromCorruptedStreamingResponse(t, intencoding.EncodingZstd, func(wire []byte) []byte {
+		return replaceFirstBytes(t, wire, []byte("size="), []byte("size=-"))
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid header size") {
+		t.Fatalf("expected invalid header size, got %v", err)
+	}
+}
+
+func TestGetManifestRejectsUnsupportedManifestComp(t *testing.T) {
+	err := getManifestFromCorruptedStreamingResponse(t, intencoding.EncodingZstd, func(wire []byte) []byte {
+		return replaceFirstBytes(t, wire, []byte("comp=zstd"), []byte("comp=lz4"))
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsupported manifest frame comp") {
+		t.Fatalf("expected unsupported comp, got %v", err)
+	}
+}
+
+func TestGetManifestRejectsCompNoneWireSizeMismatch(t *testing.T) {
+	err := getManifestFromCorruptedStreamingResponse(t, "none", func(wire []byte) []byte {
+		return replaceFirstBytes(t, wire, []byte("size="), []byte("size=999999 bad="))
+	})
+	if err == nil || !strings.Contains(err.Error(), "none-comp wsize") {
+		t.Fatalf("expected none-comp wsize mismatch, got %v", err)
+	}
+}
+
+func getManifestFromCorruptedStreamingResponse(t *testing.T, comp string, corrupt func([]byte) []byte) error {
+	t.Helper()
+	m := &Manifest{
+		TransferID:  "tx-corrupt",
+		Root:        "/remote",
+		Mode:        "fast",
+		LinkMbps:    1000,
+		Concurrency: 4,
+		Entries: []ManifestEntry{
+			{Type: 'F', ID: 1, Size: 5, Mtime: 1000, Mode: 0o644, Path: "a.txt", LinkTarget: -1},
+			{Type: 'F', ID: 2, Size: 7, Mtime: 2000, Mode: 0o644, Path: "b.txt", LinkTarget: -1},
+		},
+	}
+	rawBody, err := MarshalManifest(m)
+	if err != nil {
+		t.Fatalf("MarshalManifest: %v", err)
+	}
+	var buf bytes.Buffer
+	writeStreamingManifest(t, &buf, rawBody, comp, len(rawBody)/2+1)
+	wire := corrupt(buf.Bytes())
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		if req.Verb != intftcp.VerbTXFER {
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+		if _, err := out.Write(wire); err != nil {
+			return err
+		}
+		_, err := io.WriteString(out, "OK\r\n")
+		return err
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	defer client.Close()
+	_, err = client.GetManifest(context.Background(), GetManifestRequest{
+		Directory:   "/remote",
+		Mode:        "fast",
+		LinkMbps:    1000,
+		Concurrency: 4,
+		Comp:        comp,
+	})
+	return err
+}
+
+func replaceFirstBytes(t *testing.T, src []byte, old []byte, replacement []byte) []byte {
+	t.Helper()
+	idx := bytes.Index(src, old)
+	if idx < 0 {
+		t.Fatalf("missing %q in wire", old)
+	}
+	out := append([]byte(nil), src[:idx]...)
+	out = append(out, replacement...)
+	out = append(out, src[idx+len(old):]...)
+	return out
+}
+
+func rewriteManifestTrailer(t *testing.T, wire []byte, terminal bool, mutatePrefix func(string) string) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	remaining := wire
+	for len(remaining) > 0 {
+		nl := bytes.IndexByte(remaining, '\n')
+		if nl < 0 {
+			t.Fatalf("missing header newline")
+		}
+		headerLine := string(remaining[:nl])
+		meta, err := intencoding.ParseFXHeader(headerLine)
+		if err != nil {
+			t.Fatalf("ParseFXHeader: %v", err)
+		}
+		frameEnd := nl + 1 + int(meta.WireSize)
+		if len(remaining) < frameEnd {
+			t.Fatalf("short frame")
+		}
+		payload := remaining[nl+1 : frameEnd]
+		trailerStart := frameEnd
+		trailerNL := bytes.IndexByte(remaining[trailerStart:], '\n')
+		if trailerNL < 0 {
+			t.Fatalf("missing trailer newline")
+		}
+		trailerLine := string(remaining[trailerStart : trailerStart+trailerNL])
+		trailer, err := intencoding.ParseFXTrailer(trailerLine)
+		if err != nil {
+			t.Fatalf("ParseFXTrailer: %v", err)
+		}
+		isTerminal := trailer.Next != nil && *trailer.Next == 0
+		out.Write(remaining[:trailerStart])
+		if isTerminal == terminal {
+			prefix := mutatePrefix(trailer.ChecksumPrefix)
+			out.WriteString(prefix)
+			out.WriteString(" ")
+			out.WriteString("hash=")
+			out.WriteString(frameHash64Token(headerLine+"\n", payload, prefix))
+			out.WriteByte('\n')
+			out.Write(remaining[trailerStart+trailerNL+1:])
+			return out.Bytes()
+		}
+		out.WriteString(trailerLine)
+		out.WriteByte('\n')
+		remaining = remaining[trailerStart+trailerNL+1:]
+	}
+	t.Fatalf("no trailer matched terminal=%v", terminal)
+	return nil
+}
+
+func removeManifestTrailerHash(t *testing.T, wire []byte, terminal bool) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	remaining := wire
+	for len(remaining) > 0 {
+		nl := bytes.IndexByte(remaining, '\n')
+		if nl < 0 {
+			t.Fatalf("missing header newline")
+		}
+		meta, err := intencoding.ParseFXHeader(string(remaining[:nl]))
+		if err != nil {
+			t.Fatalf("ParseFXHeader: %v", err)
+		}
+		frameEnd := nl + 1 + int(meta.WireSize)
+		if len(remaining) < frameEnd {
+			t.Fatalf("short frame")
+		}
+		trailerStart := frameEnd
+		trailerNL := bytes.IndexByte(remaining[trailerStart:], '\n')
+		if trailerNL < 0 {
+			t.Fatalf("missing trailer newline")
+		}
+		trailerLine := string(remaining[trailerStart : trailerStart+trailerNL])
+		trailer, err := intencoding.ParseFXTrailer(trailerLine)
+		if err != nil {
+			t.Fatalf("ParseFXTrailer: %v", err)
+		}
+		isTerminal := trailer.Next != nil && *trailer.Next == 0
+		out.Write(remaining[:trailerStart])
+		if isTerminal == terminal {
+			out.WriteString(trailer.ChecksumPrefix)
+			out.WriteByte('\n')
+			out.Write(remaining[trailerStart+trailerNL+1:])
+			return out.Bytes()
+		}
+		out.WriteString(trailerLine)
+		out.WriteByte('\n')
+		remaining = remaining[trailerStart+trailerNL+1:]
+	}
+	t.Fatalf("no trailer matched terminal=%v", terminal)
+	return nil
+}
+
+func removeTokenWithPrefix(s string, prefix string) string {
+	fields := strings.Fields(s)
+	kept := fields[:0]
+	for _, field := range fields {
+		if !strings.HasPrefix(field, prefix) {
+			kept = append(kept, field)
+		}
+	}
+	return strings.Join(kept, " ")
+}

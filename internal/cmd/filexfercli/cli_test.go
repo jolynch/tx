@@ -399,10 +399,16 @@ func setupPinchState(t *testing.T, tmp string, manifestRaw string, progressRaw s
 	if err := os.MkdirAll(pinchDir, 0o755); err != nil {
 		t.Fatalf("mkdir .tx: %v", err)
 	}
+	serverManifestPath := filepath.Join(pinchDir, "manifest.server.zst")
 	if manifestRaw != "" {
-		// Write to manifest.server (the server-state file) so that start/get can use it.
-		if err := os.WriteFile(filepath.Join(pinchDir, "manifest.server"), []byte(manifestRaw), 0o644); err != nil {
-			t.Fatalf("write manifest.server: %v", err)
+		// Parse and re-save via SaveManifest so the on-disk format matches
+		// what production writes (zstd-compressed FM/1).
+		m, err := tx.ParseManifest([]byte(manifestRaw))
+		if err != nil {
+			t.Fatalf("parse seed manifest: %v", err)
+		}
+		if err := tx.SaveManifest(serverManifestPath, m); err != nil {
+			t.Fatalf("save manifest.server.zst: %v", err)
 		}
 	}
 	if progressRaw != "" {
@@ -411,7 +417,7 @@ func setupPinchState(t *testing.T, tmp string, manifestRaw string, progressRaw s
 		// the runStart/runResumeRefresh validation accepts the progress.
 		body := progressRaw
 		if manifestRaw != "" && !strings.Contains(progressRaw, progressFingerprintHeaderPrefix) {
-			m, err := tx.LoadManifest(filepath.Join(pinchDir, "manifest.server"))
+			m, err := tx.LoadManifest(serverManifestPath)
 			if err != nil {
 				t.Fatalf("load seeded manifest: %v", err)
 			}
@@ -490,6 +496,17 @@ func buildTestManifestEntryFromDisk(t *testing.T, fullPath string, relPath strin
 	return buildTestManifestEntry(id, info.Size(), info.ModTime().UnixNano(), info.Mode(), relPath)
 }
 
+// writeManifestResponse emits a raw FM/1 manifest body wrapped in
+// FX/1+FXT/1 streaming frames (file_id=0), matching the live TXFER
+// wire format. Used by fake TXFER servers in tests.
+func writeManifestResponse(out io.Writer, manifestRaw string) error {
+	cw := encoding.NewChunkedManifestWriter(out, encoding.EncodingZstd, 32, 0)
+	if _, err := io.WriteString(cw, manifestRaw); err != nil {
+		return err
+	}
+	return cw.Close()
+}
+
 func writeSyncResponse(out io.Writer, transferID string, entries []string, removedIDs []uint64) error {
 	if _, err := io.WriteString(out, buildTestManifestRaw(transferID, entries)); err != nil {
 		return err
@@ -546,12 +563,12 @@ func TestRunCLITransferAndGet(t *testing.T) {
 				if got := req.Params[0]["mode"]; got != tx.LoadStrategyFast {
 					return fmt.Errorf("unexpected mode: %q", got)
 				}
-				if _, err := io.WriteString(out, manifestRaw); err != nil {
+				if err := writeManifestResponse(out, manifestRaw); err != nil {
 					return err
 				}
 			case "/remote/a.txt":
 				singleManifest := "FM/1 txget mode=fast link-mbps=0 concurrency=8\nD0 0 0:100 0755 0:7:/remote\nF1 5 0:100 0644 0:5:a.txt\n"
-				if _, err := io.WriteString(out, singleManifest); err != nil {
+				if err := writeManifestResponse(out, singleManifest); err != nil {
 					return err
 				}
 			default:
@@ -573,13 +590,23 @@ func TestRunCLITransferAndGet(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	serverManifestPath := filepath.Join(tmp, ".tx", "dst", "manifest.server")
+	serverManifestPath := filepath.Join(tmp, ".tx", "dst", "manifest.server.zst")
 	code := runTransferCLI(srv.URL, []string{"-s", "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
 	}
 	if _, err := os.Stat(serverManifestPath); err != nil {
-		t.Fatalf("manifest.server not written: %v", err)
+		t.Fatalf("manifest.server.zst not written: %v", err)
+	}
+	serverManifestRaw, err := os.ReadFile(serverManifestPath)
+	if err != nil {
+		t.Fatalf("read manifest.server.zst: %v", err)
+	}
+	if frames := bytes.Count(serverManifestRaw, []byte{0x28, 0xb5, 0x2f, 0xfd}); frames < 2 {
+		t.Fatalf("manifest.server.zst should preserve streamed zstd frames, got %d zstd frame(s)", frames)
+	}
+	if _, err := tx.LoadManifest(serverManifestPath); err != nil {
+		t.Fatalf("load streamed manifest.server.zst: %v", err)
 	}
 
 	stdout.Reset()
@@ -607,7 +634,7 @@ func TestRunCLIGetSkipWriteDiscardsOutput(t *testing.T) {
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbTXFER:
-			if _, err := io.WriteString(out, singleManifest); err != nil {
+			if err := writeManifestResponse(out, singleManifest); err != nil {
 				return err
 			}
 			_, err := io.WriteString(out, "OK\r\n")
@@ -648,7 +675,7 @@ func TestRunCLIGetProgressFileWritesStatusAndPct(t *testing.T) {
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbTXFER:
-			if _, err := io.WriteString(out, singleManifest); err != nil {
+			if err := writeManifestResponse(out, singleManifest); err != nil {
 				return err
 			}
 			_, err := io.WriteString(out, "OK\r\n")
@@ -726,7 +753,7 @@ func TestRunCLITransferWithEncryptAuto(t *testing.T) {
 			_, err = io.WriteString(out, "OK\r\n")
 			return err
 		case intftcp.VerbTXFER:
-			if _, err := io.WriteString(out, manifestRaw); err != nil {
+			if err := writeManifestResponse(out, manifestRaw); err != nil {
 				return err
 			}
 			_, err := io.WriteString(out, "OK\r\n")
@@ -743,13 +770,17 @@ func TestRunCLITransferWithEncryptAuto(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	serverManifestPath := filepath.Join(tmp, ".tx", "dst", "manifest.server")
-	raw, err := os.ReadFile(serverManifestPath)
+	serverManifestPath := filepath.Join(tmp, ".tx", "dst", "manifest.server.zst")
+	gotManifest, err := tx.LoadManifest(serverManifestPath)
 	if err != nil {
-		t.Fatalf("read manifest.server: %v", err)
+		t.Fatalf("load manifest.server.zst: %v", err)
 	}
-	if string(raw) != manifestRaw {
-		t.Fatalf("unexpected decrypted manifest: %q", string(raw))
+	wantManifest, err := tx.ParseManifest([]byte(manifestRaw))
+	if err != nil {
+		t.Fatalf("parse expected manifest: %v", err)
+	}
+	if tx.ManifestFingerprint(gotManifest) != tx.ManifestFingerprint(wantManifest) {
+		t.Fatalf("manifest fingerprints differ after decrypted persist")
 	}
 }
 
@@ -786,7 +817,7 @@ func TestRunCLITransferWithEncryptAES(t *testing.T) {
 			_, err = io.WriteString(out, "OK\r\n")
 			return err
 		case intftcp.VerbTXFER:
-			if _, err := io.WriteString(out, manifestRaw); err != nil {
+			if err := writeManifestResponse(out, manifestRaw); err != nil {
 				return err
 			}
 			_, err := io.WriteString(out, "OK\r\n")
@@ -803,13 +834,17 @@ func TestRunCLITransferWithEncryptAES(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("transfer: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	serverManifestPath := filepath.Join(tmp, ".tx", "dst", "manifest.server")
-	raw, err := os.ReadFile(serverManifestPath)
+	serverManifestPath := filepath.Join(tmp, ".tx", "dst", "manifest.server.zst")
+	gotManifest, err := tx.LoadManifest(serverManifestPath)
 	if err != nil {
-		t.Fatalf("read manifest.server: %v", err)
+		t.Fatalf("load manifest.server.zst: %v", err)
 	}
-	if string(raw) != manifestRaw {
-		t.Fatalf("unexpected decrypted manifest: %q", string(raw))
+	wantManifest, err := tx.ParseManifest([]byte(manifestRaw))
+	if err != nil {
+		t.Fatalf("parse expected manifest: %v", err)
+	}
+	if tx.ManifestFingerprint(gotManifest) != tx.ManifestFingerprint(wantManifest) {
+		t.Fatalf("manifest fingerprints differ after decrypted persist")
 	}
 }
 
@@ -1270,7 +1305,7 @@ func TestRunCLIStartDiscardSkipsTargetMutationAndLocalManifest(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(targetDir, "a.txt")); !os.IsNotExist(err) {
 		t.Fatalf("expected discarded output to be absent, stat err=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(tmp, ".tx", "dst", "manifest")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(tmp, ".tx", "dst", "manifest.zst")); !os.IsNotExist(err) {
 		t.Fatalf("expected local manifest to be absent, stat err=%v", err)
 	}
 	if _, err := os.Stat(filepath.Join(tmp, ".tx", "dst", "manifest.progress")); !os.IsNotExist(err) {
@@ -2425,8 +2460,14 @@ func TestRunCLISyncNoOpSkipsPrompt(t *testing.T) {
 	entry := buildTestManifestEntry(1, info.Size(), info.ModTime().UnixNano(), info.Mode(), "same.txt")
 	dirEntry := buildTestDirManifestEntry(2, dirMtime.UnixNano(), 0o750, "sub")
 	manifestRaw := buildTestManifestRaw("txsyncnoop", []string{entry, dirEntry})
-	if err := os.WriteFile(filepath.Join(tmp, ".tx", "dst", "manifest.server"), []byte(manifestRaw), 0o644); err != nil {
-		t.Fatalf("write manifest.server: %v", err)
+	{
+		m, err := tx.ParseManifest([]byte(manifestRaw))
+		if err != nil {
+			t.Fatalf("parse seed manifest: %v", err)
+		}
+		if err := tx.SaveManifest(filepath.Join(tmp, ".tx", "dst", "manifest.server.zst"), m); err != nil {
+			t.Fatalf("save manifest.server.zst: %v", err)
+		}
 	}
 	withSyncPromptTestInput(t, "\n", true)
 
@@ -2887,7 +2928,7 @@ func TestRunCLICopyStartPath(t *testing.T) {
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbTXFER:
-			if _, err := io.WriteString(out, manifestRaw); err != nil {
+			if err := writeManifestResponse(out, manifestRaw); err != nil {
 				return err
 			}
 			_, err := io.WriteString(out, "OK\r\n")
@@ -2939,7 +2980,7 @@ func TestRunCLICopySyncPath(t *testing.T) {
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbTXFER:
-			if _, err := io.WriteString(out, manifestRaw); err != nil {
+			if err := writeManifestResponse(out, manifestRaw); err != nil {
 				return err
 			}
 			_, err := io.WriteString(out, "OK\r\n")
@@ -3214,7 +3255,7 @@ func TestRunCLICopyCleanWipesStateDir(t *testing.T) {
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbTXFER:
 			sawTXFER = true
-			if _, err := io.WriteString(out, freshManifestRaw); err != nil {
+			if err := writeManifestResponse(out, freshManifestRaw); err != nil {
 				return err
 			}
 			_, err := io.WriteString(out, "OK\r\n")
@@ -3404,7 +3445,7 @@ func TestRunCLICopySkipFetchVerifyMeta(t *testing.T) {
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbTXFER:
-			if _, err := io.WriteString(out, manifestRaw); err != nil {
+			if err := writeManifestResponse(out, manifestRaw); err != nil {
 				return err
 			}
 			_, err := io.WriteString(out, "OK\r\n")
@@ -3468,7 +3509,7 @@ func TestRunCLICopyMixedManifestTypesConverges(t *testing.T) {
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbTXFER:
-			if _, err := io.WriteString(out, manifestRaw); err != nil {
+			if err := writeManifestResponse(out, manifestRaw); err != nil {
 				return err
 			}
 			_, err := io.WriteString(out, "OK\r\n")
@@ -3580,7 +3621,7 @@ func TestRunCLICopyMetadataApplyWarningStillRunsVerifyData(t *testing.T) {
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbTXFER:
-			if _, err := io.WriteString(out, manifestRaw); err != nil {
+			if err := writeManifestResponse(out, manifestRaw); err != nil {
 				return err
 			}
 			_, err := io.WriteString(out, "OK\r\n")
@@ -3655,7 +3696,7 @@ func TestRunCLICopySendFailureReturnsNonzero(t *testing.T) {
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbTXFER:
-			if _, err := io.WriteString(out, manifestRaw); err != nil {
+			if err := writeManifestResponse(out, manifestRaw); err != nil {
 				return err
 			}
 			_, err := io.WriteString(out, "OK\r\n")

@@ -83,6 +83,7 @@ type copyCLIConfig struct {
 	verbose             bool
 	progress            bool
 	yes                 bool
+	withPageCache       bool
 }
 
 func cleanupCopyState(targetDir string, stderr io.Writer) int {
@@ -146,6 +147,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf.StringVar(&cfg.ackEveryRaw, "a", "ack-every", cfg.ackEveryRaw, "Bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
 	cf.StringVar(&cfg.probeSizeRaw, "", "probe-size", cfg.probeSizeRaw, "Probe payload size; e.g. 1B, 4KiB, 8MiB")
 	cf.StringVar(&cfg.deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
+	cf.BoolVar(&cfg.withPageCache, "", "with-cache-map", false, "Request page-cache residency hint per file (Linux only)")
 	cf.StringVar(&cfg.traceFile, "", "trace", "", "Write runtime/trace output to this file")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -275,17 +277,17 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	copyVerbosity := verbosityFromFlags(cfg.progress, cfg.verbose)
 
 	transferCfg := transferArgs{
-		sourceDir:    cfg.remoteSrc,
-		targetDir:    cfg.localDst,
-		agePublicKey: agePublicKey,
-		ageIdentity:  ageIdentity,
-		encMode:      encMode,
-		authTokens:   cfg.authTokens,
-		loadStrategy: loadStrategy,
-		probeBytes:   probeBytes,
-		verbosity:    0,
-		maxChunk:     0,
-		deadlineMS:   deadlineMS,
+		sourceDir:     cfg.remoteSrc,
+		targetDir:     cfg.localDst,
+		agePublicKey:  agePublicKey,
+		ageIdentity:   ageIdentity,
+		encMode:       encMode,
+		authTokens:    cfg.authTokens,
+		loadStrategy:  loadStrategy,
+		probeBytes:    probeBytes,
+		verbosity:     0,
+		deadlineMS:    deadlineMS,
+		withPageCache: cfg.withPageCache,
 	}
 	// Resume path: prior .tx/<dst>/manifest.server exists from an interrupted
 	// run, and the user has not re-created LOCAL_DST. Refresh via SYNC and

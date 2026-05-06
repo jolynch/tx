@@ -181,6 +181,7 @@ type FileFrameMeta struct {
 	WireSize        int64
 	MaxWireSizeHint int64
 	HeaderTS        int64
+	HashToken       string
 }
 
 type FrameTrailer struct {
@@ -211,6 +212,7 @@ func ParseFXHeader(line string) (FileFrameMeta, error) {
 	}
 
 	comp := props["comp"]
+	hashToken := props["hash"]
 	offset, err := parseHeaderInt(props["offset"], "offset")
 	if err != nil {
 		return FileFrameMeta{}, err
@@ -237,11 +239,23 @@ func ParseFXHeader(line string) (FileFrameMeta, error) {
 			return FileFrameMeta{}, errors.New("invalid header max-wsize")
 		}
 	}
+	if offset < 0 {
+		return FileFrameMeta{}, errors.New("invalid header offset")
+	}
+	if size < 0 {
+		return FileFrameMeta{}, errors.New("invalid header size")
+	}
+	if wsize < 0 {
+		return FileFrameMeta{}, errors.New("invalid header wsize")
+	}
 	if ts < 0 {
 		return FileFrameMeta{}, errors.New("invalid header ts")
 	}
 	if comp == "" {
 		return FileFrameMeta{}, errors.New("missing required frame properties")
+	}
+	if hashToken != "" && !ValidHashToken(hashToken) {
+		return FileFrameMeta{}, errors.New("invalid header hash token")
 	}
 	return FileFrameMeta{
 		FileID:          fileID,
@@ -251,6 +265,7 @@ func ParseFXHeader(line string) (FileFrameMeta, error) {
 		WireSize:        wsize,
 		MaxWireSizeHint: maxWSizeHint,
 		HeaderTS:        ts,
+		HashToken:       hashToken,
 	}, nil
 }
 

@@ -128,6 +128,8 @@ Options:
       --probe-size string         Probe payload size; e.g. 1B, 4KiB, 8MiB
                                   (default "1.00 MiB")
       --deadline string           Transfer deadline (e.g. 60s, 5m)
+      --with-cache-map            Request page-cache residency hint per file
+                                  (Linux only)
       --trace string              Write runtime/trace output to this file
 ```
 
@@ -163,6 +165,8 @@ Options:
   -a, --ack-every string          Bytes between progress acks; e.g. 1B, 4KiB, 8MiB
                                   (default "128.00 MiB")
       --deadline string           Transfer deadline (e.g. 60s, 5m)
+      --with-cache-map            Request page-cache residency hint per file
+                                  (Linux only)
       --trace string              Write runtime/trace output to this file
 ```
 
@@ -201,7 +205,7 @@ Behavior:
   into place
 - if `LOCAL_DST` does not exist but `.tx/<dst>/` is present from a previous
   interrupted run, `copy` resumes: it refreshes the manifest from the server via
-  `SYNC` (sending the prior `manifest.server` as the old manifest), carries any
+  `SYNC` (sending the prior `manifest.server.zst` as the old manifest), carries any
   saved progress forward by stable file identity (path + size + mtime + mode +
   link target) for unchanged files, and resumes downloads from their last
   acknowledged offsets
@@ -303,10 +307,12 @@ strategy selection.
 
 State is stored in `<LOCAL_DST>/../.tx/`:
 
-- `manifest.server`: the last remote manifest snapshot
-- `manifest`: the local manifest after a successful write
+- `manifest.server.zst`: the last remote manifest snapshot (zstd-compressed FM/1)
+- `manifest.zst`: the local manifest after a successful write (zstd-compressed FM/1)
 - `manifest.progress`: resumable progress state
 - `remote/`: start-phase staging directory
+
+The manifest files are standalone zstd archives — `zstdcat` works on them.
 
 ## Notes
 
