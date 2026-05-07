@@ -458,7 +458,11 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			markMetadataDonePersisted(fileID)
 		}
 
+		totalAllBytes, totalAllFiles, priorBytes, priorFiles := progressTotals(mergedManifest.Entries)
 		var totalCopied atomic.Int64
+		totalCopied.Store(priorBytes)
+		var doneFiles atomic.Uint64
+		doneFiles.Store(priorFiles)
 		outputWriter := func(entry tx.ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
 			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
 			if cfg.skipWrite {
@@ -515,6 +519,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 				}
 			},
 			TotalCopied:      &totalCopied,
+			DoneFiles:        &doneFiles,
 			ProgressTargets:  cfg.progressTargets,
 			ProgressInterval: cfg.progressInterval,
 			Stderr:           stderr,
@@ -523,7 +528,8 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			TransferMode:     mergedManifest.Mode,
 			ProbeBytes:       cfg.probeBytes,
 			ObservedLinkMbps: mergedManifest.LinkMbps,
-			StatusTotalBytes: totalEntrySize(pendingWork.files),
+			StatusTotalBytes: totalAllBytes,
+			StatusTotalFiles: totalAllFiles,
 			StatusPolling:    false,
 		})
 		if err != nil {

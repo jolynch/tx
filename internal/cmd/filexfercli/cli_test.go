@@ -34,6 +34,8 @@ type ftcpTestServer struct {
 	URL      string
 	listener net.Listener
 	wg       sync.WaitGroup
+	mu       sync.Mutex
+	conns    map[net.Conn]struct{}
 }
 
 func (s *ftcpTestServer) Close() {
@@ -43,6 +45,11 @@ func (s *ftcpTestServer) Close() {
 	if s.listener != nil {
 		_ = s.listener.Close()
 	}
+	s.mu.Lock()
+	for conn := range s.conns {
+		_ = conn.Close()
+	}
+	s.mu.Unlock()
 	s.wg.Wait()
 }
 
@@ -56,7 +63,7 @@ func newFTCPTestServerWithIdentity(t *testing.T, serverID *age.X25519Identity, h
 	if err != nil {
 		t.Fatalf("listen tcp: %v", err)
 	}
-	s := &ftcpTestServer{URL: ln.Addr().String(), listener: ln}
+	s := &ftcpTestServer{URL: ln.Addr().String(), listener: ln, conns: make(map[net.Conn]struct{})}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -65,10 +72,18 @@ func newFTCPTestServerWithIdentity(t *testing.T, serverID *age.X25519Identity, h
 			if err != nil {
 				return
 			}
+			s.mu.Lock()
+			s.conns[conn] = struct{}{}
+			s.mu.Unlock()
 			s.wg.Add(1)
 			go func(c net.Conn) {
 				defer s.wg.Done()
-				defer c.Close()
+				defer func() {
+					_ = c.Close()
+					s.mu.Lock()
+					delete(s.conns, c)
+					s.mu.Unlock()
+				}()
 				serveFTCPConn(c, serverID, handler)
 			}(conn)
 		}
@@ -3696,5 +3711,204 @@ func TestVerboseProgressReporterConcurrentUse(t *testing.T) {
 	}
 	if !strings.Contains(out, "file progress[2]: ") {
 		t.Fatalf("expected fd=2 progress lines, got %q", out)
+	}
+}
+
+func TestProgressTotalsCountsResumedBaseline(t *testing.T) {
+	entries := []tx.ManifestEntry{
+		// Fully complete file from a prior run.
+		{ID: 0, Size: 100, Type: encoding.EntryTypeFile, Progress: tx.ManifestProgress{AckBytes: 100, MetadataDone: true}},
+		// Partial file (12% acked, no metadata yet).
+		{ID: 1, Size: 50, Type: encoding.EntryTypeFile, Progress: tx.ManifestProgress{AckBytes: 6}},
+		// Untouched file.
+		{ID: 2, Size: 200, Type: encoding.EntryTypeFile},
+		// Non-file entries should be ignored entirely.
+		{ID: 3, Size: 999, Type: encoding.EntryTypeDir},
+		{ID: 4, Size: 999, Type: encoding.EntryTypeSymlink},
+	}
+	totalBytes, totalFiles, priorBytes, priorFiles := progressTotals(entries)
+	if totalBytes != 350 {
+		t.Errorf("totalBytes: got %d want 350", totalBytes)
+	}
+	if totalFiles != 3 {
+		t.Errorf("totalFiles: got %d want 3", totalFiles)
+	}
+	if priorBytes != 106 {
+		t.Errorf("priorBytes: got %d want 106", priorBytes)
+	}
+	if priorFiles != 1 {
+		t.Errorf("priorFiles: got %d want 1", priorFiles)
+	}
+}
+
+func TestProgressTotalsClampsOutOfRangeAckBytes(t *testing.T) {
+	entries := []tx.ManifestEntry{
+		// AckBytes negative — should clamp to 0.
+		{ID: 0, Size: 10, Type: encoding.EntryTypeFile, Progress: tx.ManifestProgress{AckBytes: -5}},
+		// AckBytes > Size — should clamp to Size and count as copied for the
+		// resume baseline even if metadata still needs refresh.
+		{ID: 1, Size: 10, Type: encoding.EntryTypeFile, Progress: tx.ManifestProgress{AckBytes: 999}},
+	}
+	totalBytes, totalFiles, priorBytes, priorFiles := progressTotals(entries)
+	if totalBytes != 20 || totalFiles != 2 {
+		t.Errorf("totals: got bytes=%d files=%d, want bytes=20 files=2", totalBytes, totalFiles)
+	}
+	if priorBytes != 10 {
+		t.Errorf("priorBytes: got %d want 10 (0 + clamp 10)", priorBytes)
+	}
+	if priorFiles != 1 {
+		t.Errorf("priorFiles: got %d want 1", priorFiles)
+	}
+}
+
+type signalWriter struct {
+	mu    sync.Mutex
+	buf   bytes.Buffer
+	wrote chan struct{}
+	once  sync.Once
+}
+
+func newSignalWriter() *signalWriter {
+	return &signalWriter{wrote: make(chan struct{})}
+}
+
+func (w *signalWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.buf.Write(p)
+	w.once.Do(func() { close(w.wrote) })
+	return n, err
+}
+
+func (w *signalWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+func TestVerboseStatusPollingUsesResumeFileBaseline(t *testing.T) {
+	var statusCalls atomic.Int64
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		if req.Verb != intftcp.VerbSTATUS {
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+		statusCalls.Add(1)
+		_, err := io.WriteString(out, `OK {"transfer_id":"txresume","directory":"/r","num_files":10011,"total_size":500,"done":0,"done_size":0,"percent_files":0.0,"percent_bytes":0.0,"download_status":{"started":10011,"running":0,"done":0,"missing":0}}`+"\r\n")
+		return err
+	})
+	defer srv.Close()
+
+	client := tx.NewClient(srv.URL)
+	defer client.Close()
+
+	var copied atomic.Int64
+	copied.Store(5 << 30)
+	var doneFiles atomic.Uint64
+	doneFiles.Store(4347)
+	stderr := newSignalWriter()
+	stop := startVerboseStatusPolling("txresume", client, &copied, 18<<30, &doneFiles, 10011, nil, stderr)
+
+	select {
+	case <-stderr.wrote:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timed out waiting for status progress; status calls=%d", statusCalls.Load())
+	}
+	stop()
+	got := stderr.String()
+	if !strings.Contains(got, "txfer-progress:[  4347/ 10011]") {
+		t.Fatalf("expected resume file baseline in status progress, got: %s", got)
+	}
+	if !strings.Contains(got, "[  5.00 GiB/ 18.00 GiB]") {
+		t.Fatalf("expected resume byte baseline in status progress, got: %s", got)
+	}
+}
+
+// TestRunCLIStartProgressFileShowsResumedBytes guards against the bug where a
+// partially-resumed transfer reported progress as 0% → (1-priorPct)% instead of
+// priorPct% → 100%. The test forces a paced transfer so the progress writer's
+// ticker fires mid-flight, then asserts every emitted progress line shows
+// bytes.done >= priorBytes (i.e. progress never drops below the resume baseline).
+func TestRunCLIStartProgressFileShowsResumedBytes(t *testing.T) {
+	tmp := t.TempDir()
+	manifestRaw := strings.Join([]string{
+		"FM/1 txstartprogressresume 7:/remote mode=fast link-mbps=700 concurrency=1",
+		"F0 10 0:100 0644 0:5:a.txt",
+		"",
+	}, "\n")
+	targetDir := setupPinchState(t, tmp, manifestRaw, "0 5 0\n")
+	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingDir, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write partial staging file: %v", err)
+	}
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbSEND:
+			// Slow the response so the 1ms progress ticker fires at least once
+			// before the final stop write forces 100%.
+			time.Sleep(50 * time.Millisecond)
+			_, err := io.WriteString(out, buildCLIFrame(0, []byte("world"), 5)+"OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	progressPath := filepath.Join(tmp, "progress.txt")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runStartCLI(srv.URL, []string{
+		"--progress=false",
+		"--skip-fsync",
+		"--concurrency", "1",
+		"--ack-every", "1KiB",
+		"--progress-path", progressPath,
+		"--progress-interval", "1ms",
+		targetDir,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("start resume with progress file: expected 0, got %d\nstderr=%s", code, stderr.String())
+	}
+
+	raw, err := os.ReadFile(progressPath)
+	if err != nil {
+		t.Fatalf("read progress file: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	if len(lines) == 0 {
+		t.Fatalf("empty progress file")
+	}
+	for i, line := range lines {
+		if !strings.Contains(line, `"total":10`) {
+			t.Errorf("line %d: expected bytes total=10, got %s", i, line)
+		}
+		// Pull bytes.done out of the JSON manually — simple substring check
+		// avoids importing encoding/json just to assert >= 5.
+		marker := `"bytes":{"done":`
+		idx := strings.Index(line, marker)
+		if idx < 0 {
+			t.Fatalf("line %d: missing bytes.done: %s", i, line)
+		}
+		rest := line[idx+len(marker):]
+		end := strings.IndexByte(rest, ',')
+		if end < 0 {
+			t.Fatalf("line %d: malformed bytes.done: %s", i, line)
+		}
+		done, err := strconv.ParseInt(rest[:end], 10, 64)
+		if err != nil {
+			t.Fatalf("line %d: parse bytes.done: %v", i, err)
+		}
+		if done < 5 {
+			t.Errorf("line %d: bytes.done=%d should be >= 5 (resume baseline): %s", i, done, line)
+		}
 	}
 }

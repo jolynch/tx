@@ -354,8 +354,15 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		}
 	}()
 
+	totalAllBytes, totalAllFiles, priorBytes, priorFiles := progressTotals(manifest.Entries)
+	if err := validateResumeProgressTotals(manifest.Entries, pendingWork, totalAllBytes, totalAllFiles, priorBytes, priorFiles); err != nil {
+		fmt.Fprintf(stderr, "copy-resume: progress/manifest mismatch: %v\n", err)
+		return 1
+	}
 	var totalCopied atomic.Int64
-	totalPendingBytes := totalEntrySize(pendingWork.files)
+	totalCopied.Store(priorBytes)
+	var doneFiles atomic.Uint64
+	doneFiles.Store(priorFiles)
 
 	if len(pendingWork.files) > 0 {
 		var miniProbe tx.ProbeResponse
@@ -450,6 +457,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 				}
 			},
 			TotalCopied:      &totalCopied,
+			DoneFiles:        &doneFiles,
 			ProgressTargets:  cfg.progressTargets,
 			ProgressInterval: cfg.progressInterval,
 			Stderr:           stderr,
@@ -458,7 +466,8 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 			TransferMode:     loadStrategy,
 			ProbeBytes:       defaultCLIProbeBytes,
 			ObservedLinkMbps: manifest.LinkMbps,
-			StatusTotalBytes: totalPendingBytes,
+			StatusTotalBytes: totalAllBytes,
+			StatusTotalFiles: totalAllFiles,
 			StatusPolling:    true,
 		})
 		if err != nil {
@@ -570,14 +579,17 @@ func printStartFileSummary(stdout io.Writer, fileID uint64, path string, meta tx
 	io.WriteString(stdout, sb.String())
 }
 
-func startVerboseStatusPolling(txferID string, client *tx.Client, localCopied *atomic.Int64, localTotalBytes int64, probe *probeReporter, stderr io.Writer) func() {
+func startVerboseStatusPolling(txferID string, client *tx.Client, localCopied *atomic.Int64, localTotalBytes int64, localDoneFiles *atomic.Uint64, localTotalFiles uint64, probe *probeReporter, stderr io.Writer) func() {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(defaultVerboseProgressInterval)
 		defer ticker.Stop()
-		var prevCopied int64
+		// Seed prevCopied from the current counter so the first tick's rate
+		// delta is 0 even when localCopied was pre-seeded with bytes already
+		// acked in a prior session (resume).
+		prevCopied := localCopied.Load()
 		prevTime := time.Now()
 		for {
 			statusResp, statusErr := client.GetStatus(ctx, tx.GetStatusRequest{
@@ -595,8 +607,16 @@ func startVerboseStatusPolling(txferID string, client *tx.Client, localCopied *a
 				// while data is actively streaming.
 				copied := localCopied.Load()
 				totalBytes := localTotalBytes
-				if s.TotalSize > totalBytes {
+				if totalBytes <= 0 {
 					totalBytes = s.TotalSize
+				}
+				doneFiles := uint64(s.Done)
+				if localDoneFiles != nil {
+					doneFiles = localDoneFiles.Load()
+				}
+				totalFiles := localTotalFiles
+				if totalFiles == 0 {
+					totalFiles = uint64(s.NumFiles)
 				}
 				now := time.Now()
 				dt := now.Sub(prevTime).Seconds()
@@ -611,6 +631,10 @@ func startVerboseStatusPolling(txferID string, client *tx.Client, localCopied *a
 				if totalBytes > 0 {
 					pctBytes = float64(copied) * 100 / float64(totalBytes)
 				}
+				var pctFiles float64
+				if totalFiles > 0 {
+					pctFiles = float64(doneFiles) * 100 / float64(totalFiles)
+				}
 				etaDisplay := fixedWidthETANA()
 				if rateBps > 0 && totalBytes > copied {
 					remaining := float64(totalBytes - copied)
@@ -621,8 +645,8 @@ func startVerboseStatusPolling(txferID string, client *tx.Client, localCopied *a
 				fmt.Fprintf(
 					stderr,
 					"txfer-progress:[%6s/%6s](%5.1f%%) [%s/%s](%5.1f%%) [eta:%s]@[%s]%s\n",
-					encoding.HumanCount(s.Done, 6), encoding.HumanCount(uint64(s.NumFiles), 6),
-					s.PercentFiles,
+					encoding.HumanCount(doneFiles, 6), encoding.HumanCount(totalFiles, 6),
+					pctFiles,
 					encoding.HumanBytesFixedWidth(copied, fixedWidthProgressBytesWidth),
 					encoding.HumanBytesFixedWidth(totalBytes, fixedWidthProgressBytesWidth),
 					pctBytes,
