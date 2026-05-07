@@ -210,13 +210,15 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		}
 	}()
 
-	syncWorker, stopSync := fsync.StartSyncWorker(fsyncInterval, skipFsync, stderr)
+	syncWorker, stopSync := fsync.StartSyncWorker(fsyncInterval, skipFsync, progressInterval, stderr)
 	defer func() {
-		stopSync()
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), defaultFsyncTimeout)
+		stopSync(stopCtx)
+		cancelStop()
 		if !skipFsync && outputPath != "-" && outputPath != os.DevNull {
 			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
 			defer cancel()
-			fsync.SyncfsDir(syncCtx, filepath.Dir(outputPath), stderr)
+			fsync.SyncfsDir(syncCtx, filepath.Dir(outputPath), progressInterval, stderr)
 		}
 	}()
 

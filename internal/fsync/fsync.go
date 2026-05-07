@@ -20,6 +20,9 @@ const (
 	backgroundSyncMemoryCapPercent       = 80
 	backgroundSyncMaxBatchFiles          = 4096
 	backgroundSyncFallbackCapBytes int64 = 8 << 30
+	fsyncProgressCountWidth              = 6
+	fsyncProgressBytesWidth              = 10
+	fsyncProgressDurationWidth           = 5
 )
 
 // SyncWorker manages per-file durability work after writes complete.
@@ -28,8 +31,16 @@ type SyncWorker struct {
 	inlineSync bool
 }
 
+type SyncSnapshot struct {
+	PendingBytes int64
+	PendingFiles int64
+	SyncedBytes  int64
+	SyncedFiles  int64
+}
+
 // StartSyncWorker starts a background sync worker. The returned stop function
-// must be called when the operation completes; it drains pending syncs and
+// must be called when the operation completes; it closes the enqueue path,
+// drains pending syncs until either the worker finishes or ctx is canceled, and
 // logs a summary to stderr.
 //
 // fsyncInterval controls behavior:
@@ -38,20 +49,20 @@ type SyncWorker struct {
 //   - <0: no per-file fdatasync
 //
 // If noSync is true, all per-file syncing is disabled and stop is a no-op.
-func StartSyncWorker(fsyncInterval int64, noSync bool, stderr io.Writer) (*SyncWorker, func()) {
+func StartSyncWorker(fsyncInterval int64, noSync bool, progressInterval time.Duration, stderr io.Writer) (*SyncWorker, func(context.Context)) {
 	worker := &SyncWorker{}
 	if noSync {
-		return worker, func() {}
+		return worker, func(context.Context) {}
 	}
 	switch {
 	case fsyncInterval == 0:
 		worker.inlineSync = true
-		return worker, func() {}
+		return worker, func(context.Context) {}
 	case fsyncInterval > 0:
 		worker.background = newBackgroundSyncer(fsyncInterval, stderr)
-		return worker, func() { worker.background.stop(stderr) }
+		return worker, func(ctx context.Context) { worker.background.stop(ctx, progressInterval, stderr) }
 	default:
-		return worker, func() {}
+		return worker, func(context.Context) {}
 	}
 }
 
@@ -89,7 +100,7 @@ func (w *SyncWorker) SyncOutput(fd *os.File, offset int64) func() error {
 
 // SyncfsDir issues a best-effort syncfs against dir and returns when either
 // syncfs completes or ctx is done.
-func SyncfsDir(ctx context.Context, dir string, stderr io.Writer) {
+func SyncfsDir(ctx context.Context, dir string, progressInterval time.Duration, stderr io.Writer) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -105,8 +116,15 @@ func SyncfsDir(ctx context.Context, dir string, stderr io.Writer) {
 	start := time.Now()
 	done := make(chan error, 1)
 	go func() {
-		done <- unix.Syncfs(fd)
+		done <- loadSyncfsFunc()(fd)
 	}()
+	var tick <-chan time.Time
+	var ticker *time.Ticker
+	if progressInterval > 0 {
+		ticker = time.NewTicker(progressInterval)
+		defer ticker.Stop()
+		tick = ticker.C
+	}
 	select {
 	case err := <-done:
 		unix.Close(fd)
@@ -115,6 +133,32 @@ func SyncfsDir(ctx context.Context, dir string, stderr io.Writer) {
 			fmt.Fprintf(stderr, "final-syncfs: [%s] filesystem sync failed after %s: %v\n", displayPath, elapsed.Round(time.Millisecond), err)
 		} else {
 			fmt.Fprintf(stderr, "final-syncfs: [%s] filesystem sync completed in %s\n", displayPath, elapsed.Round(time.Millisecond))
+		}
+	case <-tick:
+		for {
+			elapsed := time.Since(start)
+			fmt.Fprintf(stderr, "final-syncfs: [%s] waiting %s outstanding=0 files\n", displayPath, elapsed.Round(time.Millisecond))
+			select {
+			case err := <-done:
+				unix.Close(fd)
+				elapsed = time.Since(start)
+				if err != nil {
+					fmt.Fprintf(stderr, "final-syncfs: [%s] filesystem sync failed after %s: %v\n", displayPath, elapsed.Round(time.Millisecond), err)
+				} else {
+					fmt.Fprintf(stderr, "final-syncfs: [%s] filesystem sync completed in %s\n", displayPath, elapsed.Round(time.Millisecond))
+				}
+				return
+			case <-tick:
+			case <-ctx.Done():
+				unix.Close(fd)
+				elapsed = time.Since(start)
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					fmt.Fprintf(stderr, "WARNING: final-syncfs: [%s] filesystem sync timed out after %s. Data may not yet be durable on disk\n", displayPath, elapsed.Round(time.Millisecond))
+					return
+				}
+				fmt.Fprintf(stderr, "WARNING: final-syncfs: [%s] filesystem sync canceled after %s: %v\n", displayPath, elapsed.Round(time.Millisecond), ctx.Err())
+				return
+			}
 		}
 	case <-ctx.Done():
 		unix.Close(fd)
@@ -125,6 +169,18 @@ func SyncfsDir(ctx context.Context, dir string, stderr io.Writer) {
 		}
 		fmt.Fprintf(stderr, "WARNING: final-syncfs: [%s] filesystem sync canceled after %s: %v\n", displayPath, elapsed.Round(time.Millisecond), ctx.Err())
 	}
+}
+
+type syncfsFuncType func(int) error
+
+var syncfsFunc atomic.Value
+
+func init() {
+	syncfsFunc.Store(syncfsFuncType(unix.Syncfs))
+}
+
+func loadSyncfsFunc() syncfsFuncType {
+	return syncfsFunc.Load().(syncfsFuncType)
 }
 
 // backgroundSyncer moves fdatasync off the download→ack critical path. A single
@@ -141,6 +197,7 @@ type backgroundSyncer struct {
 	maxThreshold  int64
 	maxBatchFiles int
 	synced        atomic.Int64
+	syncedFiles   atomic.Int64
 	pendingBytes  atomic.Int64
 	pendingFiles  atomic.Int64
 	peakBytes     atomic.Int64
@@ -219,6 +276,7 @@ func (bs *backgroundSyncer) syncBatch(batch []syncRequest, stderr io.Writer) {
 		bs.pendingBytes.Add(-req.size)
 		bs.pendingFiles.Add(-1)
 		bs.synced.Add(req.size)
+		bs.syncedFiles.Add(1)
 	}
 }
 
@@ -230,11 +288,32 @@ func (bs *backgroundSyncer) enqueue(fd int, size int64) {
 	bs.ch <- syncRequest{fd: fd, size: size}
 }
 
-func (bs *backgroundSyncer) stop(stderr io.Writer) {
+func (bs *backgroundSyncer) snapshot() SyncSnapshot {
+	return SyncSnapshot{
+		PendingBytes: bs.pendingBytes.Load(),
+		PendingFiles: bs.pendingFiles.Load(),
+		SyncedBytes:  bs.synced.Load(),
+		SyncedFiles:  bs.syncedFiles.Load(),
+	}
+}
+
+func (bs *backgroundSyncer) stop(ctx context.Context, progressInterval time.Duration, stderr io.Writer) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	close(bs.ch)
 	start := time.Now()
-	<-bs.done
-	elapsed := time.Since(start)
+	elapsed, err := waitForBackgroundSyncDrain(ctx, bs.done, bs.snapshot, progressInterval, stderr, start)
+	if err != nil {
+		snap := bs.snapshot()
+		fmt.Fprintf(stderr, "WARNING: background-fsync: drain canceled after %s: %v pending=%s/%d files synced=%s\n",
+			elapsed.Round(time.Millisecond),
+			err,
+			encoding.HumanBytes(snap.PendingBytes),
+			snap.PendingFiles,
+			encoding.HumanBytes(snap.SyncedBytes))
+		return
+	}
 	fmt.Fprintf(stderr, "background-fsync: drained in %s, synced=%s pending=%s/%d files peak=%s/%d files batch=%s peak-batch=%s cap=%s\n",
 		elapsed.Round(time.Millisecond),
 		encoding.HumanBytes(bs.synced.Load()),
@@ -247,17 +326,157 @@ func (bs *backgroundSyncer) stop(stderr io.Writer) {
 		encoding.HumanBytes(bs.maxThreshold))
 }
 
-func (bs *backgroundSyncer) updateBatchThreshold(threshold int64, stderr io.Writer) {
-	current := bs.currentBatch.Load()
-	if threshold > current && stderr != nil {
-		fmt.Fprintf(stderr, "background-fsync: disk falling behind, growing batch threshold %s -> %s pending=%s cap=%s\n",
-			encoding.HumanBytes(current),
-			encoding.HumanBytes(threshold),
-			encoding.HumanBytes(bs.pendingBytes.Load()),
-			encoding.HumanBytes(bs.maxThreshold))
+func waitForBackgroundSyncDrain(ctx context.Context, done <-chan struct{}, snapshot func() SyncSnapshot, progressInterval time.Duration, stderr io.Writer, start time.Time) (time.Duration, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	bs.currentBatch.Store(threshold)
-	updateMaxAtomic(&bs.peakBatch, threshold)
+	if progressInterval <= 0 {
+		select {
+		case <-done:
+			return time.Since(start), nil
+		case <-ctx.Done():
+			return time.Since(start), ctx.Err()
+		}
+	}
+	ticker := time.NewTicker(progressInterval)
+	defer ticker.Stop()
+	prevSnap := snapshot()
+	prevTime := start
+	for {
+		select {
+		case <-done:
+			return time.Since(start), nil
+		case <-ctx.Done():
+			return time.Since(start), ctx.Err()
+		case <-ticker.C:
+			snap := snapshot()
+			now := time.Now()
+			fmt.Fprintln(stderr, formatFsyncProgressLine(ctx, prevSnap, snap, prevTime, now))
+			prevSnap = snap
+			prevTime = now
+		}
+	}
+}
+
+func formatFsyncProgressLine(ctx context.Context, prev SyncSnapshot, snap SyncSnapshot, prevTime time.Time, now time.Time) string {
+	doneFiles := clampInt64(snap.SyncedFiles, 0, snap.SyncedFiles+snap.PendingFiles)
+	totalFiles := clampMinInt64(snap.SyncedFiles+snap.PendingFiles, 0)
+	doneBytes := clampInt64(snap.SyncedBytes, 0, snap.SyncedBytes+snap.PendingBytes)
+	totalBytes := clampMinInt64(snap.SyncedBytes+snap.PendingBytes, 0)
+
+	var pctFiles float64
+	if totalFiles > 0 {
+		pctFiles = clampPercent(float64(doneFiles) * 100 / float64(totalFiles))
+	}
+	var pctBytes float64
+	if totalBytes > 0 {
+		pctBytes = clampPercent(float64(doneBytes) * 100 / float64(totalBytes))
+	}
+
+	etaDisplay := fixedWidthFsyncDurationNA()
+	if remainingBytes := totalBytes - doneBytes; remainingBytes > 0 {
+		if dt := now.Sub(prevTime).Seconds(); dt > 0 {
+			rateBps := float64(snap.SyncedBytes-prev.SyncedBytes) / dt
+			if rateBps > 0 {
+				etaDisplay = fixedWidthFsyncDuration(time.Duration(float64(remainingBytes) / rateBps * float64(time.Second)))
+			}
+		}
+	}
+	budgetDisplay := fixedWidthFsyncDurationNA()
+	if deadline, ok := ctx.Deadline(); ok {
+		budgetDisplay = fixedWidthFsyncDuration(deadline.Sub(now))
+	}
+
+	return fmt.Sprintf(
+		"fsync-progress:[%6s/%6s](%5.1f%%) [%s/%s](%5.1f%%) [eta:%s]@[budget:%s]",
+		encoding.HumanCount(uint64(doneFiles), fsyncProgressCountWidth),
+		encoding.HumanCount(uint64(totalFiles), fsyncProgressCountWidth),
+		pctFiles,
+		encoding.HumanBytesFixedWidth(doneBytes, fsyncProgressBytesWidth),
+		encoding.HumanBytesFixedWidth(totalBytes, fsyncProgressBytesWidth),
+		pctBytes,
+		etaDisplay,
+		budgetDisplay,
+	)
+}
+
+func fixedWidthFsyncDuration(d time.Duration) string {
+	return fmt.Sprintf("%*s", fsyncProgressDurationWidth, compactFsyncDuration(d))
+}
+
+func fixedWidthFsyncDurationNA() string {
+	return fmt.Sprintf("%*s", fsyncProgressDurationWidth, "n/a")
+}
+
+func compactFsyncDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	seconds := d.Round(time.Second).Seconds()
+	switch {
+	case seconds < 60:
+		return fmt.Sprintf("%.0fs", seconds)
+	case seconds < 60*60:
+		return fmt.Sprintf("%.1fm", seconds/60)
+	case seconds < 24*60*60:
+		return fmt.Sprintf("%.1fh", seconds/3600)
+	case seconds < 7*24*60*60:
+		return fmt.Sprintf("%.1fd", seconds/(24*3600))
+	default:
+		return fmt.Sprintf("%.1fw", seconds/(7*24*3600))
+	}
+}
+
+func clampPercent(pct float64) float64 {
+	if pct < 0 {
+		return 0
+	}
+	if pct > 100 {
+		return 100
+	}
+	return pct
+}
+
+func clampMinInt64(v int64, min int64) int64 {
+	if v < min {
+		return min
+	}
+	return v
+}
+
+func clampInt64(v int64, min int64, max int64) int64 {
+	if max < min {
+		max = min
+	}
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func (bs *backgroundSyncer) updateBatchThreshold(threshold int64, stderr io.Writer) {
+	for {
+		current := bs.currentBatch.Load()
+		if current == threshold {
+			updateMaxAtomic(&bs.peakBatch, threshold)
+			return
+		}
+		if !bs.currentBatch.CompareAndSwap(current, threshold) {
+			continue
+		}
+		peakUpdated := updateMaxAtomic(&bs.peakBatch, threshold)
+		if threshold > current && peakUpdated && stderr != nil {
+			fmt.Fprintf(stderr, "background-fsync: disk falling behind, growing batch threshold %s -> %s pending=%s cap=%s\n",
+				encoding.HumanBytes(current),
+				encoding.HumanBytes(threshold),
+				encoding.HumanBytes(bs.pendingBytes.Load()),
+				encoding.HumanBytes(bs.maxThreshold))
+		}
+		return
+	}
 }
 
 // adaptiveThreshold returns the smallest power-of-two multiple of
@@ -310,14 +529,14 @@ func systemMemoryBytes() int64 {
 	return int64(total)
 }
 
-func updateMaxAtomic(dst *atomic.Int64, candidate int64) {
+func updateMaxAtomic(dst *atomic.Int64, candidate int64) bool {
 	for {
 		current := dst.Load()
 		if candidate <= current {
-			return
+			return false
 		}
 		if dst.CompareAndSwap(current, candidate) {
-			return
+			return true
 		}
 	}
 }

@@ -863,8 +863,8 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 		progressUpdates := make(chan tx.DownloadProgressUpdate, 32)
 		stopProgress, persistProgressAck, markMetadataDone := startProgressWriter(progressPath, tx.ManifestFingerprint(manifest), state, progressUpdates, nil, io.Discard)
 		defer stopProgress()
-		syncWorker, stopSync := fsync.StartSyncWorker(-1, true, io.Discard)
-		defer stopSync()
+		syncWorker, stopSync := fsync.StartSyncWorker(-1, true, time.Second, io.Discard)
+		defer stopSync(context.Background())
 		client := tx.NewClient(srvURL, tx.WithFileRequestWindowBytes(15))
 		defer client.Close()
 		resp, err := downloadManifestFiles(manifestDownloadConfig{

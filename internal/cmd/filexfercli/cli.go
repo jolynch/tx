@@ -58,6 +58,7 @@ const verifySampleBytes int64 = 8
 const verifyChecksumCommandBudgetBytes = 3 * 1024 * 1024
 const verifyChecksumRequestTimeout = 30 * time.Second
 const defaultTransferProbeRefreshInterval = 10 * time.Second
+const defaultFsyncTimeout = 60 * time.Second
 const defaultSyncfsTimeout = 10 * time.Second
 const fixedWidthProgressBytesWidth = 10
 const fixedWidthProgressRateWidth = 13
