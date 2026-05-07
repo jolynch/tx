@@ -344,13 +344,15 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		recordFailure,
 	)
 	completed += completedNow
-	syncWorker, stopSync := fsync.StartSyncWorker(cfg.fsyncInterval, cfg.noSync, stderr)
+	syncWorker, stopSync := fsync.StartSyncWorker(cfg.fsyncInterval, cfg.noSync, cfg.progressInterval, stderr)
 	defer func() {
-		stopSync()
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), defaultFsyncTimeout)
+		stopSync(stopCtx)
+		cancelStop()
 		if !cfg.noSync && !cfg.discard {
 			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
 			defer cancel()
-			fsync.SyncfsDir(syncCtx, filepath.Dir(ps.TargetDir), stderr)
+			fsync.SyncfsDir(syncCtx, filepath.Dir(ps.TargetDir), cfg.progressInterval, stderr)
 		}
 	}()
 
