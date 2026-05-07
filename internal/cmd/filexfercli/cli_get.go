@@ -223,7 +223,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var totalCopied atomic.Int64
 	var stopStatusPolling func()
 	if verbosityFromFlags(progress, verbose) >= 1 {
-		stopStatusPolling = startVerboseStatusPolling(manifest.TransferID, client, &totalCopied, entry.Size, probeInfo, stderr)
+		stopStatusPolling = startVerboseStatusPolling(manifest.TransferID, client, &totalCopied, entry.Size, nil, 1, probeInfo, stderr)
 		defer stopStatusPolling()
 	}
 	outputWriter := func(me tx.ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {

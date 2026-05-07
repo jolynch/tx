@@ -162,7 +162,14 @@ func startTransferProbeReporter(ctx context.Context, client *tx.Client, transfer
 		strategy = tx.LoadStrategyFast
 	}
 	probeCtx, cancel := context.WithCancel(ctx)
-	pr.stop = cancel
+	done := make(chan struct{})
+	var stopOnce sync.Once
+	pr.stop = func() {
+		stopOnce.Do(func() {
+			cancel()
+			<-done
+		})
+	}
 	var observed atomic.Int64
 	if initialObservedLinkMbps > 0 {
 		observed.Store(initialObservedLinkMbps)
@@ -170,6 +177,7 @@ func startTransferProbeReporter(ctx context.Context, client *tx.Client, transfer
 		pr.lastProbeUnixS.Store(time.Now().Unix())
 	}
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(transferProbeRefreshInterval)
 		defer ticker.Stop()
 		for {
@@ -419,7 +427,6 @@ func resolveCompress(raw string) (string, error) {
 	}
 }
 
-
 func pathExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
@@ -514,9 +521,6 @@ func manifestEntryMatches(local tx.ManifestEntry, remote tx.ManifestEntry) bool 
 	}
 }
 
-
-
-
 type noOpWriteCloser struct {
 	io.Writer
 }
@@ -554,6 +558,7 @@ type manifestDownloadConfig struct {
 	OutputWriter       func(tx.ManifestEntry, int64) (io.WriteCloser, func() error, error)
 	OnFileDone         func(tx.StartFileDoneEvent)
 	TotalCopied        *atomic.Int64
+	DoneFiles          *atomic.Uint64
 	ProgressTargets    []filexfer.ProgressTarget
 	ProgressInterval   time.Duration
 	Stderr             io.Writer
@@ -563,6 +568,7 @@ type manifestDownloadConfig struct {
 	ProbeBytes         int64
 	ObservedLinkMbps   int64
 	StatusTotalBytes   int64
+	StatusTotalFiles   uint64
 	StatusPolling      bool
 }
 
@@ -572,6 +578,73 @@ func totalEntrySize(entries []tx.ManifestEntry) int64 {
 		total += entry.Size
 	}
 	return total
+}
+
+// progressTotals summarizes the current ack state across all file entries:
+// total bytes/files in the transfer, and the bytes/files already complete or
+// copied from prior runs before this session's downloads start. The returned
+// priorBytes/priorFiles drive resume-aware progress reporting so a partial
+// download's progress bar starts at the prior percent instead of zero.
+func progressTotals(entries []tx.ManifestEntry) (totalBytes int64, totalFiles uint64, priorBytes int64, priorFiles uint64) {
+	for _, entry := range entries {
+		if entry.Type != 0 && entry.Type != encoding.EntryTypeFile {
+			continue
+		}
+		totalFiles++
+		size := entry.Size
+		if size < 0 {
+			size = 0
+		}
+		totalBytes += size
+		ack := entry.Progress.AckBytes
+		if ack < 0 {
+			ack = 0
+		}
+		if ack > size {
+			ack = size
+		}
+		priorBytes += ack
+		if ack >= size && size > 0 {
+			priorFiles++
+		}
+	}
+	return
+}
+
+func remainingProgressBytes(entries []tx.ManifestEntry) int64 {
+	var remaining int64
+	for _, entry := range entries {
+		if entry.Type != 0 && entry.Type != encoding.EntryTypeFile {
+			continue
+		}
+		size := entry.Size
+		if size < 0 {
+			size = 0
+		}
+		ack := entry.Progress.AckBytes
+		if ack < 0 {
+			ack = 0
+		}
+		if ack > size {
+			ack = size
+		}
+		remaining += size - ack
+	}
+	return remaining
+}
+
+func validateResumeProgressTotals(entries []tx.ManifestEntry, pending pendingManifestWork, totalBytes int64, totalFiles uint64, priorBytes int64, priorFiles uint64) error {
+	remainingBytes := remainingProgressBytes(entries)
+	if priorBytes+remainingBytes != totalBytes {
+		return fmt.Errorf("bytes prior=%s remaining=%s total=%s",
+			encoding.HumanBytes(priorBytes),
+			encoding.HumanBytes(remainingBytes),
+			encoding.HumanBytes(totalBytes))
+	}
+	if priorFiles+uint64(len(pending.files)) != totalFiles {
+		return fmt.Errorf("files prior=%d pending=%d total=%d", priorFiles, len(pending.files), totalFiles)
+	}
+	return nil
 }
 
 func collectPendingManifestWork(
@@ -635,7 +708,10 @@ func downloadManifestFiles(cfg manifestDownloadConfig) (tx.StartFromManifestResp
 	if totalCopied == nil {
 		totalCopied = &atomic.Int64{}
 	}
-	var doneFiles atomic.Uint64
+	doneFiles := cfg.DoneFiles
+	if doneFiles == nil {
+		doneFiles = &atomic.Uint64{}
+	}
 
 	transferCtx, cancelTransfer := context.WithCancel(context.Background())
 	defer cancelTransfer()
@@ -643,22 +719,32 @@ func downloadManifestFiles(cfg manifestDownloadConfig) (tx.StartFromManifestResp
 	defer probeInfo.stop()
 
 	if cfg.StatusPolling && cfg.Verbosity >= 1 {
-		stopStatusPolling := startVerboseStatusPolling(cfg.TransferID, cfg.Client, totalCopied, cfg.StatusTotalBytes, probeInfo, cfg.Stderr)
+		stopStatusPolling := startVerboseStatusPolling(cfg.TransferID, cfg.Client, totalCopied, cfg.StatusTotalBytes, doneFiles, cfg.StatusTotalFiles, probeInfo, cfg.Stderr)
 		defer stopStatusPolling()
 	}
 
 	success := false
 	if len(cfg.ProgressTargets) > 0 {
-		totalBytes := totalEntrySize(cfg.Entries)
-		totalFiles := uint64(len(cfg.Entries))
+		totalBytes := cfg.StatusTotalBytes
+		if totalBytes <= 0 {
+			totalBytes = totalEntrySize(cfg.Entries)
+		}
+		totalFiles := cfg.StatusTotalFiles
+		if totalFiles == 0 {
+			totalFiles = uint64(len(cfg.Entries))
+		}
 		stopProgressFile := filexfer.StartProgressFileWriter(context.Background(), cfg.ProgressTargets, cfg.ProgressInterval, func() filexfer.ProgressStatus {
 			copied := totalCopied.Load()
 			if totalBytes > 0 && copied > totalBytes {
 				copied = totalBytes
 			}
+			done := doneFiles.Load()
+			if totalFiles > 0 && done > totalFiles {
+				done = totalFiles
+			}
 			return filexfer.ProgressStatus{
 				Source:     "client",
-				DoneFiles:  doneFiles.Load(),
+				DoneFiles:  done,
 				TotalFiles: totalFiles,
 				DoneBytes:  copied,
 				TotalBytes: totalBytes,
