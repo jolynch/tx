@@ -21,6 +21,7 @@ import (
 
 type sendTestDeps struct {
 	filePath       string
+	entryType      byte
 	windowHashEnd  int64
 	windowHash     string
 	setStateCalls  int
@@ -68,6 +69,7 @@ func (d *sendTestDeps) GetFile(txferID string, fileID uint64, fullPathRaw string
 		Path:       d.filePath,
 		Directory:  filepath.Dir(d.filePath),
 		FileSize:   info.Size(),
+		EntryType:  d.entryType,
 	}, nil
 }
 
@@ -82,6 +84,7 @@ func (d *sendTestDeps) GetFileRef(txferID string, fileID uint64, fullPathRaw str
 		Path:       d.filePath,
 		Directory:  filepath.Dir(d.filePath),
 		FileSize:   info.Size(),
+		EntryType:  d.entryType,
 	}, nil
 }
 
@@ -285,6 +288,57 @@ func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
 	}
 	if !sawCompressed {
 		t.Fatalf("expected adaptive mode to upgrade to a compressed frame, comps=%v", comps)
+	}
+}
+
+func TestStreamSendItemDirectoryMetadataOnly(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "meta-dir")
+	if err := os.Mkdir(dir, 0o750); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if err := os.Chmod(dir, 0o3750); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	wantMode := encoding.FormatManifestMode(info.Mode())
+	deps := &sendTestDeps{filePath: dir, entryType: encoding.EntryTypeDir}
+
+	var out bytes.Buffer
+	if err := streamSendItem(context.Background(), &out, deps, "tx-dir", sendItem{FileID: 11, Offset: 0, Size: 0, Comp: "adapt", Path: dir}, false); err != nil {
+		t.Fatalf("streamSendItem directory failed: %v", err)
+	}
+
+	frames, err := decodeFrameStream(out.Bytes())
+	if err != nil {
+		t.Fatalf("decodeFrameStream failed: %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("expected one metadata frame, got %d", len(frames))
+	}
+	if frames[0].Header.FileID != 11 || frames[0].Header.Size != 0 || frames[0].Header.WireSize != 0 || frames[0].Header.Comp != "none" {
+		t.Fatalf("unexpected metadata header: %+v", frames[0].Header)
+	}
+	if len(frames[0].Logical) != 0 {
+		t.Fatalf("metadata frame payload len = %d, want 0", len(frames[0].Logical))
+	}
+	if frames[0].Trailer.Next == nil || *frames[0].Trailer.Next != 0 {
+		t.Fatalf("metadata trailer next = %v, want 0", frames[0].Trailer.Next)
+	}
+	expectedHash := encoding.FormatXXH128HashToken(xxh3.Hash128(nil))
+	if frames[0].Trailer.FileHashToken != expectedHash {
+		t.Fatalf("metadata file hash = %q, want %q", frames[0].Trailer.FileHashToken, expectedHash)
+	}
+	raw := out.String()
+	for _, token := range []string{"meta:size=0", "meta:mtime_ns=", "meta:mode=" + wantMode, "meta:uid=", "meta:gid="} {
+		if !strings.Contains(raw, token) {
+			t.Fatalf("metadata trailer missing %q in %q", token, raw)
+		}
+	}
+	if deps.windowHash != expectedHash || deps.windowHashEnd != 0 || deps.setWindowCalls != 1 {
+		t.Fatalf("unexpected stored metadata hash state hash=%q end=%d calls=%d", deps.windowHash, deps.windowHashEnd, deps.setWindowCalls)
 	}
 }
 

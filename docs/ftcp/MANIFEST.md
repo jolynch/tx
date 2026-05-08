@@ -10,7 +10,8 @@ If `AUTH` provides a client recipient, the manifest stream is age-encrypted for 
 Manifest is line-oriented UTF-8 text:
 
 1. Header line (`FM/1`)
-2. Entry lines (one file per line)
+2. Root entry (`D0`)
+3. Child entry lines
 
 Empty lines and `#` comments are ignored.
 
@@ -19,14 +20,13 @@ Empty lines and `#` comments are ignored.
 Format:
 
 ```text
-FM/1 <transfer_id> <root-len:root> mode=<fast|gentle> link-mbps=<int> concurrency=<int>
+FM/1 <transfer_id> mode=<fast|gentle> link-mbps=<int> concurrency=<int>
 ```
 
 Header fields are required.
 
 - `FM/1`: manifest version token.
 - `<transfer_id>`: transfer identifier.
-- `<root-len:root>`: length-prefixed root path token (`<n>:<data>`).
 - `mode`: transfer mode (`fast` or `gentle`).
 - `link-mbps`: client-reported link estimate in Mbps (`>= 0`).
 - `concurrency`: planned client concurrency (`> 0`).
@@ -49,14 +49,16 @@ Format:
 
 Fields are separated by one ASCII space.
 
-## Root Token
+## Root Entry
 
 ```text
-<n>:<root-data>
+D0 0 <mtime> <mode> <absolute-root-path>
 ```
 
-- `<n>` is decimal byte length of `<root-data>`.
-- `<root-data>` may contain spaces and UTF-8 bytes except newline.
+- ID `0` is reserved for the transfer root.
+- The root entry type is always `D`.
+- The root path is absolute and is encoded with the same front-coded path token as other entries.
+- Child entries start at ID `1`.
 
 ## Mtime Front Coding
 
@@ -88,16 +90,17 @@ Decoded value:
 
 Path constraints:
 
-- must be relative (no leading `/`)
+- `D0` must be the first entry and carries the absolute transfer root path
+- child entries must be relative (no leading `/`)
 - `..` traversal is rejected
 - `\\` is rejected; use `/`
 
 ## Validation Rules
 
 - Header must be `FM/1` and include required metadata fields.
-- Header root token must parse and length-match.
 - Unknown header options are rejected.
 - Entry IDs must be unique and strictly increasing.
+- The first entry must be `D0` with an absolute path.
 - `size` must be unsigned and fit `int64`.
 - `mtime` token must decode to decimal digits and fit `int64`.
 - `mode` must be octal and `<= 07777`.
@@ -107,9 +110,10 @@ Path constraints:
 ## Example
 
 ```text
-FM/1 9f83ab12 8:repo-root mode=fast link-mbps=1200 concurrency=16
-0 4096 0:1735771234567890123 0644 0:14:data/chunk-000
-1 4096 14:90123 0644 11:3:001
-2 1024 15:1350 0644 11:3:002
-3 88 0:1736000000000000000 0600 0:15:logs/result.txt
+FM/1 9f83ab12 mode=fast link-mbps=1200 concurrency=16
+D0 0 0:1735771234000000000 0755 0:10:/repo-root
+F1 4096 13:567890123 0644 0:14:data/chunk-000
+F2 4096 14:90123 0644 11:3:001
+F3 1024 15:1350 0644 11:3:002
+F4 88 0:1736000000000000000 0600 0:15:logs/result.txt
 ```

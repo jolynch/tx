@@ -288,8 +288,9 @@ func TestWalkManifestEntriesMixedTypes(t *testing.T) {
 	wantPaths := []string{"a.txt", "b.txt", "link.txt", "sub", "sub/c.txt"}
 	wantTypes := []byte{EntryTypeFile, EntryTypeHard, EntryTypeSymlink, EntryTypeDir, EntryTypeFile}
 	for i, result := range results {
-		if result.Entry.ID != uint64(i) {
-			t.Errorf("entry %d id: got %d, want %d", i, result.Entry.ID, i)
+		wantID := uint64(i + 1)
+		if result.Entry.ID != wantID {
+			t.Errorf("entry %d id: got %d, want %d", i, result.Entry.ID, wantID)
 		}
 		if result.Entry.Path != wantPaths[i] {
 			t.Errorf("entry %d path: got %q, want %q", i, result.Entry.Path, wantPaths[i])
@@ -305,8 +306,8 @@ func TestWalkManifestEntriesMixedTypes(t *testing.T) {
 	if results[0].Entry.Size != 5 {
 		t.Errorf("a.txt size: got %d, want 5", results[0].Entry.Size)
 	}
-	if results[1].Entry.LinkTarget != 0 {
-		t.Errorf("b.txt link target: got %d, want 0", results[1].Entry.LinkTarget)
+	if results[1].Entry.LinkTarget != 1 {
+		t.Errorf("b.txt link target: got %d, want 1", results[1].Entry.LinkTarget)
 	}
 	if results[1].Entry.Size != 0 || results[1].Entry.Mtime != 0 {
 		t.Errorf("b.txt hardlink entry: size=%d mtime=%d, want 0/0", results[1].Entry.Size, results[1].Entry.Mtime)

@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -223,11 +224,32 @@ func serveFTCPConn(conn net.Conn, serverID *age.X25519Identity, handler func(int
 			}
 		}
 	}
+	if handled, handleErr := maybeWriteCLIRootMetadataOnlySEND(cmdReq, out); handled {
+		if handleErr != nil {
+			_, _ = io.WriteString(out, "ERR INTERNAL "+handleErr.Error()+"\r\n")
+		}
+		_ = closeOut()
+		return
+	}
 
 	if err := handler(cmdReq, out); err != nil {
 		_, _ = io.WriteString(out, "ERR INTERNAL "+err.Error()+"\r\n")
 	}
 	_ = closeOut()
+}
+
+func maybeWriteCLIRootMetadataOnlySEND(req intftcp.Request, out io.Writer) (bool, error) {
+	if req.Verb != intftcp.VerbSEND || len(req.Params) != 2 {
+		return false, nil
+	}
+	if req.Params[1]["fid"] != strconv.FormatUint(tx.RootFileID, 10) {
+		return false, nil
+	}
+	if err := writeCLIMetadataFrame(out, tx.RootFileID, 100, "0755"); err != nil {
+		return true, err
+	}
+	_, err := io.WriteString(out, "OK\r\n")
+	return true, err
 }
 
 func readFTCPLine(br *bufio.Reader) (string, error) {
@@ -245,6 +267,21 @@ func xxh128HexCLI(data []byte) string {
 
 func buildCLIFrame(fileID uint64, body []byte, offset int64) string {
 	return buildCLIFrameWithMetadata(fileID, body, offset, nil)
+}
+
+func testOwnershipMetadata(size int64, mtimeNS int64, mode string) *tx.FileTrailerMetadata {
+	return &tx.FileTrailerMetadata{
+		Size:    size,
+		MtimeNS: mtimeNS,
+		Mode:    mode,
+		UID:     strconv.Itoa(os.Getuid()),
+		GID:     strconv.Itoa(os.Getgid()),
+	}
+}
+
+func writeCLIMetadataFrame(out io.Writer, fileID uint64, mtimeNS int64, mode string) error {
+	_, err := io.WriteString(out, buildCLIFrameWithMetadata(fileID, nil, 0, testOwnershipMetadata(0, mtimeNS, mode)))
+	return err
 }
 
 func buildCLIFrameWithMetadata(fileID uint64, body []byte, offset int64, meta *tx.FileTrailerMetadata) string {
@@ -420,7 +457,8 @@ func writeCLIProbeResponse(req intftcp.Request, out io.Writer) error {
 func buildTestManifestRaw(transferID string, entries []string) string {
 	root := "/remote"
 	lines := []string{
-		fmt.Sprintf("FM/1 %s %d:%s mode=fast link-mbps=1000 concurrency=1", transferID, len(root), root),
+		fmt.Sprintf("FM/1 %s mode=fast link-mbps=1000 concurrency=1", transferID),
+		fmt.Sprintf("D0 0 0:100 0755 0:%d:%s", len(root), root),
 	}
 	lines = append(lines, entries...)
 	lines = append(lines, "")
@@ -476,8 +514,9 @@ func TestRunCLITransferAndGet(t *testing.T) {
 	tmp := t.TempDir()
 	targetDir := filepath.Join(tmp, "dst")
 	manifestRaw := strings.Join([]string{
-		"FM/1 txcli 7:/remote mode=fast link-mbps=1000 concurrency=8",
-		"F0 5 0:100 0644 0:5:a.txt",
+		"FM/1 txcli mode=fast link-mbps=1000 concurrency=8",
+		"D0 0 0:100 0755 0:7:/remote",
+		"F1 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
 	fileBody := []byte("hello")
@@ -511,7 +550,7 @@ func TestRunCLITransferAndGet(t *testing.T) {
 					return err
 				}
 			case "/remote/a.txt":
-				singleManifest := "FM/1 txget 7:/remote mode=fast link-mbps=0 concurrency=8\nF0 5 0:100 0644 0:5:a.txt\n"
+				singleManifest := "FM/1 txget mode=fast link-mbps=0 concurrency=8\nD0 0 0:100 0755 0:7:/remote\nF1 5 0:100 0644 0:5:a.txt\n"
 				if _, err := io.WriteString(out, singleManifest); err != nil {
 					return err
 				}
@@ -521,7 +560,7 @@ func TestRunCLITransferAndGet(t *testing.T) {
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
 		case intftcp.VerbSEND:
-			_, err := io.WriteString(out, buildCLIFrame(0, fileBody, 0))
+			_, err := io.WriteString(out, buildCLIFrame(1, fileBody, 0))
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -560,7 +599,7 @@ func TestRunCLITransferAndGet(t *testing.T) {
 
 func TestRunCLIGetSkipWriteDiscardsOutput(t *testing.T) {
 	payload := []byte("hello")
-	singleManifest := "FM/1 txdevnull 7:/remote mode=fast link-mbps=0 concurrency=8\nF0 5 0:100 0644 0:5:a.txt\n"
+	singleManifest := "FM/1 txdevnull mode=fast link-mbps=0 concurrency=8\nD0 0 0:100 0755 0:7:/remote\nF1 5 0:100 0644 0:5:a.txt\n"
 	var sawAck atomic.Bool
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
@@ -574,7 +613,7 @@ func TestRunCLIGetSkipWriteDiscardsOutput(t *testing.T) {
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
 		case intftcp.VerbSEND:
-			_, err := io.WriteString(out, buildCLIFrame(0, payload, 0))
+			_, err := io.WriteString(out, buildCLIFrame(1, payload, 0))
 			return err
 		case intftcp.VerbACK:
 			sawAck.Store(true)
@@ -602,7 +641,7 @@ func TestRunCLIGetSkipWriteDiscardsOutput(t *testing.T) {
 
 func TestRunCLIGetProgressFileWritesStatusAndPct(t *testing.T) {
 	payload := []byte("hello")
-	singleManifest := "FM/1 txprogress 7:/remote mode=fast link-mbps=0 concurrency=8\nF0 5 0:100 0644 0:5:a.txt\n"
+	singleManifest := "FM/1 txprogress mode=fast link-mbps=0 concurrency=8\nD0 0 0:100 0755 0:7:/remote\nF1 5 0:100 0644 0:5:a.txt\n"
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
@@ -615,7 +654,7 @@ func TestRunCLIGetProgressFileWritesStatusAndPct(t *testing.T) {
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
 		case intftcp.VerbSEND:
-			_, err := io.WriteString(out, buildCLIFrame(0, payload, 0))
+			_, err := io.WriteString(out, buildCLIFrame(1, payload, 0))
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -658,8 +697,9 @@ func TestRunCLITransferWithEncryptAuto(t *testing.T) {
 	tmp := t.TempDir()
 	targetDir := filepath.Join(tmp, "dst")
 	manifestRaw := strings.Join([]string{
-		"FM/1 txenccli 7:/remote mode=fast link-mbps=1000 concurrency=8",
-		"F0 5 0:100 0644 0:5:a.txt",
+		"FM/1 txenccli mode=fast link-mbps=1000 concurrency=8",
+		"D0 0 0:100 0755 0:7:/remote",
+		"F1 5 2:0 0644 0:5:a.txt",
 		"",
 	}, "\n")
 
@@ -717,8 +757,9 @@ func TestRunCLITransferWithEncryptAES(t *testing.T) {
 	tmp := t.TempDir()
 	targetDir := filepath.Join(tmp, "dst")
 	manifestRaw := strings.Join([]string{
-		"FM/1 txaescli 7:/remote mode=fast link-mbps=1000 concurrency=8",
-		"F0 5 0:100 0644 0:5:a.txt",
+		"FM/1 txaescli mode=fast link-mbps=1000 concurrency=8",
+		"D0 0 0:100 0755 0:7:/remote",
+		"F1 5 2:0 0644 0:5:a.txt",
 		"",
 	}, "\n")
 
@@ -775,9 +816,10 @@ func TestRunCLITransferWithEncryptAES(t *testing.T) {
 func TestRunCLIStartDownloadsAll(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
-		"FM/1 txstart 7:/remote mode=gentle link-mbps=700 concurrency=3",
-		"F0 5 0:100 0644 0:5:a.txt",
-		"1 4 0:101 0644 0:5:b.txt",
+		"FM/1 txstart mode=gentle link-mbps=700 concurrency=3",
+		"D0 0 0:100 0755 0:7:/remote",
+		"F1 5 0:100 0644 0:5:a.txt",
+		"F2 4 0:101 0644 0:5:b.txt",
 		"",
 	}, "\n")
 	targetDir := setupPinchState(t, tmp, manifestRaw, "")
@@ -794,12 +836,12 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 			}
 			for _, p := range req.Params[1:] {
 				switch p["fid"] {
-				case "0":
-					if _, err := io.WriteString(out, buildCLIFrame(0, []byte("hello"), 0)); err != nil {
+				case "1":
+					if _, err := io.WriteString(out, buildCLIFrame(1, []byte("hello"), 0)); err != nil {
 						return err
 					}
-				case "1":
-					if _, err := io.WriteString(out, buildCLIFrame(1, []byte("test"), 0)); err != nil {
+				case "2":
+					if _, err := io.WriteString(out, buildCLIFrame(2, []byte("test"), 0)); err != nil {
 						return err
 					}
 				default:
@@ -852,7 +894,7 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 		LinkMbps:    1000,
 		Concurrency: 1,
 		Entries: []tx.ManifestEntry{
-			{ID: 0, Size: int64(len(payload)), Path: "big.bin"},
+			{ID: 1, Size: int64(len(payload)), Path: "big.bin"},
 		},
 	}
 	destPath := filepath.Join(outRoot, "big.bin")
@@ -906,7 +948,7 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 				return fmt.Errorf("parse offset: %w", err)
 			}
 			if offset == 0 {
-				_, err := io.WriteString(out, buildCLIFrame(0, payload[:5], 0)+"OK\r\n")
+				_, err := io.WriteString(out, buildCLIFrame(1, payload[:5], 0)+"OK\r\n")
 				return err
 			}
 			select {
@@ -941,7 +983,7 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 	if err != nil {
 		t.Fatalf("load progress after interruption: %v", err)
 	}
-	if got := state[0].AckBytes; got != 5 {
+	if got := state[1].AckBytes; got != 5 {
 		t.Fatalf("expected persisted resume offset 5, got %d", got)
 	}
 	partial, err := os.ReadFile(destPath)
@@ -972,7 +1014,7 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 			if err != nil {
 				return fmt.Errorf("parse size: %w", err)
 			}
-			_, err = io.WriteString(out, buildCLIFrame(0, payload[offset:offset+size], offset)+"OK\r\n")
+			_, err = io.WriteString(out, buildCLIFrame(1, payload[offset:offset+size], offset)+"OK\r\n")
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -1005,11 +1047,12 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 func TestRunCLIStartPrintsResumeProgress(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
-		"FM/1 txstartresume 7:/remote mode=fast link-mbps=700 concurrency=1",
-		"F0 10 0:100 0644 0:5:a.txt",
+		"FM/1 txstartresume mode=fast link-mbps=700 concurrency=1",
+		"D0 0 0:100 0755 0:7:/remote",
+		"F1 10 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "0 5 0\n")
+	targetDir := setupPinchState(t, tmp, manifestRaw, "1 5 0\n")
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)
@@ -1030,7 +1073,7 @@ func TestRunCLIStartPrintsResumeProgress(t *testing.T) {
 			if got := target["size"]; got != "5" {
 				return fmt.Errorf("expected resume size 5, got %q", got)
 			}
-			_, err := io.WriteString(out, buildCLIFrame(0, []byte("world"), 5)+"OK\r\n")
+			_, err := io.WriteString(out, buildCLIFrame(1, []byte("world"), 5)+"OK\r\n")
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -1049,7 +1092,7 @@ func TestRunCLIStartPrintsResumeProgress(t *testing.T) {
 	}
 	errText := stderr.String()
 	if !strings.Contains(errText, "copy-resume: resuming 1 file(s), 5 B/10 B already copied") ||
-		!strings.Contains(errText, "copy-resume:   id=0 done=5 B/10 B (50.0%)") ||
+		!strings.Contains(errText, "copy-resume:   id=1 done=5 B/10 B (50.0%)") ||
 		strings.Contains(errText, "copy-resume: skipping") ||
 		strings.Contains(errText, "path=a.txt") {
 		t.Fatalf("missing resume progress output: %s", errText)
@@ -1066,12 +1109,13 @@ func TestRunCLIStartPrintsResumeProgress(t *testing.T) {
 func TestRunCLIStartPrintsSkippedResumeProgress(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
-		"FM/1 txstartskipresume 7:/remote mode=fast link-mbps=700 concurrency=1",
-		"F0 5 0:100 0644 0:5:a.txt",
-		"1 10 0:101 0644 0:5:b.txt",
+		"FM/1 txstartskipresume mode=fast link-mbps=700 concurrency=1",
+		"D0 0 0:100 0755 0:7:/remote",
+		"F1 5 0:100 0644 0:5:a.txt",
+		"F2 10 0:101 0644 0:5:b.txt",
 		"",
 	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "0 5 1\n1 5 0\n")
+	targetDir := setupPinchState(t, tmp, manifestRaw, "1 5 1\n2 5 0\n")
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)
@@ -1089,13 +1133,13 @@ func TestRunCLIStartPrintsSkippedResumeProgress(t *testing.T) {
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbSEND:
 			target := req.Params[len(req.Params)-1]
-			if got := target["fid"]; got != "1" {
-				return fmt.Errorf("expected SEND for fid=1 only, got %q", got)
+			if got := target["fid"]; got != "2" {
+				return fmt.Errorf("expected SEND for fid=2 only, got %q", got)
 			}
 			if got := target["offset"]; got != "5" {
 				return fmt.Errorf("expected resume offset 5, got %q", got)
 			}
-			_, err := io.WriteString(out, buildCLIFrame(1, []byte("world"), 5)+"OK\r\n")
+			_, err := io.WriteString(out, buildCLIFrame(2, []byte("world"), 5)+"OK\r\n")
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -1115,7 +1159,7 @@ func TestRunCLIStartPrintsSkippedResumeProgress(t *testing.T) {
 	errText := stderr.String()
 	if !strings.Contains(errText, "copy-resume: skipping 1 file(s), 5 B already copied") ||
 		!strings.Contains(errText, "copy-resume: resuming 1 file(s), 5 B/10 B already copied") ||
-		!strings.Contains(errText, "copy-resume:   id=1 done=5 B/10 B (50.0%)") {
+		!strings.Contains(errText, "copy-resume:   id=2 done=5 B/10 B (50.0%)") {
 		t.Fatalf("missing skip/resume progress output: %s", errText)
 	}
 }
@@ -1123,8 +1167,9 @@ func TestRunCLIStartPrintsSkippedResumeProgress(t *testing.T) {
 func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
-		"FM/1 txstartdefault 7:/remote mode=fast link-mbps=1200 concurrency=5",
-		"F0 5 0:100 0644 0:5:a.txt",
+		"FM/1 txstartdefault mode=fast link-mbps=1200 concurrency=5",
+		"D0 0 0:100 0755 0:7:/remote",
+		"F1 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
 	targetDir := setupPinchState(t, tmp, manifestRaw, "")
@@ -1137,7 +1182,7 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 			if got := req.Params[1]["mode"]; got != tx.LoadStrategyFast {
 				return fmt.Errorf("expected SEND mode=%s, got %q", tx.LoadStrategyFast, got)
 			}
-			if _, err := io.WriteString(out, buildCLIFrame(0, []byte("hello"), 0)); err != nil {
+			if _, err := io.WriteString(out, buildCLIFrame(1, []byte("hello"), 0)); err != nil {
 				return err
 			}
 			_, err := io.WriteString(out, "OK\r\n")
@@ -1173,8 +1218,9 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 func TestRunCLIStartDiscardSkipsTargetMutationAndLocalManifest(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
-		"FM/1 txdiscard 7:/remote mode=fast link-mbps=700 concurrency=1",
-		"F0 5 0:100 0644 0:5:a.txt",
+		"FM/1 txdiscard mode=fast link-mbps=700 concurrency=1",
+		"D0 0 0:100 0755 0:7:/remote",
+		"F1 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
 	targetDir := setupPinchState(t, tmp, manifestRaw, "")
@@ -1190,7 +1236,7 @@ func TestRunCLIStartDiscardSkipsTargetMutationAndLocalManifest(t *testing.T) {
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
 		case intftcp.VerbSEND:
-			if _, err := io.WriteString(out, buildCLIFrame(0, []byte("hello"), 0)); err != nil {
+			if _, err := io.WriteString(out, buildCLIFrame(1, []byte("hello"), 0)); err != nil {
 				return err
 			}
 			_, err := io.WriteString(out, "OK\r\n")
@@ -1235,11 +1281,12 @@ func TestRunCLIStartDiscardSkipsTargetMutationAndLocalManifest(t *testing.T) {
 func TestRunCLIStartDiscardSkipsCompletedMetadataRefresh(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
-		"FM/1 txdiscardrefresh 7:/remote mode=fast link-mbps=700 concurrency=1",
-		"F0 5 0:100 0644 0:5:a.txt",
+		"FM/1 txdiscardrefresh mode=fast link-mbps=700 concurrency=1",
+		"D0 0 0:100 0755 0:7:/remote",
+		"F1 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "0 5 0\n")
+	targetDir := setupPinchState(t, tmp, manifestRaw, "1 5 0\n")
 
 	srv := newUnexpectedVerbFTCPTestServer(t)
 	defer srv.Close()
@@ -1267,11 +1314,34 @@ func TestRunCLIStartDirectoryOnlyDoesNotTransfer(t *testing.T) {
 	t.Run("write", func(t *testing.T) {
 		tmp := t.TempDir()
 		manifestRaw := buildTestManifestRaw("txdironly", []string{
-			buildTestDirManifestEntry(0, 100, 0o750, "sub"),
+			buildTestDirManifestEntry(1, 100, 0o750, "sub"),
 		})
 		targetDir := setupPinchState(t, tmp, manifestRaw, "")
 
-		srv := newUnexpectedVerbFTCPTestServer(t)
+		rootFID := strconv.FormatUint(tx.RootFileID, 10)
+		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+			switch req.Verb {
+			case intftcp.VerbSEND:
+				for _, p := range req.Params[1:] {
+					switch p["fid"] {
+					case rootFID:
+						if err := writeCLIMetadataFrame(out, tx.RootFileID, 200, "0755"); err != nil {
+							return err
+						}
+					case "1":
+						if err := writeCLIMetadataFrame(out, 1, 100, "0750"); err != nil {
+							return err
+						}
+					default:
+						return fmt.Errorf("unexpected SEND fid: %q", p["fid"])
+					}
+				}
+				_, err := io.WriteString(out, "OK\r\n")
+				return err
+			default:
+				return fmt.Errorf("unexpected verb: %v", req.Verb)
+			}
+		})
 		defer srv.Close()
 
 		var stdout bytes.Buffer
@@ -1297,7 +1367,7 @@ func TestRunCLIStartDirectoryOnlyDoesNotTransfer(t *testing.T) {
 	t.Run("discard", func(t *testing.T) {
 		tmp := t.TempDir()
 		manifestRaw := buildTestManifestRaw("txdironlydiscard", []string{
-			buildTestDirManifestEntry(0, 100, 0o750, "sub"),
+			buildTestDirManifestEntry(1, 100, 0o750, "sub"),
 		})
 		targetDir := setupPinchState(t, tmp, manifestRaw, "")
 
@@ -1318,12 +1388,13 @@ func TestRunCLIStartDirectoryOnlyDoesNotTransfer(t *testing.T) {
 
 func TestRunCLIStartHardlinkDedup(t *testing.T) {
 	tmp := t.TempDir()
-	// F0: regular file "a.txt" (5 bytes), H1: hardlink "b.txt" → file id 0
-	// H entry: mtime field carries target file ID (0), size=0
+	// F1: regular file "a.txt" (5 bytes), H2: hardlink "b.txt" → file id 1
+	// H entry: mtime field carries target file ID (1), size=0
 	manifestRaw := strings.Join([]string{
-		"FM/1 txhl 7:/remote mode=fast link-mbps=700 concurrency=1",
-		"F0 5 0:100 0644 0:5:a.txt",
-		"H1 0 0:0 0644 0:5:b.txt",
+		"FM/1 txhl mode=fast link-mbps=700 concurrency=1",
+		"D0 0 0:100 0755 0:7:/remote",
+		"F1 5 0:100 0644 0:5:a.txt",
+		"H2 0 0:1 0644 0:5:b.txt",
 		"",
 	}, "\n")
 	targetDir := setupPinchState(t, tmp, manifestRaw, "")
@@ -1337,8 +1408,8 @@ func TestRunCLIStartHardlinkDedup(t *testing.T) {
 			for _, p := range req.Params[1:] {
 				sentFIDs = append(sentFIDs, p["fid"])
 				switch p["fid"] {
-				case "0":
-					if _, err := io.WriteString(out, buildCLIFrame(0, []byte("hello"), 0)); err != nil {
+				case "1":
+					if _, err := io.WriteString(out, buildCLIFrame(1, []byte("hello"), 0)); err != nil {
 						return err
 					}
 				default:
@@ -1363,9 +1434,9 @@ func TestRunCLIStartHardlinkDedup(t *testing.T) {
 		t.Fatalf("start: expected 0, got %d\nstdout=%s\nstderr=%s", code, stdout.String(), stderr.String())
 	}
 
-	// Only file 0 should have been sent — not the hardlink.
-	if len(sentFIDs) != 1 || sentFIDs[0] != "0" {
-		t.Fatalf("expected SEND for fid=0 only, got %v", sentFIDs)
+	// Only file 1 should have been sent — not the hardlink.
+	if len(sentFIDs) != 1 || sentFIDs[0] != "1" {
+		t.Fatalf("expected SEND for fid=1 only, got %v", sentFIDs)
 	}
 
 	// Both files should exist.
@@ -1397,11 +1468,12 @@ func TestRunCLIStartHardlinkDedup(t *testing.T) {
 
 func TestRunCLIStartSymlinks(t *testing.T) {
 	tmp := t.TempDir()
-	// F0: regular file "a.txt" (5 bytes), S1: symlink "link.txt" → "a.txt"
+	// F1: regular file "a.txt" (5 bytes), S2: symlink "link.txt" → "a.txt"
 	manifestRaw := strings.Join([]string{
-		"FM/1 txsym 7:/remote mode=fast link-mbps=700 concurrency=1",
-		"F0 5 0:100 0644 0:5:a.txt",
-		"S1 0 0:100 0777 0:8:link.txt 5:a.txt",
+		"FM/1 txsym mode=fast link-mbps=700 concurrency=1",
+		"D0 0 0:100 0755 0:7:/remote",
+		"F1 5 0:100 0644 0:5:a.txt",
+		"S2 0 0:100 0777 0:8:link.txt 5:a.txt",
 		"",
 	}, "\n")
 	targetDir := setupPinchState(t, tmp, manifestRaw, "")
@@ -1413,8 +1485,8 @@ func TestRunCLIStartSymlinks(t *testing.T) {
 		case intftcp.VerbSEND:
 			for _, p := range req.Params[1:] {
 				switch p["fid"] {
-				case "0":
-					if _, err := io.WriteString(out, buildCLIFrame(0, []byte("hello"), 0)); err != nil {
+				case "1":
+					if _, err := io.WriteString(out, buildCLIFrame(1, []byte("hello"), 0)); err != nil {
 						return err
 					}
 				default:
@@ -1458,15 +1530,19 @@ func TestRunCLIStartSymlinks(t *testing.T) {
 
 func TestRunCLIStartDirectories(t *testing.T) {
 	tmp := t.TempDir()
-	// D0: directory "sub" with mode 0750, F1: file "sub/a.txt" (5 bytes)
+	// D1: directory "sub" with mode 0750, F2: file "sub/a.txt" (5 bytes)
 	// Path front-coding: prev="sub", "3:6:/a.txt" → prefix 3 chars of "sub" + "/a.txt" = "sub/a.txt"
 	manifestRaw := strings.Join([]string{
-		"FM/1 txdir 7:/remote mode=fast link-mbps=700 concurrency=1",
-		"D0 0 0:100 0750 0:3:sub",
-		"F1 5 0:100 0644 3:6:/a.txt",
+		"FM/1 txdir mode=fast link-mbps=700 concurrency=1",
+		"D0 0 0:100 0755 0:7:/remote",
+		"D1 0 0:100 0750 0:3:sub",
+		"F2 5 1:00 0644 3:6:/a.txt",
 		"",
 	}, "\n")
 	targetDir := setupPinchState(t, tmp, manifestRaw, "")
+	rootFID := strconv.FormatUint(tx.RootFileID, 10)
+	rootMeta := testOwnershipMetadata(0, 200, "0755")
+	dirMeta := testOwnershipMetadata(0, 100, "1750")
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
@@ -1475,12 +1551,20 @@ func TestRunCLIStartDirectories(t *testing.T) {
 		case intftcp.VerbSEND:
 			for _, p := range req.Params[1:] {
 				switch p["fid"] {
+				case "2":
+					if _, err := io.WriteString(out, buildCLIFrame(2, []byte("hello"), 0)); err != nil {
+						return err
+					}
+				case rootFID:
+					if _, err := io.WriteString(out, buildCLIFrameWithMetadata(tx.RootFileID, nil, 0, rootMeta)); err != nil {
+						return err
+					}
 				case "1":
-					if _, err := io.WriteString(out, buildCLIFrame(1, []byte("hello"), 0)); err != nil {
+					if _, err := io.WriteString(out, buildCLIFrameWithMetadata(1, nil, 0, dirMeta)); err != nil {
 						return err
 					}
 				default:
-					return fmt.Errorf("unexpected SEND fid: %q (directory should not be sent)", p["fid"])
+					return fmt.Errorf("unexpected SEND fid: %q", p["fid"])
 				}
 			}
 			_, err := io.WriteString(out, "OK\r\n")
@@ -1510,8 +1594,11 @@ func TestRunCLIStartDirectories(t *testing.T) {
 	if !info.IsDir() {
 		t.Fatalf("sub should be a directory")
 	}
-	if perm := info.Mode().Perm(); perm != 0o750 {
-		t.Errorf("sub mode: got %o, want 0750", perm)
+	if mode := info.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky); mode != os.ModeSticky|0o750 {
+		t.Errorf("sub mode: got %o, want 1750", mode)
+	}
+	if info.ModTime().UnixNano() != dirMeta.MtimeNS {
+		t.Errorf("sub mtime: got %d, want %d", info.ModTime().UnixNano(), dirMeta.MtimeNS)
 	}
 
 	// sub/a.txt should exist.
@@ -1524,13 +1611,16 @@ func TestRunCLIStartMixedManifestTypes(t *testing.T) {
 	tmp := t.TempDir()
 	payload := []byte("hello")
 	manifestRaw := buildTestManifestRaw("txmixed-start", []string{
-		buildTestDirManifestEntry(0, 100, 0o750, "sub"),
-		buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "sub/a.txt"),
-		buildTestHardlinkManifestEntry(2, 1, 0o644, "sub/b.txt"),
-		buildTestSymlinkManifestEntry(3, 100, 0o777, "sub/link.txt", "a.txt"),
+		buildTestDirManifestEntry(1, 100, 0o750, "sub"),
+		buildTestManifestEntry(2, int64(len(payload)), 100, 0o644, "sub/a.txt"),
+		buildTestHardlinkManifestEntry(3, 2, 0o644, "sub/b.txt"),
+		buildTestSymlinkManifestEntry(4, 100, 0o777, "sub/link.txt", "a.txt"),
 	})
 	targetDir := setupPinchState(t, tmp, manifestRaw, "")
-	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
+	meta := testOwnershipMetadata(int64(len(payload)), 100, "0644")
+	rootFID := strconv.FormatUint(tx.RootFileID, 10)
+	rootMeta := testOwnershipMetadata(0, 300, "0755")
+	dirMeta := testOwnershipMetadata(0, 200, "0750")
 
 	var sentFIDs []string
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
@@ -1540,11 +1630,24 @@ func TestRunCLIStartMixedManifestTypes(t *testing.T) {
 		case intftcp.VerbSEND:
 			for _, p := range req.Params[1:] {
 				sentFIDs = append(sentFIDs, p["fid"])
-				if p["fid"] != "1" {
+				switch p["fid"] {
+				case "2":
+					if _, err := io.WriteString(out, buildCLIFrameWithMetadata(2, payload, 0, meta)); err != nil {
+						return err
+					}
+				case rootFID:
+					if _, err := io.WriteString(out, buildCLIFrameWithMetadata(tx.RootFileID, nil, 0, rootMeta)); err != nil {
+						return err
+					}
+				case "1":
+					if _, err := io.WriteString(out, buildCLIFrameWithMetadata(1, nil, 0, dirMeta)); err != nil {
+						return err
+					}
+				default:
 					return fmt.Errorf("unexpected SEND fid: %q", p["fid"])
 				}
 			}
-			_, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
+			_, err := io.WriteString(out, "OK\r\n")
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -1561,8 +1664,8 @@ func TestRunCLIStartMixedManifestTypes(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start mixed types: expected 0, got %d\nstdout=%s\nstderr=%s", code, stdout.String(), stderr.String())
 	}
-	if len(sentFIDs) != 1 || sentFIDs[0] != "1" {
-		t.Fatalf("expected SEND for fid=1 only, got %v", sentFIDs)
+	if !slices.Contains(sentFIDs, "1") || !slices.Contains(sentFIDs, "0") || !slices.Contains(sentFIDs, rootFID) {
+		t.Fatalf("expected SENDs for file, dir, and root metadata, got %v", sentFIDs)
 	}
 
 	subPath := filepath.Join(targetDir, "sub")
@@ -1575,6 +1678,9 @@ func TestRunCLIStartMixedManifestTypes(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o750 {
 		t.Fatalf("sub mode: got %o, want 0750", perm)
+	}
+	if info.ModTime().UnixNano() != dirMeta.MtimeNS {
+		t.Fatalf("sub mtime: got %d, want %d", info.ModTime().UnixNano(), dirMeta.MtimeNS)
 	}
 
 	aPath := filepath.Join(subPath, "a.txt")
@@ -2317,8 +2423,8 @@ func TestRunCLISyncNoOpSkipsPrompt(t *testing.T) {
 		t.Fatalf("stat target file: %v", err)
 	}
 	entry := buildTestManifestEntry(1, info.Size(), info.ModTime().UnixNano(), info.Mode(), "same.txt")
-	dirEntry := buildTestDirManifestEntry(0, dirMtime.UnixNano(), 0o750, "sub")
-	manifestRaw := buildTestManifestRaw("txsyncnoop", []string{dirEntry, entry})
+	dirEntry := buildTestDirManifestEntry(2, dirMtime.UnixNano(), 0o750, "sub")
+	manifestRaw := buildTestManifestRaw("txsyncnoop", []string{entry, dirEntry})
 	if err := os.WriteFile(filepath.Join(tmp, ".tx", "dst", "manifest.server"), []byte(manifestRaw), 0o644); err != nil {
 		t.Fatalf("write manifest.server: %v", err)
 	}
@@ -2329,7 +2435,7 @@ func TestRunCLISyncNoOpSkipsPrompt(t *testing.T) {
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbSYNC:
-			return writeSyncResponse(out, "txsyncnoop", []string{dirEntry, entry}, nil)
+			return writeSyncResponse(out, "txsyncnoop", []string{entry, dirEntry}, nil)
 		default:
 			return fmt.Errorf("unexpected verb: %v", req.Verb)
 		}
@@ -2356,7 +2462,7 @@ func TestRunCLISyncDownloadPromptDefaultsYes(t *testing.T) {
 	withSyncPromptTestInput(t, "\n", true)
 
 	payload := []byte("hello")
-	entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "new.txt")
+	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "new.txt")
 	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
@@ -2369,7 +2475,7 @@ func TestRunCLISyncDownloadPromptDefaultsYes(t *testing.T) {
 			if got := req.Params[0]["txferid"]; got != "txsyncdownload" {
 				return fmt.Errorf("unexpected transfer id: %q", got)
 			}
-			_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+			_, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -2400,7 +2506,8 @@ func TestRunCLISyncDownloadPromptDefaultsYes(t *testing.T) {
 
 func TestRunCLISyncDeletePromptDefaultsNo(t *testing.T) {
 	tmp := t.TempDir()
-	targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncdelete", nil), "")
+	oldEntry := buildTestManifestEntry(1, 3, 100, 0o644, "old.txt")
+	targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncdelete", []string{oldEntry}), "")
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		t.Fatalf("mkdir target: %v", err)
 	}
@@ -2415,7 +2522,7 @@ func TestRunCLISyncDeletePromptDefaultsNo(t *testing.T) {
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbSYNC:
-			return writeSyncResponse(out, "txsyncdelete", nil, []uint64{0})
+			return writeSyncResponse(out, "txsyncdelete", nil, []uint64{1})
 		default:
 			return fmt.Errorf("unexpected verb: %v", req.Verb)
 		}
@@ -2441,7 +2548,8 @@ func TestRunCLISyncDeletePromptDefaultsNo(t *testing.T) {
 
 func TestRunCLISyncMixedPromptDefaultsNo(t *testing.T) {
 	tmp := t.TempDir()
-	targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncmixed", nil), "")
+	oldEntry := buildTestManifestEntry(1, 3, 100, 0o644, "old.txt")
+	targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncmixed", []string{oldEntry}), "")
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		t.Fatalf("mkdir target: %v", err)
 	}
@@ -2451,13 +2559,13 @@ func TestRunCLISyncMixedPromptDefaultsNo(t *testing.T) {
 	}
 	withSyncPromptTestInput(t, "\n", true)
 
-	entry := buildTestManifestEntry(0, 5, 100, 0o644, "new.txt")
+	entry := buildTestManifestEntry(2, 5, 100, 0o644, "new.txt")
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbSYNC:
-			return writeSyncResponse(out, "txsyncmixed", []string{entry}, []uint64{0})
+			return writeSyncResponse(out, "txsyncmixed", []string{entry}, []uint64{1})
 		default:
 			return fmt.Errorf("unexpected verb: %v", req.Verb)
 		}
@@ -2491,7 +2599,7 @@ func TestRunCLISyncPromptAcceptsExplicitYes(t *testing.T) {
 		withSyncPromptTestInput(t, "Y\n", true)
 
 		payload := []byte("hello")
-		entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "new.txt")
+		entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "new.txt")
 		meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
 		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 			switch req.Verb {
@@ -2500,7 +2608,7 @@ func TestRunCLISyncPromptAcceptsExplicitYes(t *testing.T) {
 			case intftcp.VerbSYNC:
 				return writeSyncResponse(out, "txsyncyesdownload", []string{entry}, nil)
 			case intftcp.VerbSEND:
-				_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+				_, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
 				return err
 			case intftcp.VerbACK:
 				_, err := io.WriteString(out, "OK\r\n")
@@ -2527,7 +2635,8 @@ func TestRunCLISyncPromptAcceptsExplicitYes(t *testing.T) {
 
 	t.Run("delete-default-no", func(t *testing.T) {
 		tmp := t.TempDir()
-		targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncyesdelete", nil), "")
+		oldEntry := buildTestManifestEntry(1, 3, 100, 0o644, "old.txt")
+		targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncyesdelete", []string{oldEntry}), "")
 		if err := os.MkdirAll(targetDir, 0o755); err != nil {
 			t.Fatalf("mkdir target: %v", err)
 		}
@@ -2545,7 +2654,7 @@ func TestRunCLISyncPromptAcceptsExplicitYes(t *testing.T) {
 			case intftcp.VerbSYNC:
 				syncCalls++
 				if syncCalls == 1 {
-					return writeSyncResponse(out, "txsyncyesdelete", nil, []uint64{0})
+					return writeSyncResponse(out, "txsyncyesdelete", nil, []uint64{1})
 				}
 				return writeSyncResponse(out, "txsyncyesdelete", nil, nil)
 			default:
@@ -2575,7 +2684,7 @@ func TestRunCLISyncNonTerminalSkipsPrompt(t *testing.T) {
 	withSyncPromptTestInput(t, "", false)
 
 	payload := []byte("hello")
-	entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "new.txt")
+	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "new.txt")
 	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
@@ -2584,7 +2693,7 @@ func TestRunCLISyncNonTerminalSkipsPrompt(t *testing.T) {
 		case intftcp.VerbSYNC:
 			return writeSyncResponse(out, "txsyncnonterm", []string{entry}, nil)
 		case intftcp.VerbSEND:
-			_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+			_, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -2612,7 +2721,8 @@ func TestRunCLISyncNonTerminalSkipsPrompt(t *testing.T) {
 func TestRunCLISyncYesFlagBypassesPrompt(t *testing.T) {
 	t.Run("delete-only", func(t *testing.T) {
 		tmp := t.TempDir()
-		targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncyesflagdelete", nil), "")
+		oldEntry := buildTestManifestEntry(1, 3, 100, 0o644, "old.txt")
+		targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncyesflagdelete", []string{oldEntry}), "")
 		if err := os.MkdirAll(targetDir, 0o755); err != nil {
 			t.Fatalf("mkdir target: %v", err)
 		}
@@ -2630,7 +2740,7 @@ func TestRunCLISyncYesFlagBypassesPrompt(t *testing.T) {
 			case intftcp.VerbSYNC:
 				syncCalls++
 				if syncCalls == 1 {
-					return writeSyncResponse(out, "txsyncyesflagdelete", nil, []uint64{0})
+					return writeSyncResponse(out, "txsyncyesflagdelete", nil, []uint64{1})
 				}
 				return writeSyncResponse(out, "txsyncyesflagdelete", nil, nil)
 			default:
@@ -2655,7 +2765,8 @@ func TestRunCLISyncYesFlagBypassesPrompt(t *testing.T) {
 
 	t.Run("mixed", func(t *testing.T) {
 		tmp := t.TempDir()
-		targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncyesflagmixed", nil), "")
+		oldEntry := buildTestManifestEntry(1, 3, 100, 0o644, "old.txt")
+		targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncyesflagmixed", []string{oldEntry}), "")
 		if err := os.MkdirAll(targetDir, 0o755); err != nil {
 			t.Fatalf("mkdir target: %v", err)
 		}
@@ -2666,7 +2777,7 @@ func TestRunCLISyncYesFlagBypassesPrompt(t *testing.T) {
 		withSyncPromptTestInput(t, "\n", true)
 
 		payload := []byte("hello")
-		entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "new.txt")
+		entry := buildTestManifestEntry(2, int64(len(payload)), 100, 0o644, "new.txt")
 		syncCalls := 0
 		meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
 		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
@@ -2676,11 +2787,11 @@ func TestRunCLISyncYesFlagBypassesPrompt(t *testing.T) {
 			case intftcp.VerbSYNC:
 				syncCalls++
 				if syncCalls == 1 {
-					return writeSyncResponse(out, "txsyncyesflagmixed", []string{entry}, []uint64{0})
+					return writeSyncResponse(out, "txsyncyesflagmixed", []string{entry}, []uint64{1})
 				}
 				return writeSyncResponse(out, "txsyncyesflagmixed", []string{entry}, nil)
 			case intftcp.VerbSEND:
-				_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+				_, err := io.WriteString(out, buildCLIFrameWithMetadata(2, payload, 0, meta))
 				return err
 			case intftcp.VerbACK:
 				_, err := io.WriteString(out, "OK\r\n")
@@ -2731,8 +2842,8 @@ func TestRunCLISyncSkipWriteSkipsTransferWhenOnlyNonFilesPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat local file: %v", err)
 	}
-	fileEntry := buildTestManifestEntry(0, info.Size(), info.ModTime().UnixNano(), info.Mode(), "a.txt")
-	dirEntry := "D1 0 0:100 0750 0:3:sub"
+	fileEntry := buildTestManifestEntry(1, info.Size(), info.ModTime().UnixNano(), info.Mode(), "a.txt")
+	dirEntry := "D2 0 0:100 0750 0:3:sub"
 
 	var probeCount atomic.Int64
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
@@ -2767,7 +2878,7 @@ func TestRunCLICopyStartPath(t *testing.T) {
 	targetDir := filepath.Join(tmp, "dst")
 	payload := []byte("hello")
 	manifestRaw := buildTestManifestRaw("txcopy-start", []string{
-		buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "new.txt"),
+		buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "new.txt"),
 	})
 	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
 
@@ -2782,7 +2893,7 @@ func TestRunCLICopyStartPath(t *testing.T) {
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
 		case intftcp.VerbSEND:
-			_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+			_, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -2818,7 +2929,7 @@ func TestRunCLICopySyncPath(t *testing.T) {
 		t.Fatalf("mkdir target: %v", err)
 	}
 	payload := []byte("hello")
-	entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "new.txt")
+	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "new.txt")
 	manifestRaw := buildTestManifestRaw("txcopy-sync", []string{entry})
 	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
 	withSyncPromptTestInput(t, "", false)
@@ -2839,7 +2950,7 @@ func TestRunCLICopySyncPath(t *testing.T) {
 			}
 			return writeSyncResponse(out, "txcopy-sync", []string{entry}, nil)
 		case intftcp.VerbSEND:
-			_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+			_, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -2877,11 +2988,11 @@ func TestRunCLICopyResumeFromPriorStateUnchanged(t *testing.T) {
 	tmp := t.TempDir()
 	payload := []byte("helloworld")
 	const partial = 5
-	entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "a.txt")
+	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "a.txt")
 	manifestRaw := buildTestManifestRaw("txcopy-resume", []string{entry})
 	// Seed prior state: manifest.server, manifest.progress (auto-fingerprinted
 	// by setupPinchState), and a partially-written staging file.
-	targetDir := setupPinchState(t, tmp, manifestRaw, "0 5 0\n")
+	targetDir := setupPinchState(t, tmp, manifestRaw, "1 5 0\n")
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)
@@ -2911,7 +3022,7 @@ func TestRunCLICopyResumeFromPriorStateUnchanged(t *testing.T) {
 				return fmt.Errorf("parse offset: %w", err)
 			}
 			sendOffset = off
-			_, err = io.WriteString(out, buildCLIFrameWithMetadata(0, payload[off:], off, meta))
+			_, err = io.WriteString(out, buildCLIFrameWithMetadata(1, payload[off:], off, meta))
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -2955,9 +3066,9 @@ func TestRunCLICopyResumeFromPriorStateUnchanged(t *testing.T) {
 func TestRunCLICopyResumeFromPriorStateChangedFile(t *testing.T) {
 	tmp := t.TempDir()
 	payload := []byte("helloworld!!")
-	priorEntry := buildTestManifestEntry(0, 10, 100, 0o644, "a.txt")
+	priorEntry := buildTestManifestEntry(1, 10, 100, 0o644, "a.txt")
 	priorManifestRaw := buildTestManifestRaw("txcopy-resume", []string{priorEntry})
-	targetDir := setupPinchState(t, tmp, priorManifestRaw, "0 5 0\n")
+	targetDir := setupPinchState(t, tmp, priorManifestRaw, "1 5 0\n")
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)
@@ -2968,7 +3079,7 @@ func TestRunCLICopyResumeFromPriorStateChangedFile(t *testing.T) {
 
 	// SYNC response advertises a different size+mtime, so the prior progress
 	// entry should not be carried forward.
-	newEntry := buildTestManifestEntry(0, int64(len(payload)), 200, 0o644, "a.txt")
+	newEntry := buildTestManifestEntry(1, int64(len(payload)), 200, 0o644, "a.txt")
 	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 200, Mode: "0644"}
 
 	var sendOffset int64 = -1
@@ -2985,7 +3096,7 @@ func TestRunCLICopyResumeFromPriorStateChangedFile(t *testing.T) {
 				return fmt.Errorf("parse offset: %w", err)
 			}
 			sendOffset = off
-			_, err = io.WriteString(out, buildCLIFrameWithMetadata(0, payload[off:], off, meta))
+			_, err = io.WriteString(out, buildCLIFrameWithMetadata(1, payload[off:], off, meta))
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -3015,11 +3126,11 @@ func TestRunCLICopyResumeFromPriorStateChangedFile(t *testing.T) {
 func TestRunCLICopyResumeRemovedPathDropsStaging(t *testing.T) {
 	tmp := t.TempDir()
 	keptPayload := []byte("kept!")
-	keepEntry := buildTestManifestEntry(0, int64(len(keptPayload)), 100, 0o644, "keep.txt")
-	rmEntry := buildTestManifestEntry(1, 5, 100, 0o644, "gone.txt")
+	keepEntry := buildTestManifestEntry(1, int64(len(keptPayload)), 100, 0o644, "keep.txt")
+	rmEntry := buildTestManifestEntry(2, 5, 100, 0o644, "gone.txt")
 	priorManifestRaw := buildTestManifestRaw("txcopy-rm", []string{keepEntry, rmEntry})
 	// Seed progress for both files.
-	targetDir := setupPinchState(t, tmp, priorManifestRaw, "0 5 1\n1 3 0\n")
+	targetDir := setupPinchState(t, tmp, priorManifestRaw, "1 5 1\n2 3 0\n")
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)
@@ -3039,13 +3150,13 @@ func TestRunCLICopyResumeRemovedPathDropsStaging(t *testing.T) {
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbSYNC:
-			// New manifest: only keep.txt remains; gone.txt is removed (RM 1).
-			return writeSyncResponse(out, "txcopy-rm2", []string{keepEntry}, []uint64{1})
+			// New manifest: only keep.txt remains; gone.txt is removed (RM 2).
+			return writeSyncResponse(out, "txcopy-rm2", []string{keepEntry}, []uint64{2})
 		case intftcp.VerbSEND:
 			target := req.Params[len(req.Params)-1]
 			path := target["path"]
 			sentPaths = append(sentPaths, path)
-			_, err := io.WriteString(out, buildCLIFrameWithMetadata(0, keptPayload, 0, keepMeta))
+			_, err := io.WriteString(out, buildCLIFrameWithMetadata(1, keptPayload, 0, keepMeta))
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -3067,7 +3178,7 @@ func TestRunCLICopyResumeRemovedPathDropsStaging(t *testing.T) {
 		}
 	}
 	if !strings.Contains(stderr.String(), "rm[     1]") {
-		t.Fatalf("expected copy-resume to report rm[1], got: %s", stderr.String())
+		t.Fatalf("expected copy-resume to report one removed file, got: %s", stderr.String())
 	}
 	if _, err := os.Stat(filepath.Join(stagingDir, "gone.txt")); !os.IsNotExist(err) {
 		t.Fatalf("expected staging gone.txt to be removed, stat err=%v", err)
@@ -3081,9 +3192,9 @@ func TestRunCLICopyResumeRemovedPathDropsStaging(t *testing.T) {
 func TestRunCLICopyCleanWipesStateDir(t *testing.T) {
 	tmp := t.TempDir()
 	payload := []byte("hello")
-	entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "new.txt")
+	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "new.txt")
 	priorManifestRaw := buildTestManifestRaw("txcopy-prior", []string{entry})
-	targetDir := setupPinchState(t, tmp, priorManifestRaw, "0 3 0\n")
+	targetDir := setupPinchState(t, tmp, priorManifestRaw, "1 3 0\n")
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)
@@ -3118,7 +3229,7 @@ func TestRunCLICopyCleanWipesStateDir(t *testing.T) {
 				return fmt.Errorf("parse offset: %w", err)
 			}
 			sendOffset = off
-			_, err = io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+			_, err = io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -3151,11 +3262,11 @@ func TestRunCLICopyCleanWipesStateDir(t *testing.T) {
 func TestRunCLICopyResumeFingerprintMismatch(t *testing.T) {
 	tmp := t.TempDir()
 	payload := []byte("helloworld")
-	entry := buildTestManifestEntry(0, int64(len(payload)), 100, 0o644, "a.txt")
+	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "a.txt")
 	priorManifestRaw := buildTestManifestRaw("txcopy-fpmismatch", []string{entry})
 	// Hand-craft a progress file with a clearly-wrong fingerprint header so
 	// setupPinchState's auto-fingerprint logic does not overwrite it.
-	rawProgress := progressFingerprintHeaderPrefix + "deadbeefdeadbeefdeadbeefdeadbeef\n0 5 0\n"
+	rawProgress := progressFingerprintHeaderPrefix + "deadbeefdeadbeefdeadbeefdeadbeef\n1 5 0\n"
 	targetDir := setupPinchState(t, tmp, priorManifestRaw, rawProgress)
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
@@ -3180,7 +3291,7 @@ func TestRunCLICopyResumeFingerprintMismatch(t *testing.T) {
 				return fmt.Errorf("parse offset: %w", err)
 			}
 			sendOffset = off
-			_, err = io.WriteString(out, buildCLIFrameWithMetadata(0, payload, 0, meta))
+			_, err = io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -3276,9 +3387,17 @@ func TestRunCLICopySkipFetchVerifyMeta(t *testing.T) {
 		t.Fatalf("chtimes subdir: %v", err)
 	}
 	manifestRaw := buildTestManifestRaw("txcopy-verify", []string{
-		buildTestDirManifestEntry(0, dirMtime.UnixNano(), 0o750, "sub"),
-		buildTestManifestEntry(1, info.Size(), info.ModTime().UnixNano(), info.Mode(), "same.txt"),
+		buildTestDirManifestEntry(1, dirMtime.UnixNano(), 0o750, "sub"),
+		buildTestManifestEntry(2, info.Size(), info.ModTime().UnixNano(), info.Mode(), "same.txt"),
 	})
+	if err := os.Chmod(targetDir, 0o755); err != nil {
+		t.Fatalf("chmod target: %v", err)
+	}
+	rootInfo, err := os.Stat(targetDir)
+	if err != nil {
+		t.Fatalf("stat target root: %v", err)
+	}
+	rootFID := strconv.FormatUint(tx.RootFileID, 10)
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
@@ -3287,6 +3406,23 @@ func TestRunCLICopySkipFetchVerifyMeta(t *testing.T) {
 		case intftcp.VerbTXFER:
 			if _, err := io.WriteString(out, manifestRaw); err != nil {
 				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbSEND:
+			for _, p := range req.Params[1:] {
+				switch p["fid"] {
+				case rootFID:
+					if err := writeCLIMetadataFrame(out, tx.RootFileID, rootInfo.ModTime().UnixNano(), "0755"); err != nil {
+						return err
+					}
+				case "1":
+					if err := writeCLIMetadataFrame(out, 1, dirMtime.UnixNano(), "0750"); err != nil {
+						return err
+					}
+				default:
+					return fmt.Errorf("unexpected SEND fid: %q", p["fid"])
+				}
 			}
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
@@ -3317,13 +3453,14 @@ func TestRunCLICopyMixedManifestTypesConverges(t *testing.T) {
 
 	payload := []byte("hello")
 	manifestEntries := []string{
-		buildTestDirManifestEntry(0, 100, 0o750, "sub"),
-		buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "sub/a.txt"),
-		buildTestHardlinkManifestEntry(2, 1, 0o644, "sub/b.txt"),
-		buildTestSymlinkManifestEntry(3, 100, 0o777, "sub/link.txt", "a.txt"),
+		buildTestDirManifestEntry(1, 100, 0o750, "sub"),
+		buildTestManifestEntry(2, int64(len(payload)), 100, 0o644, "sub/a.txt"),
+		buildTestHardlinkManifestEntry(3, 2, 0o644, "sub/b.txt"),
+		buildTestSymlinkManifestEntry(4, 100, 0o777, "sub/link.txt", "a.txt"),
 	}
 	manifestRaw := buildTestManifestRaw("txcopy-mixed", manifestEntries)
-	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
+	meta := testOwnershipMetadata(int64(len(payload)), 100, "0644")
+	rootFID := strconv.FormatUint(tx.RootFileID, 10)
 
 	var sendCount atomic.Int64
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
@@ -3339,13 +3476,26 @@ func TestRunCLICopyMixedManifestTypesConverges(t *testing.T) {
 		case intftcp.VerbSYNC:
 			return writeSyncResponse(out, "txcopy-mixed", manifestEntries, nil)
 		case intftcp.VerbSEND:
-			sendCount.Add(1)
 			for _, p := range req.Params[1:] {
-				if p["fid"] != "1" {
+				switch p["fid"] {
+				case "2":
+					sendCount.Add(1)
+					if _, err := io.WriteString(out, buildCLIFrameWithMetadata(2, payload, 0, meta)); err != nil {
+						return err
+					}
+				case rootFID:
+					if err := writeCLIMetadataFrame(out, tx.RootFileID, 100, "0755"); err != nil {
+						return err
+					}
+				case "1":
+					if err := writeCLIMetadataFrame(out, 1, 100, "0750"); err != nil {
+						return err
+					}
+				default:
 					return fmt.Errorf("unexpected SEND fid: %q", p["fid"])
 				}
 			}
-			_, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
+			_, err := io.WriteString(out, "OK\r\n")
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
@@ -3406,6 +3556,126 @@ func TestRunCLICopyMixedManifestTypesConverges(t *testing.T) {
 	}
 	if target != "a.txt" {
 		t.Fatalf("symlink target: got %q, want %q", target, "a.txt")
+	}
+}
+
+func TestRunCLICopyMetadataApplyWarningStillRunsVerifyData(t *testing.T) {
+	tmp := t.TempDir()
+	targetDir := filepath.Join(tmp, "dst")
+	payload := []byte("hello")
+	manifestRaw := buildTestManifestRaw("txcopy-metawarn", []string{
+		buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "a.txt"),
+	})
+	fileMeta := &tx.FileTrailerMetadata{
+		Size:    int64(len(payload)),
+		MtimeNS: 100,
+		Mode:    "0644",
+		UID:     "not-a-number",
+		GID:     strconv.Itoa(os.Getgid()),
+	}
+	rootFID := strconv.FormatUint(tx.RootFileID, 10)
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbTXFER:
+			if _, err := io.WriteString(out, manifestRaw); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbSEND:
+			for _, p := range req.Params[1:] {
+				switch p["fid"] {
+				case "1":
+					if _, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, fileMeta)); err != nil {
+						return err
+					}
+				case rootFID:
+					if err := writeCLIMetadataFrame(out, tx.RootFileID, 100, "0755"); err != nil {
+						return err
+					}
+				default:
+					return fmt.Errorf("unexpected SEND fid: %q", p["fid"])
+				}
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbCXSUM:
+			for _, target := range checksumTargetsFromRequest(t, req) {
+				if target.FileID != 1 {
+					return fmt.Errorf("unexpected checksum fid: %d", target.FileID)
+				}
+				hash := checksumTokenForRange(payload, target.Offset, target.Size)
+				if err := writeChecksumFrame(out, target.FileID, target.Offset, target.Size, hash); err != nil {
+					return err
+				}
+			}
+			return nil
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--skip-fsync", "--verify", "full", "/remote", targetDir}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("copy should fail when metadata mirroring fails\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
+	}
+	errText := stderr.String()
+	if strings.Contains(errText, "start error:") {
+		t.Fatalf("metadata apply failure should be summarized at copy end, got: %s", errText)
+	}
+	if !strings.Contains(errText, "copy-verify-meta: [fail]") {
+		t.Fatalf("expected verify-meta failure line, got: %s", errText)
+	}
+	if !strings.Contains(errText, "copy-verify-data: [ok]") {
+		t.Fatalf("expected verify-data line after metadata failure, got: %s", errText)
+	}
+	if !strings.Contains(errText, "WARN copy: metadata apply") || !strings.Contains(errText, "a.txt") {
+		t.Fatalf("expected final metadata warning with file path, got: %s", errText)
+	}
+}
+
+func TestRunCLICopySendFailureReturnsNonzero(t *testing.T) {
+	tmp := t.TempDir()
+	targetDir := filepath.Join(tmp, "dst")
+	manifestRaw := buildTestManifestRaw("txcopy-sendfail", []string{
+		buildTestManifestEntry(1, 5, 100, 0o644, "a.txt"),
+	})
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbTXFER:
+			if _, err := io.WriteString(out, manifestRaw); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbSEND:
+			return fmt.Errorf("intentional SEND failure")
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify", "none", "/remote", targetDir}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("copy should fail when SEND fails\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "start error:") || !strings.Contains(stderr.String(), "intentional SEND failure") {
+		t.Fatalf("expected SEND failure to be reported, got: %s", stderr.String())
 	}
 }
 
@@ -3831,11 +4101,12 @@ func TestVerboseStatusPollingUsesResumeFileBaseline(t *testing.T) {
 func TestRunCLIStartProgressFileShowsResumedBytes(t *testing.T) {
 	tmp := t.TempDir()
 	manifestRaw := strings.Join([]string{
-		"FM/1 txstartprogressresume 7:/remote mode=fast link-mbps=700 concurrency=1",
-		"F0 10 0:100 0644 0:5:a.txt",
+		"FM/1 txstartprogressresume mode=fast link-mbps=700 concurrency=1",
+		"D0 0 0:100 0755 0:7:/remote",
+		"F1 10 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "0 5 0\n")
+	targetDir := setupPinchState(t, tmp, manifestRaw, "1 5 0\n")
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)
@@ -3852,7 +4123,7 @@ func TestRunCLIStartProgressFileShowsResumedBytes(t *testing.T) {
 			// Slow the response so the 1ms progress ticker fires at least once
 			// before the final stop write forces 100%.
 			time.Sleep(50 * time.Millisecond)
-			_, err := io.WriteString(out, buildCLIFrame(0, []byte("world"), 5)+"OK\r\n")
+			_, err := io.WriteString(out, buildCLIFrame(1, []byte("world"), 5)+"OK\r\n")
 			return err
 		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")

@@ -143,7 +143,6 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	// Write FM/1 header.
 	hdr := encoding.FormatManifestHeader(encoding.ManifestHeader{
 		TransferID:  transfer.ID,
-		Root:        root,
 		Mode:        manifestMode,
 		LinkMbps:    manifestLinkMbps,
 		Concurrency: manifestConcurrency,
@@ -171,11 +170,43 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	defer func() {
 		closeUpdates()
 	}()
-	fileID := 0
+	fileID := uint64(1)
 	prevPath := ""
 	prevMtime := ""
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return protocolErr{code: "BAD_REQUEST", message: err.Error()}
+	}
+	rootEntry := encoding.ManifestEntry{
+		Type:       encoding.EntryTypeDir,
+		ID:         encoding.RootFileID,
+		Size:       0,
+		Mtime:      rootInfo.ModTime().UnixNano(),
+		Mode:       encoding.NormalizeManifestMode(rootInfo.Mode()),
+		Path:       filepath.Clean(root),
+		LinkTarget: -1,
+	}
+	rootLine, nextPath, nextMtime, err := encoding.MarshalManifestEntry(rootEntry, prevPath, prevMtime)
+	if err != nil {
+		return protocolErr{code: "BAD_REQUEST", message: err.Error()}
+	}
+	updatesCh <- TransferFileStateUpdate{
+		FileID:    encoding.RootFileID,
+		EntryType: encoding.EntryTypeDir,
+		PathHash:  xxh3.Hash128([]byte(filepath.Clean(root))),
+		FileSize:  0,
+	}
+	if _, err := io.WriteString(out, rootLine+"\n"); err != nil {
+		if isBrokenPipe(err) {
+			return nil
+		}
+		return err
+	}
+	prevPath = nextPath
+	prevMtime = nextMtime
 
 	emitSyncEntry := func(entry encoding.ManifestEntry) error {
+		entry.ID = fileID
 		// Mark in pathIndex that this path still exists on disk.
 		pathHash := xxh3.Hash128([]byte(entry.Path))
 		if old, ok := pathIndex[pathHash]; ok {
@@ -190,7 +221,7 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 
 		fullPath := filepath.Clean(filepath.Join(root, entry.Path))
 		updatesCh <- TransferFileStateUpdate{
-			FileID:    uint64(fileID),
+			FileID:    entry.ID,
 			EntryType: entry.Type,
 			PathHash:  xxh3.Hash128([]byte(fullPath)),
 			FileSize:  entry.Size,
@@ -275,6 +306,14 @@ func readOldManifest(in io.Reader) (map[xxh3.Uint128]*oldEntry, error) {
 		entry, nextPath, nextMtime, parseErr := encoding.ParseManifestEntry(trimmed, prevPath, prevMtime)
 		if parseErr != nil {
 			return nil, parseErr
+		}
+		if entry.ID == encoding.RootFileID && entry.Type == encoding.EntryTypeDir && filepath.IsAbs(entry.Path) {
+			prevPath = nextPath
+			prevMtime = nextMtime
+			if err == io.EOF {
+				break
+			}
+			continue
 		}
 		// Hash path immediately and discard the string — no path strings retained.
 		pathHash := xxh3.Hash128([]byte(entry.Path))

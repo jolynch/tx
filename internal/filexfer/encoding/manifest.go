@@ -19,6 +19,9 @@ const (
 	EntryTypeHard    byte = 'H' // hardlink (mtime carries target file ID)
 	EntryTypeDir     byte = 'D' // directory
 	EntryTypeSymlink byte = 'S' // symlink (link target after path token)
+
+	// RootFileID is reserved for the transfer root manifest entry.
+	RootFileID = uint64(0)
 )
 
 // ManifestEntry is the internal representation of one FM/1 manifest line.
@@ -291,11 +294,12 @@ func ParseManifestEntry(line string, prevPath string, prevMtime string) (Manifes
 	if strings.Contains(pathResolved, `\`) {
 		return ManifestEntry{}, "", "", errors.New("manifest path contains backslash")
 	}
-	if strings.HasPrefix(pathResolved, "/") {
+	isRootEntry := id == RootFileID && entryType == EntryTypeDir && filepath.IsAbs(pathResolved)
+	if strings.HasPrefix(pathResolved, "/") && !isRootEntry {
 		return ManifestEntry{}, "", "", errors.New("manifest path must be relative")
 	}
 	cleanPath := filepath.Clean(filepath.FromSlash(pathResolved))
-	if cleanPath == "." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) || cleanPath == ".." {
+	if !isRootEntry && (cleanPath == "." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) || cleanPath == "..") {
 		return ManifestEntry{}, "", "", errors.New("manifest path traversal is not allowed")
 	}
 
@@ -336,7 +340,7 @@ func ParseManifestEntry(line string, prevPath string, prevMtime string) (Manifes
 // WalkManifestEntries streams filesystem-derived manifest entries in walk order.
 func WalkManifestEntries(root string, fn func(WalkResult) error) error {
 	root = filepath.Clean(root)
-	var fileID uint64
+	fileID := uint64(1)
 	inodeSeen := make(map[uint64]map[uint64]uint64, 4)
 
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
@@ -419,17 +423,17 @@ func MarshalManifestEntry(entry ManifestEntry, prevPath string, prevMtime string
 	if strings.Contains(entry.Path, `\`) {
 		return "", "", "", fmt.Errorf("manifest path contains backslash: %q", entry.Path)
 	}
-	if strings.HasPrefix(entry.Path, "/") {
-		return "", "", "", fmt.Errorf("manifest path must be relative: %q", entry.Path)
-	}
-	cleanPath := filepath.Clean(filepath.FromSlash(entry.Path))
-	if cleanPath == "." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) || cleanPath == ".." {
-		return "", "", "", fmt.Errorf("manifest path traversal is not allowed: %q", entry.Path)
-	}
-
 	entryType := entry.Type
 	if entryType == 0 {
 		entryType = EntryTypeFile
+	}
+	isRootEntry := entry.ID == RootFileID && entryType == EntryTypeDir && filepath.IsAbs(entry.Path)
+	if strings.HasPrefix(entry.Path, "/") && !isRootEntry {
+		return "", "", "", fmt.Errorf("manifest path must be relative: %q", entry.Path)
+	}
+	cleanPath := filepath.Clean(filepath.FromSlash(entry.Path))
+	if !isRootEntry && (cleanPath == "." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) || cleanPath == "..") {
+		return "", "", "", fmt.Errorf("manifest path traversal is not allowed: %q", entry.Path)
 	}
 
 	// For H entries, the mtime field carries the target file ID.
@@ -468,12 +472,14 @@ func ParseManifestHeader(line string) (ManifestHeader, error) {
 		return ManifestHeader{}, errors.New("invalid manifest header")
 	}
 	txferID := rest[:sep]
-	rootRaw := rest[sep+1:]
-	root, consumed, err := ParseLenPrefixedPrefix(rootRaw)
-	if err != nil {
-		return ManifestHeader{}, fmt.Errorf("invalid manifest root token: %w", err)
+	optionsRaw := strings.TrimSpace(rest[sep+1:])
+	root := ""
+	if strings.Contains(optionsRaw, ":") {
+		if parsedRoot, consumed, err := ParseLenPrefixedPrefix(optionsRaw); err == nil {
+			root = parsedRoot
+			optionsRaw = strings.TrimSpace(optionsRaw[consumed:])
+		}
 	}
-	optionsRaw := strings.TrimSpace(rootRaw[consumed:])
 	if optionsRaw == "" {
 		return ManifestHeader{}, errors.New("manifest header missing metadata options")
 	}
@@ -500,22 +506,25 @@ func ParseManifestHeader(line string) (ManifestHeader, error) {
 			hdr.Mode = value
 			seenMode = true
 		case "link-mbps":
-			hdr.LinkMbps, err = strconv.ParseInt(strings.TrimSpace(value), 10, 64)
-			if err != nil || hdr.LinkMbps < 0 {
+			linkMbps, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+			if err != nil || linkMbps < 0 {
 				return ManifestHeader{}, errors.New("invalid manifest link-mbps")
 			}
+			hdr.LinkMbps = linkMbps
 			seenLink = true
 		case "concurrency":
-			hdr.Concurrency, err = strconv.Atoi(strings.TrimSpace(value))
-			if err != nil || hdr.Concurrency <= 0 {
+			concurrency, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil || concurrency <= 0 {
 				return ManifestHeader{}, errors.New("invalid manifest concurrency")
 			}
+			hdr.Concurrency = concurrency
 			seenConc = true
 		case "deadline-ms":
-			hdr.DeadlineMS, err = strconv.ParseInt(strings.TrimSpace(value), 10, 64)
-			if err != nil || hdr.DeadlineMS < 0 {
+			deadlineMS, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+			if err != nil || deadlineMS < 0 {
 				return ManifestHeader{}, errors.New("invalid manifest deadline-ms")
 			}
+			hdr.DeadlineMS = deadlineMS
 		default:
 			return ManifestHeader{}, errors.New("unknown manifest header option")
 		}
@@ -529,10 +538,8 @@ func ParseManifestHeader(line string) (ManifestHeader, error) {
 // FormatManifestHeader formats an FM/1 header line (without trailing newline).
 func FormatManifestHeader(hdr ManifestHeader) string {
 	s := fmt.Sprintf(
-		"FM/1 %s %d:%s mode=%s link-mbps=%d concurrency=%d",
+		"FM/1 %s mode=%s link-mbps=%d concurrency=%d",
 		hdr.TransferID,
-		len(hdr.Root),
-		hdr.Root,
 		hdr.Mode,
 		hdr.LinkMbps,
 		hdr.Concurrency,

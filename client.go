@@ -209,6 +209,7 @@ type Manifest struct {
 	Concurrency int
 	DeadlineMS  int64
 	Entries     []ManifestEntry
+	rootEntry   ManifestEntry
 
 	// wireBytes is the size of the manifest in its on-disk/wire FM/1 encoding.
 	// Set by parseManifest from len(raw); zero for manifests built in-memory
@@ -235,6 +236,7 @@ func (m *Manifest) Size() (mem, disk int64) {
 	}
 	total := int64(unsafe.Sizeof(*m))
 	total += int64(len(m.TransferID) + len(m.Root) + len(m.Mode))
+	total += int64(len(m.rootEntry.Path))
 	total += int64(cap(m.Entries)) * manifestEntrySize
 	for i := range m.Entries {
 		total += int64(len(m.Entries[i].Path))
@@ -428,6 +430,9 @@ type FetchFileTarget struct {
 	Size     int64
 	Comp     string // adapt|none|lz4|zstd; empty means server default (adapt)
 }
+
+// RootFileID is the manifest file ID reserved for the transfer root.
+const RootFileID = intencoding.RootFileID
 
 type GetChecksumRequest struct {
 	TransferID string
@@ -797,6 +802,115 @@ func (c *Client) fetchFileWindow(
 		return nil, nil, fmt.Errorf("file id mismatch: expected %d got %d", fileID, meta.FileID)
 	}
 	return fileStream, meta, nil
+}
+
+// GetEntryMetadata issues metadata-only SEND requests for directory entries.
+// The pathsByID map is keyed by manifest file ID and stores the absolute remote
+// path for each entry. File ID 0 may be used for the transfer root.
+func (c *Client) GetEntryMetadata(ctx context.Context, transferID string, pathsByID map[uint64]string) (map[uint64]*FileTrailerMetadata, error) {
+	if c == nil {
+		return nil, errors.New("nil client")
+	}
+	if transferID == "" {
+		return nil, errors.New("missing transfer id")
+	}
+	if len(pathsByID) == 0 {
+		return nil, errors.New("missing metadata targets")
+	}
+
+	ids := make([]uint64, 0, len(pathsByID))
+	for fileID, fullPath := range pathsByID {
+		if strings.TrimSpace(fullPath) == "" {
+			return nil, fmt.Errorf("metadata target id=%d missing full path", fileID)
+		}
+		ids = append(ids, fileID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	requestTargets := make([]FetchFileTarget, 0, len(ids))
+	for _, fileID := range ids {
+		requestTargets = append(requestTargets, FetchFileTarget{
+			FileID:   fileID,
+			FullPath: pathsByID[fileID],
+			Comp:     "none",
+		})
+	}
+	stream, err := c.fetchFileBatchTCP(ctx, transferID, requestTargets)
+	if err != nil {
+		return nil, err
+	}
+	defer stream.Close()
+	br := c.acquireLineReader(stream)
+	defer c.releaseLineReader(br)
+
+	results := make(map[uint64]*FileTrailerMetadata, len(ids))
+	for i, fileID := range ids {
+		meta, err := readEntryMetadataFrame(br, fileID)
+		if err != nil {
+			return nil, fmt.Errorf("entry metadata target %d id=%d: %w", i, fileID, err)
+		}
+		results[fileID] = meta
+	}
+	statusLine, err := readTCPLine(br, maxTCPLineBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read metadata terminal status: %w", err)
+	}
+	if err := parseErrControlFrame(statusLine); err != nil {
+		return nil, err
+	}
+	if _, ok := parseOKStatusLine(statusLine); !ok {
+		return nil, fmt.Errorf("unexpected metadata terminal status: %s", strings.TrimSpace(statusLine))
+	}
+	return results, nil
+}
+
+func readEntryMetadataFrame(br *bufio.Reader, fileID uint64) (*FileTrailerMetadata, error) {
+	headerLine, err := br.ReadString('\n')
+	if err != nil {
+		return nil, fmt.Errorf("read frame header: %w", err)
+	}
+	headerTrimmed := strings.TrimRight(headerLine, "\r\n")
+	if isStatusLine(headerTrimmed) {
+		return nil, fmt.Errorf("unexpected status line before metadata frame: %s", headerTrimmed)
+	}
+	frameMeta, err := parseFXHeader(headerTrimmed)
+	if err != nil {
+		return nil, err
+	}
+	if frameMeta.FileID != fileID {
+		return nil, fmt.Errorf("file id mismatch: expected=%d got=%d", fileID, frameMeta.FileID)
+	}
+	if frameMeta.Offset != 0 || frameMeta.Size != 0 || frameMeta.WireSize != 0 {
+		return nil, fmt.Errorf("metadata frame must be empty: offset=%d size=%d wsize=%d", frameMeta.Offset, frameMeta.Size, frameMeta.WireSize)
+	}
+	if frameMeta.Comp != "none" {
+		return nil, fmt.Errorf("metadata frame comp=%q, want none", frameMeta.Comp)
+	}
+	trailerLine, err := br.ReadString('\n')
+	if err != nil {
+		return nil, fmt.Errorf("read frame trailer: %w", err)
+	}
+	trailer, err := parseFXTrailer(strings.TrimRight(trailerLine, "\r\n"))
+	if err != nil {
+		return nil, err
+	}
+	if trailer.FileID != fileID {
+		return nil, fmt.Errorf("trailer file id mismatch: expected=%d got=%d", fileID, trailer.FileID)
+	}
+	if trailer.Next == nil || *trailer.Next != 0 {
+		return nil, errors.New("metadata trailer must be terminal next=0")
+	}
+	if trailer.Metadata == nil {
+		return nil, errors.New("metadata trailer missing meta fields")
+	}
+	if trailer.FileHashToken == "" {
+		return nil, errors.New("metadata trailer missing file hash")
+	}
+	expectedHash := intencoding.FormatXXH128HashToken(xxh3.Hash128(nil))
+	if !strings.EqualFold(trailer.FileHashToken, expectedHash) {
+		return nil, fmt.Errorf("metadata frame hash mismatch: got=%s want=%s", trailer.FileHashToken, expectedHash)
+	}
+	return cloneTrailerMetadata(trailer.Metadata), nil
 }
 
 func (c *Client) GetChecksum(ctx context.Context, request GetChecksumRequest) (GetChecksumResponse, error) {
@@ -2479,6 +2593,7 @@ func parseManifest(raw []byte) (*Manifest, error) {
 	var prevMtime string
 	var lastID uint64
 	haveLastID := false
+	rootSeen := false
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -2501,7 +2616,7 @@ func parseManifest(raw []byte) (*Manifest, error) {
 					manifest.Concurrency = hdr.Concurrency
 					manifest.DeadlineMS = hdr.DeadlineMS
 					seenHeader = true
-				} else if manifest.TransferID != hdr.TransferID || manifest.Root != hdr.Root || manifest.Mode != hdr.Mode || manifest.LinkMbps != hdr.LinkMbps || manifest.Concurrency != hdr.Concurrency {
+				} else if manifest.TransferID != hdr.TransferID || (hdr.Root != "" && manifest.Root != hdr.Root) || manifest.Mode != hdr.Mode || manifest.LinkMbps != hdr.LinkMbps || manifest.Concurrency != hdr.Concurrency {
 					return nil, errors.New("manifest chunk header mismatch")
 				}
 				prevPath = ""
@@ -2523,6 +2638,26 @@ func parseManifest(raw []byte) (*Manifest, error) {
 					Path:       raw.Path,
 					LinkTarget: raw.LinkTarget,
 					LinkPath:   raw.LinkPath,
+				}
+				if entry.ID == intencoding.RootFileID && entry.Type == intencoding.EntryTypeDir && filepath.IsAbs(entry.Path) {
+					if _, exists := seenIDs[entry.ID]; exists {
+						return nil, fmt.Errorf("duplicate manifest id: %d", entry.ID)
+					}
+					if strings.TrimSpace(manifest.Root) != "" && manifest.Root != filepath.Clean(entry.Path) {
+						return nil, errors.New("manifest root entry/header mismatch")
+					}
+					manifest.Root = filepath.Clean(entry.Path)
+					manifest.rootEntry = entry
+					rootSeen = true
+					seenIDs[entry.ID] = struct{}{}
+					lastID = entry.ID
+					haveLastID = true
+					prevPath = nextPath
+					prevMtime = nextMtime
+					continue
+				}
+				if !rootSeen && strings.TrimSpace(manifest.Root) == "" {
+					return nil, errors.New("manifest missing root entry")
 				}
 				if _, exists := seenIDs[entry.ID]; exists {
 					return nil, fmt.Errorf("duplicate manifest id: %d", entry.ID)
@@ -2546,6 +2681,9 @@ func parseManifest(raw []byte) (*Manifest, error) {
 	if !seenHeader {
 		return nil, errors.New("manifest missing header")
 	}
+	if strings.TrimSpace(manifest.Root) == "" {
+		return nil, errors.New("manifest missing root entry")
+	}
 
 	sort.Slice(manifest.Entries, func(i, j int) bool { return manifest.Entries[i].ID < manifest.Entries[j].ID })
 	manifest.Size() // warm cache
@@ -2558,9 +2696,6 @@ func marshalManifest(manifest *Manifest) ([]byte, error) {
 	}
 	if strings.TrimSpace(manifest.TransferID) == "" {
 		return nil, errors.New("manifest transfer id is required")
-	}
-	if strings.TrimSpace(manifest.Root) == "" {
-		return nil, errors.New("manifest root is required")
 	}
 	entries := append([]ManifestEntry(nil), manifest.Entries...)
 	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
@@ -2577,7 +2712,6 @@ func marshalManifest(manifest *Manifest) ([]byte, error) {
 	var b strings.Builder
 	hdr := intencoding.FormatManifestHeader(intencoding.ManifestHeader{
 		TransferID:  manifest.TransferID,
-		Root:        manifest.Root,
 		Mode:        mode,
 		LinkMbps:    manifest.LinkMbps,
 		Concurrency: manifest.Concurrency,
@@ -2587,7 +2721,43 @@ func marshalManifest(manifest *Manifest) ([]byte, error) {
 	b.WriteByte('\n')
 	prevPath := ""
 	prevMtime := ""
-	seenIDs := make(map[uint64]struct{}, len(entries))
+	if strings.TrimSpace(manifest.Root) == "" {
+		return nil, errors.New("manifest root is required")
+	}
+	rootEntry := ManifestEntry{
+		Type:       intencoding.EntryTypeDir,
+		ID:         intencoding.RootFileID,
+		Size:       0,
+		Mtime:      0,
+		Mode:       0o755,
+		Path:       filepath.Clean(manifest.Root),
+		LinkTarget: -1,
+	}
+	if manifest.rootEntry.Path != "" {
+		rootEntry = manifest.rootEntry
+		rootEntry.Type = intencoding.EntryTypeDir
+		rootEntry.ID = intencoding.RootFileID
+		rootEntry.Size = 0
+		rootEntry.Path = filepath.Clean(rootEntry.Path)
+		rootEntry.LinkTarget = -1
+	}
+	line, nextPath, nextMtime, err := intencoding.MarshalManifestEntry(intencoding.ManifestEntry{
+		Type:       rootEntry.Type,
+		ID:         rootEntry.ID,
+		Size:       rootEntry.Size,
+		Mtime:      rootEntry.Mtime,
+		Mode:       rootEntry.Mode,
+		Path:       rootEntry.Path,
+		LinkTarget: rootEntry.LinkTarget,
+	}, prevPath, prevMtime)
+	if err != nil {
+		return nil, err
+	}
+	b.WriteString(line)
+	b.WriteByte('\n')
+	prevPath = nextPath
+	prevMtime = nextMtime
+	seenIDs := map[uint64]struct{}{intencoding.RootFileID: {}}
 	for i, entry := range entries {
 		if _, exists := seenIDs[entry.ID]; exists {
 			return nil, fmt.Errorf("duplicate manifest id: %d", entry.ID)

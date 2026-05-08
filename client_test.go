@@ -624,6 +624,48 @@ func TestParseFXTrailerWithoutTrailerHash(t *testing.T) {
 	}
 }
 
+func TestGetEntryMetadataParsesMultipleEmptyFrames(t *testing.T) {
+	emptyHash := intencoding.FormatXXH128HashToken(xxh3.Hash128(nil))
+	handler := func(req intftcp.Request, out io.Writer) error {
+		if req.Verb != intftcp.VerbSEND {
+			return fmt.Errorf("unexpected verb %v", req.Verb)
+		}
+		if len(req.Params) != 3 {
+			return fmt.Errorf("unexpected SEND param count %d", len(req.Params))
+		}
+		if req.Params[1]["fid"] != "1" || req.Params[2]["fid"] != "2" {
+			return fmt.Errorf("unexpected fds: %+v", req.Params)
+		}
+		_, err := io.WriteString(out,
+			"FX/1 1 offset=0 size=0 wsize=0 comp=none ts=1000\n"+
+				"FXT/1 1 status=ok ts=1001 file-hash="+emptyHash+" next=0 meta:size=0 meta:mtime_ns=111 meta:mode=2750 meta:uid=123 meta:gid=456 meta:user=u meta:group=g\n"+
+				"FX/1 2 offset=0 size=0 wsize=0 comp=none ts=1002\n"+
+				"FXT/1 2 status=ok ts=1003 file-hash="+emptyHash+" next=0 meta:size=0 meta:mtime_ns=222 meta:mode=1755 meta:uid=789 meta:gid=321 meta:user=u meta:group=g\n"+
+				"OK\n")
+		return err
+	}
+	dialer := newCountingPipeDialer(handler)
+
+	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
+	defer client.Close()
+	metadataByID, err := client.GetEntryMetadata(context.Background(), "txmeta", map[uint64]string{
+		1: "/remote/a",
+		2: "/remote/b",
+	})
+	if err != nil {
+		t.Fatalf("GetEntryMetadata failed: %v", err)
+	}
+	if len(metadataByID) != 2 {
+		t.Fatalf("entries len = %d, want 2", len(metadataByID))
+	}
+	if metadataByID[1].Mode != "2750" || metadataByID[1].UID != "123" {
+		t.Fatalf("unexpected first metadata: %+v", metadataByID[1])
+	}
+	if metadataByID[2].Mode != "1755" || metadataByID[2].GID != "321" {
+		t.Fatalf("unexpected second metadata: %+v", metadataByID[2])
+	}
+}
+
 func TestEffectiveFrameReadBufferSize(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -2477,6 +2519,72 @@ func TestManifestSizeCached(t *testing.T) {
 	}
 	if disk != firstDisk {
 		t.Errorf("disk changed after mutation: got %d, want %d", disk, firstDisk)
+	}
+}
+
+func TestParseManifestRootlessHeaderUsesD0Root(t *testing.T) {
+	raw := strings.Join([]string{
+		"FM/1 txroot mode=fast link-mbps=1000 concurrency=2",
+		"D0 0 0:123 2755 0:7:/remote",
+		"F1 5 0:124 0644 0:5:a.txt",
+		"",
+	}, "\n")
+	m, err := parseManifest([]byte(raw))
+	if err != nil {
+		t.Fatalf("parseManifest failed: %v", err)
+	}
+	if m.Root != "/remote" {
+		t.Fatalf("root = %q, want /remote", m.Root)
+	}
+	if len(m.Entries) != 1 {
+		t.Fatalf("entries len = %d, want 1", len(m.Entries))
+	}
+	if m.Entries[0].ID != 1 || m.Entries[0].Path != "a.txt" {
+		t.Fatalf("unexpected child entry: %+v", m.Entries[0])
+	}
+}
+
+func TestMarshalManifestWritesRootlessHeaderAndD0(t *testing.T) {
+	raw, err := MarshalManifest(&Manifest{
+		TransferID:  "txmarshalroot",
+		Root:        "/remote",
+		Mode:        LoadStrategyFast,
+		LinkMbps:    1000,
+		Concurrency: 2,
+		Entries: []ManifestEntry{
+			{Type: intencoding.EntryTypeFile, ID: 1, Size: 5, Mtime: 124, Mode: 0o644, Path: "a.txt", LinkTarget: -1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("MarshalManifest failed: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("line count = %d, want 3\n%s", len(lines), string(raw))
+	}
+	if strings.Contains(lines[0], ":/remote") {
+		t.Fatalf("header still contains root token: %q", lines[0])
+	}
+	if !strings.HasPrefix(lines[0], "FM/1 txmarshalroot mode=fast ") {
+		t.Fatalf("unexpected header: %q", lines[0])
+	}
+	if !strings.HasPrefix(lines[1], "D0 0 ") || !strings.Contains(lines[1], ":/remote") {
+		t.Fatalf("missing D0 root line: %q", lines[1])
+	}
+	if !strings.HasPrefix(lines[2], "F1 ") {
+		t.Fatalf("missing F1 child line: %q", lines[2])
+	}
+}
+
+func TestParseManifestRootlessRejectsNonRootAbsolutePath(t *testing.T) {
+	raw := strings.Join([]string{
+		"FM/1 txbadabs mode=fast link-mbps=1000 concurrency=1",
+		"D0 0 0:123 0755 0:7:/remote",
+		"F1 5 0:124 0644 7:6:/a.txt",
+		"",
+	}, "\n")
+	if _, err := parseManifest([]byte(raw)); err == nil {
+		t.Fatal("expected parseManifest to reject non-root absolute path")
 	}
 }
 
