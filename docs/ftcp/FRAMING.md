@@ -213,6 +213,18 @@ Path/blob args are encoded as quoted strings or length-prefixed tokens (`<len>:<
 The server repeats these triplets until each requested window is complete.
 Default logical frame size cap is `4 MiB`.
 
+Directory `SEND` requests are metadata-only. For a manifest directory entry,
+the server emits exactly one empty frame:
+
+```text
+FX/1 <file_id> offset=0 size=0 wsize=0 comp=none ts=<unix_ms>
+FXT/1 <file_id> status=ok ts=<unix_ms> file-hash=xxh128:<empty-hash> next=0 meta:size=0 meta:mtime_ns=<n> meta:mode=<octal07777> meta:uid=<uid> meta:gid=<gid> meta:user=<user> meta:group=<group>
+```
+
+The transfer root is queried the same way as manifest entry `D0`, using
+`file_id=0`; the path token is the manifest root path itself.
+Directory/root metadata frames are not acknowledged as copied payload bytes.
+
 For `SEND` responses, header properties are emitted in this order:
 `offset`, `size`, `wsize`, `comp`, `hash`, optional `max-wsize`, then `ts`.
 Current implementation supports adaptive compression and may vary `comp` per frame.

@@ -222,6 +222,22 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 	if err != nil {
 		return protocolErr{code: "INTERNAL", message: "failed to stat file"}
 	}
+	entryType := fileRef.EntryType
+	if entryType == 0 {
+		entryType = encoding.EntryTypeFile
+	}
+	if fileInfo.IsDir() {
+		if entryType != encoding.EntryTypeDir {
+			return protocolErr{code: "BAD_REQUEST", message: "SEND path is a directory but manifest entry is not"}
+		}
+		if item.Offset != 0 || item.Size != 0 {
+			return protocolErr{code: "BAD_REQUEST", message: "directory SEND must request offset=0 size=0"}
+		}
+		return streamSendMetadataOnly(ctx, out, deps, txferID, item, fileRef, fileInfo)
+	}
+	if entryType != encoding.EntryTypeFile {
+		return protocolErr{code: "BAD_REQUEST", message: "SEND metadata-only supports directories only for non-file entries"}
+	}
 	windowLen := fileInfo.Size()
 	if windowLen < 0 {
 		return protocolErr{code: "INTERNAL", message: "invalid file size"}
@@ -484,6 +500,38 @@ func initialCompressionMode(comp string) policy.CompressionMode {
 	default:
 		return policy.CompressionModeNone
 	}
+}
+
+func streamSendMetadataOnly(ctx context.Context, out io.Writer, deps Deps, txferID string, item sendItem, fileRef FileRef, fileInfo os.FileInfo) error {
+	md := encoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
+	md.Size = 0
+	windowHasher := xxh3.New128()
+	args := frameStreamArgs{
+		Ctx:          ctx,
+		FileID:       item.FileID,
+		Offset:       0,
+		FrameSize:    0,
+		Comp:         "none",
+		Mode:         item.Mode,
+		HeaderTS:     time.Now().UnixMilli(),
+		Next:         0,
+		IsTerminal:   true,
+		TerminalMD:   &md,
+		WindowHasher: windowHasher,
+		Output:       out,
+	}
+	if err := writeFrameHeader(out, args, 0, nil); err != nil {
+		return err
+	}
+	windowHashToken, err := writeFrameTrailer(out, args, nil)
+	if err != nil {
+		return err
+	}
+	if !deps.SetTransferFileWindowHash(txferID, item.FileID, 0, windowHashToken) {
+		return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
+	}
+	_ = deps.SetTransferFileState(txferID, item.FileID, TransferStateDone)
+	return nil
 }
 
 func maxFrameWireHint(comp string, logicalSize int64) (int64, error) {

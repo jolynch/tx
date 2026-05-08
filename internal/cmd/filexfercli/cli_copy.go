@@ -271,6 +271,8 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		localExists = false
 	}
 	hasPriorState := pathExists(ps.ServerManifestPath)
+	metadataFailures := &metadataFailureCollector{}
+	copyVerbosity := verbosityFromFlags(cfg.progress, cfg.verbose)
 
 	transferCfg := transferArgs{
 		sourceDir:    cfg.remoteSrc,
@@ -327,19 +329,20 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 			traceFile:           cfg.traceFile,
 			progressTargets:     progressTargets,
 			progressInterval:    progressInterval,
+			metadataFailures:    metadataFailures,
 		}
 		if code := runSync(serverURL, syncCfg, stdout, stderr); code != 0 {
+			printMetadataMirrorWarnings(stderr, "copy", metadataFailures.snapshot(), copyVerbosity)
 			return code
 		}
 	} else {
-		verbosity := verbosityFromFlags(cfg.progress, cfg.verbose)
 		startCfg := startArgs{
 			targetDir:           cfg.localDst,
 			agePublicKey:        agePublicKey,
 			ageIdentity:         ageIdentity,
 			encMode:             encMode,
 			authTokens:          cfg.authTokens,
-			verbosity:           verbosity,
+			verbosity:           copyVerbosity,
 			concurrency:         cfg.concurrency,
 			concurrencyExplicit: cfg.concurrency > 0,
 			ackEvery:            ackEvery,
@@ -351,16 +354,29 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 			traceFile:           cfg.traceFile,
 			progressTargets:     progressTargets,
 			progressInterval:    progressInterval,
+			metadataFailures:    metadataFailures,
 		}
 		if code := runStart(serverURL, startCfg, stdout, stderr); code != 0 {
+			printMetadataMirrorWarnings(stderr, "copy", metadataFailures.snapshot(), copyVerbosity)
 			return code
 		}
 	}
 
+	exitCode := 0
 	if cfg.verifyMeta {
 		if code := verifyCopy(serverURL, cfg, stdout, stderr); code != 0 {
-			return code
+			exitCode = code
 		}
+	}
+	metadataWarnings := metadataFailures.snapshot()
+	if len(metadataWarnings) > 0 {
+		printMetadataMirrorWarnings(stderr, "copy", metadataWarnings, copyVerbosity)
+		if exitCode == 0 {
+			exitCode = 1
+		}
+	}
+	if exitCode != 0 {
+		return exitCode
 	}
 	if code := cleanupCopyState(cfg.localDst, stderr); code != 0 {
 		return code
@@ -400,6 +416,7 @@ func verifyCopy(serverURL string, cfg copyCLIConfig, stdout io.Writer, stderr io
 		fmt.Fprintf(stderr, "scan local directory failed: %v\n", err)
 		return 1
 	}
+	metaFailed := false
 	delta := compareManifestEntries(localManifest, serverManifest)
 	if len(delta.newFiles) > 0 || len(delta.staleFiles) > 0 || len(delta.removedPaths) > 0 {
 		fmt.Fprintf(
@@ -411,19 +428,26 @@ func verifyCopy(serverURL string, cfg copyCLIConfig, stdout io.Writer, stderr io
 			encoding.HumanBytes(delta.staleBytes),
 			len(delta.removedPaths),
 		)
-		return 1
+		metaFailed = true
+	} else if err := verifyCopyRemoteMetadata(serverURL, cfg, serverManifest, ps.TargetDir); err != nil {
+		fmt.Fprintf(stderr, "copy-verify-meta: [fail] %v\n", err)
+		metaFailed = true
+	} else {
+		files, hardlinks, symlinks, dirs := countManifestEntryTypes(serverManifest.Entries)
+		fmt.Fprintf(
+			stderr,
+			"copy-verify-meta: [ok] total=%d files=%d hardlinks=%d symlinks=%d dirs=%d\n",
+			len(serverManifest.Entries),
+			files,
+			hardlinks,
+			symlinks,
+			dirs,
+		)
 	}
-	files, hardlinks, symlinks, dirs := countManifestEntryTypes(serverManifest.Entries)
-	fmt.Fprintf(
-		stderr,
-		"copy-verify-meta: [ok] total=%d files=%d hardlinks=%d symlinks=%d dirs=%d\n",
-		len(serverManifest.Entries),
-		files,
-		hardlinks,
-		symlinks,
-		dirs,
-	)
 	if cfg.verifyDataSamplePct <= 0 {
+		if metaFailed {
+			return 1
+		}
 		return 0
 	}
 	sampledFiles, sampledRanges, elapsed, partial, err := verifyCopyDataSamples(serverURL, cfg, serverManifest, stderr)
@@ -432,7 +456,72 @@ func verifyCopy(serverURL string, cfg copyCLIConfig, stdout io.Writer, stderr io
 		return 1
 	}
 	fmt.Fprintln(stderr, formatVerifyDataSummaryLine(sampledFiles, sampledRanges, cfg.verifyDataSamplePct, cfg.verifyBudget, elapsed, partial))
+	if metaFailed {
+		return 1
+	}
 	return 0
+}
+
+func verifyCopyRemoteMetadata(serverURL string, cfg copyCLIConfig, manifest *tx.Manifest, targetDir string) error {
+	if manifest == nil {
+		return errors.New("missing manifest")
+	}
+	agePublicKey, ageIdentity, encMode, err := resolveEncryptionOptionsWithKeys(cfg.encryptMode, cfg.keysDir)
+	if err != nil {
+		return fmt.Errorf("invalid --encrypt: %w", err)
+	}
+	client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...))
+	defer client.Close()
+
+	var dirs []tx.ManifestEntry
+	for _, entry := range manifest.Entries {
+		if entry.Type == encoding.EntryTypeDir {
+			dirs = append(dirs, entry)
+		}
+	}
+	labels := make(map[uint64]string, len(manifest.Entries)+1)
+	localPaths := make(map[uint64]string, len(manifest.Entries)+1)
+	labels[tx.RootFileID] = "."
+	localPaths[tx.RootFileID] = targetDir
+	for _, entry := range dirs {
+		labels[entry.ID] = entry.Path
+		localPaths[entry.ID] = filepath.Join(targetDir, filepath.FromSlash(entry.Path))
+	}
+	metaByID, err := client.GetEntryMetadata(context.Background(), manifest.TransferID, directoryMetadataPaths(manifest, dirs))
+	if err != nil {
+		return fmt.Errorf("remote metadata fetch failed: %w", err)
+	}
+	for fileID, meta := range metaByID {
+		label := labels[fileID]
+		if err := verifyLocalPathMetadata(label, localPaths[fileID], meta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyLocalPathMetadata(label string, path string, remote *tx.FileTrailerMetadata) error {
+	if remote == nil {
+		return fmt.Errorf("%s: missing remote metadata", label)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("%s: stat local path: %w", label, err)
+	}
+	local := encoding.CollectFileFrameMetadata(path, info)
+	if remote.Mode != "" && remote.Mode != local.Mode {
+		return fmt.Errorf("%s: mode mismatch local=%s remote=%s", label, local.Mode, remote.Mode)
+	}
+	if remote.MtimeNS > 0 && remote.MtimeNS != local.MtimeNS {
+		return fmt.Errorf("%s: mtime mismatch local=%d remote=%d", label, local.MtimeNS, remote.MtimeNS)
+	}
+	if remote.UID != "" && remote.UID != local.UID {
+		return fmt.Errorf("%s: uid mismatch local=%s remote=%s", label, local.UID, remote.UID)
+	}
+	if remote.GID != "" && remote.GID != local.GID {
+		return fmt.Errorf("%s: gid mismatch local=%s remote=%s", label, local.GID, remote.GID)
+	}
+	return nil
 }
 
 func formatVerifyDataSummaryLine(files int, samples int, pct int, budget time.Duration, elapsed time.Duration, partial bool) string {

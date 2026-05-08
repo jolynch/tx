@@ -131,7 +131,8 @@ Creates a transfer and streams a manifest.
 
 ## SEND
 
-Streams one or more file windows as `FX/1` frames.
+Streams one or more file windows as `FX/1` frames. Directory entries use the
+same command for metadata-only responses.
 
 ### Request
 
@@ -149,6 +150,10 @@ Streams one or more file windows as `FX/1` frames.
 - in `adapt`, server may emit different per-frame `comp` values as it adjusts compression.
 - unknown compression values are rejected with `ERR UNSUPPORTED_COMP ...`.
 - each `<path>` is quoted or length-prefixed.
+- directory entries must request `offset=0` and omit `size`; they return one
+  empty frame plus terminal metadata trailer.
+- the transfer root is manifest entry `D0` and may be requested for metadata
+  with `fid=0` and the root path itself.
 - unknown `key=value` fields are ignored.
 
 ### Response

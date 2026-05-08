@@ -45,7 +45,7 @@ func transferToStatus(id string, transfer Transfer) encoding.TransferStatus {
 		if i < len(transfer.EntryType) {
 			entryType = transfer.EntryType[i]
 		}
-		if i >= transfer.NumEntries || !isStatusFileEntryType(entryType) {
+		if !isStatusFileEntryType(entryType) {
 			continue
 		}
 		switch s {

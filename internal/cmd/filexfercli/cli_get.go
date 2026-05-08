@@ -259,7 +259,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 
 	downloadBatchResp, err := client.GetFiles(transferCtx, tx.GetFilesRequest{
 		Manifest:           manifest,
-		FileIDs:            []uint64{0},
+		FileIDs:            []uint64{entry.ID},
 		BatchMaxBytes:      batchSize,
 		SplitWindowWorkers: batchPlan.SplitWindowWorkers,
 		OutputWriter:       outputWriter,
@@ -279,6 +279,6 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintf(stderr, "get failed: %v\n", err)
 		return 1
 	}
-	printFileMetrics(stdout, manifest.TransferID, 0, outputPath, downloadResp.Meta, downloadResp.LocalFileHash, elapsed)
+	printFileMetrics(stdout, manifest.TransferID, entry.ID, outputPath, downloadResp.Meta, downloadResp.LocalFileHash, elapsed)
 	return 0
 }

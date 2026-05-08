@@ -63,6 +63,7 @@ const defaultSyncfsTimeout = 10 * time.Second
 const fixedWidthProgressBytesWidth = 10
 const fixedWidthProgressRateWidth = 13
 const maxTransferErrorLines = 5
+const maxMetadataWarningLines = 10
 
 var transferProbeRefreshInterval = defaultTransferProbeRefreshInterval
 var verifyBudgetGracePeriod = 10 * time.Second
@@ -459,6 +460,78 @@ func printTransferErrors(stderr io.Writer, phase string, errs []error, verbosity
 	}
 }
 
+type metadataMirrorFailure struct {
+	Kind      string
+	EntryType byte
+	Path      string
+	Err       error
+}
+
+func (f metadataMirrorFailure) Error() string {
+	if f.Path == "" {
+		return fmt.Sprintf("%s: %v", f.Kind, f.Err)
+	}
+	return fmt.Sprintf("%s %s: %v", f.Kind, f.Path, f.Err)
+}
+
+type metadataFailureCollector struct {
+	mu       sync.Mutex
+	failures []metadataMirrorFailure
+}
+
+func (c *metadataFailureCollector) add(kind string, entryType byte, path string, err error) {
+	if c == nil || err == nil {
+		return
+	}
+	c.mu.Lock()
+	c.failures = append(c.failures, metadataMirrorFailure{
+		Kind:      kind,
+		EntryType: entryType,
+		Path:      path,
+		Err:       err,
+	})
+	c.mu.Unlock()
+}
+
+func (c *metadataFailureCollector) snapshot() []metadataMirrorFailure {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]metadataMirrorFailure(nil), c.failures...)
+}
+
+func printMetadataMirrorWarnings(stderr io.Writer, label string, failures []metadataMirrorFailure, verbosity int) {
+	if stderr == nil || len(failures) == 0 {
+		return
+	}
+	if verbosity >= 2 || len(failures) <= maxMetadataWarningLines {
+		for _, failure := range failures {
+			fmt.Fprintf(stderr, "WARN %s: %v\n", label, failure)
+		}
+		return
+	}
+	if len(failures) > maxMetadataWarningLines {
+		var files, dirs, hardlinks, symlinks, other int
+		for _, failure := range failures {
+			switch failure.EntryType {
+			case encoding.EntryTypeDir:
+				dirs++
+			case encoding.EntryTypeHard:
+				hardlinks++
+			case encoding.EntryTypeSymlink:
+				symlinks++
+			case 0, encoding.EntryTypeFile:
+				files++
+			default:
+				other++
+			}
+		}
+		fmt.Fprintf(stderr, "WARN %s: %d metadata failures (files=%d dirs=%d hardlinks=%d symlinks=%d other=%d)\n", label, len(failures), files, dirs, hardlinks, symlinks, other)
+	}
+}
+
 type manifestDelta struct {
 	newFiles       []tx.ManifestEntry
 	staleFiles     []tx.ManifestEntry
@@ -796,8 +869,9 @@ func separateEntriesByType(entries []tx.ManifestEntry) (files, hardlinks, symlin
 	return
 }
 
-// applyNonFileEntries creates hardlinks, symlinks, and applies directory metadata
-// after all file data has been downloaded. Returns any errors encountered.
+// applyNonFileEntries creates hardlinks, symlinks, and directories after all
+// file data has been downloaded. Directory ownership/mode/mtime is applied by
+// applyRemoteDirectoryMetadata after the full tree shape exists.
 func applyNonFileEntries(allEntries []tx.ManifestEntry, hardlinks, symlinks, dirs []tx.ManifestEntry, outRoot string) []error {
 	var errs []error
 
@@ -839,26 +913,71 @@ func applyNonFileEntries(allEntries []tx.ManifestEntry, hardlinks, symlinks, dir
 		}
 	}
 
-	// 3. Directories — apply permissions and mtime last, since writing files
-	// changes directory mtime. Process in reverse depth order (deepest first)
-	// so parent mtime isn't overwritten by child dir metadata application.
-	sort.Slice(dirs, func(i, j int) bool {
-		return len(dirs[i].Path) > len(dirs[j].Path)
-	})
+	// 3. Directories — create the tree shape. Final metadata is fetched from
+	// SEND trailers and applied after all directories exist.
 	for _, de := range dirs {
 		dstPath := filepath.Join(outRoot, filepath.FromSlash(de.Path))
 		if err := os.MkdirAll(dstPath, 0o755); err != nil {
 			errs = append(errs, fmt.Errorf("dir %s: mkdir: %w", de.Path, err))
 			continue
 		}
-		os.Chmod(dstPath, de.Mode.Perm())
-		if de.Mtime > 0 {
-			mt := time.Unix(0, de.Mtime)
-			os.Chtimes(dstPath, mt, mt)
-		}
 	}
 
 	return errs
+}
+
+func applyRemoteDirectoryMetadata(ctx context.Context, client *tx.Client, manifest *tx.Manifest, dirs []tx.ManifestEntry, outRoot string) []error {
+	if client == nil || manifest == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := os.MkdirAll(outRoot, 0o755); err != nil {
+		return []error{fmt.Errorf("root %s: mkdir: %w", outRoot, err)}
+	}
+
+	metaByID, err := client.GetEntryMetadata(ctx, manifest.TransferID, directoryMetadataPaths(manifest, dirs))
+	if err != nil {
+		return []error{fmt.Errorf("directory metadata fetch failed: %w", err)}
+	}
+
+	var errs []error
+	dirsToApply := append([]tx.ManifestEntry(nil), dirs...)
+	sort.Slice(dirsToApply, func(i, j int) bool {
+		return len(dirsToApply[i].Path) > len(dirsToApply[j].Path)
+	})
+	for _, de := range dirsToApply {
+		meta := metaByID[de.ID]
+		if meta == nil {
+			errs = append(errs, fmt.Errorf("dir %s: missing remote metadata", de.Path))
+			continue
+		}
+		dstPath := filepath.Join(outRoot, filepath.FromSlash(de.Path))
+		if err := applyTrailerMetadataToPath(dstPath, meta); err != nil {
+			errs = append(errs, fmt.Errorf("dir %s: apply metadata: %w", de.Path, err))
+		}
+	}
+	if meta := metaByID[tx.RootFileID]; meta != nil {
+		if err := applyTrailerMetadataToPath(outRoot, meta); err != nil {
+			errs = append(errs, fmt.Errorf("root %s: apply metadata: %w", outRoot, err))
+		}
+	} else {
+		errs = append(errs, fmt.Errorf("root %s: missing remote metadata", outRoot))
+	}
+	return errs
+}
+
+func directoryMetadataPaths(manifest *tx.Manifest, dirs []tx.ManifestEntry) map[uint64]string {
+	if manifest == nil {
+		return nil
+	}
+	paths := make(map[uint64]string, len(dirs)+1)
+	paths[tx.RootFileID] = filepath.Clean(manifest.Root)
+	for _, de := range dirs {
+		paths[de.ID] = filepath.Clean(filepath.Join(manifest.Root, filepath.FromSlash(de.Path)))
+	}
+	return paths
 }
 
 func resolveDownloadDestinationPath(entry tx.ManifestEntry, outRoot string, outFile string) string {
@@ -1555,13 +1674,31 @@ func applyTrailerMetadataToPath(path string, meta *tx.FileTrailerMetadata) error
 	}
 	defer fd.Close()
 
+	uidRaw := strings.TrimSpace(meta.UID)
+	gidRaw := strings.TrimSpace(meta.GID)
+	if uidRaw != "" || gidRaw != "" {
+		if uidRaw == "" || gidRaw == "" {
+			return errors.New("trailer uid/gid must both be set")
+		}
+		uid, err := strconv.Atoi(uidRaw)
+		if err != nil {
+			return fmt.Errorf("invalid trailer uid %q: %w", uidRaw, err)
+		}
+		gid, err := strconv.Atoi(gidRaw)
+		if err != nil {
+			return fmt.Errorf("invalid trailer gid %q: %w", gidRaw, err)
+		}
+		if err := fd.Chown(uid, gid); err != nil {
+			return fmt.Errorf("chown destination uid=%d gid=%d: %w", uid, gid, err)
+		}
+	}
 	modeRaw := strings.TrimSpace(meta.Mode)
 	if modeRaw != "" {
 		modeBits, err := strconv.ParseUint(modeRaw, 8, 32)
 		if err != nil || modeBits > 0o7777 {
 			return fmt.Errorf("invalid trailer mode %q", modeRaw)
 		}
-		if err := fd.Chmod(os.FileMode(modeBits)); err != nil {
+		if err := fd.Chmod(unixModeBitsToFileMode(modeBits)); err != nil {
 			return fmt.Errorf("chmod destination to %s: %w", modeRaw, err)
 		}
 	}
@@ -1571,26 +1708,21 @@ func applyTrailerMetadataToPath(path string, meta *tx.FileTrailerMetadata) error
 			return fmt.Errorf("set destination mtime to %d: %w", meta.MtimeNS, err)
 		}
 	}
-	uidRaw := strings.TrimSpace(meta.UID)
-	gidRaw := strings.TrimSpace(meta.GID)
-	if uidRaw == "" && gidRaw == "" {
-		return nil
-	}
-	if uidRaw == "" || gidRaw == "" {
-		return errors.New("trailer uid/gid must both be set")
-	}
-	uid, err := strconv.Atoi(uidRaw)
-	if err != nil {
-		return fmt.Errorf("invalid trailer uid %q: %w", uidRaw, err)
-	}
-	gid, err := strconv.Atoi(gidRaw)
-	if err != nil {
-		return fmt.Errorf("invalid trailer gid %q: %w", gidRaw, err)
-	}
-	if err := fd.Chown(uid, gid); err != nil {
-		return fmt.Errorf("chown destination uid=%d gid=%d: %w", uid, gid, err)
-	}
 	return nil
+}
+
+func unixModeBitsToFileMode(bits uint64) os.FileMode {
+	mode := os.FileMode(bits & 0o777)
+	if bits&0o4000 != 0 {
+		mode |= os.ModeSetuid
+	}
+	if bits&0o2000 != 0 {
+		mode |= os.ModeSetgid
+	}
+	if bits&0o1000 != 0 {
+		mode |= os.ModeSticky
+	}
+	return mode
 }
 
 type verboseProgressReporter struct {

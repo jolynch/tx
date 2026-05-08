@@ -56,7 +56,7 @@ func CollectFileFrameMetadata(path string, info os.FileInfo) FileFrameMetadata {
 	meta := FileFrameMetadata{
 		Size:    info.Size(),
 		MtimeNS: info.ModTime().UnixNano(),
-		Mode:    fmt.Sprintf("%04o", info.Mode().Perm()|(info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky))),
+		Mode:    FormatManifestMode(info.Mode()),
 		UID:     "unknown",
 		GID:     "unknown",
 		User:    "unknown",

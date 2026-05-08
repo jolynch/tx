@@ -477,6 +477,11 @@ func parseSYNCResponseEntries(raw string, _ map[uint64]string) ([]encoding.Manif
 		if err != nil {
 			continue
 		}
+		if entry.ID == encoding.RootFileID && entry.Type == encoding.EntryTypeDir && filepath.IsAbs(entry.Path) {
+			prevPath = nextPath
+			prevMtime = nextMtime
+			continue
+		}
 		entries = append(entries, entry)
 		prevPath = nextPath
 		prevMtime = nextMtime
@@ -490,7 +495,6 @@ func fuzzBuildManifestFromEntries(t *testing.T, root string, entries []encoding.
 	var b strings.Builder
 	hdr := encoding.FormatManifestHeader(encoding.ManifestHeader{
 		TransferID:  "fuzz-tx",
-		Root:        root,
 		Mode:        "fast",
 		LinkMbps:    1000,
 		Concurrency: 8,
@@ -499,6 +503,15 @@ func fuzzBuildManifestFromEntries(t *testing.T, root string, entries []encoding.
 	b.WriteByte('\n')
 	prevPath := ""
 	prevMtime := ""
+	rootEntry := encoding.ManifestEntry{Type: encoding.EntryTypeDir, ID: encoding.RootFileID, Path: filepath.Clean(root), LinkTarget: -1}
+	rootLine, nextPath, nextMtime, err := encoding.MarshalManifestEntry(rootEntry, prevPath, prevMtime)
+	if err != nil {
+		t.Fatalf("marshal root entry: %v", err)
+	}
+	b.WriteString(rootLine)
+	b.WriteByte('\n')
+	prevPath = nextPath
+	prevMtime = nextMtime
 	for _, e := range entries {
 		line, nextPath, nextMtime, err := encoding.MarshalManifestEntry(e, prevPath, prevMtime)
 		if err != nil {

@@ -3,7 +3,6 @@ package ftcp
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"os"
@@ -202,31 +201,56 @@ func encodeSingleFileManifest(
 		return err
 	}
 
-	rootToken := fmt.Sprintf("%d:%s", len(root), root)
-	header := fmt.Sprintf(
-		"FM/1 %s %s mode=%s link-mbps=%d concurrency=%d",
-		transferID,
-		rootToken,
-		mode,
-		linkMbps,
-		concurrency,
-	)
-	if deadlineMS > 0 {
-		header += fmt.Sprintf(" deadline-ms=%d", deadlineMS)
-	}
+	header := encoding.FormatManifestHeader(encoding.ManifestHeader{
+		TransferID:  transferID,
+		Mode:        mode,
+		LinkMbps:    linkMbps,
+		Concurrency: concurrency,
+		DeadlineMS:  deadlineMS,
+	})
 	header += "\n"
 
 	if _, err := io.WriteString(w, header); err != nil {
 		return err
 	}
 
-	entryMtime := strconv.FormatInt(info.ModTime().UnixNano(), 10)
-	entryMode := encoding.FormatManifestMode(info.Mode())
-	pathToken := encoding.EncodePathToken("", filename)
-	mtimeToken, _ := encoding.EncodeMtimeToken("", entryMtime)
-	line := fmt.Sprintf("0 %d %s %s %s\n", info.Size(), mtimeToken, entryMode, pathToken)
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return err
+	}
+	rootEntry := encoding.ManifestEntry{
+		Type:       encoding.EntryTypeDir,
+		ID:         encoding.RootFileID,
+		Size:       0,
+		Mtime:      rootInfo.ModTime().UnixNano(),
+		Mode:       encoding.NormalizeManifestMode(rootInfo.Mode()),
+		Path:       filepath.Clean(root),
+		LinkTarget: -1,
+	}
+	rootLine, prevPath, prevMtime, err := encoding.MarshalManifestEntry(rootEntry, "", "")
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, rootLine+"\n"); err != nil {
+		return err
+	}
 
-	updatesCh := make(chan TransferFileStateUpdate, 1)
+	entry := encoding.ManifestEntry{
+		Type:       encoding.EntryTypeFile,
+		ID:         1,
+		Size:       info.Size(),
+		Mtime:      info.ModTime().UnixNano(),
+		Mode:       encoding.NormalizeManifestMode(info.Mode()),
+		Path:       filename,
+		LinkTarget: -1,
+	}
+	line, _, _, err := encoding.MarshalManifestEntry(entry, prevPath, prevMtime)
+	if err != nil {
+		return err
+	}
+	line += "\n"
+
+	updatesCh := make(chan TransferFileStateUpdate, 2)
 	done := deps.RegisterTransferFileState(transferID, updatesCh, TransferStateStarted)
 	closedUpdates := false
 	closeUpdates := func() {
@@ -242,7 +266,13 @@ func encodeSingleFileManifest(
 	}()
 
 	updatesCh <- TransferFileStateUpdate{
-		FileID:    0,
+		FileID:    encoding.RootFileID,
+		EntryType: encoding.EntryTypeDir,
+		PathHash:  xxh3.Hash128([]byte(filepath.Clean(root))),
+		FileSize:  0,
+	}
+	updatesCh <- TransferFileStateUpdate{
+		FileID:    entry.ID,
 		EntryType: encoding.EntryTypeFile,
 		PathHash:  xxh3.Hash128([]byte(filepath.Clean(fullPath))),
 		FileSize:  info.Size(),
@@ -268,18 +298,13 @@ func encodeManifest(
 	verbose bool,
 	deps Deps,
 ) error {
-	rootToken := fmt.Sprintf("%d:%s", len(root), root)
-	header := fmt.Sprintf(
-		"FM/1 %s %s mode=%s link-mbps=%d concurrency=%d",
-		transferID,
-		rootToken,
-		mode,
-		linkMbps,
-		concurrency,
-	)
-	if deadlineMS > 0 {
-		header += fmt.Sprintf(" deadline-ms=%d", deadlineMS)
-	}
+	header := encoding.FormatManifestHeader(encoding.ManifestHeader{
+		TransferID:  transferID,
+		Mode:        mode,
+		LinkMbps:    linkMbps,
+		Concurrency: concurrency,
+		DeadlineMS:  deadlineMS,
+	})
 	header += "\n"
 	if maxChunkSize > 0 && len(header) > maxChunkSize {
 		return errors.New("max-manifest-chunk-size is too small for header")
@@ -302,7 +327,11 @@ func encodeManifest(
 	defer func() {
 		closeUpdates()
 	}()
-	fileID := 0
+	fileID := uint64(1)
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return err
+	}
 
 	startChunk := func() error {
 		if _, err := io.WriteString(w, header); err != nil {
@@ -317,7 +346,38 @@ func encodeManifest(
 		return err
 	}
 
+	rootEntry := encoding.ManifestEntry{
+		Type:       encoding.EntryTypeDir,
+		ID:         encoding.RootFileID,
+		Size:       0,
+		Mtime:      rootInfo.ModTime().UnixNano(),
+		Mode:       encoding.NormalizeManifestMode(rootInfo.Mode()),
+		Path:       filepath.Clean(root),
+		LinkTarget: -1,
+	}
+	rootLine, nextPath, nextMtime, err := encoding.MarshalManifestEntry(rootEntry, prevPath, prevMtime)
+	if err != nil {
+		return err
+	}
+	rootLine += "\n"
+	if maxChunkSize > 0 && chunkBytes+len(rootLine) > maxChunkSize {
+		return errors.New("max-manifest-chunk-size is too small for root manifest entry")
+	}
+	updatesCh <- TransferFileStateUpdate{
+		FileID:    encoding.RootFileID,
+		EntryType: encoding.EntryTypeDir,
+		PathHash:  xxh3.Hash128([]byte(filepath.Clean(root))),
+		FileSize:  0,
+	}
+	if _, err := io.WriteString(w, rootLine); err != nil {
+		return err
+	}
+	chunkBytes += len(rootLine)
+	prevPath = nextPath
+	prevMtime = nextMtime
+
 	emitEntry := func(entry encoding.ManifestEntry) error {
+		entry.ID = fileID
 		prevP := prevPath
 		prevM := prevMtime
 		if verbose {
@@ -352,7 +412,7 @@ func encodeManifest(
 
 		fullPath := filepath.Clean(filepath.Join(root, entry.Path))
 		updatesCh <- TransferFileStateUpdate{
-			FileID:    uint64(fileID),
+			FileID:    entry.ID,
 			EntryType: entry.Type,
 			PathHash:  xxh3.Hash128([]byte(fullPath)),
 			FileSize:  entry.Size,
@@ -367,7 +427,7 @@ func encodeManifest(
 		return nil
 	}
 
-	err := encoding.WalkManifestEntries(root, func(result encoding.WalkResult) error {
+	err = encoding.WalkManifestEntries(root, func(result encoding.WalkResult) error {
 		return emitEntry(result.Entry)
 	})
 	if err != nil {

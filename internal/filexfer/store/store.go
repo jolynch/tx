@@ -84,6 +84,7 @@ type FileRef struct {
 	Path       string
 	Directory  string
 	FileSize   int64
+	EntryType  byte
 }
 
 type FileLookupError struct {
@@ -476,11 +477,12 @@ func (s *transferStore) appendFileStates(txferID string, updates []TransferFileS
 
 	for _, update := range updates {
 		idx := int(update.FileID)
+		oldLen := len(managed.transfer.State)
 		ensureLen(idx + 1)
 
-		wasRegularFile := idx < managed.transfer.NumEntries && isRegularFileEntryType(managed.transfer.EntryType[idx])
-		if idx+1 > managed.transfer.NumEntries {
-			managed.transfer.NumEntries = idx + 1
+		wasRegularFile := idx < oldLen && isRegularFileEntryType(managed.transfer.EntryType[idx])
+		if update.FileID != intencoding.RootFileID && idx >= oldLen {
+			managed.transfer.NumEntries++
 		}
 		managed.transfer.EntryType[idx] = update.EntryType
 		isRegularFile := isRegularFileEntryType(update.EntryType)
@@ -712,13 +714,31 @@ func (s *transferStore) resolveFileRef(txferID string, fileID uint64, fullPathRa
 		managed.mu.RUnlock()
 		return FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "transfer not found"}
 	}
+	directory := managed.transfer.Directory
+	if fileID == intencoding.RootFileID {
+		managed.mu.RUnlock()
+		if fullPath != filepath.Clean(directory) {
+			return FileRef{}, &FileLookupError{Code: http.StatusForbidden, Msg: "root metadata path must equal transfer root"}
+		}
+		return FileRef{
+			TransferID: txferID,
+			FileID:     fileID,
+			Path:       fullPath,
+			Directory:  directory,
+			FileSize:   0,
+			EntryType:  intencoding.EntryTypeDir,
+		}, nil
+	}
 	if fileID >= uint64(len(managed.transfer.State)) {
 		managed.mu.RUnlock()
 		return FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "file id out of range"}
 	}
-	directory := managed.transfer.Directory
 	expectedDigest := managed.transfer.PathHash[fileID]
 	fileSize := managed.transfer.FileSize[fileID]
+	entryType := byte(intencoding.EntryTypeFile)
+	if fileID < uint64(len(managed.transfer.EntryType)) && managed.transfer.EntryType[fileID] != 0 {
+		entryType = managed.transfer.EntryType[fileID]
+	}
 	managed.mu.RUnlock()
 
 	if !pathWithinRoot(directory, fullPath) {
@@ -736,6 +756,7 @@ func (s *transferStore) resolveFileRef(txferID string, fileID uint64, fullPathRa
 		Path:       fullPath,
 		Directory:  directory,
 		FileSize:   fileSize,
+		EntryType:  entryType,
 	}, nil
 }
 

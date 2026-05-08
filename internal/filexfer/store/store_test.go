@@ -90,9 +90,9 @@ func TestRegisterTransferFileStateMixedEntriesTrackAckableFiles(t *testing.T) {
 		t.Fatalf("NewTransfer returned error: %v", err)
 	}
 	RegisterTransferFileStates(transfer.ID, []TransferFileStateUpdate{
-		{FileID: 0, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/file")), FileSize: 10},
-		{FileID: 1, EntryType: encoding.EntryTypeDir, PathHash: xxh3.Hash128([]byte("/tmp/x/sub")), FileSize: 0},
-		{FileID: 2, EntryType: encoding.EntryTypeSymlink, PathHash: xxh3.Hash128([]byte("/tmp/x/link")), FileSize: 0},
+		{FileID: 1, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/file")), FileSize: 10},
+		{FileID: 2, EntryType: encoding.EntryTypeDir, PathHash: xxh3.Hash128([]byte("/tmp/x/sub")), FileSize: 0},
+		{FileID: 3, EntryType: encoding.EntryTypeSymlink, PathHash: xxh3.Hash128([]byte("/tmp/x/link")), FileSize: 0},
 	}, TransferStateStarted)
 
 	stored := waitForTransferState(t, transfer.ID, func(stored Transfer) bool {
@@ -101,7 +101,7 @@ func TestRegisterTransferFileStateMixedEntriesTrackAckableFiles(t *testing.T) {
 	if stored.NumEntries != 3 || stored.NumFiles != 1 {
 		t.Fatalf("unexpected counts: entries=%d files=%d", stored.NumEntries, stored.NumFiles)
 	}
-	if stored.EntryType[0] != encoding.EntryTypeFile || stored.EntryType[1] != encoding.EntryTypeDir || stored.EntryType[2] != encoding.EntryTypeSymlink {
+	if stored.EntryType[1] != encoding.EntryTypeFile || stored.EntryType[2] != encoding.EntryTypeDir || stored.EntryType[3] != encoding.EntryTypeSymlink {
 		t.Fatalf("unexpected entry types: %q", string(stored.EntryType))
 	}
 }
@@ -394,9 +394,9 @@ func TestMaybeLogTransferCompleteLogsForMixedEntries(t *testing.T) {
 		t.Fatalf("NewTransfer returned error: %v", err)
 	}
 	RegisterTransferFileStates(transfer.ID, []TransferFileStateUpdate{
-		{FileID: 0, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/file")), FileSize: 10},
-		{FileID: 1, EntryType: encoding.EntryTypeDir, PathHash: xxh3.Hash128([]byte("/tmp/x/sub")), FileSize: 0},
-		{FileID: 2, EntryType: encoding.EntryTypeSymlink, PathHash: xxh3.Hash128([]byte("/tmp/x/link")), FileSize: 0},
+		{FileID: 1, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/file")), FileSize: 10},
+		{FileID: 2, EntryType: encoding.EntryTypeDir, PathHash: xxh3.Hash128([]byte("/tmp/x/sub")), FileSize: 0},
+		{FileID: 3, EntryType: encoding.EntryTypeSymlink, PathHash: xxh3.Hash128([]byte("/tmp/x/link")), FileSize: 0},
 	}, TransferStateStarted)
 
 	var buf bytes.Buffer
@@ -412,7 +412,7 @@ func TestMaybeLogTransferCompleteLogsForMixedEntries(t *testing.T) {
 	if ok := ClipTransfer(transfer.ID); !ok {
 		t.Fatalf("ClipTransfer returned false")
 	}
-	if ok := AcknowledgeTransferFile(transfer.ID, 0, 10); !ok {
+	if ok := AcknowledgeTransferFile(transfer.ID, 1, 10); !ok {
 		t.Fatalf("AcknowledgeTransferFile returned false")
 	}
 	MaybeLogTransferComplete(transfer.ID)
@@ -766,15 +766,16 @@ func setupLookupFixture(t *testing.T, fileName string, content []byte) (string, 
 			t.Fatalf("write fixture file: %v", err)
 		}
 	}
-	transfer, err := NewTransfer(root, 1, int64(len(content)))
+	transfer, err := NewTransfer(root, 0, int64(len(content)))
 	if err != nil {
 		t.Fatalf("NewTransfer failed: %v", err)
 	}
 	RegisterTransferFileStates(transfer.ID, []TransferFileStateUpdate{
 		{
-			FileID:   0,
-			PathHash: xxh3.Hash128([]byte(filepath.Clean(fullPath))),
-			FileSize: int64(len(content)),
+			FileID:    1,
+			EntryType: encoding.EntryTypeFile,
+			PathHash:  xxh3.Hash128([]byte(filepath.Clean(fullPath))),
+			FileSize:  int64(len(content)),
 		},
 	}, TransferStateStarted)
 	return transfer.ID, fullPath
@@ -804,17 +805,33 @@ func TestGetFileRefTransferNotFound(t *testing.T) {
 func TestGetFileRefFileIDOutOfRange(t *testing.T) {
 	resetTransferStore()
 	txferID, fullPath := setupLookupFixture(t, "a.txt", []byte("hello"))
-	_, err := GetFileRef(txferID, 1, fullPath)
+	_, err := GetFileRef(txferID, 2, fullPath)
 	lookupErr := mustLookupErr(t, err)
 	if lookupErr.Code != http.StatusNotFound || lookupErr.Msg != "file id out of range" {
 		t.Fatalf("unexpected lookup error: %+v", lookupErr)
 	}
 }
 
+func TestGetFileRefRootMetadataIDAllowsTransferRoot(t *testing.T) {
+	resetTransferStore()
+	txferID, fullPath := setupLookupFixture(t, "a.txt", []byte("hello"))
+	root := filepath.Dir(fullPath)
+	ref, err := GetFileRef(txferID, encoding.RootFileID, root)
+	if err != nil {
+		t.Fatalf("GetFileRef root metadata failed: %v", err)
+	}
+	if ref.Path != filepath.Clean(root) {
+		t.Fatalf("root ref path = %q, want %q", ref.Path, filepath.Clean(root))
+	}
+	if ref.EntryType != encoding.EntryTypeDir {
+		t.Fatalf("root ref entry type = %q, want dir", ref.EntryType)
+	}
+}
+
 func TestGetFileRefRejectsNonAbsolutePath(t *testing.T) {
 	resetTransferStore()
 	txferID, _ := setupLookupFixture(t, "a.txt", []byte("hello"))
-	_, err := GetFileRef(txferID, 0, "a.txt")
+	_, err := GetFileRef(txferID, 1, "a.txt")
 	lookupErr := mustLookupErr(t, err)
 	if lookupErr.Code != http.StatusBadRequest || lookupErr.Msg != "path must be absolute" {
 		t.Fatalf("unexpected lookup error: %+v", lookupErr)
@@ -824,7 +841,7 @@ func TestGetFileRefRejectsNonAbsolutePath(t *testing.T) {
 func TestGetFileRefRejectsOutsideRoot(t *testing.T) {
 	resetTransferStore()
 	txferID, _ := setupLookupFixture(t, "a.txt", []byte("hello"))
-	_, err := GetFileRef(txferID, 0, "/tmp/not-in-root.txt")
+	_, err := GetFileRef(txferID, 1, "/tmp/not-in-root.txt")
 	lookupErr := mustLookupErr(t, err)
 	if lookupErr.Code != http.StatusForbidden || lookupErr.Msg != "path must be within transfer root" {
 		t.Fatalf("unexpected lookup error: %+v", lookupErr)
@@ -835,7 +852,7 @@ func TestGetFileRefRejectsDigestMismatch(t *testing.T) {
 	resetTransferStore()
 	txferID, fullPath := setupLookupFixture(t, "a.txt", []byte("hello"))
 	altPath := filepath.Join(filepath.Dir(fullPath), "b.txt")
-	_, err := GetFileRef(txferID, 0, altPath)
+	_, err := GetFileRef(txferID, 1, altPath)
 	lookupErr := mustLookupErr(t, err)
 	if lookupErr.Code != http.StatusForbidden || lookupErr.Msg != "file path digest mismatch" {
 		t.Fatalf("unexpected lookup error: %+v", lookupErr)
@@ -845,7 +862,7 @@ func TestGetFileRefRejectsDigestMismatch(t *testing.T) {
 func TestGetFileReturnsNotFoundWhenMissing(t *testing.T) {
 	resetTransferStore()
 	txferID, fullPath := setupLookupFixture(t, "missing.txt", nil)
-	fd, _, err := GetFile(txferID, 0, fullPath)
+	fd, _, err := GetFile(txferID, 1, fullPath)
 	if fd != nil {
 		_ = fd.Close()
 		t.Fatalf("expected nil fd for missing file")
@@ -859,12 +876,12 @@ func TestGetFileReturnsNotFoundWhenMissing(t *testing.T) {
 func TestGetFileSuccess(t *testing.T) {
 	resetTransferStore()
 	txferID, fullPath := setupLookupFixture(t, "a.txt", []byte("hello"))
-	fd, ref, err := GetFile(txferID, 0, fullPath)
+	fd, ref, err := GetFile(txferID, 1, fullPath)
 	if err != nil {
 		t.Fatalf("GetFile failed: %v", err)
 	}
 	defer fd.Close()
-	if ref.TransferID != txferID || ref.FileID != 0 {
+	if ref.TransferID != txferID || ref.FileID != 1 {
 		t.Fatalf("unexpected ref IDs: %+v", ref)
 	}
 	if ref.Path != filepath.Clean(fullPath) {

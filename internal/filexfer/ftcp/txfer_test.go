@@ -189,6 +189,26 @@ func TestEncodeManifestHardlinks(t *testing.T) {
 	}
 }
 
+func TestEncodeManifestEmitsD0RootEntry(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "a.txt", "hello")
+
+	raw := runTXFERTest(t, root)
+	lines := strings.Split(strings.TrimSpace(raw), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("expected header, root, and file lines, got %q", raw)
+	}
+	if strings.Contains(lines[0], ":/") {
+		t.Fatalf("header should not contain root token: %q", lines[0])
+	}
+	if !strings.HasPrefix(lines[1], "D0 0 ") || !strings.Contains(lines[1], ":"+root) {
+		t.Fatalf("expected D0 absolute root line, got %q", lines[1])
+	}
+	if !strings.HasPrefix(lines[2], "F1 ") {
+		t.Fatalf("expected first child to use id 1, got %q", lines[2])
+	}
+}
+
 func TestEncodeManifestSymlinks(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, root, "a.txt", "hello")

@@ -40,6 +40,7 @@ type syncArgs struct {
 	traceFile           string
 	progressTargets     []filexfer.ProgressTarget
 	progressInterval    time.Duration
+	metadataFailures    *metadataFailureCollector
 }
 
 func confirmSyncProceed(stderr io.Writer, newCount int, staleCount int, rmCount int) bool {
@@ -503,7 +504,12 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			OnFileDone: func(evt tx.StartFileDoneEvent) {
 				entry, ok := entryByID[evt.File.Meta.FileID]
 				if !ok {
-					recordFailure(fmt.Errorf("id=%d metadata apply failed: file id not in manifest", evt.File.Meta.FileID))
+					err := fmt.Errorf("id=%d metadata apply failed: file id not in manifest", evt.File.Meta.FileID)
+					if cfg.metadataFailures != nil {
+						cfg.metadataFailures.add("metadata apply", encoding.EntryTypeFile, "", err)
+					} else {
+						recordFailure(err)
+					}
 					return
 				}
 				destPath := resolveDownloadDestinationPath(entry, outRoot, "")
@@ -511,7 +517,12 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 					destPath = os.DevNull
 				}
 				if err := applyDownloadedTrailerMetadata(destPath, evt.File.Meta.TrailerMetadata); err != nil {
-					recordFailure(fmt.Errorf("id=%d metadata apply failed: %w", evt.File.Meta.FileID, err))
+					err = fmt.Errorf("id=%d metadata apply failed: %w", evt.File.Meta.FileID, err)
+					if cfg.metadataFailures != nil {
+						cfg.metadataFailures.add("metadata apply", entry.Type, destPath, err)
+					} else {
+						recordFailure(err)
+					}
 					return
 				}
 				persistFileDone(evt.File.Meta.FileID, entry.Size)
@@ -553,6 +564,14 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		if !cfg.skipWrite {
 			for _, nfErr := range applyNonFileEntries(mergedManifest.Entries, pendingWork.hardlinks, pendingWork.symlinks, pendingWork.dirs, outRoot) {
 				recordFailure(nfErr)
+			}
+			_, _, _, allDirs := separateEntriesByType(mergedManifest.Entries)
+			for _, metaErr := range applyRemoteDirectoryMetadata(context.Background(), client, mergedManifest, allDirs, outRoot) {
+				if cfg.metadataFailures != nil {
+					cfg.metadataFailures.add("metadata apply", encoding.EntryTypeDir, "", metaErr)
+				} else {
+					recordFailure(metaErr)
+				}
 			}
 		}
 
