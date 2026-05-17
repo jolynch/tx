@@ -2,6 +2,7 @@ package filexfercli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/fsync"
+	"github.com/jolynch/tx/internal/pagecache"
 )
 
 func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -46,7 +48,9 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var progressFilePaths []string
 	var progressFormats []string
 	var progressIntervalRaw string
-	var withPageCache bool
+	var cacheLoadRaw string
+	var cacheLoadEnabled bool
+	var cacheLoadBudget time.Duration
 	cf.StringVar(&outFile, "o", "", "", "Output file path, or '-' for stdout")
 	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&keysDir, "k", "keys", "", "Persistent age keys directory (default: ephemeral)")
@@ -62,10 +66,11 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	cf.StringSliceVar(&progressFilePaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
 	cf.StringSliceVar(&progressFormats, "f", "progress-format", "Progress format: json|int; 1 applies to all targets, or one per target (default json)")
 	cf.StringVar(&progressIntervalRaw, "", "progress-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
+	cacheLoadRaw = "none"
+	cf.StringVar(&cacheLoadRaw, "", "cache-load", cacheLoadRaw, "Load downloaded file into page cache after success: none|full|<duration> (default none)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
 	cf.StringVar(&deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
-	cf.BoolVar(&withPageCache, "", "with-cache-map", false, "Request page-cache residency hint per file (Linux only)")
 	cf.StringVar(&traceFile, "", "trace", "", "Write runtime/trace output to this file")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -83,6 +88,15 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	if !filepath.IsAbs(remotePath) {
 		fmt.Fprintln(stderr, "get requires REMOTE_PATH to be an absolute server path")
 		return 2
+	}
+	{
+		enabled, budget, err := parseCacheLoadFlag(cacheLoadRaw)
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid --cache-load: %v\n", err)
+			return 2
+		}
+		cacheLoadEnabled = enabled
+		cacheLoadBudget = budget
 	}
 	progressInterval, err := time.ParseDuration(progressIntervalRaw)
 	if err != nil {
@@ -162,7 +176,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		LinkMbps:      0,
 		Concurrency:   effectiveConcurrency,
 		DeadlineMS:    deadlineMS,
-		WithPageCache: withPageCache,
+		PreserveCache: cacheLoadEnabled,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "get failed: %v\n", err)
@@ -282,6 +296,40 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		fmt.Fprintf(stderr, "get failed: %v\n", err)
 		return 1
 	}
+	if cacheLoadEnabled {
+		touchGetCache(outputPath, entry, cacheLoadBudget, stderr)
+	}
 	printFileMetrics(stdout, manifest.TransferID, entry.ID, outputPath, downloadResp.Meta, downloadResp.LocalFileHash, elapsed)
 	return 0
+}
+
+func touchGetCache(outputPath string, entry tx.ManifestEntry, cacheLoadBudget time.Duration, stderr io.Writer) {
+	if !pagecache.TouchSupported() || outputPath == "-" || outputPath == os.DevNull || len(entry.PageCache) == 0 {
+		return
+	}
+	ce := &pagecache.CacheEntry{}
+	if err := encoding.DecodePageCacheEntry(entry.PageCache, ce); err != nil || ce.Empty() {
+		return
+	}
+	budget := pagecache.SystemPageBudget(touchCacheReserveBytes)
+	ctx := context.Background()
+	cancel := func() {}
+	if cacheLoadBudget > 0 {
+		ctx, cancel = context.WithTimeout(ctx, cacheLoadBudget)
+	}
+	defer cancel()
+	start := time.Now()
+	touched, touchErr := pagecache.TouchEntries(ctx, func(yield func(pagecache.TouchEntry) bool) {
+		yield(pagecache.TouchEntry{Path: outputPath, Entry: ce})
+	}, budget, 1)
+	status := "[ok]"
+	budgetPart := ""
+	if errors.Is(touchErr, context.DeadlineExceeded) {
+		status = "[partial-ok]"
+		budgetPart = fmt.Sprintf(" budget=%s", cacheLoadBudget)
+	}
+	fmt.Fprintf(stderr,
+		"touch-cache: %s warmed=%d/1 budget-pages=%d total-pages=%d%s elapsed=%s\n",
+		status, touched, budget, ce.NumResidentPages(), budgetPart, time.Since(start).Round(time.Millisecond),
+	)
 }

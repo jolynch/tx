@@ -257,7 +257,7 @@ type ManifestEntry struct {
 	LinkTarget int64  // H: target file ID; -1 otherwise
 	LinkPath   string // S: symlink target path; "" otherwise
 	// PageCache is the optional encoded page-cache residency hint emitted
-	// by the server when WithPageCache was set on the manifest request.
+	// by the server when PreserveCache was set on the manifest request.
 	// Decode via internal/filexfer/encoding.DecodePageCacheEntry to recover a
 	// pagecache.CacheEntry usable for Touch.
 	PageCache []byte
@@ -376,10 +376,10 @@ type GetManifestRequest struct {
 	LinkMbps    int64
 	Concurrency int
 	DeadlineMS  int64
-	// WithPageCache, when true, asks the server to attach a per-file
+	// PreserveCache, when true, asks the server to attach a per-file
 	// page-cache residency hint to each manifest entry. Decode via
 	// encoding.DecodePageCacheEntry to recover a pagecache.CacheEntry.
-	WithPageCache bool
+	PreserveCache bool
 	// Comp selects the wire compression for the manifest stream. Empty
 	// defaults to "zstd". Use "none" for an uncompressed FM/1 response.
 	Comp string

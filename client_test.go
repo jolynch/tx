@@ -2888,6 +2888,52 @@ func TestGetManifestCompZstdStreamingFrames(t *testing.T) {
 	}
 }
 
+func TestGetManifestPreserveCacheSendsCacheMap(t *testing.T) {
+	m := &Manifest{
+		TransferID:  "tx-preserve-cache",
+		Root:        "/remote",
+		Mode:        "fast",
+		LinkMbps:    1000,
+		Concurrency: 4,
+		Entries: []ManifestEntry{
+			{Type: 'F', ID: 1, Size: 5, Mtime: 1000, Mode: 0o644, Path: "a.txt", LinkTarget: -1},
+		},
+	}
+	rawBody, err := MarshalManifest(m)
+	if err != nil {
+		t.Fatalf("MarshalManifest: %v", err)
+	}
+	var sawCacheMap atomic.Bool
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		if req.Verb != intftcp.VerbTXFER {
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+		if req.Params[0]["cache-map"] == "1" {
+			sawCacheMap.Store(true)
+		}
+		writeStreamingManifest(t, out, rawBody, intencoding.EncodingZstd, len(rawBody))
+		_, err := io.WriteString(out, "OK\r\n")
+		return err
+	})
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	defer client.Close()
+	if _, err := client.GetManifest(context.Background(), GetManifestRequest{
+		Directory:     "/remote",
+		Mode:          "fast",
+		LinkMbps:      1000,
+		Concurrency:   4,
+		PreserveCache: true,
+	}); err != nil {
+		t.Fatalf("GetManifest: %v", err)
+	}
+	if !sawCacheMap.Load() {
+		t.Fatalf("expected TXFER cache-map=1")
+	}
+}
+
 func TestGetManifestCompNoneStreamingFrames(t *testing.T) {
 	m := &Manifest{
 		TransferID:  "tx-none",

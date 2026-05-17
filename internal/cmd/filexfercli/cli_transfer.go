@@ -16,17 +16,17 @@ import (
 )
 
 type transferArgs struct {
-	sourceDir     string
-	targetDir     string
-	agePublicKey  string
-	ageIdentity   string
-	encMode       string
-	authTokens    []string
-	loadStrategy  string
-	probeBytes    int64
-	verbosity     int
-	deadlineMS    int64
-	withPageCache bool
+	sourceDir    string
+	targetDir    string
+	agePublicKey string
+	ageIdentity  string
+	encMode      string
+	authTokens   []string
+	loadStrategy string
+	probeBytes   int64
+	verbosity    int
+	deadlineMS   int64
+	cacheLoad    bool
 }
 
 func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -42,7 +42,6 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	var probeSizeRaw string
 	var verbose bool
 	var deadlineRaw string
-	var withPageCache bool
 	cf.StringVar(&sourceDir, "s", "source-directory", "", "Absolute source directory to transfer")
 	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&loadStrategyRaw, "", "load-strategy", tx.LoadStrategyFast, "Server load strategy (fast|gentle)")
@@ -50,7 +49,6 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	cf.StringVar(&probeSizeRaw, "", "probe-size", probeSizeRaw, "Probe payload size for transfer metadata; 1B, 4KiB, 8MiB")
 	cf.BoolVar(&verbose, "v", "verbose", false, "Disable front-coding")
 	cf.StringVar(&deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
-	cf.BoolVar(&withPageCache, "", "with-cache-map", false, "Request page-cache residency hint per file (Linux only)")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -98,16 +96,15 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		deadlineMS = d.Milliseconds()
 	}
 	return runTransfer(serverURL, transferArgs{
-		sourceDir:     sourceDir,
-		targetDir:     cf.Arg(0),
-		agePublicKey:  agePublicKey,
-		ageIdentity:   ageIdentity,
-		encMode:       resolvedEncMode,
-		loadStrategy:  loadStrategy,
-		probeBytes:    probeBytes,
-		verbosity:     verbosityFromFlags(false, verbose),
-		deadlineMS:    deadlineMS,
-		withPageCache: withPageCache,
+		sourceDir:    sourceDir,
+		targetDir:    cf.Arg(0),
+		agePublicKey: agePublicKey,
+		ageIdentity:  ageIdentity,
+		encMode:      resolvedEncMode,
+		loadStrategy: loadStrategy,
+		probeBytes:   probeBytes,
+		verbosity:    verbosityFromFlags(false, verbose),
+		deadlineMS:   deadlineMS,
 	}, stdout, stderr)
 }
 
@@ -177,7 +174,7 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 		LinkMbps:         probeResult.LinkMbps,
 		Concurrency:      probeResult.SuggestedConcurrency,
 		DeadlineMS:       cfg.deadlineMS,
-		WithPageCache:    cfg.withPageCache,
+		PreserveCache:    cfg.cacheLoad,
 		RawSink:          rawSink,
 		ManifestProgress: progressCh,
 	})

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/jolynch/tx"
 	"github.com/jolynch/tx/internal/cliflags"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/pagecache"
 	"github.com/jolynch/tx/internal/sampler"
 	"github.com/zeebo/xxh3"
 )
@@ -55,6 +57,23 @@ func parseVerifyFlag(raw string) (bool, int, time.Duration, error) {
 	return false, 0, 0, fmt.Errorf("unsupported --verify value %q (supported: none, meta, N%%data, full, <duration>)", s)
 }
 
+func parseCacheLoadFlag(raw string) (bool, time.Duration, error) {
+	s := strings.TrimSpace(raw)
+	switch s {
+	case "none":
+		return false, 0, nil
+	case "full":
+		return true, 0, nil
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		if d <= 0 {
+			return false, 0, fmt.Errorf("--cache-load duration must be > 0")
+		}
+		return true, d, nil
+	}
+	return false, 0, fmt.Errorf("unsupported --cache-load value %q (supported: none, full, <duration>)", s)
+}
+
 type copyCLIConfig struct {
 	remoteSrc           string
 	localDst            string
@@ -80,10 +99,12 @@ type copyCLIConfig struct {
 	verifyMeta          bool
 	verifyDataSamplePct int
 	verifyBudget        time.Duration
+	cacheLoadRaw        string
+	cacheLoadEnabled    bool
+	cacheLoadBudget     time.Duration
 	verbose             bool
 	progress            bool
 	yes                 bool
-	withPageCache       bool
 }
 
 func cleanupCopyState(targetDir string, stderr io.Writer) int {
@@ -124,6 +145,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		probeSizeRaw:        encoding.HumanBytes(defaultCLIProbeBytes),
 		progressIntervalRaw: "1s",
 		fsyncIntervalRaw:    "512MiB",
+		cacheLoadRaw:        "none",
 		progress:            true,
 	}
 	cf.BoolVar(&cfg.clean, "", "clean", false, "Remove LOCAL_DST first, then force a clean transfer")
@@ -131,7 +153,8 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf.BoolVar(&cfg.skipWrite, "", "skip-write", false, "Do not mutate LOCAL_DST; fetch file bodies to discard instead of writing them")
 	cf.BoolVar(&cfg.skipFsync, "", "skip-fsync", false, "Acknowledge writes without fdatasync")
 	cf.StringVar(&cfg.fsyncIntervalRaw, "", "fsync-interval", cfg.fsyncIntervalRaw, "Background fsync batch threshold; 0=inline fdatasync, -1=syncfs-only at exit")
-	cf.StringVar(&cfg.verifyRaw, "", "verify", "meta", "Verification after copy: none|meta|N%data|full|<duration> (default meta)")
+	cf.StringVar(&cfg.verifyRaw, "", "verify", "meta", "Integrity checks after copy: none|meta|N%data|full|<duration> (default meta)")
+	cf.StringVar(&cfg.cacheLoadRaw, "", "cache-load", cfg.cacheLoadRaw, "Mirror sender page cache after success: none|full|<duration> (default none)")
 	cf.StringVar(&cfg.modeRaw, "", "mode", tx.LoadStrategyFast, "Server read strategy: fast|gentle")
 	cf.StringVar(&cfg.encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&cfg.keysDir, "k", "keys", "", "Persistent age keys directory (default: ephemeral)")
@@ -147,7 +170,6 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	cf.StringVar(&cfg.ackEveryRaw, "a", "ack-every", cfg.ackEveryRaw, "Bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
 	cf.StringVar(&cfg.probeSizeRaw, "", "probe-size", cfg.probeSizeRaw, "Probe payload size; e.g. 1B, 4KiB, 8MiB")
 	cf.StringVar(&cfg.deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
-	cf.BoolVar(&cfg.withPageCache, "", "with-cache-map", false, "Request page-cache residency hint per file (Linux only)")
 	cf.StringVar(&cfg.traceFile, "", "trace", "", "Write runtime/trace output to this file")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -174,6 +196,15 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		cfg.verifyMeta = meta
 		cfg.verifyDataSamplePct = dataPct
 		cfg.verifyBudget = budget
+	}
+	{
+		enabled, budget, err := parseCacheLoadFlag(cfg.cacheLoadRaw)
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid --cache-load: %v\n", err)
+			return 2
+		}
+		cfg.cacheLoadEnabled = enabled
+		cfg.cacheLoadBudget = budget
 	}
 	if cfg.verifyDataSamplePct > 0 && (cfg.skipFetch || cfg.skipWrite) {
 		fmt.Fprintf(stderr, "--verify N%%data/full cannot be used with --skip-fetch or --skip-write\n")
@@ -277,17 +308,17 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	copyVerbosity := verbosityFromFlags(cfg.progress, cfg.verbose)
 
 	transferCfg := transferArgs{
-		sourceDir:     cfg.remoteSrc,
-		targetDir:     cfg.localDst,
-		agePublicKey:  agePublicKey,
-		ageIdentity:   ageIdentity,
-		encMode:       encMode,
-		authTokens:    cfg.authTokens,
-		loadStrategy:  loadStrategy,
-		probeBytes:    probeBytes,
-		verbosity:     0,
-		deadlineMS:    deadlineMS,
-		withPageCache: cfg.withPageCache,
+		sourceDir:    cfg.remoteSrc,
+		targetDir:    cfg.localDst,
+		agePublicKey: agePublicKey,
+		ageIdentity:  ageIdentity,
+		encMode:      encMode,
+		authTokens:   cfg.authTokens,
+		loadStrategy: loadStrategy,
+		probeBytes:   probeBytes,
+		verbosity:    0,
+		deadlineMS:   deadlineMS,
+		cacheLoad:    cfg.cacheLoadEnabled,
 	}
 	// Resume path: prior .tx/<dst>/manifest.server exists from an interrupted
 	// run, and the user has not re-created LOCAL_DST. Refresh via SYNC and
@@ -380,10 +411,207 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	if exitCode != 0 {
 		return exitCode
 	}
+
+	// Only touch and cleanup if success
+	if cfg.cacheLoadEnabled {
+		touchCopyCache(cfg, progressInterval, stderr)
+	}
 	if code := cleanupCopyState(cfg.localDst, stderr); code != 0 {
 		return code
 	}
 	return 0
+}
+
+// touchCacheReserveBytes is the amount of RAM withheld from the page-cache
+// warming budget so tx itself (manifest, zstd encoder pools, verify buffers)
+// has working memory regardless of host size.
+const touchCacheReserveBytes int64 = 1 << 30 // 1 GiB
+
+// cacheProgressState holds the counters and budgets formatCacheProgressLine
+// renders. Budgets <= 0 indicate "unknown / unlimited" and cause their
+// denominator slot to render as `n/a`.
+type cacheProgressState struct {
+	filesTouched int64
+	totalFiles   int64
+	bytesTouched int64
+	totalBytes   int64
+	pagesTouched int64
+	pageBudget   int64
+	elapsed      time.Duration
+	timeBudget   time.Duration
+}
+
+const (
+	cacheProgressCountWidth    = 6
+	cacheProgressBytesWidth    = 10
+	cacheProgressDurationWidth = 5
+)
+
+// formatCacheProgressLine renders one progress / summary line in the same
+// bracketed style as fsync-progress, ending with a `budget[time/time][mem/mem]`
+// block. The status (`[ok]` / `[partial-ok]`) is baked into tag for the final
+// summary; the periodic line passes tag="cache-progress:".
+func formatCacheProgressLine(tag string, s cacheProgressState) string {
+	filesTouched := max(s.filesTouched, int64(0))
+	totalFiles := max(s.totalFiles, int64(0))
+	bytesTouched := max(s.bytesTouched, int64(0))
+	totalBytes := max(s.totalBytes, int64(0))
+
+	var pctFiles, pctBytes float64
+	if totalFiles > 0 {
+		pctFiles = clampCachePercent(float64(filesTouched) * 100 / float64(totalFiles))
+	}
+	if totalBytes > 0 {
+		pctBytes = clampCachePercent(float64(bytesTouched) * 100 / float64(totalBytes))
+	}
+
+	elapsedField := fixedWidthCacheDuration(s.elapsed)
+	timeBudgetField := fixedWidthCacheDurationNA()
+	if s.timeBudget > 0 {
+		timeBudgetField = fixedWidthCacheDuration(s.timeBudget)
+	}
+
+	pageSize := int64(pagecache.PageSize())
+	memUsedField := encoding.HumanBytesFixedWidth(max(s.pagesTouched, int64(0))*pageSize, cacheProgressBytesWidth)
+	memBudgetField := fixedWidthCacheBytesNA()
+	if s.pageBudget > 0 {
+		memBudgetField = encoding.HumanBytesFixedWidth(s.pageBudget*pageSize, cacheProgressBytesWidth)
+	}
+
+	return fmt.Sprintf(
+		"%s[%s/%s](%5.1f%%) [%s/%s](%5.1f%%) budget[%s/%s][%s/%s]",
+		tag,
+		encoding.HumanCount(uint64(filesTouched), cacheProgressCountWidth),
+		encoding.HumanCount(uint64(totalFiles), cacheProgressCountWidth),
+		pctFiles,
+		encoding.HumanBytesFixedWidth(bytesTouched, cacheProgressBytesWidth),
+		encoding.HumanBytesFixedWidth(totalBytes, cacheProgressBytesWidth),
+		pctBytes,
+		elapsedField,
+		timeBudgetField,
+		memUsedField,
+		memBudgetField,
+	)
+}
+
+func fixedWidthCacheDuration(d time.Duration) string {
+	return fmt.Sprintf("%*s", cacheProgressDurationWidth, compactETA(d))
+}
+
+func fixedWidthCacheDurationNA() string {
+	return fmt.Sprintf("%*s", cacheProgressDurationWidth, "n/a")
+}
+
+func fixedWidthCacheBytesNA() string {
+	return fmt.Sprintf("%*s", cacheProgressBytesWidth, "n/a")
+}
+
+func clampCachePercent(pct float64) float64 {
+	if pct < 0 {
+		return 0
+	}
+	if pct > 100 {
+		return 100
+	}
+	return pct
+}
+
+// touchCopyCache decodes per-file page-cache hints from the just-fetched
+// manifest and issues posix_fadvise(WILLNEED) for each file, oldest-mtime
+// first, up to a system-RAM-derived page budget. No-op on platforms where
+// (*pagecache.CacheEntry).Touch isn't backed by real syscalls.
+//
+// Decoding happens lazily inside the TouchEntries yield closure so that the
+// decompressed bitmaps for un-touched candidates never accumulate in memory,
+// and so we never allocate a parallel slice of joined path strings — those
+// are constructed only at the moment of yielding.
+func touchCopyCache(cfg copyCLIConfig, progressInterval time.Duration, stderr io.Writer) {
+	if !pagecache.TouchSupported() {
+		return
+	}
+	ps, err := newPinchState(cfg.localDst)
+	if err != nil {
+		fmt.Fprintf(stderr, "touch-cache: skip (%v)\n", err)
+		return
+	}
+	manifest, err := tx.LoadManifest(ps.ServerManifestPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "touch-cache: skip (load manifest: %v)\n", err)
+		return
+	}
+
+	var candidateIndexes []int
+	var totalBytes int64
+	for i := range manifest.Entries {
+		e := &manifest.Entries[i]
+		if e.Type != encoding.EntryTypeFile || len(e.PageCache) == 0 {
+			continue
+		}
+		candidateIndexes = append(candidateIndexes, i)
+		totalBytes += e.Size
+	}
+	if len(candidateIndexes) == 0 {
+		return
+	}
+	sort.Slice(candidateIndexes, func(i, j int) bool {
+		return manifest.Entries[candidateIndexes[i]].Mtime < manifest.Entries[candidateIndexes[j]].Mtime
+	})
+	totalFiles := int64(len(candidateIndexes))
+
+	budget := pagecache.SystemPageBudget(touchCacheReserveBytes)
+	ctx := context.Background()
+	cancel := func() {}
+	if cfg.cacheLoadBudget > 0 {
+		ctx, cancel = context.WithTimeout(ctx, cfg.cacheLoadBudget)
+	}
+	defer cancel()
+
+	start := time.Now()
+	var filesTouched, bytesTouched, pagesTouched int64
+	lastProgress := start
+	snapshot := func() cacheProgressState {
+		return cacheProgressState{
+			filesTouched: filesTouched,
+			totalFiles:   totalFiles,
+			bytesTouched: bytesTouched,
+			totalBytes:   totalBytes,
+			pagesTouched: pagesTouched,
+			pageBudget:   budget,
+			elapsed:      time.Since(start),
+			timeBudget:   cfg.cacheLoadBudget,
+		}
+	}
+	_, touchErr := pagecache.TouchEntries(ctx, func(yield func(pagecache.TouchEntry) bool) {
+		for _, idx := range candidateIndexes {
+			e := &manifest.Entries[idx]
+			ce := &pagecache.CacheEntry{}
+			if err := encoding.DecodePageCacheEntry(e.PageCache, ce); err != nil || ce.Empty() {
+				continue
+			}
+			pages := int64(ce.NumResidentPages())
+			if !yield(pagecache.TouchEntry{
+				Path:  filepath.Join(ps.TargetDir, e.Path),
+				Entry: ce,
+			}) {
+				return
+			}
+			filesTouched++
+			bytesTouched += e.Size
+			pagesTouched += pages
+
+			now := time.Now()
+			if progressInterval > 0 && now.Sub(lastProgress) >= progressInterval {
+				fmt.Fprintln(stderr, formatCacheProgressLine("cache-progress:", snapshot()))
+				lastProgress = now
+			}
+		}
+	}, budget, 0)
+
+	status := "[ok]"
+	if errors.Is(touchErr, context.DeadlineExceeded) {
+		status = "[partial-ok]"
+	}
+	fmt.Fprintln(stderr, formatCacheProgressLine("touch-cache:"+status, snapshot()))
 }
 
 func countManifestEntryTypes(entries []tx.ManifestEntry) (files, hardlinks, symlinks, dirs int) {

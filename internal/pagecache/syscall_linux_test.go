@@ -15,7 +15,7 @@ import (
 func TestLoadRealMincore(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "data.bin")
-	const numPages = 8
+	const numPages = 9
 	pageSize := os.Getpagesize()
 	data := make([]byte, pageSize*numPages)
 	for i := range data {
@@ -42,6 +42,9 @@ func TestLoadRealMincore(t *testing.T) {
 	}
 	if entry.numPages != numPages {
 		t.Fatalf("numPages = %d, want %d", entry.numPages, numPages)
+	}
+	if bits, pages := entry.PageBits(); pages != numPages || len(bits) != 2 {
+		t.Fatalf("PageBits = (%d bytes, %d pages), want (2 bytes, %d pages)", len(bits), pages, numPages)
 	}
 
 	if err := entry.Touch(path); err != nil {

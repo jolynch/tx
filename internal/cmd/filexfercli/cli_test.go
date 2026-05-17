@@ -28,6 +28,7 @@ import (
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	"github.com/jolynch/tx/internal/fsync"
+	"github.com/jolynch/tx/internal/pagecache"
 	"github.com/zeebo/xxh3"
 )
 
@@ -663,6 +664,65 @@ func TestRunCLIGetSkipWriteDiscardsOutput(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "  path: "+os.DevNull) {
 		t.Fatalf("expected file metrics path %q, got: %s", os.DevNull, stdout.String())
+	}
+}
+
+func TestRunCLIGetCacheLoadRequestsAndTouchesHint(t *testing.T) {
+	payload := []byte("hello")
+	var cacheEntry pagecache.CacheEntry
+	if err := cacheEntry.SetPageBits([]byte{0x01}, 1); err != nil {
+		t.Fatalf("SetPageBits: %v", err)
+	}
+	pageCacheBlob, err := encoding.EncodePageCacheEntry(&cacheEntry)
+	if err != nil {
+		t.Fatalf("EncodePageCacheEntry: %v", err)
+	}
+	pageCacheToken := encoding.EncodePageCacheToken(pageCacheBlob)
+	singleManifest := fmt.Sprintf(
+		"FM/1 txpreservecache mode=fast link-mbps=0 concurrency=8\nD0 0 0:100 0755 0:7:/remote\nF1 %d 0:100 0644 0:5:a.txt %s\n",
+		len(payload),
+		pageCacheToken,
+	)
+	var sawCacheMap atomic.Bool
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbTXFER:
+			if req.Params[0]["cache-map"] == "1" {
+				sawCacheMap.Store(true)
+			}
+			if err := writeManifestResponse(out, singleManifest); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildCLIFrame(1, payload, 0))
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	tmp := t.TempDir()
+	outputPath := filepath.Join(tmp, "a.txt")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "get", "--cache-load=full", "--progress=false", "-a", "1KiB", "-o", outputPath, "/remote/a.txt"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("get cache-load: expected 0, got %d stderr=%s", code, stderr.String())
+	}
+	if !sawCacheMap.Load() {
+		t.Fatalf("expected TXFER cache-map=1")
+	}
+	if pagecache.TouchSupported() && !strings.Contains(stderr.String(), "touch-cache: [ok] warmed=1/1") {
+		t.Fatalf("expected touch-cache warming output, got: %s", stderr.String())
 	}
 }
 
@@ -1999,6 +2059,100 @@ func TestFixedWidthETANA(t *testing.T) {
 	}
 }
 
+func TestFormatCacheProgressLine(t *testing.T) {
+	pageSize := int64(pagecache.PageSize())
+	memField := func(pages int64) string {
+		return encoding.HumanBytesFixedWidth(pages*pageSize, cacheProgressBytesWidth)
+	}
+	naBytes := fmt.Sprintf("%*s", cacheProgressBytesWidth, "n/a")
+	naDur := fmt.Sprintf("%*s", cacheProgressDurationWidth, "n/a")
+
+	for _, tc := range []struct {
+		name  string
+		tag   string
+		state cacheProgressState
+		want  string
+	}{
+		{
+			name: "both-budgets-periodic",
+			tag:  "cache-progress:",
+			state: cacheProgressState{
+				filesTouched: 10, totalFiles: 100,
+				bytesTouched: 1 * 1024 * 1024, totalBytes: 10 * 1024 * 1024,
+				pagesTouched: 1000, pageBudget: 10000,
+				elapsed: 5 * time.Second, timeBudget: 30 * time.Second,
+			},
+			want: fmt.Sprintf(
+				"cache-progress:[    10/   100]( 10.0%%) [  1.00 MiB/ 10.00 MiB]( 10.0%%) budget[   5s/  30s][%s/%s]",
+				memField(1000), memField(10000),
+			),
+		},
+		{
+			name: "no-budgets-final-ok",
+			tag:  "touch-cache:[ok]",
+			state: cacheProgressState{
+				filesTouched: 5, totalFiles: 5,
+				bytesTouched: 0, totalBytes: 0,
+				pagesTouched: 200, pageBudget: 0,
+				elapsed: 2 * time.Second, timeBudget: 0,
+			},
+			want: fmt.Sprintf(
+				"touch-cache:[ok][     5/     5](100.0%%) [       0 B/       0 B](  0.0%%) budget[   2s/%s][%s/%s]",
+				naDur, memField(200), naBytes,
+			),
+		},
+		{
+			name: "page-budget-only-partial",
+			tag:  "touch-cache:[partial-ok]",
+			state: cacheProgressState{
+				filesTouched: 50, totalFiles: 100,
+				bytesTouched: 5 * 1024 * 1024, totalBytes: 10 * 1024 * 1024,
+				pagesTouched: 7500, pageBudget: 10000,
+				elapsed: 30 * time.Second, timeBudget: 0,
+			},
+			want: fmt.Sprintf(
+				"touch-cache:[partial-ok][    50/   100]( 50.0%%) [  5.00 MiB/ 10.00 MiB]( 50.0%%) budget[  30s/%s][%s/%s]",
+				naDur, memField(7500), memField(10000),
+			),
+		},
+		{
+			name: "time-budget-only",
+			tag:  "cache-progress:",
+			state: cacheProgressState{
+				filesTouched: 1, totalFiles: 10,
+				bytesTouched: 512, totalBytes: 5120,
+				pagesTouched: 4, pageBudget: -1,
+				elapsed: 10 * time.Second, timeBudget: 60 * time.Second,
+			},
+			want: fmt.Sprintf(
+				"cache-progress:[     1/    10]( 10.0%%) [     512 B/  5.00 KiB]( 10.0%%) budget[  10s/ 1.0m][%s/%s]",
+				memField(4), naBytes,
+			),
+		},
+		{
+			name: "overrun-clamped",
+			tag:  "touch-cache:[partial-ok]",
+			state: cacheProgressState{
+				filesTouched: 100, totalFiles: 100,
+				bytesTouched: 10 * 1024 * 1024, totalBytes: 10 * 1024 * 1024,
+				pagesTouched: 12000, pageBudget: 10000,
+				elapsed: 35 * time.Second, timeBudget: 30 * time.Second,
+			},
+			want: fmt.Sprintf(
+				"touch-cache:[partial-ok][   100/   100](100.0%%) [ 10.00 MiB/ 10.00 MiB](100.0%%) budget[  35s/  30s][%s/%s]",
+				memField(12000), memField(10000),
+			),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatCacheProgressLine(tc.tag, tc.state)
+			if got != tc.want {
+				t.Fatalf("formatCacheProgressLine\n  got:  %q\n  want: %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestFormatVerifyDataSummaryLine(t *testing.T) {
 	t.Run("budgeted", func(t *testing.T) {
 		got := formatVerifyDataSummaryLine(10011, 14224, 100, 10*time.Second, 9876*time.Millisecond, false)
@@ -2352,6 +2506,38 @@ func TestVerbosityFromFlags(t *testing.T) {
 				t.Fatalf("verbosityFromFlags(%v, %v) = %d, want %d", tt.progress, tt.verbose, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseCacheLoadFlag(t *testing.T) {
+	tests := []struct {
+		raw         string
+		wantEnable  bool
+		wantBudget  time.Duration
+		wantErrPart string
+	}{
+		{raw: "none"},
+		{raw: "full", wantEnable: true},
+		{raw: "120s", wantEnable: true, wantBudget: 120 * time.Second},
+		{raw: "5m", wantEnable: true, wantBudget: 5 * time.Minute},
+		{raw: "0s", wantErrPart: "--cache-load duration must be > 0"},
+		{raw: "-1s", wantErrPart: "--cache-load duration must be > 0"},
+		{raw: "meta", wantErrPart: "unsupported --cache-load value"},
+	}
+	for _, tt := range tests {
+		gotEnable, gotBudget, err := parseCacheLoadFlag(tt.raw)
+		if tt.wantErrPart != "" {
+			if err == nil || !strings.Contains(err.Error(), tt.wantErrPart) {
+				t.Fatalf("parseCacheLoadFlag(%q) err = %v, want containing %q", tt.raw, err, tt.wantErrPart)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("parseCacheLoadFlag(%q): %v", tt.raw, err)
+		}
+		if gotEnable != tt.wantEnable || gotBudget != tt.wantBudget {
+			t.Fatalf("parseCacheLoadFlag(%q) = (%v, %s), want (%v, %s)", tt.raw, gotEnable, gotBudget, tt.wantEnable, tt.wantBudget)
+		}
 	}
 }
 
@@ -3830,6 +4016,33 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	if !strings.Contains(copyHelp, "--verify string") {
 		t.Fatalf("expected --verify string in copy help, got: %s", copyHelp)
 	}
+	if !strings.Contains(copyHelp, "--cache-load string") {
+		t.Fatalf("expected --cache-load string in copy help, got: %s", copyHelp)
+	}
+	if strings.Contains(copyHelp, "--preserve-cache") || strings.Contains(copyHelp, "--with-cache-map") || strings.Contains(copyHelp, "--with-page-map") {
+		t.Fatalf("expected old cache flags to be absent from copy help, got: %s", copyHelp)
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--preserve-cache", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for removed --preserve-cache flag, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "flag provided but not defined: -preserve-cache") {
+		t.Fatalf("expected removed --preserve-cache flag error, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--with-cache-map", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for removed --with-cache-map flag, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "flag provided but not defined: -with-cache-map") {
+		t.Fatalf("expected removed --with-cache-map flag error, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--with-page-map", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for removed --with-page-map flag, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "flag provided but not defined: -with-page-map") {
+		t.Fatalf("expected removed --with-page-map flag error, got: %s", stderr.String())
+	}
 	stderr.Reset()
 	if code := runCopyCLI("127.0.0.1:1", []string{"--compress", "bogus", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for invalid --compress, got %d", code)
@@ -3871,6 +4084,13 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "invalid --progress-interval") {
 		t.Fatalf("expected invalid --progress-interval error, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--cache-load", "0s", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for invalid --cache-load, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid --cache-load") {
+		t.Fatalf("expected invalid --cache-load error, got: %s", stderr.String())
 	}
 	stderr.Reset()
 	if code := runCopyCLI("127.0.0.1:1", []string{"--verify", "5%data", "--skip-fetch", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {

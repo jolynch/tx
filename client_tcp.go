@@ -643,7 +643,7 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 	if request.DeadlineMS > 0 {
 		cmd += " deadline-ms=" + strconv.FormatInt(request.DeadlineMS, 10)
 	}
-	if request.WithPageCache {
+	if request.PreserveCache {
 		cmd += " cache-map=1"
 	}
 	cmd += " comp=" + comp

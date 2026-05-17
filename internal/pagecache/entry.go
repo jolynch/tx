@@ -4,6 +4,9 @@
 // file are resident at transfer time, ships that hint alongside the file
 // data, and the receiver replays the hint to warm its own page cache.
 //
+// See https://github.com/hashbrowncipher/happycache for the inspiration
+// of this module.
+//
 // The package is Linux-only at runtime; on other platforms Load and Touch
 // return ErrUnsupported. The wire encoding for a CacheEntry lives in
 // internal/filexfer/encoding so this package stays free of compression and
@@ -11,8 +14,10 @@
 package pagecache
 
 import (
+	"context"
 	"errors"
 	"io/fs"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -41,7 +46,7 @@ type CacheEntry struct {
 // entry. On non-Linux platforms returns ErrUnsupported. A 0-byte file
 // leaves the entry empty without error.
 func (e *CacheEntry) Load(path string) error {
-	vec, numPages, err := loadResidencyFn(path)
+	bits, numPages, err := loadResidencyFn(path)
 	if err != nil {
 		return err
 	}
@@ -49,12 +54,6 @@ func (e *CacheEntry) Load(path string) error {
 		e.bits = nil
 		e.numPages = 0
 		return nil
-	}
-	bits := make([]byte, (numPages+7)/8)
-	for i := 0; i < numPages; i++ {
-		if vec[i]&1 != 0 {
-			bits[i/8] |= 1 << uint(i%8)
-		}
 	}
 	e.bits = bits
 	e.numPages = numPages
@@ -70,6 +69,21 @@ func (e *CacheEntry) Touch(path string) error {
 		return nil
 	}
 	return touchPagesFn(path, e.bits, e.numPages)
+}
+
+// NumResidentPages returns the number of bits set in the entry's
+// bitmap, i.e. the count of pages reported as resident at probe time.
+// Used for RAM-budget accounting by callers that need to limit how
+// many pages they ask the kernel to warm.
+func (e *CacheEntry) NumResidentPages() int {
+	if e.numPages == 0 {
+		return 0
+	}
+	count := 0
+	for _, b := range e.bits {
+		count += bits.OnesCount8(b)
+	}
+	return count
 }
 
 // Empty reports whether the entry holds any resident-page hints.
@@ -116,6 +130,17 @@ func (e *CacheEntry) SetPageBits(bits []byte, numPages int) error {
 // PageSize returns the OS page size used by Load and Touch.
 func PageSize() int {
 	return os.Getpagesize()
+}
+
+var touchSupportedFn = func() bool {
+	return touchSupported
+}
+
+// TouchSupported reports whether (*CacheEntry).Touch can actually warm
+// the OS page cache on this platform. False on non-Linux, where Touch
+// returns ErrUnsupported and the per-file syscalls are absent.
+func TouchSupported() bool {
+	return touchSupportedFn()
 }
 
 // LoadDirectory walks root and concurrently calls (*CacheEntry).Load for
@@ -189,4 +214,114 @@ func LoadDirectory(root string, parallelism int) (map[string]*CacheEntry, error)
 		out[r.path] = r.entry
 	}
 	return out, <-walkErrCh
+}
+
+// TouchEntry pairs a filesystem path with a decoded residency bitmap.
+type TouchEntry struct {
+	Path  string
+	Entry *CacheEntry
+}
+
+// TouchEntryFunc yields TouchEntry values in caller-defined priority order.
+// It must stop yielding when yield returns false.
+type TouchEntryFunc func(yield func(TouchEntry) bool)
+
+// TouchEntries issues posix_fadvise(WILLNEED) hints to the OS page cache for
+// each generated entry, in caller-supplied order. Iteration stops when ctx is
+// canceled, or at the first entry whose resident-page count would push the
+// cumulative count over maxResidentPages; passing maxResidentPages <= 0
+// disables the cap (touch everything).
+//
+// Returns the number of entries actually handed to a worker. Per-file Touch
+// errors after that point are silently dropped — the hint is advisory. If ctx
+// prevents an entry from being handed to a worker, ctx.Err() is returned after
+// already-queued work drains.
+//
+// On platforms where TouchSupported is false, TouchEntries returns (0, nil)
+// without consuming entries.
+//
+// parallelism <= 0 defaults to runtime.NumCPU() * 4, matching
+// LoadDirectory.
+func TouchEntries(ctx context.Context, entries TouchEntryFunc, maxResidentPages int64, parallelism int) (int, error) {
+	if entries == nil {
+		return 0, nil
+	}
+	if !TouchSupported() {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if parallelism <= 0 {
+		parallelism = runtime.NumCPU() * 4
+	}
+
+	jobs := make(chan TouchEntry, parallelism*2)
+	var wg sync.WaitGroup
+	wg.Add(parallelism)
+	for i := 0; i < parallelism; i++ {
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				_ = j.Entry.Touch(j.Path) // advisory; drop per-file errors
+			}
+		}()
+	}
+
+	var cumulative int64
+	touched := 0
+	accepting := true
+	var stopErr error
+	entries(func(e TouchEntry) bool {
+		if !accepting {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			accepting = false
+			stopErr = ctx.Err()
+			return false
+		default:
+		}
+		if e.Entry == nil || e.Entry.Empty() {
+			return true
+		}
+		pages := int64(e.Entry.NumResidentPages())
+		if maxResidentPages > 0 && cumulative+pages > maxResidentPages {
+			accepting = false
+			return false // deterministic stop-at-first-overflow
+		}
+		cumulative += pages
+		select {
+		case <-ctx.Done():
+			accepting = false
+			stopErr = ctx.Err()
+			return false
+		case jobs <- e:
+			touched++
+			return true
+		}
+	})
+	close(jobs)
+	wg.Wait()
+	return touched, stopErr
+}
+
+// SystemPageBudget returns the page count available for warming after
+// subtracting reserveBytes from system RAM. Returns -1 on platforms
+// where total RAM cannot be queried — callers should treat that as
+// "unlimited" (the kernel will manage residency under memory pressure).
+func SystemPageBudget(reserveBytes int64) int64 {
+	total, err := systemMemoryBytes()
+	if err != nil || total <= 0 {
+		return -1
+	}
+	avail := total - reserveBytes
+	if avail <= 0 {
+		return 0
+	}
+	return avail / int64(PageSize())
 }

@@ -9,7 +9,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// mincoreChunkPages bounds the mincore call size so the returned vector
+const touchSupported = true
+
+// mincoreChunkPages bounds the mincore call size so the temporary vector
 // stays small on huge files (1M pages = 4 GiB at 4 KiB pages).
 const mincoreChunkPages = 1 << 20
 
@@ -44,7 +46,12 @@ func loadResidency(path string) ([]byte, int, error) {
 	}
 	defer unix.Munmap(addr)
 
-	vec := make([]byte, numPages)
+	bits := make([]byte, (numPages+7)/8)
+	vecPages := mincoreChunkPages
+	if numPages < vecPages {
+		vecPages = numPages
+	}
+	vec := make([]byte, vecPages)
 	for offset := 0; offset < numPages; offset += mincoreChunkPages {
 		end := offset + mincoreChunkPages
 		if end > numPages {
@@ -52,11 +59,18 @@ func loadResidency(path string) ([]byte, int, error) {
 		}
 		chunkBytes := (end - offset) * pageSize
 		chunk := addr[offset*pageSize : offset*pageSize+chunkBytes]
-		if mErr := mincore(chunk, vec[offset:end]); mErr != nil {
+		chunkVec := vec[:end-offset]
+		if mErr := mincore(chunk, chunkVec); mErr != nil {
 			return nil, 0, mErr
 		}
+		for i, v := range chunkVec {
+			if v&1 != 0 {
+				page := offset + i
+				bits[page/8] |= 1 << uint(page%8)
+			}
+		}
 	}
-	return vec, numPages, nil
+	return bits, numPages, nil
 }
 
 func touchPages(path string, bits []byte, numPages int) error {
@@ -104,6 +118,15 @@ func touchPages(path string, bits []byte, numPages int) error {
 		}
 	}
 	return nil
+}
+
+// systemMemoryBytes returns total system RAM via sysinfo(2).
+func systemMemoryBytes() (int64, error) {
+	var info unix.Sysinfo_t
+	if err := unix.Sysinfo(&info); err != nil {
+		return 0, err
+	}
+	return int64(info.Totalram) * int64(info.Unit), nil
 }
 
 // mincore wraps the SYS_MINCORE syscall. It returns one byte per page in
