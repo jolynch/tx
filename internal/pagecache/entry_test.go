@@ -16,14 +16,26 @@ func withStubLoad(t *testing.T, fn func(string) ([]byte, int, error)) {
 func withStubTouch(t *testing.T, fn func(string, []byte, int) error) {
 	t.Helper()
 	prev := touchPagesFn
+	prevSupported := touchSupportedFn
 	touchPagesFn = fn
-	t.Cleanup(func() { touchPagesFn = prev })
+	touchSupportedFn = func() bool { return true }
+	t.Cleanup(func() {
+		touchPagesFn = prev
+		touchSupportedFn = prevSupported
+	})
 }
 
-func TestLoadPacksMincoreVector(t *testing.T) {
-	// Pages 0, 3, 7 resident across two bytes; pages 1, 2, 4, 5, 6, 8 not.
+func withTouchSupport(t *testing.T, supported bool) {
+	t.Helper()
+	prev := touchSupportedFn
+	touchSupportedFn = func() bool { return supported }
+	t.Cleanup(func() { touchSupportedFn = prev })
+}
+
+func TestLoadAssignsPackedBitmap(t *testing.T) {
+	// Pages 0, 3, and 7 resident across two bytes; page 8 not resident.
 	withStubLoad(t, func(string) ([]byte, int, error) {
-		return []byte{1, 0, 0, 1, 0, 0, 0, 1, 0}, 9, nil
+		return []byte{0b10001001, 0b00000000}, 9, nil
 	})
 
 	var e CacheEntry

@@ -46,18 +46,22 @@ Options:
       --gentle-bw string           Percent of observed link bandwidth used for gentle
                                    limiting (default "25%")
   -k, --keys string                Age keys directory (default "/var/lib/pinch/keys")
-      --require-auth               Require AUTH before commands
+      --require-auth               Require AUTH before commands (default false)
       --require-auth-token string  Allowlisted auth token (opaque string >8 bytes,
-                                   repeatable); implies --require-auth
-      --target-io-depth int        Target IO depth per CPU advertised in PROBE (default 4)
-      --disable-zero-copy          Force buffered send path (for benchmarking)
-      --exit-after string          Exit duration after transfer completes; 'never'
-                                   to run forever (e.g. 5s, 1m) (default "60s")
-      --trace string               Write runtime/trace output to this file
+                                   repeatable); implies --require-auth (default "")
+      --target-io-depth int        Target IO depth per CPU advertised in PROBE (default
+                                   4)
+      --disable-zero-copy          Force buffered send path (for benchmarking) (default
+                                   false)
+      --exit-after string          Exit duration after transfer completes; 'never' to
+                                   run forever (e.g. 5s, 1m) (default "60s")
+      --trace string               Write runtime/trace output to this file (default "")
   -p, --progress-path string       Progress output target; repeatable, use - for stdout
+                                   (default "")
   -f, --progress-format string     Progress format: json|int; 1 applies to all targets,
                                    or one per target (default json)
-      --progress-interval string   Progress write interval (e.g. 500ms, 10s) (default "1s")
+      --progress-interval string   Progress write interval (e.g. 500ms, 10s) (default
+                                   "1s")
 ```
 
 ### `tx recv`
@@ -85,52 +89,53 @@ usage: tx recv [addr] copy [flags] REMOTE_SRC LOCAL_DST
 Copy REMOTE_SRC from the remote to LOCAL_DST on the local machine.
 
 Behavior:
-  - If LOCAL_DST does not exist and no prior `.tx/<dst>/` state exists: full transfer
-  - If LOCAL_DST does not exist but `.tx/<dst>/` is present from an interrupted run:
-    refresh the manifest via SYNC and resume from the saved progress
+  - If LOCAL_DST does not exist and no prior .tx/<dst>/ state: full transfer
+  - If LOCAL_DST does not exist but .tx/<dst>/ exists: resume via SYNC
   - If LOCAL_DST exists: diff remote and send deltas
-  - --clean removes both LOCAL_DST and `.tx/<dst>/` first and forces a clean transfer
+  - --clean removes LOCAL_DST and .tx/<dst>/, then forces a clean transfer
   - --skip-fetch fetches and writes manifest state only; no start/sync
   - --skip-write fetches bodies to a discard sink and never mutates LOCAL_DST
-  - --verify=MODE verification after copy: none|meta|N%data|full|<duration> (default meta)
+  - --verify=MODE post-copy verification: none|meta|N%data|full|<dur>
 
 Options:
-      --clean                     Remove LOCAL_DST and `.tx/<dst>/` first, then force a clean transfer
+      --clean                     Remove LOCAL_DST first, then force a clean transfer
+                                  (default false)
       --skip-fetch                Fetch and persist remote manifest state only; do not
-                                  start or sync files
+                                  start or sync files (default false)
       --skip-write                Do not mutate LOCAL_DST; fetch file bodies to discard
-                                  instead of writing them
-      --skip-fsync                Acknowledge writes without fdatasync
+                                  instead of writing them (default false)
+      --skip-fsync                Acknowledge writes without fdatasync (default false)
       --fsync-interval string     Background fsync batch threshold; 0=inline fdatasync,
                                   -1=syncfs-only at exit (default "512MiB")
-      --verify string              Verification after copy:
-                                  none|meta|N%data|full|<duration>
-                                  (default "meta")
+      --verify string             Integrity checks after copy:
+                                  none|meta|N%data|full|<duration> (default meta)
+      --cache-load string         Mirror sender page cache after success:
+                                  none|full|<duration> (default none)
       --mode string               Server read strategy: fast|gentle (default "fast")
-      --encrypt string            Encryption algorithm: none|auto|aes|chacha20
-                                  (default: none)
+      --encrypt string            Encryption algorithm: none|auto|aes|chacha20 (default:
+                                  none)
   -k, --keys string               Persistent age keys directory (default: ephemeral)
   -t, --auth-token string         Client auth token presented in encrypted AUTH blob;
-                                  repeatable
-      --compress string           Compression algorithm: adapt|none|lz4|zstd
-                                  (default: adapt)
-      --concurrency int           Parallel download / verification workers
-                                  (0=adapt from server) (default 0)
+                                  repeatable (default "")
+      --compress string           Compression algorithm: adapt|none|lz4|zstd (default:
+                                  adapt)
+      --concurrency int           Parallel download / verification workers (0=adapt from
+                                  server) (default 0)
       --progress                  Show transfer progress every 2s (default true)
-  -v, --verbose                   Per-file progress output
+  -v, --verbose                   Per-file progress output (default false)
   -p, --progress-path string      Progress output target; repeatable, use - for stdout
+                                  (default "")
   -f, --progress-format string    Progress format: json|int; 1 applies to all targets,
                                   or one per target (default json)
-      --progress-interval string  Progress write interval (e.g. 500ms, 10s) (default "1s")
-  -y, --yes                       Skip confirmation prompt on sync paths
+      --progress-interval string  Progress write interval (e.g. 500ms, 10s) (default
+                                  "1s")
+  -y, --yes                       Skip confirmation prompt on sync paths (default false)
   -a, --ack-every string          Bytes between progress acks; e.g. 1B, 4KiB, 8MiB
                                   (default "128.00 MiB")
-      --probe-size string         Probe payload size; e.g. 1B, 4KiB, 8MiB
-                                  (default "1.00 MiB")
-      --deadline string           Transfer deadline (e.g. 60s, 5m)
-      --with-cache-map            Request page-cache residency hint per file
-                                  (Linux only)
-      --trace string              Write runtime/trace output to this file
+      --probe-size string         Probe payload size; e.g. 1B, 4KiB, 8MiB (default "1.00
+                                  MiB")
+      --deadline string           Transfer deadline (e.g. 60s, 5m) (default "")
+      --trace string              Write runtime/trace output to this file (default "")
 ```
 
 #### `tx recv get`
@@ -143,31 +148,34 @@ Download a single remote file. REMOTE_PATH must be an absolute path to a file
 on the server. Output defaults to the file's basename in the current directory.
 
 Options:
-  -o string                       Output file path, or '-' for stdout
-      --encrypt string            Encryption algorithm: none|auto|aes|chacha20
-                                  (default: none)
+  -o string                       Output file path, or '-' for stdout (default "")
+      --encrypt string            Encryption algorithm: none|auto|aes|chacha20 (default:
+                                  none)
   -k, --keys string               Persistent age keys directory (default: ephemeral)
   -t, --auth-token string         Client auth token presented in encrypted AUTH blob;
-                                  repeatable
-      --compress string           Compression algorithm: adapt|none|lz4|zstd
-                                  (default: adapt)
+                                  repeatable (default "")
+      --compress string           Compression algorithm: adapt|none|lz4|zstd (default:
+                                  adapt)
       --concurrency int           Parallel download workers (0=auto) (default 0)
       --skip-write                Do not write the file; fetch to discard instead
-      --skip-fsync                Acknowledge writes without fdatasync
+                                  (default false)
+      --skip-fsync                Acknowledge writes without fdatasync (default false)
       --fsync-interval string     Background fsync batch threshold; 0=inline fdatasync,
                                   -1=syncfs-only at exit (default "512MiB")
       --progress                  Show transfer progress every 2s (default true)
-  -v, --verbose                   Per-file progress output
+  -v, --verbose                   Per-file progress output (default false)
   -p, --progress-path string      Progress output target; repeatable, use - for stdout
+                                  (default "")
   -f, --progress-format string    Progress format: json|int; 1 applies to all targets,
                                   or one per target (default json)
-      --progress-interval string  Progress write interval (e.g. 500ms, 10s) (default "1s")
+      --progress-interval string  Progress write interval (e.g. 500ms, 10s) (default
+                                  "1s")
+      --cache-load string         Load downloaded file into page cache after success:
+                                  none|full|<duration> (default none)
   -a, --ack-every string          Bytes between progress acks; e.g. 1B, 4KiB, 8MiB
                                   (default "128.00 MiB")
-      --deadline string           Transfer deadline (e.g. 60s, 5m)
-      --with-cache-map            Request page-cache residency hint per file
-                                  (Linux only)
-      --trace string              Write runtime/trace output to this file
+      --deadline string           Transfer deadline (e.g. 60s, 5m) (default "")
+      --trace string              Write runtime/trace output to this file (default "")
 ```
 
 #### `tx recv status`
@@ -184,10 +192,11 @@ Modes:
   status                 List all active transfers on the server
 
 Options:
-      --tid string         Transfer ID
+      --tid string         Transfer ID (default "")
       --encrypt string     Encryption algorithm: none|auto|aes|chacha20 (default: none)
   -k, --keys string        Persistent age keys directory (default: ephemeral)
-  -t, --auth-token string  Client auth token presented in encrypted AUTH blob; repeatable
+  -t, --auth-token string  Client auth token presented in encrypted AUTH blob;
+                           repeatable (default "")
 ```
 
 ---

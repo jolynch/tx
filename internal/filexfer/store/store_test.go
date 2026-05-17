@@ -148,8 +148,13 @@ func TestRegisterTransferFileStatePreservesPrestoredPageCacheLength(t *testing.T
 		{FileID: 0, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/1")), FileSize: 42},
 	}, TransferStateStarted)
 
+	// FileID 0 is RootFileID, which RegisterTransferFileStates explicitly
+	// excludes from NumEntries (root entries are implicit). Wait on the
+	// post-Register effect we actually care about: State has been grown
+	// to match the registered FileID range, and PageCache wasn't wiped or
+	// truncated in the process.
 	stored := waitForTransferState(t, transfer.ID, func(stored Transfer) bool {
-		return stored.NumEntries == 1 && len(stored.PageCache) == 1
+		return len(stored.State) == 1 && len(stored.PageCache) == 1
 	})
 	if len(stored.PageCache) != len(stored.State) {
 		t.Fatalf("PageCache len = %d, State len = %d", len(stored.PageCache), len(stored.State))
