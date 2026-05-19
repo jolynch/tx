@@ -439,6 +439,46 @@ func TestHandleTXFEREmitsPageCacheWhenRequested(t *testing.T) {
 	}
 }
 
+// TestEncodeManifestEmitsPageCacheWithRelativeRoot regresses the bug where
+// pagecache.LoadDirectory keys its result map by absolute paths while
+// WalkManifestEntries yields FullPath relative to the caller's root form, so
+// the lookup silently missed every entry when the server was launched with a
+// relative chroot. Encode the manifest directly with a relative root and
+// assert at least one entry carries a `pc:` blob.
+func TestEncodeManifestEmitsPageCacheWithRelativeRoot(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("cache-map emission requires Linux mincore")
+	}
+	parent := t.TempDir()
+	rootDirName := "data"
+	absRoot := filepath.Join(parent, rootDirName)
+	if err := os.Mkdir(absRoot, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(absRoot, "warm.bin")
+	if err := os.WriteFile(path, make([]byte, 4096), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := io.ReadAll(f); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	f.Close()
+
+	t.Chdir(parent)
+
+	var out bytes.Buffer
+	if err := encodeManifest(&out, "tx-rel", rootDirName, "fast", 900, 4, 0, false, true, &txferTestDeps{}); err != nil {
+		t.Fatalf("encodeManifest: %v", err)
+	}
+	if !strings.Contains(out.String(), " pc:") {
+		t.Fatalf("expected pagecache token in manifest with relative root, got %q", out.String())
+	}
+}
+
 func TestParseTXFERRequestAcceptsPageCache(t *testing.T) {
 	req, err := ParseRequest([]byte(`TXFER "/tmp" mode=fast link-mbps=900 concurrency=4 cache-map=1`))
 	if err != nil {

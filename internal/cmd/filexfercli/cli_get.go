@@ -319,7 +319,7 @@ func touchGetCache(outputPath string, entry tx.ManifestEntry, cacheLoadBudget ti
 	}
 	defer cancel()
 	start := time.Now()
-	touched, touchErr := pagecache.TouchEntries(ctx, func(yield func(pagecache.TouchEntry) bool) {
+	summary, touchErr := pagecache.TouchEntries(ctx, func(yield func(pagecache.TouchEntry) bool) {
 		yield(pagecache.TouchEntry{Path: outputPath, Entry: ce})
 	}, budget, 1)
 	status := "[ok]"
@@ -328,8 +328,13 @@ func touchGetCache(outputPath string, entry tx.ManifestEntry, cacheLoadBudget ti
 		status = "[partial-ok]"
 		budgetPart = fmt.Sprintf(" budget=%s", cacheLoadBudget)
 	}
+	errPart := ""
+	if summary.OpenErrors+summary.AdviseErrors+summary.ReadErrors > 0 {
+		errPart = fmt.Sprintf(" errs=open=%d/advise=%d/read=%d",
+			summary.OpenErrors, summary.AdviseErrors, summary.ReadErrors)
+	}
 	fmt.Fprintf(stderr,
-		"touch-cache: %s warmed=%d/1 budget-pages=%d total-pages=%d%s elapsed=%s\n",
-		status, touched, budget, ce.NumResidentPages(), budgetPart, time.Since(start).Round(time.Millisecond),
+		"cache-touch: %s warmed=%d/1 budget-pages=%d total-pages=%d%s elapsed=%s%s\n",
+		status, summary.Touched, budget, ce.NumResidentPages(), budgetPart, time.Since(start).Round(time.Millisecond), errPart,
 	)
 }

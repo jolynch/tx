@@ -13,7 +13,7 @@ func withStubLoad(t *testing.T, fn func(string) ([]byte, int, error)) {
 	t.Cleanup(func() { loadResidencyFn = prev })
 }
 
-func withStubTouch(t *testing.T, fn func(string, []byte, int) error) {
+func withStubTouch(t *testing.T, fn func(string, []byte, int, bool) (int, error)) {
 	t.Helper()
 	prev := touchPagesFn
 	prevSupported := touchSupportedFn
@@ -152,12 +152,12 @@ func TestSetPageBitsZeroPages(t *testing.T) {
 
 func TestTouchEmpty(t *testing.T) {
 	called := false
-	withStubTouch(t, func(string, []byte, int) error {
+	withStubTouch(t, func(string, []byte, int, bool) (int, error) {
 		called = true
-		return nil
+		return 0, nil
 	})
 	var e CacheEntry
-	if err := e.Touch("ignored"); err != nil {
+	if _, err := e.Touch("ignored", true); err != nil {
 		t.Fatalf("Touch: %v", err)
 	}
 	if called {
@@ -169,21 +169,31 @@ func TestTouchDispatch(t *testing.T) {
 	var gotPath string
 	var gotPages int
 	var gotBits []byte
-	withStubTouch(t, func(path string, bits []byte, numPages int) error {
+	var gotAdvise bool
+	withStubTouch(t, func(path string, bits []byte, numPages int, advise bool) (int, error) {
 		gotPath = path
 		gotBits = bits
 		gotPages = numPages
-		return nil
+		gotAdvise = advise
+		return 0, nil
 	})
 
 	e := CacheEntry{bits: []byte{0b10001001}, numPages: 4}
-	if err := e.Touch("/tmp/file"); err != nil {
+	if _, err := e.Touch("/tmp/file", true); err != nil {
 		t.Fatalf("Touch: %v", err)
 	}
-	if gotPath != "/tmp/file" || gotPages != 4 {
-		t.Fatalf("Touch args: path=%q numPages=%d", gotPath, gotPages)
+	if gotPath != "/tmp/file" || gotPages != 4 || !gotAdvise {
+		t.Fatalf("Touch args: path=%q numPages=%d advise=%v", gotPath, gotPages, gotAdvise)
 	}
 	if !reflect.DeepEqual(gotBits, []byte{0b10001001}) {
 		t.Fatalf("Touch bits = %08b", gotBits)
+	}
+
+	// Same entry, advise=false should reach the stub with advise=false.
+	if _, err := e.Touch("/tmp/file", false); err != nil {
+		t.Fatalf("Touch advise=false: %v", err)
+	}
+	if gotAdvise {
+		t.Fatalf("expected stub to see advise=false on second call")
 	}
 }

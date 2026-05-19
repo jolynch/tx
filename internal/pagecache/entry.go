@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 )
 
 // ErrUnsupported is returned by Load and Touch on platforms that do not
@@ -60,15 +61,21 @@ func (e *CacheEntry) Load(path string) error {
 	return nil
 }
 
-// Touch issues posix_fadvise(WILLNEED) over every resident page run.
-// The file is opened O_RDONLY; reads past the file's actual size are
-// clipped so partial files do not produce errors. On non-Linux returns
-// ErrUnsupported. A no-op on empty entries.
-func (e *CacheEntry) Touch(path string) error {
+// Touch operates on the resident pages recorded in e against the file at
+// path. When advise is true the kernel is asked (asynchronously) to bring
+// the pages in via posix_fadvise(WILLNEED). When advise is false each
+// resident-run is mmaped PROT_READ and one byte per page is accessed so any
+// not-yet-resident page faults in synchronously.
+//
+// The first return is the count of fadvise calls that returned a non-nil
+// errno (advisory, dropped per-call but counted); always 0 for the
+// advise=false path. The second return is a setup error (open / stat /
+// unsupported platform). A no-op on empty entries.
+func (e *CacheEntry) Touch(path string, advise bool) (int, error) {
 	if e.Empty() {
-		return nil
+		return 0, nil
 	}
-	return touchPagesFn(path, e.bits, e.numPages)
+	return touchPagesFn(path, e.bits, e.numPages, advise)
 }
 
 // NumResidentPages returns the number of bits set in the entry's
@@ -226,47 +233,106 @@ type TouchEntry struct {
 // It must stop yielding when yield returns false.
 type TouchEntryFunc func(yield func(TouchEntry) bool)
 
+// TouchSummary aggregates per-call accounting from one TouchEntries pass.
+type TouchSummary struct {
+	// Touched is the number of entries actually handed to the fadvise
+	// stage worker pool.
+	Touched int
+	// OpenErrors counts entries whose advise-stage Touch returned a setup
+	// error (open or stat failure). Those entries do not progress to the
+	// read-touch stage.
+	OpenErrors int64
+	// AdviseErrors counts the cumulative number of fadvise calls across
+	// all touched files that returned a non-nil errno. Each touched file
+	// can issue many fadvise calls (one per resident-run, batched), so
+	// this number is bounded by the total resident-page count, not by
+	// Touched.
+	AdviseErrors int64
+	// ReadTouched is the number of entries that completed the read-touch
+	// stage (mmap + per-page byte access) without error. Equals Touched
+	// minus OpenErrors minus ReadErrors in a healthy run.
+	ReadTouched int
+	// ReadErrors counts entries whose read-touch stage failed (open /
+	// mmap). Those entries had their fadvise hint issued but their pages
+	// were not synchronously faulted in.
+	ReadErrors int64
+}
+
 // TouchEntries issues posix_fadvise(WILLNEED) hints to the OS page cache for
 // each generated entry, in caller-supplied order. Iteration stops when ctx is
 // canceled, or at the first entry whose resident-page count would push the
 // cumulative count over maxResidentPages; passing maxResidentPages <= 0
 // disables the cap (touch everything).
 //
-// Returns the number of entries actually handed to a worker. Per-file Touch
-// errors after that point are silently dropped — the hint is advisory. If ctx
-// prevents an entry from being handed to a worker, ctx.Err() is returned after
-// already-queued work drains.
+// Returns a TouchSummary describing how many entries were handed to a worker
+// and how many of those entries / their fadvise calls failed. Per-file
+// failures are still considered advisory and do not surface as a returned
+// error. If ctx prevents an entry from being handed to a worker, ctx.Err()
+// is returned after already-queued work drains.
 //
-// On platforms where TouchSupported is false, TouchEntries returns (0, nil)
-// without consuming entries.
+// On platforms where TouchSupported is false, TouchEntries returns
+// (TouchSummary{}, nil) without consuming entries.
 //
 // parallelism <= 0 defaults to runtime.NumCPU() * 4, matching
 // LoadDirectory.
-func TouchEntries(ctx context.Context, entries TouchEntryFunc, maxResidentPages int64, parallelism int) (int, error) {
+func TouchEntries(ctx context.Context, entries TouchEntryFunc, maxResidentPages int64, parallelism int) (TouchSummary, error) {
 	if entries == nil {
-		return 0, nil
+		return TouchSummary{}, nil
 	}
 	if !TouchSupported() {
-		return 0, nil
+		return TouchSummary{}, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return TouchSummary{}, err
 	}
 	if parallelism <= 0 {
 		parallelism = runtime.NumCPU() * 4
 	}
 
+	// Stage 1 (fadvise) feeds stage 2 (read-touch) via a 1024-deep
+	// buffered channel — the fadvise pool is allowed to run up to 1024
+	// entries ahead of read-touch so the kernel has time to honor the
+	// WILLNEED hint before the synchronous mmap+access arrives.
+	const readTouchBuffer = 1024
 	jobs := make(chan TouchEntry, parallelism*2)
-	var wg sync.WaitGroup
+	readTouchCh := make(chan TouchEntry, readTouchBuffer)
+	var wg, readWg sync.WaitGroup
+	var openErrs, adviseErrs, readTouched, readErrs atomic.Int64
 	wg.Add(parallelism)
 	for i := 0; i < parallelism; i++ {
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
-				_ = j.Entry.Touch(j.Path) // advisory; drop per-file errors
+				ae, err := j.Entry.Touch(j.Path, true) // advise=true
+				if err != nil {
+					openErrs.Add(1)
+					continue
+				}
+				if ae > 0 {
+					adviseErrs.Add(int64(ae))
+				}
+				// Forward to read-touch stage. Blocking send back-pressures
+				// the fadvise pool once readTouchCh fills.
+				readTouchCh <- j
+			}
+		}()
+	}
+	readWg.Add(parallelism)
+	for i := 0; i < parallelism; i++ {
+		go func() {
+			defer readWg.Done()
+			for j := range readTouchCh {
+				if ctx.Err() != nil {
+					continue // drain without I/O so the fadvise pool's sends never block
+				}
+				if _, err := j.Entry.Touch(j.Path, false); err != nil { // advise=false
+					readErrs.Add(1)
+					continue
+				}
+				readTouched.Add(1)
 			}
 		}()
 	}
@@ -307,7 +373,17 @@ func TouchEntries(ctx context.Context, entries TouchEntryFunc, maxResidentPages 
 	})
 	close(jobs)
 	wg.Wait()
-	return touched, stopErr
+	// Fadvise pool is drained; no more sends to readTouchCh — safe to close
+	// and wait for the read-touch pool.
+	close(readTouchCh)
+	readWg.Wait()
+	return TouchSummary{
+		Touched:      touched,
+		OpenErrors:   openErrs.Load(),
+		AdviseErrors: adviseErrs.Load(),
+		ReadTouched:  int(readTouched.Load()),
+		ReadErrors:   readErrs.Load(),
+	}, stopErr
 }
 
 // SystemPageBudget returns the page count available for warming after

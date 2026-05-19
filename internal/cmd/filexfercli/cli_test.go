@@ -721,8 +721,8 @@ func TestRunCLIGetCacheLoadRequestsAndTouchesHint(t *testing.T) {
 	if !sawCacheMap.Load() {
 		t.Fatalf("expected TXFER cache-map=1")
 	}
-	if pagecache.TouchSupported() && !strings.Contains(stderr.String(), "touch-cache: [ok] warmed=1/1") {
-		t.Fatalf("expected touch-cache warming output, got: %s", stderr.String())
+	if pagecache.TouchSupported() && !strings.Contains(stderr.String(), "cache-touch: [ok] warmed=1/1") {
+		t.Fatalf("expected cache-touch warming output, got: %s", stderr.String())
 	}
 }
 
@@ -2089,7 +2089,7 @@ func TestFormatCacheProgressLine(t *testing.T) {
 		},
 		{
 			name: "no-budgets-final-ok",
-			tag:  "touch-cache:[ok]",
+			tag:  "cache-touch:[ok]",
 			state: cacheProgressState{
 				filesTouched: 5, totalFiles: 5,
 				bytesTouched: 0, totalBytes: 0,
@@ -2097,13 +2097,13 @@ func TestFormatCacheProgressLine(t *testing.T) {
 				elapsed: 2 * time.Second, timeBudget: 0,
 			},
 			want: fmt.Sprintf(
-				"touch-cache:[ok][     5/     5](100.0%%) [       0 B/       0 B](  0.0%%) budget[   2s/%s][%s/%s]",
+				"cache-touch:[ok][     5/     5](100.0%%) [       0 B/       0 B](  0.0%%) budget[   2s/%s][%s/%s]",
 				naDur, memField(200), naBytes,
 			),
 		},
 		{
 			name: "page-budget-only-partial",
-			tag:  "touch-cache:[partial-ok]",
+			tag:  "cache-touch:[partial-ok]",
 			state: cacheProgressState{
 				filesTouched: 50, totalFiles: 100,
 				bytesTouched: 5 * 1024 * 1024, totalBytes: 10 * 1024 * 1024,
@@ -2111,7 +2111,7 @@ func TestFormatCacheProgressLine(t *testing.T) {
 				elapsed: 30 * time.Second, timeBudget: 0,
 			},
 			want: fmt.Sprintf(
-				"touch-cache:[partial-ok][    50/   100]( 50.0%%) [  5.00 MiB/ 10.00 MiB]( 50.0%%) budget[  30s/%s][%s/%s]",
+				"cache-touch:[partial-ok][    50/   100]( 50.0%%) [  5.00 MiB/ 10.00 MiB]( 50.0%%) budget[  30s/%s][%s/%s]",
 				naDur, memField(7500), memField(10000),
 			),
 		},
@@ -2131,7 +2131,7 @@ func TestFormatCacheProgressLine(t *testing.T) {
 		},
 		{
 			name: "overrun-clamped",
-			tag:  "touch-cache:[partial-ok]",
+			tag:  "cache-touch:[partial-ok]",
 			state: cacheProgressState{
 				filesTouched: 100, totalFiles: 100,
 				bytesTouched: 10 * 1024 * 1024, totalBytes: 10 * 1024 * 1024,
@@ -2139,7 +2139,7 @@ func TestFormatCacheProgressLine(t *testing.T) {
 				elapsed: 35 * time.Second, timeBudget: 30 * time.Second,
 			},
 			want: fmt.Sprintf(
-				"touch-cache:[partial-ok][   100/   100](100.0%%) [ 10.00 MiB/ 10.00 MiB](100.0%%) budget[  35s/  30s][%s/%s]",
+				"cache-touch:[partial-ok][   100/   100](100.0%%) [ 10.00 MiB/ 10.00 MiB](100.0%%) budget[  35s/  30s][%s/%s]",
 				memField(12000), memField(10000),
 			),
 		},
@@ -2148,6 +2148,71 @@ func TestFormatCacheProgressLine(t *testing.T) {
 			got := formatCacheProgressLine(tc.tag, tc.state)
 			if got != tc.want {
 				t.Fatalf("formatCacheProgressLine\n  got:  %q\n  want: %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFormatCacheVerifyLine(t *testing.T) {
+	pageSize := int64(pagecache.PageSize())
+	memField := func(pages int64) string {
+		return encoding.HumanBytesFixedWidth(pages*pageSize, cacheProgressBytesWidth)
+	}
+	for _, tc := range []struct {
+		name  string
+		probe pagecache.ChunkProbeResult
+		want  string
+	}{
+		{
+			name: "full-honor",
+			probe: pagecache.ChunkProbeResult{
+				SampledChunks: 25600, PlannedChunks: 25600,
+				ExpectedPages: 4_200_000, HonoredPages: 4_200_000,
+			},
+			want: fmt.Sprintf(
+				"cache-verify:[ok][ 25600/ 25600 chunks](100.0%% honored) [%s/%s]",
+				memField(4_200_000), memField(4_200_000),
+			),
+		},
+		{
+			name: "partial-honor",
+			probe: pagecache.ChunkProbeResult{
+				SampledChunks: 25600, PlannedChunks: 25600,
+				ExpectedPages: 4_200_000, HonoredPages: 3_100_000,
+			},
+			want: fmt.Sprintf(
+				"cache-verify:[ok][ 25600/ 25600 chunks]( 73.8%% honored) [%s/%s]",
+				memField(3_100_000), memField(4_200_000),
+			),
+		},
+		{
+			name: "partial-budget-expired",
+			probe: pagecache.ChunkProbeResult{
+				SampledChunks: 12345, PlannedChunks: 25600,
+				ExpectedPages: 2_200_000, HonoredPages: 1_500_000,
+				Partial: true,
+			},
+			want: fmt.Sprintf(
+				"cache-verify:[partial-ok][ 12345/ 25600 chunks]( 68.2%% honored) [%s/%s]",
+				memField(1_500_000), memField(2_200_000),
+			),
+		},
+		{
+			name: "zero-expected",
+			probe: pagecache.ChunkProbeResult{
+				SampledChunks: 5, PlannedChunks: 5,
+				ExpectedPages: 0, HonoredPages: 0,
+			},
+			want: fmt.Sprintf(
+				"cache-verify:[ok][     5/     5 chunks](  0.0%% honored) [%s/%s]",
+				memField(0), memField(0),
+			),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatCacheVerifyLine(tc.probe)
+			if got != tc.want {
+				t.Fatalf("formatCacheVerifyLine\n  got:  %q\n  want: %q", got, tc.want)
 			}
 		})
 	}
