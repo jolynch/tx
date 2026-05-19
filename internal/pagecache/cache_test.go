@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func writeFile(t *testing.T, dir, name string, size int) string {
@@ -248,35 +249,35 @@ func touchEntryGenerator(entries ...TouchEntry) TouchEntryFunc {
 }
 
 func TestTouchEntriesEmpty(t *testing.T) {
-	touched, err := TouchEntries(context.Background(), nil, -1, 0)
-	if err != nil || touched != 0 {
-		t.Fatalf("nil: got (%d, %v), want (0, nil)", touched, err)
+	summary, err := TouchEntries(context.Background(), nil, -1, 0)
+	if err != nil || summary.Touched != 0 {
+		t.Fatalf("nil: got (%d, %v), want (0, nil)", summary.Touched, err)
 	}
-	touched, err = TouchEntries(context.Background(), touchEntryGenerator(), -1, 0)
-	if err != nil || touched != 0 {
-		t.Fatalf("empty: got (%d, %v), want (0, nil)", touched, err)
+	summary, err = TouchEntries(context.Background(), touchEntryGenerator(), -1, 0)
+	if err != nil || summary.Touched != 0 {
+		t.Fatalf("empty: got (%d, %v), want (0, nil)", summary.Touched, err)
 	}
 }
 
 func TestTouchEntriesSkipsWhenUnsupported(t *testing.T) {
 	var touchCalls int32
-	withStubTouch(t, func(string, []byte, int) error {
+	withStubTouch(t, func(string, []byte, int, bool) (int, error) {
 		atomic.AddInt32(&touchCalls, 1)
-		return nil
+		return 0, nil
 	})
 	withTouchSupport(t, false)
 
 	full := mustSetEntry(t, []byte{0x01}, 1)
 	var yielded int32
-	touched, err := TouchEntries(context.Background(), func(yield func(TouchEntry) bool) {
+	summary, err := TouchEntries(context.Background(), func(yield func(TouchEntry) bool) {
 		atomic.AddInt32(&yielded, 1)
 		yield(TouchEntry{Path: "/a", Entry: full})
 	}, -1, 1)
 	if err != nil {
 		t.Fatalf("TouchEntries: %v", err)
 	}
-	if touched != 0 {
-		t.Fatalf("unsupported TouchEntries should touch 0 entries, got %d", touched)
+	if summary.Touched != 0 {
+		t.Fatalf("unsupported TouchEntries should touch 0 entries, got %d", summary.Touched)
 	}
 	if got := atomic.LoadInt32(&yielded); got != 0 {
 		t.Fatalf("unsupported TouchEntries should not consume generator, yielded %d entries", got)
@@ -287,7 +288,7 @@ func TestTouchEntriesSkipsWhenUnsupported(t *testing.T) {
 }
 
 func TestTouchEntriesFanOut(t *testing.T) {
-	withStubTouch(t, func(string, []byte, int) error { return nil })
+	withStubTouch(t, func(string, []byte, int, bool) (int, error) { return 0, nil })
 
 	makeEntry := func(setBits int) *CacheEntry {
 		bits := make([]byte, (setBits+7)/8)
@@ -301,20 +302,24 @@ func TestTouchEntriesFanOut(t *testing.T) {
 		{Path: "/b", Entry: makeEntry(4)},
 		{Path: "/c", Entry: makeEntry(4)},
 	}
-	touched, err := TouchEntries(context.Background(), touchEntryGenerator(entries...), -1, 4)
+	summary, err := TouchEntries(context.Background(), touchEntryGenerator(entries...), -1, 4)
 	if err != nil {
 		t.Fatalf("TouchEntries: %v", err)
 	}
-	if touched != 3 {
-		t.Fatalf("want touched=3, got %d", touched)
+	if summary.Touched != 3 {
+		t.Fatalf("want touched=3, got %d", summary.Touched)
 	}
 }
 
 func TestTouchEntriesRespectsBudget(t *testing.T) {
-	var touchCalls int32
-	withStubTouch(t, func(string, []byte, int) error {
-		atomic.AddInt32(&touchCalls, 1)
-		return nil
+	var adviseCalls, readCalls int32
+	withStubTouch(t, func(_ string, _ []byte, _ int, advise bool) (int, error) {
+		if advise {
+			atomic.AddInt32(&adviseCalls, 1)
+		} else {
+			atomic.AddInt32(&readCalls, 1)
+		}
+		return 0, nil
 	})
 
 	mk := func(setBits int) *CacheEntry {
@@ -330,30 +335,39 @@ func TestTouchEntriesRespectsBudget(t *testing.T) {
 		{Path: "/c", Entry: mk(10)},
 	}
 	// Budget of 20 pages — first two fit (10+10=20), third would overflow.
-	touched, err := TouchEntries(context.Background(), touchEntryGenerator(entries...), 20, 2)
+	summary, err := TouchEntries(context.Background(), touchEntryGenerator(entries...), 20, 2)
 	if err != nil {
 		t.Fatalf("TouchEntries: %v", err)
 	}
-	if touched != 2 {
-		t.Fatalf("budget=20 with 10/10/10 entries: want touched=2, got %d", touched)
+	if summary.Touched != 2 {
+		t.Fatalf("budget=20 with 10/10/10 entries: want touched=2, got %d", summary.Touched)
 	}
-	if got := atomic.LoadInt32(&touchCalls); got != 2 {
-		t.Fatalf("want 2 Touch calls, got %d", got)
+	if got := atomic.LoadInt32(&adviseCalls); got != 2 {
+		t.Fatalf("want 2 advise-stage Touch calls, got %d", got)
+	}
+	if got := atomic.LoadInt32(&readCalls); got != 2 {
+		t.Fatalf("want 2 read-stage Touch calls (one per advise-success), got %d", got)
+	}
+	if summary.ReadTouched != 2 {
+		t.Fatalf("want ReadTouched=2, got %d", summary.ReadTouched)
 	}
 
 	// Tighter budget: only the first entry fits.
-	touchCalls = 0
-	touched, err = TouchEntries(context.Background(), touchEntryGenerator(entries...), 10, 2)
+	adviseCalls, readCalls = 0, 0
+	summary, err = TouchEntries(context.Background(), touchEntryGenerator(entries...), 10, 2)
 	if err != nil {
 		t.Fatalf("TouchEntries: %v", err)
 	}
-	if touched != 1 {
-		t.Fatalf("budget=10: want touched=1, got %d", touched)
+	if summary.Touched != 1 {
+		t.Fatalf("budget=10: want touched=1, got %d", summary.Touched)
+	}
+	if got := atomic.LoadInt32(&adviseCalls); got != 1 {
+		t.Fatalf("want 1 advise call, got %d", got)
 	}
 }
 
 func TestTouchEntriesStopsConsumingGeneratorOnBudgetOverflow(t *testing.T) {
-	withStubTouch(t, func(string, []byte, int) error { return nil })
+	withStubTouch(t, func(string, []byte, int, bool) (int, error) { return 0, nil })
 
 	mk := func(setBits int) *CacheEntry {
 		bits := make([]byte, (setBits+7)/8)
@@ -369,7 +383,7 @@ func TestTouchEntriesStopsConsumingGeneratorOnBudgetOverflow(t *testing.T) {
 		{Path: "/d", Entry: mk(10)},
 	}
 	var yielded int32
-	touched, err := TouchEntries(context.Background(), func(yield func(TouchEntry) bool) {
+	summary, err := TouchEntries(context.Background(), func(yield func(TouchEntry) bool) {
 		for _, entry := range entries {
 			atomic.AddInt32(&yielded, 1)
 			if !yield(entry) {
@@ -380,8 +394,8 @@ func TestTouchEntriesStopsConsumingGeneratorOnBudgetOverflow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TouchEntries: %v", err)
 	}
-	if touched != 2 {
-		t.Fatalf("want touched=2, got %d", touched)
+	if summary.Touched != 2 {
+		t.Fatalf("want touched=2, got %d", summary.Touched)
 	}
 	if got := atomic.LoadInt32(&yielded); got != 3 {
 		t.Fatalf("want generator to stop after overflow candidate, yielded %d entries", got)
@@ -389,21 +403,21 @@ func TestTouchEntriesStopsConsumingGeneratorOnBudgetOverflow(t *testing.T) {
 }
 
 func TestTouchEntriesStopsConsumingGeneratorOnCanceledContext(t *testing.T) {
-	withStubTouch(t, func(string, []byte, int) error { return nil })
+	withStubTouch(t, func(string, []byte, int, bool) (int, error) { return 0, nil })
 	full := mustSetEntry(t, []byte{0x01}, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	var yielded int32
-	touched, err := TouchEntries(ctx, func(yield func(TouchEntry) bool) {
+	summary, err := TouchEntries(ctx, func(yield func(TouchEntry) bool) {
 		atomic.AddInt32(&yielded, 1)
 		yield(TouchEntry{Path: "/a", Entry: full})
 	}, -1, 1)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("TouchEntries err = %v, want context.Canceled", err)
 	}
-	if touched != 0 {
-		t.Fatalf("want touched=0, got %d", touched)
+	if summary.Touched != 0 {
+		t.Fatalf("want touched=0, got %d", summary.Touched)
 	}
 	if got := atomic.LoadInt32(&yielded); got != 0 {
 		t.Fatalf("want canceled context to avoid consuming generator, yielded %d entries", got)
@@ -411,7 +425,7 @@ func TestTouchEntriesStopsConsumingGeneratorOnCanceledContext(t *testing.T) {
 }
 
 func TestTouchEntriesSkipsEmptyEntries(t *testing.T) {
-	withStubTouch(t, func(string, []byte, int) error { return nil })
+	withStubTouch(t, func(string, []byte, int, bool) (int, error) { return 0, nil })
 
 	full := mustSetEntry(t, []byte{0x01}, 1)
 	emptyByZero := &CacheEntry{} // never SetPageBits'd
@@ -423,33 +437,58 @@ func TestTouchEntriesSkipsEmptyEntries(t *testing.T) {
 		{Path: "/full2", Entry: full},
 		{Path: "/nil", Entry: nil},
 	}
-	touched, err := TouchEntries(context.Background(), touchEntryGenerator(entries...), -1, 2)
+	summary, err := TouchEntries(context.Background(), touchEntryGenerator(entries...), -1, 2)
 	if err != nil {
 		t.Fatalf("TouchEntries: %v", err)
 	}
-	if touched != 2 {
-		t.Fatalf("want touched=2 (full1+full2 only), got %d", touched)
+	if summary.Touched != 2 {
+		t.Fatalf("want touched=2 (full1+full2 only), got %d", summary.Touched)
 	}
 }
 
 func TestTouchEntriesDropsPerFileErrors(t *testing.T) {
-	withStubTouch(t, func(path string, _ []byte, _ int) error {
+	withStubTouch(t, func(path string, _ []byte, _ int, _ bool) (int, error) {
 		if path == "/bad" {
-			return errors.New("simulated touch error")
+			return 0, errors.New("simulated touch error")
 		}
-		return nil
+		return 0, nil
 	})
 	full := mustSetEntry(t, []byte{0x01}, 1)
 	entries := []TouchEntry{
 		{Path: "/ok", Entry: full},
 		{Path: "/bad", Entry: full},
 	}
-	touched, err := TouchEntries(context.Background(), touchEntryGenerator(entries...), -1, 1)
+	summary, err := TouchEntries(context.Background(), touchEntryGenerator(entries...), -1, 1)
 	if err != nil {
 		t.Fatalf("TouchEntries should drop per-file errors, got %v", err)
 	}
-	if touched != 2 {
-		t.Fatalf("want touched=2 (both handed to worker), got %d", touched)
+	if summary.Touched != 2 {
+		t.Fatalf("want touched=2 (both handed to worker), got %d", summary.Touched)
+	}
+	if summary.OpenErrors != 1 {
+		t.Fatalf("want OpenErrors=1 (one /bad entry), got %d", summary.OpenErrors)
+	}
+}
+
+func TestTouchEntriesAggregatesAdviseErrors(t *testing.T) {
+	withStubTouch(t, func(path string, _ []byte, _ int, _ bool) (int, error) {
+		// Simulate 3 fadvise failures per file.
+		return 3, nil
+	})
+	full := mustSetEntry(t, []byte{0x01}, 1)
+	entries := []TouchEntry{
+		{Path: "/a", Entry: full},
+		{Path: "/b", Entry: full},
+	}
+	summary, err := TouchEntries(context.Background(), touchEntryGenerator(entries...), -1, 2)
+	if err != nil {
+		t.Fatalf("TouchEntries: %v", err)
+	}
+	if summary.AdviseErrors != 6 {
+		t.Fatalf("want AdviseErrors=6 (2 files * 3 advise errs each), got %d", summary.AdviseErrors)
+	}
+	if summary.OpenErrors != 0 {
+		t.Fatalf("want OpenErrors=0, got %d", summary.OpenErrors)
 	}
 }
 
@@ -485,4 +524,129 @@ func mustSetEntry(t *testing.T, bits []byte, numPages int) *CacheEntry {
 		t.Fatalf("SetPageBits: %v", err)
 	}
 	return e
+}
+
+func TestTouchEntriesReadTouchHappy(t *testing.T) {
+	var adviseCalls, readCalls int32
+	withStubTouch(t, func(_ string, _ []byte, _ int, advise bool) (int, error) {
+		if advise {
+			atomic.AddInt32(&adviseCalls, 1)
+		} else {
+			atomic.AddInt32(&readCalls, 1)
+		}
+		return 0, nil
+	})
+	full := mustSetEntry(t, []byte{0x01}, 1)
+	entries := []TouchEntry{
+		{Path: "/a", Entry: full},
+		{Path: "/b", Entry: full},
+		{Path: "/c", Entry: full},
+	}
+	summary, err := TouchEntries(context.Background(), touchEntryGenerator(entries...), -1, 2)
+	if err != nil {
+		t.Fatalf("TouchEntries: %v", err)
+	}
+	if summary.Touched != 3 || summary.ReadTouched != 3 {
+		t.Fatalf("want Touched=3 ReadTouched=3, got Touched=%d ReadTouched=%d",
+			summary.Touched, summary.ReadTouched)
+	}
+	if got := atomic.LoadInt32(&adviseCalls); got != 3 {
+		t.Fatalf("want 3 advise calls, got %d", got)
+	}
+	if got := atomic.LoadInt32(&readCalls); got != 3 {
+		t.Fatalf("want 3 read calls, got %d", got)
+	}
+	if summary.OpenErrors != 0 || summary.ReadErrors != 0 {
+		t.Fatalf("expected no errors, got %+v", summary)
+	}
+}
+
+func TestTouchEntriesReadTouchErrors(t *testing.T) {
+	withStubTouch(t, func(path string, _ []byte, _ int, advise bool) (int, error) {
+		if !advise && path == "/bad" {
+			return 0, errors.New("mmap denied")
+		}
+		return 0, nil
+	})
+	full := mustSetEntry(t, []byte{0x01}, 1)
+	entries := []TouchEntry{
+		{Path: "/ok", Entry: full},
+		{Path: "/bad", Entry: full},
+		{Path: "/ok2", Entry: full},
+	}
+	summary, err := TouchEntries(context.Background(), touchEntryGenerator(entries...), -1, 1)
+	if err != nil {
+		t.Fatalf("TouchEntries: %v", err)
+	}
+	if summary.Touched != 3 {
+		t.Fatalf("want Touched=3 (all reached advise), got %d", summary.Touched)
+	}
+	if summary.ReadTouched != 2 {
+		t.Fatalf("want ReadTouched=2 (/bad failed), got %d", summary.ReadTouched)
+	}
+	if summary.ReadErrors != 1 {
+		t.Fatalf("want ReadErrors=1, got %d", summary.ReadErrors)
+	}
+}
+
+func TestTouchEntriesReadTouchSkippedAfterFadviseFailure(t *testing.T) {
+	var adviseCalls, readCalls int32
+	withStubTouch(t, func(path string, _ []byte, _ int, advise bool) (int, error) {
+		if advise {
+			atomic.AddInt32(&adviseCalls, 1)
+			if path == "/bad" {
+				return 0, errors.New("advise open denied")
+			}
+			return 0, nil
+		}
+		atomic.AddInt32(&readCalls, 1)
+		if path == "/bad" {
+			t.Errorf("read-touch should not run for /bad after advise open failed")
+		}
+		return 0, nil
+	})
+	full := mustSetEntry(t, []byte{0x01}, 1)
+	entries := []TouchEntry{
+		{Path: "/ok", Entry: full},
+		{Path: "/bad", Entry: full},
+	}
+	summary, err := TouchEntries(context.Background(), touchEntryGenerator(entries...), -1, 1)
+	if err != nil {
+		t.Fatalf("TouchEntries: %v", err)
+	}
+	if summary.OpenErrors != 1 {
+		t.Fatalf("want OpenErrors=1, got %d", summary.OpenErrors)
+	}
+	if summary.ReadTouched != 1 {
+		t.Fatalf("want ReadTouched=1 (/bad never reached read stage), got %d", summary.ReadTouched)
+	}
+	if got := atomic.LoadInt32(&adviseCalls); got != 2 {
+		t.Fatalf("want 2 advise calls, got %d", got)
+	}
+	if got := atomic.LoadInt32(&readCalls); got != 1 {
+		t.Fatalf("want 1 read call (only /ok), got %d", got)
+	}
+}
+
+func TestTouchEntriesReadTouchHonorsContextCancel(t *testing.T) {
+	// Make the read-touch stage slow so cancellation has a clear effect on
+	// how many entries actually complete it.
+	withStubTouch(t, func(_ string, _ []byte, _ int, advise bool) (int, error) {
+		if !advise {
+			time.Sleep(50 * time.Millisecond)
+		}
+		return 0, nil
+	})
+	full := mustSetEntry(t, []byte{0x01}, 1)
+	entries := make([]TouchEntry, 50)
+	for i := range entries {
+		entries[i] = TouchEntry{Path: "/x", Entry: full}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	summary, _ := TouchEntries(ctx, touchEntryGenerator(entries...), -1, 1)
+	if summary.ReadTouched >= len(entries) {
+		t.Fatalf("expected ctx cancel to short-circuit read-touch; got ReadTouched=%d of %d",
+			summary.ReadTouched, len(entries))
+	}
 }

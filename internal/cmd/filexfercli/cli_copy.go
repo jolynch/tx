@@ -206,6 +206,12 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		cfg.cacheLoadEnabled = enabled
 		cfg.cacheLoadBudget = budget
 	}
+	// If --verify=<dur> was passed but --cache-load lacks an explicit
+	// duration, inherit the verify deadline so the touch pass and the
+	// post-touch cache-verify pass share the same overall budget.
+	if cfg.cacheLoadEnabled && cfg.cacheLoadBudget == 0 && cfg.verifyBudget > 0 {
+		cfg.cacheLoadBudget = cfg.verifyBudget
+	}
 	if cfg.verifyDataSamplePct > 0 && (cfg.skipFetch || cfg.skipWrite) {
 		fmt.Fprintf(stderr, "--verify N%%data/full cannot be used with --skip-fetch or --skip-write\n")
 		return 2
@@ -531,12 +537,12 @@ func touchCopyCache(cfg copyCLIConfig, progressInterval time.Duration, stderr io
 	}
 	ps, err := newPinchState(cfg.localDst)
 	if err != nil {
-		fmt.Fprintf(stderr, "touch-cache: skip (%v)\n", err)
+		fmt.Fprintf(stderr, "cache-touch: skip (%v)\n", err)
 		return
 	}
 	manifest, err := tx.LoadManifest(ps.ServerManifestPath)
 	if err != nil {
-		fmt.Fprintf(stderr, "touch-cache: skip (load manifest: %v)\n", err)
+		fmt.Fprintf(stderr, "cache-touch: skip (load manifest: %v)\n", err)
 		return
 	}
 
@@ -581,7 +587,39 @@ func touchCopyCache(cfg copyCLIConfig, progressInterval time.Duration, stderr io
 			timeBudget:   cfg.cacheLoadBudget,
 		}
 	}
-	_, touchErr := pagecache.TouchEntries(ctx, func(yield func(pagecache.TouchEntry) bool) {
+	// Sample size scales with the total warmable bytes: ~10% of the chunks
+	// the manifest covers. Big files contribute more chunks than small ones
+	// so the retained sample is weighted by file size rather than file count.
+	chunkSizeBytes := int64(pagecache.DefaultChunkSamplePages) * int64(pagecache.PageSize())
+	totalChunks := (totalBytes + chunkSizeBytes - 1) / chunkSizeBytes
+	sampleCap := int(float64(totalChunks) * pagecache.DefaultChunkSampleRate)
+	if sampleCap < pagecache.MinChunkSampleCap {
+		sampleCap = pagecache.MinChunkSampleCap
+	}
+	sampler := pagecache.NewChunkSampler(sampleCap, pagecache.DefaultChunkSamplePages)
+
+	// Wipe the slate first: evict whatever pages the writer left in the page
+	// cache for every transferred regular file. Without this step, the
+	// receiver's cache state is the writer's "I just wrote these" plus our
+	// WILLNEED additions — not the sender's snapshot we're trying to
+	// reproduce. Use the same ctx so a tight --cache-load budget covers
+	// evict + touch together.
+	evict, _ := pagecache.EvictPaths(ctx, func(yield func(string) bool) {
+		for i := range manifest.Entries {
+			e := &manifest.Entries[i]
+			if e.Type != encoding.EntryTypeFile {
+				continue
+			}
+			if !yield(filepath.Join(ps.TargetDir, e.Path)) {
+				return
+			}
+		}
+	}, 0)
+	if evict.Evicted+evict.Errors > 0 {
+		fmt.Fprintf(stderr, "cache-evict: evicted=%d errors=%d\n", evict.Evicted, evict.Errors)
+	}
+
+	touchSummary, touchErr := pagecache.TouchEntries(ctx, func(yield func(pagecache.TouchEntry) bool) {
 		for _, idx := range candidateIndexes {
 			e := &manifest.Entries[idx]
 			ce := &pagecache.CacheEntry{}
@@ -589,12 +627,14 @@ func touchCopyCache(cfg copyCLIConfig, progressInterval time.Duration, stderr io
 				continue
 			}
 			pages := int64(ce.NumResidentPages())
-			if !yield(pagecache.TouchEntry{
+			te := pagecache.TouchEntry{
 				Path:  filepath.Join(ps.TargetDir, e.Path),
 				Entry: ce,
-			}) {
+			}
+			if !yield(te) {
 				return
 			}
+			sampler.Observe(te)
 			filesTouched++
 			bytesTouched += e.Size
 			pagesTouched += pages
@@ -611,7 +651,57 @@ func touchCopyCache(cfg copyCLIConfig, progressInterval time.Duration, stderr io
 	if errors.Is(touchErr, context.DeadlineExceeded) {
 		status = "[partial-ok]"
 	}
-	fmt.Fprintln(stderr, formatCacheProgressLine("touch-cache:"+status, snapshot()))
+	tag := "cache-touch:" + status
+	if touchSummary.OpenErrors+touchSummary.AdviseErrors+touchSummary.ReadErrors > 0 {
+		tag += fmt.Sprintf("[errs=open=%d/advise=%d/read=%d]",
+			touchSummary.OpenErrors, touchSummary.AdviseErrors, touchSummary.ReadErrors)
+	}
+	fmt.Fprintln(stderr, formatCacheProgressLine(tag, snapshot()))
+
+	// Reprobe runs against whatever fraction of the cache-load budget is
+	// still on the clock. If the budget is already gone there's no time to
+	// verify; skip entirely. The user already saw cache-touch:[partial-ok].
+	reprobeCtx := context.Background()
+	if cfg.cacheLoadBudget > 0 {
+		remaining := cfg.cacheLoadBudget - time.Since(start)
+		if remaining <= 0 {
+			return
+		}
+		var reprobeCancel context.CancelFunc
+		reprobeCtx, reprobeCancel = context.WithTimeout(reprobeCtx, remaining)
+		defer reprobeCancel()
+	}
+	probe := pagecache.ReprobeChunks(reprobeCtx, sampler.Samples())
+	if probe.SampledChunks > 0 || probe.Partial {
+		fmt.Fprintln(stderr, formatCacheVerifyLine(probe))
+	}
+}
+
+// formatCacheVerifyLine renders the post-touch verification line in the same
+// bracketed style as cache-progress / cache-touch. Status is [ok] or
+// [partial-ok] (the latter when the remaining cache-load budget expired
+// mid-reprobe). The first bracket is SampledChunks/PlannedChunks; the
+// percentage in parens is the kernel honor rate; the second bracket is
+// honored/expected pages expressed as bytes.
+func formatCacheVerifyLine(probe pagecache.ChunkProbeResult) string {
+	status := "[ok]"
+	if probe.Partial {
+		status = "[partial-ok]"
+	}
+	var honorPct float64
+	if probe.ExpectedPages > 0 {
+		honorPct = clampCachePercent(float64(probe.HonoredPages) * 100 / float64(probe.ExpectedPages))
+	}
+	pageSize := int64(pagecache.PageSize())
+	return fmt.Sprintf(
+		"cache-verify:%s[%s/%s chunks](%5.1f%% honored) [%s/%s]",
+		status,
+		encoding.HumanCount(uint64(max(probe.SampledChunks, 0)), cacheProgressCountWidth),
+		encoding.HumanCount(uint64(max(probe.PlannedChunks, 0)), cacheProgressCountWidth),
+		honorPct,
+		encoding.HumanBytesFixedWidth(probe.HonoredPages*pageSize, cacheProgressBytesWidth),
+		encoding.HumanBytesFixedWidth(probe.ExpectedPages*pageSize, cacheProgressBytesWidth),
+	)
 }
 
 func countManifestEntryTypes(entries []tx.ManifestEntry) (files, hardlinks, symlinks, dirs int) {

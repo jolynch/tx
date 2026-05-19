@@ -418,6 +418,14 @@ func encodeManifest(
 
 	var loadedFilePages map[string]*pagecache.CacheEntry
 	if pageCache {
+		// LoadDirectory keys its result map by absolute paths (it calls
+		// filepath.Abs internally) while WalkManifestEntries below yields
+		// FullPath in whatever form `root` was passed. Normalize once so the
+		// two lookups agree even when the server was launched with a relative
+		// chroot.
+		if absRoot, absErr := filepath.Abs(root); absErr == nil {
+			root = absRoot
+		}
 		loadedFilePages, _ = pagecache.LoadDirectory(root, 0)
 	}
 
