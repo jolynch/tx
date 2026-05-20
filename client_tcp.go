@@ -2,7 +2,6 @@ package tx
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -23,11 +22,9 @@ import (
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	ftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	intlimit "github.com/jolynch/tx/internal/filexfer/limit"
-	"github.com/zeebo/xxh3"
 )
 
 const maxTCPLineBytes = 4 * 1024 * 1024
-const maxManifestFrameWireBytes = 64 * 1024 * 1024
 
 type tcpAuthState struct {
 	publicKey      string // client's age public key
@@ -652,161 +649,44 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 		return GetManifestResponse{}, fmt.Errorf("TXFER: %w", err)
 	}
 
-	var raw bytes.Buffer
-	fileHasher := xxh3.New128()
-	var totalWire int64
-	var totalLogical int64
-	frameIdx := 0
-	for {
-		headerLine, err := readTCPLine(br, maxTCPLineBytes)
-		if err != nil {
-			return GetManifestResponse{}, fmt.Errorf("read TXFER response: %w", err)
-		}
-		if _, ok := parseOKStatusLine(headerLine); ok {
-			return GetManifestResponse{}, fmt.Errorf("TXFER ended before terminal frame")
-		}
-		if err := parseErrControlFrame(headerLine); err != nil {
-			return GetManifestResponse{}, err
-		}
-		meta, err := intencoding.ParseFXHeader(headerLine)
-		if err != nil {
-			return GetManifestResponse{}, fmt.Errorf("invalid TXFER frame: %w", err)
-		}
-		if meta.FileID != intencoding.ManifestFrameFileID {
-			return GetManifestResponse{}, fmt.Errorf("unexpected TXFER frame file_id=%d", meta.FileID)
-		}
-		if meta.HashToken == "" {
-			return GetManifestResponse{}, fmt.Errorf("frame %d missing header hash", frameIdx)
-		}
-		if meta.Offset != totalLogical {
-			return GetManifestResponse{}, fmt.Errorf("frame %d offset mismatch: expected=%d got=%d", frameIdx, totalLogical, meta.Offset)
-		}
-		if meta.WireSize > maxManifestFrameWireBytes {
-			return GetManifestResponse{}, fmt.Errorf("frame %d wire size too large: %d", frameIdx, meta.WireSize)
-		}
-
-		wire := make([]byte, meta.WireSize)
-		if meta.WireSize > 0 {
-			if _, err := io.ReadFull(br, wire); err != nil {
-				return GetManifestResponse{}, fmt.Errorf("read TXFER frame payload: %w", err)
+	mr := intencoding.NewChunkedManifestReader(br, intencoding.ChunkedManifestReaderOpts{
+		RawSink: request.RawSink,
+		OnFrame: func(s intencoding.ManifestFrameStats) {
+			if request.ManifestProgress == nil {
+				return
 			}
-		}
-
-		var chunkLogical []byte
-		switch meta.Comp {
-		case intencoding.EncodingZstd:
-			if request.RawSink != nil && len(wire) > 0 {
-				if _, werr := request.RawSink.Write(wire); werr != nil {
-					return GetManifestResponse{}, fmt.Errorf("write raw sink: %w", werr)
-				}
-			}
-			chunkLogical, err = intencoding.DecompressZstd(wire)
-			if err != nil {
-				return GetManifestResponse{}, fmt.Errorf("decompress frame %d: %w", frameIdx, err)
-			}
-		case "none":
-			if meta.WireSize != meta.Size {
-				return GetManifestResponse{}, fmt.Errorf("frame %d none-comp wsize=%d != size=%d", frameIdx, meta.WireSize, meta.Size)
-			}
-			chunkLogical = wire
-		default:
-			return GetManifestResponse{}, fmt.Errorf("unsupported manifest frame comp=%q", meta.Comp)
-		}
-		if int64(len(chunkLogical)) != meta.Size {
-			return GetManifestResponse{}, fmt.Errorf("frame %d size mismatch: header=%d actual=%d", frameIdx, meta.Size, len(chunkLogical))
-		}
-		wantChunkHash := intencoding.FormatXXH128HashToken(xxh3.Hash128(chunkLogical))
-		if !strings.EqualFold(meta.HashToken, wantChunkHash) {
-			return GetManifestResponse{}, fmt.Errorf("frame %d header hash mismatch: want=%s got=%s", frameIdx, wantChunkHash, meta.HashToken)
-		}
-		raw.Write(chunkLogical)
-		fileHasher.Write(chunkLogical)
-		totalLogical += meta.Size
-		totalWire += meta.WireSize
-
-		trailerLine, err := readTCPLine(br, maxTCPLineBytes)
-		if err != nil {
-			return GetManifestResponse{}, fmt.Errorf("read TXFER trailer: %w", err)
-		}
-		trailer, err := intencoding.ParseFXTrailer(trailerLine)
-		if err != nil {
-			return GetManifestResponse{}, fmt.Errorf("invalid TXFER trailer: %w", err)
-		}
-		if trailer.FileID != intencoding.ManifestFrameFileID {
-			return GetManifestResponse{}, fmt.Errorf("unexpected trailer file_id=%d", trailer.FileID)
-		}
-		if trailer.HashToken == "" {
-			return GetManifestResponse{}, fmt.Errorf("frame %d missing trailer hash", frameIdx)
-		}
-		wantFrameHash := manifestFrameHashToken(headerLine, wire, trailer.ChecksumPrefix)
-		if !strings.EqualFold(trailer.HashToken, wantFrameHash) {
-			return GetManifestResponse{}, fmt.Errorf("frame %d trailer hash mismatch: want=%s got=%s", frameIdx, wantFrameHash, trailer.HashToken)
-		}
-		if trailer.Next == nil {
-			return GetManifestResponse{}, fmt.Errorf("frame %d missing trailer next", frameIdx)
-		}
-		terminal := trailer.Next != nil && *trailer.Next == 0
-		if terminal {
-			if trailer.FileHashToken == "" {
-				return GetManifestResponse{}, fmt.Errorf("terminal manifest frame missing file-hash")
-			}
-		} else {
-			if *trailer.Next != totalLogical {
-				return GetManifestResponse{}, fmt.Errorf("frame %d next mismatch: expected=%d got=%d", frameIdx, totalLogical, *trailer.Next)
-			}
-			if trailer.FileHashToken != "" {
-				return GetManifestResponse{}, fmt.Errorf("non-terminal manifest frame %d has file-hash", frameIdx)
-			}
-		}
-
-		if request.ManifestProgress != nil {
 			select {
 			case request.ManifestProgress <- ManifestProgressUpdate{
-				FrameIndex:   frameIdx,
-				WireBytes:    meta.WireSize,
-				LogicalBytes: meta.Size,
-				TotalWire:    totalWire,
-				TotalLogical: totalLogical,
-				Terminal:     terminal,
+				FrameIndex:   s.FrameIndex,
+				WireBytes:    s.WireBytes,
+				LogicalBytes: s.LogicalBytes,
+				TotalWire:    s.TotalWire,
+				TotalLogical: s.TotalLogical,
+				Terminal:     s.Terminal,
 			}:
 			default:
 			}
-		}
-		frameIdx++
-
-		if terminal {
-			want := intencoding.FormatXXH128HashToken(fileHasher.Sum128())
-			if !strings.EqualFold(trailer.FileHashToken, want) {
-				return GetManifestResponse{}, fmt.Errorf("manifest file-hash mismatch: want=%s got=%s", want, trailer.FileHashToken)
-			}
-			statusLine, err := readTCPLine(br, maxTCPLineBytes)
-			if err != nil {
-				return GetManifestResponse{}, fmt.Errorf("read TXFER status: %w", err)
-			}
-			if _, ok := parseOKStatusLine(statusLine); !ok {
-				if err := parseErrControlFrame(statusLine); err != nil {
-					return GetManifestResponse{}, err
-				}
-				return GetManifestResponse{}, fmt.Errorf("unexpected TXFER terminator: %q", statusLine)
-			}
-			manifest, err := parseManifest(raw.Bytes())
-			if err != nil {
-				return GetManifestResponse{}, err
-			}
-			return GetManifestResponse{Manifest: manifest}, nil
-		}
+		},
+	})
+	raw, err := io.ReadAll(mr)
+	if err != nil {
+		return GetManifestResponse{}, fmt.Errorf("read TXFER manifest: %w", err)
 	}
-}
-
-func manifestFrameHashToken(headerLine string, payload []byte, trailerPrefix string) string {
-	h := xxh3.New()
-	_, _ = h.Write([]byte(headerLine))
-	_, _ = h.Write([]byte("\n"))
-	if len(payload) > 0 {
-		_, _ = h.Write(payload)
+	statusLine, err := readTCPLine(br, maxTCPLineBytes)
+	if err != nil {
+		return GetManifestResponse{}, fmt.Errorf("read TXFER status: %w", err)
 	}
-	_, _ = h.Write([]byte(trailerPrefix))
-	return intencoding.FormatXXH64HashToken(h.Sum64())
+	if _, ok := parseOKStatusLine(statusLine); !ok {
+		if err := parseErrControlFrame(statusLine); err != nil {
+			return GetManifestResponse{}, err
+		}
+		return GetManifestResponse{}, fmt.Errorf("unexpected TXFER terminator: %q", statusLine)
+	}
+	manifest, err := parseManifest(raw)
+	if err != nil {
+		return GetManifestResponse{}, err
+	}
+	return GetManifestResponse{Manifest: manifest}, nil
 }
 
 func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestRequest) (SyncManifestResponse, error) {
@@ -816,6 +696,11 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 	}
 	defer func() { _ = c.releaseManagedTCPConn(conn, pool) }()
 
+	comp := request.Comp
+	if comp == "" {
+		comp = intencoding.EncodingZstd
+	}
+
 	// Send SYNC command line.
 	cmd := "SYNC " + makeLenToken(request.Directory) +
 		" mode=" + request.Mode +
@@ -824,20 +709,23 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 	if request.DeadlineMS > 0 {
 		cmd += " deadline-ms=" + strconv.FormatInt(request.DeadlineMS, 10)
 	}
+	cmd += " comp=" + comp
 	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
 		return SyncManifestResponse{}, fmt.Errorf("send SYNC: %w", err)
 	}
 
-	// Send old manifest body followed by blank line terminator.
+	// Send the old manifest as an FX/1 + FXT/1 framed stream — mirrors TXFER's
+	// response framing so the server can validate the body chunk-by-chunk.
 	oldManifestBytes, err := marshalManifest(request.OldManifest)
 	if err != nil {
 		return SyncManifestResponse{}, fmt.Errorf("marshal old manifest: %w", err)
 	}
-	if _, err := conn.Write(oldManifestBytes); err != nil {
+	requestWriter := intencoding.NewChunkedManifestWriter(conn, comp, intencoding.DefaultManifestChunkSize, intencoding.DefaultManifestFlushInterval)
+	if _, err := requestWriter.Write(oldManifestBytes); err != nil {
 		return SyncManifestResponse{}, fmt.Errorf("write old manifest: %w", err)
 	}
-	if _, err := io.WriteString(conn, "\r\n"); err != nil {
-		return SyncManifestResponse{}, fmt.Errorf("write manifest terminator: %w", err)
+	if err := requestWriter.Close(); err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("flush old manifest frames: %w", err)
 	}
 
 	// Build ID→path index from the old manifest so we can resolve RM fileIDs.
@@ -846,52 +734,65 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 		oldByID[e.ID] = e.Path
 	}
 
-	// Read response: FM/1 lines, then RM lines, then OK.
+	// Read response: framed FM/1 + interleaved RM lines, then verb OK.
 	responseReader, err := c.responseReaderForTCP(conn, state)
 	if err != nil {
 		return SyncManifestResponse{}, fmt.Errorf("initialize SYNC response stream: %w", err)
 	}
 	br := bufio.NewReader(responseReader)
+	mr := intencoding.NewChunkedManifestReader(br, intencoding.ChunkedManifestReaderOpts{})
 
 	manifestBuf := c.acquireScratchBuffer(maxTCPLineBytes)
 	defer c.releaseScratchBuffer(manifestBuf)
 	var rmPaths []string
 
+	deframed := bufio.NewReader(mr)
 	for {
-		line, err := readTCPLine(br, maxTCPLineBytes)
-		if err != nil {
-			return SyncManifestResponse{}, fmt.Errorf("read SYNC response: %w", err)
-		}
-		if _, ok := parseOKStatusLine(line); ok {
-			manifest, parseErr := parseManifest(manifestBuf.Bytes())
-			if parseErr != nil {
-				return SyncManifestResponse{}, parseErr
+		line, readErr := deframed.ReadString('\n')
+		if len(line) > 0 {
+			trimmed := strings.TrimRight(line, "\r\n")
+			if strings.HasPrefix(trimmed, "RM ") {
+				fileID, parseErr := strconv.ParseUint(strings.TrimSpace(trimmed[3:]), 10, 64)
+				if parseErr != nil {
+					return SyncManifestResponse{}, fmt.Errorf("parse RM line: %w", parseErr)
+				}
+				path, ok := oldByID[fileID]
+				if !ok {
+					return SyncManifestResponse{}, fmt.Errorf("RM fileID %d not in old manifest", fileID)
+				}
+				rmPaths = append(rmPaths, path)
+			} else if trimmed != "" {
+				manifestBuf.WriteString(trimmed)
+				manifestBuf.WriteByte('\n')
 			}
-			return SyncManifestResponse{
-				Manifest:     manifest,
-				RemovedPaths: rmPaths,
-			}, nil
 		}
-		if err := parseErrControlFrame(line); err != nil {
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return SyncManifestResponse{}, fmt.Errorf("read SYNC response: %w", readErr)
+		}
+	}
+
+	statusLine, err := readTCPLine(br, maxTCPLineBytes)
+	if err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("read SYNC status: %w", err)
+	}
+	if _, ok := parseOKStatusLine(statusLine); !ok {
+		if err := parseErrControlFrame(statusLine); err != nil {
 			return SyncManifestResponse{}, err
 		}
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "RM ") {
-			fileID, parseErr := strconv.ParseUint(trimmed[3:], 10, 64)
-			if parseErr != nil {
-				return SyncManifestResponse{}, fmt.Errorf("parse RM line: %w", parseErr)
-			}
-			path, ok := oldByID[fileID]
-			if !ok {
-				return SyncManifestResponse{}, fmt.Errorf("RM fileID %d not in old manifest", fileID)
-			}
-			rmPaths = append(rmPaths, path)
-			continue
-		}
-		// FM/1 header or manifest entry line.
-		manifestBuf.WriteString(line)
-		manifestBuf.WriteByte('\n')
+		return SyncManifestResponse{}, fmt.Errorf("unexpected SYNC terminator: %q", statusLine)
 	}
+
+	manifest, parseErr := parseManifest(manifestBuf.Bytes())
+	if parseErr != nil {
+		return SyncManifestResponse{}, parseErr
+	}
+	return SyncManifestResponse{
+		Manifest:     manifest,
+		RemovedPaths: rmPaths,
+	}, nil
 }
 
 func (c *Client) fetchFileWindowTCP(

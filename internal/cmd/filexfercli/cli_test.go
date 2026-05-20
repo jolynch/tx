@@ -213,16 +213,11 @@ func serveFTCPConn(conn net.Conn, serverID *age.X25519Identity, handler func(int
 		}
 	}
 	if cmdReq.Verb == intftcp.VerbSYNC {
-		for {
-			line, readErr := readFTCPLine(br)
-			if readErr != nil {
-				_, _ = io.WriteString(out, "ERR BAD_REQUEST invalid sync manifest\r\n")
-				_ = closeOut()
-				return
-			}
-			if strings.TrimSpace(line) == "" {
-				break
-			}
+		mr := encoding.NewChunkedManifestReader(br, encoding.ChunkedManifestReaderOpts{})
+		if _, drainErr := io.Copy(io.Discard, mr); drainErr != nil {
+			_, _ = io.WriteString(out, "ERR BAD_REQUEST invalid sync manifest\r\n")
+			_ = closeOut()
+			return
 		}
 	}
 	if handled, handleErr := maybeWriteCLIRootMetadataOnlySEND(cmdReq, out); handled {
@@ -509,13 +504,17 @@ func writeManifestResponse(out io.Writer, manifestRaw string) error {
 }
 
 func writeSyncResponse(out io.Writer, transferID string, entries []string, removedIDs []uint64) error {
-	if _, err := io.WriteString(out, buildTestManifestRaw(transferID, entries)); err != nil {
+	cw := encoding.NewChunkedManifestWriter(out, encoding.EncodingZstd, 32, 0)
+	if _, err := io.WriteString(cw, buildTestManifestRaw(transferID, entries)); err != nil {
 		return err
 	}
 	for _, id := range removedIDs {
-		if _, err := io.WriteString(out, fmt.Sprintf("RM %d\n", id)); err != nil {
+		if _, err := io.WriteString(cw, fmt.Sprintf("RM %d\n", id)); err != nil {
 			return err
 		}
+	}
+	if err := cw.Close(); err != nil {
+		return err
 	}
 	_, err := io.WriteString(out, "OK\r\n")
 	return err

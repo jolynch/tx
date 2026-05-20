@@ -113,6 +113,21 @@ func TestHandleSYNCAllRemoved(t *testing.T) {
 	}
 }
 
+func TestHandleSYNCZstdRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "a.txt", "hello")
+	writeTestFile(t, root, "sub/b.txt", "world")
+
+	initialManifest := runTXFERTest(t, root)
+	newManifest, rmPaths := runSYNCTestWithComp(t, root, initialManifest, encoding.EncodingZstd)
+	if len(rmPaths) != 0 {
+		t.Fatalf("expected no removals, got %v", rmPaths)
+	}
+	if len(newManifest) != 3 { // sub/ + a.txt + sub/b.txt
+		t.Fatalf("expected 3 entries, got %d", len(newManifest))
+	}
+}
+
 func TestHandleSYNCMixedDelta(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, root, "keep.txt", "unchanged")
@@ -204,26 +219,42 @@ func unframeManifestWire(t *testing.T, wire []byte) string {
 
 // runSYNCTest runs SYNC with the given old manifest body and returns parsed entries + RM paths.
 // RM fileIDs in the server response are resolved to paths using oldManifest.
+// The old manifest is wrapped in FX/1 frames before being handed to the server,
+// and the server's framed response is unwrapped before parsing.
 func runSYNCTest(t *testing.T, root string, oldManifest string) ([]encoding.ManifestEntry, []string) {
+	t.Helper()
+	return runSYNCTestWithComp(t, root, oldManifest, "none")
+}
+
+func runSYNCTestWithComp(t *testing.T, root string, oldManifest string, comp string) ([]encoding.ManifestEntry, []string) {
 	t.Helper()
 
 	// Build ID→path index from old manifest for RM resolution.
 	oldByID := buildOldByID(oldManifest)
 
 	// Build SYNC request.
-	reqRaw := fmt.Sprintf(`SYNC %q mode=fast link-mbps=1000 concurrency=8`, root)
+	reqRaw := fmt.Sprintf(`SYNC %q mode=fast link-mbps=1000 concurrency=8 comp=%s`, root, comp)
 	req, err := ParseRequest([]byte(reqRaw))
 	if err != nil {
 		t.Fatalf("ParseRequest: %v", err)
 	}
 
-	// Create input: old manifest body + blank line.
+	// Frame the old manifest body.
 	var input bytes.Buffer
-	input.WriteString(oldManifest)
-	if oldManifest != "" && !strings.HasSuffix(oldManifest, "\n") {
-		input.WriteByte('\n')
+	cw := encoding.NewChunkedManifestWriter(&input, comp, encoding.DefaultManifestChunkSize, 0)
+	if oldManifest != "" {
+		if _, err := cw.Write([]byte(oldManifest)); err != nil {
+			t.Fatalf("frame old manifest: %v", err)
+		}
+		if !strings.HasSuffix(oldManifest, "\n") {
+			if _, err := cw.Write([]byte("\n")); err != nil {
+				t.Fatalf("frame old manifest: %v", err)
+			}
+		}
 	}
-	input.WriteByte('\n') // blank line terminator
+	if err := cw.Close(); err != nil {
+		t.Fatalf("close framed old manifest: %v", err)
+	}
 
 	deps := &syncTestDeps{}
 	var out bytes.Buffer
@@ -231,7 +262,7 @@ func runSYNCTest(t *testing.T, root string, oldManifest string) ([]encoding.Mani
 		t.Fatalf("handleSYNCWithInput: %v", err)
 	}
 
-	return parseSYNCResponse(t, out.String(), oldByID)
+	return parseSYNCResponse(t, unframeManifestWire(t, out.Bytes()), oldByID)
 }
 
 // buildOldByID parses a raw FM/1 manifest and returns a fileID→path map.

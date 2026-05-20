@@ -20,6 +20,7 @@ type syncRequest struct {
 	LinkMbps    int64
 	Concurrency int
 	DeadlineMS  int64
+	Comp        string
 }
 
 type oldEntry struct {
@@ -40,7 +41,7 @@ func parseSYNCRequest(req Request) (syncRequest, error) {
 	p := req.Params[0]
 	for key := range p {
 		switch key {
-		case "directory", "mode", "link-mbps", "concurrency", "deadline-ms":
+		case "directory", "mode", "link-mbps", "concurrency", "deadline-ms", "comp":
 		default:
 			return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "unknown SYNC option"}
 		}
@@ -68,12 +69,22 @@ func parseSYNCRequest(req Request) (syncRequest, error) {
 			return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "deadline-ms must be >= 0"}
 		}
 	}
+	comp := strings.ToLower(strings.TrimSpace(p["comp"]))
+	if comp == "" {
+		comp = encoding.EncodingZstd
+	}
+	switch comp {
+	case "none", encoding.EncodingZstd:
+	default:
+		return syncRequest{}, protocolErr{code: "UNSUPPORTED_COMP", message: "supported comp values: none, zstd"}
+	}
 	return syncRequest{
 		Directory:   directory,
 		Mode:        mode,
 		LinkMbps:    linkMbps,
 		Concurrency: concurrency,
 		DeadlineMS:  deadlineMS,
+		Comp:        comp,
 	}, nil
 }
 
@@ -99,8 +110,9 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 
 	root := filepath.Clean(parsed.Directory)
 
-	// Read old manifest from input stream (lines until blank line).
-	pathIndex, parseErr := readOldManifest(in)
+	// Read the framed old-manifest body from the input stream and parse it.
+	oldManifestReader := encoding.NewChunkedManifestReader(in, encoding.ChunkedManifestReaderOpts{})
+	pathIndex, parseErr := readOldManifest(oldManifestReader)
 	if parseErr != nil {
 		return protocolErr{code: "BAD_REQUEST", message: fmt.Sprintf("invalid old manifest: %s", parseErr)}
 	}
@@ -140,6 +152,11 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 		}
 	}()
 
+	// Wrap the output writer with a chunked manifest writer so FM/1 and RM
+	// lines flow through FX/1 + FXT/1 frames with per-frame compression,
+	// matching TXFER's response framing.
+	cw := encoding.NewChunkedManifestWriter(out, parsed.Comp, encoding.DefaultManifestChunkSize, encoding.DefaultManifestFlushInterval)
+
 	// Write FM/1 header.
 	hdr := encoding.FormatManifestHeader(encoding.ManifestHeader{
 		TransferID:  transfer.ID,
@@ -148,7 +165,7 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 		Concurrency: manifestConcurrency,
 		DeadlineMS:  parsed.DeadlineMS,
 	})
-	if _, err := io.WriteString(out, hdr+"\n"); err != nil {
+	if _, err := io.WriteString(cw, hdr+"\n"); err != nil {
 		if isBrokenPipe(err) {
 			return nil
 		}
@@ -196,7 +213,7 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 		PathHash:  xxh3.Hash128([]byte(filepath.Clean(root))),
 		FileSize:  0,
 	}
-	if _, err := io.WriteString(out, rootLine+"\n"); err != nil {
+	if _, err := io.WriteString(cw, rootLine+"\n"); err != nil {
 		if isBrokenPipe(err) {
 			return nil
 		}
@@ -226,7 +243,7 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 			PathHash:  xxh3.Hash128([]byte(fullPath)),
 			FileSize:  entry.Size,
 		}
-		if _, err := io.WriteString(out, line); err != nil {
+		if _, err := io.WriteString(cw, line); err != nil {
 			return err
 		}
 		prevPath = entry.Path
@@ -252,7 +269,7 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 			continue
 		}
 		rmLine := fmt.Sprintf("RM %d\n", old.fileID)
-		if _, err := io.WriteString(out, rmLine); err != nil {
+		if _, err := io.WriteString(cw, rmLine); err != nil {
 			if isBrokenPipe(err) {
 				return nil
 			}
@@ -260,6 +277,12 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 		}
 	}
 
+	if err := cw.Close(); err != nil {
+		if isBrokenPipe(err) {
+			return nil
+		}
+		return protocolErr{code: "INTERNAL", message: "flush manifest frames: " + err.Error()}
+	}
 	closeUpdates()
 	deps.ClipTransfer(transfer.ID)
 	cleanupTransfer = false
