@@ -2,6 +2,7 @@ package encoding
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -134,6 +135,158 @@ type testFrame struct {
 	Payload      []byte
 	Trailer      FrameTrailer
 	TerminalNext int64
+}
+
+func TestChunkedManifestReaderRoundTripNone(t *testing.T) {
+	payload := []byte(strings.Repeat("FM/1 manifest line content here\n", 8))
+	var wire bytes.Buffer
+	cw := NewChunkedManifestWriter(&wire, "none", 16, 0)
+	if _, err := cw.Write(payload); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	r := NewChunkedManifestReader(&wire, ChunkedManifestReaderOpts{})
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("round-trip mismatch: got %q want %q", got, payload)
+	}
+	if r.FileHash() == "" {
+		t.Fatalf("FileHash empty after EOF")
+	}
+}
+
+func TestChunkedManifestReaderRoundTripZstd(t *testing.T) {
+	payload := []byte(strings.Repeat("FM/1 entry: alpha bravo charlie delta echo\n", 8))
+	var wire bytes.Buffer
+	cw := NewChunkedManifestWriter(&wire, EncodingZstd, 32, 0)
+	if _, err := cw.Write(payload); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	var stats []ManifestFrameStats
+	var raw bytes.Buffer
+	r := NewChunkedManifestReader(&wire, ChunkedManifestReaderOpts{
+		OnFrame: func(s ManifestFrameStats) { stats = append(stats, s) },
+		RawSink: &raw,
+	})
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("round-trip mismatch: got %q want %q", got, payload)
+	}
+	if len(stats) < 2 {
+		t.Fatalf("expected >=2 frame stats, got %d", len(stats))
+	}
+	if !stats[len(stats)-1].Terminal {
+		t.Fatalf("last stat must be terminal")
+	}
+	if raw.Len() == 0 {
+		t.Fatalf("RawSink received no bytes")
+	}
+}
+
+func TestChunkedManifestReaderEmpty(t *testing.T) {
+	var wire bytes.Buffer
+	cw := NewChunkedManifestWriter(&wire, "none", 16, 0)
+	if err := cw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	r := NewChunkedManifestReader(&wire, ChunkedManifestReaderOpts{})
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty payload, got %q", got)
+	}
+	if r.FileHash() == "" {
+		t.Fatalf("FileHash empty after EOF")
+	}
+}
+
+func TestChunkedManifestReaderRejectsCorruptedPayload(t *testing.T) {
+	payload := []byte("abcdefghij")
+	var wire bytes.Buffer
+	cw := NewChunkedManifestWriter(&wire, "none", 4, 0)
+	if _, err := cw.Write(payload); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Flip a byte in the first frame's payload. The frame layout is
+	// "FX/1 ...\n<payload>\nFXT/1 ...\n", so find the first newline and
+	// mutate the next byte (start of payload).
+	buf := wire.Bytes()
+	nl := bytes.IndexByte(buf, '\n')
+	if nl < 0 || nl+1 >= len(buf) {
+		t.Fatalf("malformed test fixture")
+	}
+	buf[nl+1] ^= 0xFF
+	r := NewChunkedManifestReader(bytes.NewReader(buf), ChunkedManifestReaderOpts{})
+	if _, err := io.ReadAll(r); err == nil {
+		t.Fatalf("expected error from corrupted chunk, got nil")
+	}
+}
+
+func TestChunkedManifestReaderRejectsTruncatedStream(t *testing.T) {
+	payload := []byte("abcdefghijklmnop")
+	var wire bytes.Buffer
+	cw := NewChunkedManifestWriter(&wire, "none", 4, 0)
+	if _, err := cw.Write(payload); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Truncate the last frame entirely so no terminal trailer is seen.
+	trimmed := wire.Bytes()[:wire.Len()/2]
+	r := NewChunkedManifestReader(bytes.NewReader(trimmed), ChunkedManifestReaderOpts{})
+	_, err := io.ReadAll(r)
+	if err == nil {
+		t.Fatalf("expected error from truncated stream")
+	}
+	if err == io.EOF { //nolint:errorlint
+		t.Fatalf("truncation must not surface as clean EOF: %v", err)
+	}
+}
+
+func TestChunkedManifestReaderReturnsEOFAtTerminalAndLeavesTrailingBytes(t *testing.T) {
+	payload := []byte("hello world")
+	var wire bytes.Buffer
+	cw := NewChunkedManifestWriter(&wire, "none", 16, 0)
+	if _, err := cw.Write(payload); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	wire.WriteString("OK\r\n") // simulate a trailing protocol line.
+	r := NewChunkedManifestReader(&wire, ChunkedManifestReaderOpts{})
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload mismatch: got %q", got)
+	}
+	rest, err := io.ReadAll(r.Buffered())
+	if err != nil {
+		t.Fatalf("read trailing bytes: %v", err)
+	}
+	if string(rest) != "OK\r\n" {
+		t.Fatalf("trailing bytes: got %q, want %q", rest, "OK\r\n")
+	}
 }
 
 func parseAllFrames(t *testing.T, wire []byte) []testFrame {

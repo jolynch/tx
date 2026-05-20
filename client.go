@@ -451,6 +451,10 @@ type SyncManifestRequest struct {
 	LinkMbps    int64
 	Concurrency int
 	DeadlineMS  int64
+	// Comp selects the per-frame codec the server uses for the response
+	// manifest stream. Empty defaults to zstd. The client sends its own
+	// request body using the same codec; frames are self-describing.
+	Comp string
 }
 
 type SyncManifestResponse struct {
