@@ -640,8 +640,9 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 	if request.DeadlineMS > 0 {
 		cmd += " deadline-ms=" + strconv.FormatInt(request.DeadlineMS, 10)
 	}
-	if request.PreserveCache {
-		cmd += " cache-map=1"
+	cacheMap := strings.ToLower(strings.TrimSpace(request.CacheMap))
+	if cacheMap != "" && cacheMap != "none" {
+		cmd += " cache-map=" + cacheMap
 	}
 	cmd += " comp=" + comp
 	br, err := c.sendAndReadTCP(conn, state, cmd)
@@ -710,6 +711,10 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 		cmd += " deadline-ms=" + strconv.FormatInt(request.DeadlineMS, 10)
 	}
 	cmd += " comp=" + comp
+	cacheMap := strings.ToLower(strings.TrimSpace(request.CacheMap))
+	if cacheMap != "" && cacheMap != "none" {
+		cmd += " cache-map=" + cacheMap
+	}
 	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
 		return SyncManifestResponse{}, fmt.Errorf("send SYNC: %w", err)
 	}

@@ -176,7 +176,7 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		LinkMbps:      0,
 		Concurrency:   effectiveConcurrency,
 		DeadlineMS:    deadlineMS,
-		PreserveCache: cacheLoadEnabled,
+		CacheMap:    cacheMapValue(cacheLoadEnabled),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "get failed: %v\n", err)
@@ -311,7 +311,7 @@ func touchGetCache(outputPath string, entry tx.ManifestEntry, cacheLoadBudget ti
 	if err := encoding.DecodePageCacheEntry(entry.PageCache, ce); err != nil || ce.Empty() {
 		return
 	}
-	budget := pagecache.SystemPageBudget(touchCacheReserveBytes)
+	budget := pagecache.SystemPageBudget(pagecache.TouchCacheReserveBytes)
 	ctx := context.Background()
 	cancel := func() {}
 	if cacheLoadBudget > 0 {

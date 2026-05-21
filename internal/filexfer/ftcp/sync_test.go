@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/pagecache"
 )
 
 type syncTestDeps struct {
@@ -128,6 +129,148 @@ func TestHandleSYNCZstdRoundTrip(t *testing.T) {
 	}
 }
 
+func TestHandleSYNCCacheMapRecvEnqueuesAndEchoes(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "a.txt", "hello")
+	writeTestFile(t, root, "stale.txt", "ignore")
+
+	// Build an old-manifest body whose F-entry for a.txt carries a
+	// synthetic pc:<hex> blob. We expect the server to (a) enqueue a
+	// restore for that {path, decoded entry} pair and (b) echo the
+	// blob verbatim on the response entry for a.txt.
+	info, err := os.Stat(filepath.Join(root, "a.txt"))
+	if err != nil {
+		t.Fatalf("stat a.txt: %v", err)
+	}
+	ce := pagecache.CacheEntry{}
+	// One resident page is enough — the bitmap travels as data.
+	if err := ce.SetPageBits([]byte{0x01}, 1); err != nil {
+		t.Fatalf("SetPageBits: %v", err)
+	}
+	pcBlob, err := encoding.EncodePageCacheEntry(&ce)
+	if err != nil {
+		t.Fatalf("EncodePageCacheEntry: %v", err)
+	}
+	oldEntry := encoding.ManifestEntry{
+		Type:       encoding.EntryTypeFile,
+		ID:         1,
+		Size:       info.Size(),
+		Mtime:      info.ModTime().UnixNano(),
+		Mode:       encoding.NormalizeManifestMode(info.Mode()),
+		Path:       "a.txt",
+		LinkTarget: -1,
+		PageCache:  pcBlob,
+	}
+	hdr := encoding.FormatManifestHeader(encoding.ManifestHeader{TransferID: "old-tx", Mode: "fast", LinkMbps: 1000, Concurrency: 8})
+	rootEntry := encoding.ManifestEntry{Type: encoding.EntryTypeDir, ID: encoding.RootFileID, Path: filepath.Clean(root), LinkTarget: -1}
+	rootLine, prevPath, prevMtime, err := encoding.MarshalManifestEntry(rootEntry, "", "")
+	if err != nil {
+		t.Fatalf("marshal root: %v", err)
+	}
+	entryLine, _, _, err := encoding.MarshalManifestEntry(oldEntry, prevPath, prevMtime)
+	if err != nil {
+		t.Fatalf("marshal old entry: %v", err)
+	}
+	body := hdr + "\n" + rootLine + "\n" + entryLine + "\n"
+
+	entries, _, deps := runSYNCTestFull(t, root, body, "none", "recv")
+
+	var seenA bool
+	for _, e := range entries {
+		if e.Path == "a.txt" {
+			seenA = true
+			if !bytes.Equal(e.PageCache, pcBlob) {
+				t.Fatalf("expected response pc blob to echo client's; got %d bytes vs want %d bytes", len(e.PageCache), len(pcBlob))
+			}
+		}
+	}
+	if !seenA {
+		t.Fatalf("a.txt missing from response manifest")
+	}
+	if deps.cacheRestoreCall != 1 {
+		t.Fatalf("expected one EnqueueCacheRestoreBatch call, got %d", deps.cacheRestoreCall)
+	}
+	if deps.cacheRestoreTxID != "tx123" {
+		t.Fatalf("expected batch tagged with the SYNC's transfer id (tx123), got %q", deps.cacheRestoreTxID)
+	}
+	if len(deps.cacheRestoreCh) != 1 {
+		t.Fatalf("expected one item in the batch, got %d", len(deps.cacheRestoreCh))
+	}
+	if !strings.HasSuffix(deps.cacheRestoreCh[0].Path, filepath.Join(root, "a.txt")) {
+		t.Fatalf("unexpected enqueued path: %q", deps.cacheRestoreCh[0].Path)
+	}
+	if deps.cacheRestoreCh[0].Entry.NumResidentPages() != 1 {
+		t.Fatalf("expected decoded entry to report 1 resident page")
+	}
+}
+
+func TestHandleSYNCCacheMapSendDoesNotEnqueue(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "a.txt", "hello")
+	// cache-map=send only attaches server-side pc; never enqueues client pcs.
+	_, _, deps := runSYNCTestFull(t, root, "", "none", "send")
+	if deps.cacheRestoreCall != 0 || len(deps.cacheRestoreCh) != 0 {
+		t.Fatalf("expected zero EnqueueCacheRestoreBatch calls in send mode, got call=%d items=%d",
+			deps.cacheRestoreCall, len(deps.cacheRestoreCh))
+	}
+}
+
+// TestHandleSYNCZeroDeltaAutoAcksAndCompletes covers the happy path the
+// exit-after timer depends on: when every file in the client's old
+// manifest matches the on-disk entry (same size+mtime+mode), the SYNC
+// handler auto-acks each one and MaybeLogTransferComplete fires once.
+func TestHandleSYNCZeroDeltaAutoAcksAndCompletes(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "a.txt", "hello")
+	writeTestFile(t, root, "b.txt", "world")
+	initialManifest := runTXFERTest(t, root)
+
+	_, _, deps := runSYNCTestFull(t, root, initialManifest, "none", "")
+
+	if len(deps.ackCalls) == 0 {
+		t.Fatalf("expected auto-acks for matched files, got none")
+	}
+	// Every ack should target the file's full size.
+	for _, c := range deps.ackCalls {
+		if c.ackBytes == 0 {
+			t.Fatalf("ack for fileID=%d had ackBytes=0 (must equal file size)", c.fileID)
+		}
+	}
+	if deps.completeCalls != 1 {
+		t.Fatalf("expected MaybeLogTransferComplete to fire exactly once, got %d", deps.completeCalls)
+	}
+}
+
+// TestHandleSYNCDeltaDoesNotAutoAckChangedEntries proves a size/mtime
+// drift between the client's old manifest and the on-disk entry leaves
+// the changed file un-acked. The client will SEND+ACK it later via the
+// regular path, which fires MaybeLogTransferComplete from ack.go.
+func TestHandleSYNCDeltaDoesNotAutoAckChangedEntries(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "keep.txt", "unchanged")
+	writeTestFile(t, root, "stale.txt", "old content")
+	initialManifest := runTXFERTest(t, root)
+
+	// Mutate stale.txt so its size/mtime no longer match the manifest.
+	time.Sleep(10 * time.Millisecond)
+	writeTestFile(t, root, "stale.txt", "new content!!!")
+
+	_, _, deps := runSYNCTestFull(t, root, initialManifest, "none", "")
+
+	// Exactly one auto-ack (for keep.txt), not two — stale.txt drifted.
+	if len(deps.ackCalls) != 1 {
+		t.Fatalf("expected exactly one auto-ack (keep.txt), got %d: %+v",
+			len(deps.ackCalls), deps.ackCalls)
+	}
+	// MaybeLogTransferComplete still fires unconditionally at the end of
+	// the SYNC handler; the store-side check (Done == NumFiles) decides
+	// whether to actually emit the complete log. Tests use mockDeps so
+	// we just verify the call count.
+	if deps.completeCalls != 1 {
+		t.Fatalf("expected one MaybeLogTransferComplete call, got %d", deps.completeCalls)
+	}
+}
+
 func TestHandleSYNCMixedDelta(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, root, "keep.txt", "unchanged")
@@ -228,12 +371,21 @@ func runSYNCTest(t *testing.T, root string, oldManifest string) ([]encoding.Mani
 
 func runSYNCTestWithComp(t *testing.T, root string, oldManifest string, comp string) ([]encoding.ManifestEntry, []string) {
 	t.Helper()
+	entries, rmPaths, _ := runSYNCTestFull(t, root, oldManifest, comp, "")
+	return entries, rmPaths
+}
+
+func runSYNCTestFull(t *testing.T, root string, oldManifest string, comp string, cacheMap string) ([]encoding.ManifestEntry, []string, *syncTestDeps) {
+	t.Helper()
 
 	// Build ID→path index from old manifest for RM resolution.
 	oldByID := buildOldByID(oldManifest)
 
 	// Build SYNC request.
 	reqRaw := fmt.Sprintf(`SYNC %q mode=fast link-mbps=1000 concurrency=8 comp=%s`, root, comp)
+	if cacheMap != "" {
+		reqRaw += " cache-map=" + cacheMap
+	}
 	req, err := ParseRequest([]byte(reqRaw))
 	if err != nil {
 		t.Fatalf("ParseRequest: %v", err)
@@ -262,7 +414,8 @@ func runSYNCTestWithComp(t *testing.T, root string, oldManifest string, comp str
 		t.Fatalf("handleSYNCWithInput: %v", err)
 	}
 
-	return parseSYNCResponse(t, unframeManifestWire(t, out.Bytes()), oldByID)
+	entries, rmPaths := parseSYNCResponse(t, unframeManifestWire(t, out.Bytes()), oldByID)
+	return entries, rmPaths, deps
 }
 
 // buildOldByID parses a raw FM/1 manifest and returns a fileID→path map.

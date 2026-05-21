@@ -96,6 +96,14 @@ Behavior:
   - --skip-fetch fetches and writes manifest state only; no start/sync
   - --skip-write fetches bodies to a discard sink and never mutates LOCAL_DST
   - --verify=MODE post-copy verification: none|meta|N%data|full|<dur>
+  - When --verify (any non-none value, including the default meta) or
+    --cache-load is set, copy issues a closing SYNC to detect drift the
+    server tree may have accumulated mid-transfer, repairs any new/changed/
+    removed files the response reveals, and retries up to 3 rounds. Copy
+    fails with "remote has not converged" if the tree still has differences
+    after the cap. When --cache-load is set, the closing SYNC also carries
+    cache-map=recv so the server can converge its page cache back to the
+    pre-transfer snapshot.
 
 Options:
       --clean                     Remove LOCAL_DST first, then force a clean transfer

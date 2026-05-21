@@ -689,7 +689,7 @@ func TestRunCLIGetCacheLoadRequestsAndTouchesHint(t *testing.T) {
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbTXFER:
-			if req.Params[0]["cache-map"] == "1" {
+			if req.Params[0]["cache-map"] == "send" {
 				sawCacheMap.Store(true)
 			}
 			if err := writeManifestResponse(out, singleManifest); err != nil {
@@ -718,7 +718,7 @@ func TestRunCLIGetCacheLoadRequestsAndTouchesHint(t *testing.T) {
 		t.Fatalf("get cache-load: expected 0, got %d stderr=%s", code, stderr.String())
 	}
 	if !sawCacheMap.Load() {
-		t.Fatalf("expected TXFER cache-map=1")
+		t.Fatalf("expected TXFER cache-map=send")
 	}
 	if pagecache.TouchSupported() && !strings.Contains(stderr.String(), "cache-touch: [ok] warmed=1/1") {
 		t.Fatalf("expected cache-touch warming output, got: %s", stderr.String())
@@ -2685,304 +2685,38 @@ func TestFormatProbeRateSuffixOmitsWhenNoProbeData(t *testing.T) {
 	}
 }
 
-func TestRunCLISyncNoOpSkipsPrompt(t *testing.T) {
+// TestRunCLISync* tests have been removed: the runSyncCLI entry point is
+// gone now that tx recv sync isn't a real CLI subcommand. The convergence
+// loop they covered is now exercised through copy via the end-of-copy
+// SYNC; see TestRunCLICopyConverge* below.
+
+// TestRunCLICopyConvergeNoDrift drives the happy path: copy finishes, the
+// closing SYNC (triggered by the default --verify=meta) reports zero
+// drift, and copy exits 0 after one convergence round.
+func TestRunCLICopyConvergeNoDrift(t *testing.T) {
 	tmp := t.TempDir()
-	targetDir := setupPinchState(t, tmp, "", "")
-	if err := os.MkdirAll(targetDir, 0o755); err != nil {
-		t.Fatalf("mkdir target: %v", err)
-	}
-	subDir := filepath.Join(targetDir, "sub")
-	if err := os.MkdirAll(subDir, 0o750); err != nil {
-		t.Fatalf("mkdir subdir: %v", err)
-	}
-	dirMtime := time.Unix(0, 90)
-	if err := os.Chtimes(subDir, dirMtime, dirMtime); err != nil {
-		t.Fatalf("chtimes subdir: %v", err)
-	}
-	destPath := filepath.Join(targetDir, "same.txt")
-	if err := os.WriteFile(destPath, []byte("hello"), 0o644); err != nil {
-		t.Fatalf("write target file: %v", err)
-	}
-	info, err := os.Stat(destPath)
-	if err != nil {
-		t.Fatalf("stat target file: %v", err)
-	}
-	entry := buildTestManifestEntry(1, info.Size(), info.ModTime().UnixNano(), info.Mode(), "same.txt")
-	dirEntry := buildTestDirManifestEntry(2, dirMtime.UnixNano(), 0o750, "sub")
-	manifestRaw := buildTestManifestRaw("txsyncnoop", []string{entry, dirEntry})
-	{
-		m, err := tx.ParseManifest([]byte(manifestRaw))
-		if err != nil {
-			t.Fatalf("parse seed manifest: %v", err)
-		}
-		if err := tx.SaveManifest(filepath.Join(tmp, ".tx", "dst", "manifest.server.zst"), m); err != nil {
-			t.Fatalf("save manifest.server.zst: %v", err)
-		}
-	}
-	withSyncPromptTestInput(t, "\n", true)
-
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		switch req.Verb {
-		case intftcp.VerbPROBE:
-			return writeCLIProbeResponse(req, out)
-		case intftcp.VerbSYNC:
-			return writeSyncResponse(out, "txsyncnoop", []string{entry, dirEntry}, nil)
-		default:
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-	})
-	defer srv.Close()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := runSyncCLI(srv.URL, []string{"--probe-size", "1B", targetDir}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("sync no-op: expected 0, got %d stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "sync: remote and local converged, nothing to do") {
-		t.Fatalf("expected converged output, got: %s", stderr.String())
-	}
-	if strings.Contains(stderr.String(), "proceed?") {
-		t.Fatalf("did not expect prompt for no-op sync, got stderr=%s", stderr.String())
-	}
-}
-
-func TestRunCLISyncDownloadPromptDefaultsYes(t *testing.T) {
-	tmp := t.TempDir()
-	targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncdownload", nil), "")
-	withSyncPromptTestInput(t, "\n", true)
-
+	targetDir := filepath.Join(tmp, "dst")
 	payload := []byte("hello")
-	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "new.txt")
+	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "a.txt")
+	manifestRaw := buildTestManifestRaw("txcopy-converge-clean", []string{entry})
 	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
 
+	var syncCalls atomic.Int64
+	var lastSyncCacheMap atomic.Value
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
-		case intftcp.VerbSYNC:
-			return writeSyncResponse(out, "txsyncdownload", []string{entry}, nil)
-		case intftcp.VerbSEND:
-			if got := req.Params[0]["txferid"]; got != "txsyncdownload" {
-				return fmt.Errorf("unexpected transfer id: %q", got)
+		case intftcp.VerbTXFER:
+			if err := writeManifestResponse(out, manifestRaw); err != nil {
+				return err
 			}
-			_, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
-			return err
-		case intftcp.VerbACK:
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
-		default:
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-	})
-	defer srv.Close()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := runSyncCLI(srv.URL, []string{"--probe-size", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("sync download: expected 0, got %d stderr=%s", code, stderr.String())
-	}
-	got, err := os.ReadFile(filepath.Join(targetDir, "new.txt"))
-	if err != nil {
-		t.Fatalf("read synced file: %v", err)
-	}
-	if string(got) != string(payload) {
-		t.Fatalf("unexpected synced file: %q", string(got))
-	}
-	if !strings.Contains(stderr.String(), "proceed? [Y/n]: ") {
-		t.Fatalf("expected [Y/n] prompt, got stderr=%s", stderr.String())
-	}
-}
-
-func TestRunCLISyncDeletePromptDefaultsNo(t *testing.T) {
-	tmp := t.TempDir()
-	oldEntry := buildTestManifestEntry(1, 3, 100, 0o644, "old.txt")
-	targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncdelete", []string{oldEntry}), "")
-	if err := os.MkdirAll(targetDir, 0o755); err != nil {
-		t.Fatalf("mkdir target: %v", err)
-	}
-	destPath := filepath.Join(targetDir, "old.txt")
-	if err := os.WriteFile(destPath, []byte("old"), 0o644); err != nil {
-		t.Fatalf("write old file: %v", err)
-	}
-	withSyncPromptTestInput(t, "\n", true)
-
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		switch req.Verb {
-		case intftcp.VerbPROBE:
-			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbSYNC:
-			return writeSyncResponse(out, "txsyncdelete", nil, []uint64{1})
-		default:
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-	})
-	defer srv.Close()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := runSyncCLI(srv.URL, []string{"--probe-size", "1B", targetDir}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("sync delete abort: expected 0, got %d stderr=%s", code, stderr.String())
-	}
-	if _, err := os.Stat(destPath); err != nil {
-		t.Fatalf("expected delete-only sync to abort before removing file: %v", err)
-	}
-	if !strings.Contains(stderr.String(), "proceed? [y/N]: ") {
-		t.Fatalf("expected [y/N] prompt, got stderr=%s", stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "aborted") {
-		t.Fatalf("expected abort message, got stderr=%s", stderr.String())
-	}
-}
-
-func TestRunCLISyncMixedPromptDefaultsNo(t *testing.T) {
-	tmp := t.TempDir()
-	oldEntry := buildTestManifestEntry(1, 3, 100, 0o644, "old.txt")
-	targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncmixed", []string{oldEntry}), "")
-	if err := os.MkdirAll(targetDir, 0o755); err != nil {
-		t.Fatalf("mkdir target: %v", err)
-	}
-	oldPath := filepath.Join(targetDir, "old.txt")
-	if err := os.WriteFile(oldPath, []byte("old"), 0o644); err != nil {
-		t.Fatalf("write old file: %v", err)
-	}
-	withSyncPromptTestInput(t, "\n", true)
-
-	entry := buildTestManifestEntry(2, 5, 100, 0o644, "new.txt")
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		switch req.Verb {
-		case intftcp.VerbPROBE:
-			return writeCLIProbeResponse(req, out)
-		case intftcp.VerbSYNC:
-			return writeSyncResponse(out, "txsyncmixed", []string{entry}, []uint64{1})
-		default:
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-	})
-	defer srv.Close()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := runSyncCLI(srv.URL, []string{"--probe-size", "1B", targetDir}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("sync mixed abort: expected 0, got %d stderr=%s", code, stderr.String())
-	}
-	if _, err := os.Stat(oldPath); err != nil {
-		t.Fatalf("expected mixed sync to abort before removing old file: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(targetDir, "new.txt")); !os.IsNotExist(err) {
-		t.Fatalf("expected mixed sync to abort before downloading new file, err=%v", err)
-	}
-	if !strings.Contains(stderr.String(), "proceed? [y/N]: ") {
-		t.Fatalf("expected [y/N] prompt, got stderr=%s", stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "aborted") {
-		t.Fatalf("expected abort message, got stderr=%s", stderr.String())
-	}
-}
-
-func TestRunCLISyncPromptAcceptsExplicitYes(t *testing.T) {
-	t.Run("download-default-yes", func(t *testing.T) {
-		tmp := t.TempDir()
-		targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncyesdownload", nil), "")
-		withSyncPromptTestInput(t, "Y\n", true)
-
-		payload := []byte("hello")
-		entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "new.txt")
-		meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
-		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-			switch req.Verb {
-			case intftcp.VerbPROBE:
-				return writeCLIProbeResponse(req, out)
-			case intftcp.VerbSYNC:
-				return writeSyncResponse(out, "txsyncyesdownload", []string{entry}, nil)
-			case intftcp.VerbSEND:
-				_, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
-				return err
-			case intftcp.VerbACK:
-				_, err := io.WriteString(out, "OK\r\n")
-				return err
-			default:
-				return fmt.Errorf("unexpected verb: %v", req.Verb)
-			}
-		})
-		defer srv.Close()
-
-		var stdout bytes.Buffer
-		var stderr bytes.Buffer
-		code := runSyncCLI(srv.URL, []string{"--probe-size", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
-		if code != 0 {
-			t.Fatalf("sync explicit yes download: expected 0, got %d stderr=%s", code, stderr.String())
-		}
-		if _, err := os.Stat(filepath.Join(targetDir, "new.txt")); err != nil {
-			t.Fatalf("expected new file to download: %v", err)
-		}
-		if !strings.Contains(stderr.String(), "proceed? [Y/n]: ") {
-			t.Fatalf("expected [Y/n] prompt, got stderr=%s", stderr.String())
-		}
-	})
-
-	t.Run("delete-default-no", func(t *testing.T) {
-		tmp := t.TempDir()
-		oldEntry := buildTestManifestEntry(1, 3, 100, 0o644, "old.txt")
-		targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncyesdelete", []string{oldEntry}), "")
-		if err := os.MkdirAll(targetDir, 0o755); err != nil {
-			t.Fatalf("mkdir target: %v", err)
-		}
-		oldPath := filepath.Join(targetDir, "old.txt")
-		if err := os.WriteFile(oldPath, []byte("old"), 0o644); err != nil {
-			t.Fatalf("write old file: %v", err)
-		}
-		withSyncPromptTestInput(t, "y\n", true)
-
-		syncCalls := 0
-		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-			switch req.Verb {
-			case intftcp.VerbPROBE:
-				return writeCLIProbeResponse(req, out)
-			case intftcp.VerbSYNC:
-				syncCalls++
-				if syncCalls == 1 {
-					return writeSyncResponse(out, "txsyncyesdelete", nil, []uint64{1})
-				}
-				return writeSyncResponse(out, "txsyncyesdelete", nil, nil)
-			default:
-				return fmt.Errorf("unexpected verb: %v", req.Verb)
-			}
-		})
-		defer srv.Close()
-
-		var stdout bytes.Buffer
-		var stderr bytes.Buffer
-		code := runSyncCLI(srv.URL, []string{"--probe-size", "1B", targetDir}, &stdout, &stderr)
-		if code != 0 {
-			t.Fatalf("sync explicit yes delete: expected 0, got %d stderr=%s", code, stderr.String())
-		}
-		if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
-			t.Fatalf("expected old file to be removed, err=%v", err)
-		}
-		if !strings.Contains(stderr.String(), "proceed? [y/N]: ") {
-			t.Fatalf("expected [y/N] prompt, got stderr=%s", stderr.String())
-		}
-	})
-}
-
-func TestRunCLISyncNonTerminalSkipsPrompt(t *testing.T) {
-	tmp := t.TempDir()
-	targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncnonterm", nil), "")
-	withSyncPromptTestInput(t, "", false)
-
-	payload := []byte("hello")
-	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "new.txt")
-	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		switch req.Verb {
-		case intftcp.VerbPROBE:
-			return writeCLIProbeResponse(req, out)
-		case intftcp.VerbSYNC:
-			return writeSyncResponse(out, "txsyncnonterm", []string{entry}, nil)
+			syncCalls.Add(1)
+			lastSyncCacheMap.Store(req.Params[0]["cache-map"])
+			return writeSyncResponse(out, "txcopy-converge-clean", []string{entry}, nil)
 		case intftcp.VerbSEND:
 			_, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
 			return err
@@ -2995,182 +2729,149 @@ func TestRunCLISyncNonTerminalSkipsPrompt(t *testing.T) {
 	})
 	defer srv.Close()
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := runSyncCLI(srv.URL, []string{"--probe-size", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
+	var stdout, stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify=meta", "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("sync non-terminal: expected 0, got %d stderr=%s", code, stderr.String())
+		t.Fatalf("copy converge no-drift: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if _, err := os.Stat(filepath.Join(targetDir, "new.txt")); err != nil {
-		t.Fatalf("expected new file to download: %v", err)
+	if got := syncCalls.Load(); got != 1 {
+		t.Fatalf("expected exactly one closing SYNC, got %d", got)
 	}
-	if strings.Contains(stderr.String(), "proceed?") {
-		t.Fatalf("did not expect prompt for non-terminal stdin, got stderr=%s", stderr.String())
+	if got, _ := lastSyncCacheMap.Load().(string); got != "" {
+		t.Fatalf("expected closing SYNC to omit cache-map (only --verify was set), got %q", got)
+	}
+	if !strings.Contains(stderr.String(), "copy-converge: remote and local converged") {
+		t.Fatalf("expected convergence-success line, got: %s", stderr.String())
 	}
 }
 
-func TestRunCLISyncYesFlagBypassesPrompt(t *testing.T) {
-	t.Run("delete-only", func(t *testing.T) {
-		tmp := t.TempDir()
-		oldEntry := buildTestManifestEntry(1, 3, 100, 0o644, "old.txt")
-		targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncyesflagdelete", []string{oldEntry}), "")
-		if err := os.MkdirAll(targetDir, 0o755); err != nil {
-			t.Fatalf("mkdir target: %v", err)
-		}
-		oldPath := filepath.Join(targetDir, "old.txt")
-		if err := os.WriteFile(oldPath, []byte("old"), 0o644); err != nil {
-			t.Fatalf("write old file: %v", err)
-		}
-		withSyncPromptTestInput(t, "\n", true)
-
-		syncCalls := 0
-		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-			switch req.Verb {
-			case intftcp.VerbPROBE:
-				return writeCLIProbeResponse(req, out)
-			case intftcp.VerbSYNC:
-				syncCalls++
-				if syncCalls == 1 {
-					return writeSyncResponse(out, "txsyncyesflagdelete", nil, []uint64{1})
-				}
-				return writeSyncResponse(out, "txsyncyesflagdelete", nil, nil)
-			default:
-				return fmt.Errorf("unexpected verb: %v", req.Verb)
-			}
-		})
-		defer srv.Close()
-
-		var stdout bytes.Buffer
-		var stderr bytes.Buffer
-		code := runSyncCLI(srv.URL, []string{"--yes", "--probe-size", "1B", targetDir}, &stdout, &stderr)
-		if code != 0 {
-			t.Fatalf("sync --yes delete-only: expected 0, got %d stderr=%s", code, stderr.String())
-		}
-		if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
-			t.Fatalf("expected old file to be removed, err=%v", err)
-		}
-		if strings.Contains(stderr.String(), "proceed?") {
-			t.Fatalf("did not expect prompt with --yes, got stderr=%s", stderr.String())
-		}
-	})
-
-	t.Run("mixed", func(t *testing.T) {
-		tmp := t.TempDir()
-		oldEntry := buildTestManifestEntry(1, 3, 100, 0o644, "old.txt")
-		targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncyesflagmixed", []string{oldEntry}), "")
-		if err := os.MkdirAll(targetDir, 0o755); err != nil {
-			t.Fatalf("mkdir target: %v", err)
-		}
-		oldPath := filepath.Join(targetDir, "old.txt")
-		if err := os.WriteFile(oldPath, []byte("old"), 0o644); err != nil {
-			t.Fatalf("write old file: %v", err)
-		}
-		withSyncPromptTestInput(t, "\n", true)
-
-		payload := []byte("hello")
-		entry := buildTestManifestEntry(2, int64(len(payload)), 100, 0o644, "new.txt")
-		syncCalls := 0
-		meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
-		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-			switch req.Verb {
-			case intftcp.VerbPROBE:
-				return writeCLIProbeResponse(req, out)
-			case intftcp.VerbSYNC:
-				syncCalls++
-				if syncCalls == 1 {
-					return writeSyncResponse(out, "txsyncyesflagmixed", []string{entry}, []uint64{1})
-				}
-				return writeSyncResponse(out, "txsyncyesflagmixed", []string{entry}, nil)
-			case intftcp.VerbSEND:
-				_, err := io.WriteString(out, buildCLIFrameWithMetadata(2, payload, 0, meta))
-				return err
-			case intftcp.VerbACK:
-				_, err := io.WriteString(out, "OK\r\n")
-				return err
-			default:
-				return fmt.Errorf("unexpected verb: %v", req.Verb)
-			}
-		})
-		defer srv.Close()
-
-		var stdout bytes.Buffer
-		var stderr bytes.Buffer
-		code := runSyncCLI(srv.URL, []string{"--yes", "--probe-size", "1B", "--ack-every", "1B", targetDir}, &stdout, &stderr)
-		if code != 0 {
-			t.Fatalf("sync --yes mixed: expected 0, got %d stderr=%s", code, stderr.String())
-		}
-		if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
-			t.Fatalf("expected old file to be removed, err=%v", err)
-		}
-		got, err := os.ReadFile(filepath.Join(targetDir, "new.txt"))
-		if err != nil {
-			t.Fatalf("read new file: %v", err)
-		}
-		if string(got) != string(payload) {
-			t.Fatalf("unexpected new file contents: %q", string(got))
-		}
-		if strings.Contains(stderr.String(), "proceed?") {
-			t.Fatalf("did not expect prompt with --yes, got stderr=%s", stderr.String())
-		}
-	})
-}
-
-func TestRunCLISyncSkipWriteSkipsTransferWhenOnlyNonFilesPending(t *testing.T) {
+// TestRunCLICopyConvergeCacheMapSendsRecv asserts that --cache-load makes
+// the closing SYNC carry cache-map=recv so the server can restore its
+// page cache.
+func TestRunCLICopyConvergeCacheMapSendsRecv(t *testing.T) {
 	tmp := t.TempDir()
-	targetDir := setupPinchState(t, tmp, buildTestManifestRaw("txsyncskipwrite", nil), "")
-	if err := os.MkdirAll(targetDir, 0o755); err != nil {
-		t.Fatalf("mkdir target: %v", err)
-	}
-	filePath := filepath.Join(targetDir, "a.txt")
-	if err := os.WriteFile(filePath, []byte("hello"), 0o644); err != nil {
-		t.Fatalf("write local file: %v", err)
-	}
-	mtime := time.Unix(0, 100)
-	if err := os.Chtimes(filePath, mtime, mtime); err != nil {
-		t.Fatalf("chtimes local file: %v", err)
-	}
-	info, err := os.Stat(filePath)
-	if err != nil {
-		t.Fatalf("stat local file: %v", err)
-	}
-	fileEntry := buildTestManifestEntry(1, info.Size(), info.ModTime().UnixNano(), info.Mode(), "a.txt")
-	dirEntry := "D2 0 0:100 0750 0:3:sub"
+	targetDir := filepath.Join(tmp, "dst")
+	payload := []byte("hello")
+	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "a.txt")
+	manifestRaw := buildTestManifestRaw("txcopy-converge-cache", []string{entry})
+	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
 
-	var probeCount atomic.Int64
+	var sawCacheMapRecv atomic.Bool
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
 		case intftcp.VerbPROBE:
-			probeCount.Add(1)
 			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbTXFER:
+			if err := writeManifestResponse(out, manifestRaw); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
 		case intftcp.VerbSYNC:
-			return writeSyncResponse(out, "txsyncskipwrite", []string{fileEntry, dirEntry}, nil)
+			if req.Params[0]["cache-map"] == "recv" {
+				sawCacheMapRecv.Store(true)
+			}
+			return writeSyncResponse(out, "txcopy-converge-cache", []string{entry}, nil)
+		case intftcp.VerbSEND:
+			_, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
 		default:
 			return fmt.Errorf("unexpected verb: %v", req.Verb)
 		}
 	})
 	defer srv.Close()
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := runSyncCLI(srv.URL, []string{"--skip-write", "--probe-size", "1B", targetDir}, &stdout, &stderr)
+	var stdout, stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify=none", "--cache-load=full", "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("sync skip-write non-files: expected 0, got %d stderr=%s", code, stderr.String())
+		t.Fatalf("copy converge cache-load: expected 0, got %d stderr=%s", code, stderr.String())
 	}
-	if got := probeCount.Load(); got != 1 {
-		t.Fatalf("expected a single 1-byte discovery probe, got %d", got)
-	}
-	if _, err := os.Stat(filepath.Join(targetDir, "sub")); !os.IsNotExist(err) {
-		t.Fatalf("expected skip-write mode to skip directory creation, stat err=%v", err)
+	if !sawCacheMapRecv.Load() {
+		t.Fatalf("expected closing SYNC to carry cache-map=recv when --cache-load=full")
 	}
 }
+
+// TestRunCLICopyConvergeFailsAfterMaxRounds asserts that a server which
+// keeps returning drift on every SYNC eventually causes copy to fail with
+// a "remote has not converged" message after maxSyncRounds attempts.
+func TestRunCLICopyConvergeFailsAfterMaxRounds(t *testing.T) {
+	tmp := t.TempDir()
+	targetDir := filepath.Join(tmp, "dst")
+	payload := []byte("hello")
+	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "a.txt")
+	manifestRaw := buildTestManifestRaw("txcopy-converge-noconv", []string{entry})
+	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
+
+	var syncCalls atomic.Int64
+	driftPayload := []byte("drift")
+	driftMeta := &tx.FileTrailerMetadata{Size: int64(len(driftPayload)), MtimeNS: 200, Mode: "0644"}
+
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbTXFER:
+			if err := writeManifestResponse(out, manifestRaw); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbSYNC:
+			// Each SYNC declares a brand-new file the client doesn't have.
+			n := syncCalls.Add(1)
+			driftEntry := buildTestManifestEntry(uint64(1+n), int64(len(driftPayload)), 200+n, 0o644,
+				fmt.Sprintf("drift-%d.txt", n))
+			return writeSyncResponse(out, "txcopy-converge-noconv",
+				[]string{entry, driftEntry}, nil)
+		case intftcp.VerbSEND:
+			// Serve either the original or any drift file requested.
+			for _, p := range req.Params[1:] {
+				switch p["fid"] {
+				case "1":
+					if _, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta)); err != nil {
+						return err
+					}
+				default:
+					fid, _ := strconv.ParseUint(p["fid"], 10, 64)
+					if _, err := io.WriteString(out, buildCLIFrameWithMetadata(fid, driftPayload, 0, driftMeta)); err != nil {
+						return err
+					}
+				}
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify=meta", "/remote", targetDir}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("copy should fail when the remote never converges, stderr=%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "remote has not converged") {
+		t.Fatalf("expected 'remote has not converged' message, got: %s", stderr.String())
+	}
+	if got := syncCalls.Load(); got != int64(maxSyncRounds) {
+		t.Fatalf("expected exactly %d SYNC rounds, got %d", maxSyncRounds, got)
+	}
+}
+
 
 func TestRunCLICopyStartPath(t *testing.T) {
 	tmp := t.TempDir()
 	targetDir := filepath.Join(tmp, "dst")
 	payload := []byte("hello")
-	manifestRaw := buildTestManifestRaw("txcopy-start", []string{
-		buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "new.txt"),
-	})
+	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "new.txt")
+	manifestRaw := buildTestManifestRaw("txcopy-start", []string{entry})
 	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
@@ -3183,6 +2884,8 @@ func TestRunCLICopyStartPath(t *testing.T) {
 			}
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
+		case intftcp.VerbSYNC:
+			return writeSyncResponse(out, "txcopy-start", []string{entry}, nil)
 		case intftcp.VerbSEND:
 			_, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
 			return err
@@ -3512,7 +3215,7 @@ func TestRunCLICopyCleanWipesStateDir(t *testing.T) {
 			return err
 		case intftcp.VerbSYNC:
 			sawSYNC = true
-			return fmt.Errorf("--clean must not call SYNC")
+			return fmt.Errorf("--clean must not call SYNC for resume")
 		case intftcp.VerbSEND:
 			target := req.Params[len(req.Params)-1]
 			off, err := parseOptionalInt64(target["offset"])
@@ -3532,7 +3235,9 @@ func TestRunCLICopyCleanWipesStateDir(t *testing.T) {
 	defer srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--clean", "/remote", targetDir}, &stdout, &stderr)
+	// --verify=none suppresses the end-of-copy convergence SYNC; the test
+	// here is about the resume path, not convergence.
+	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify=none", "--clean", "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy --clean: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -3854,9 +3559,8 @@ func TestRunCLICopyMetadataApplyWarningStillRunsVerifyData(t *testing.T) {
 	tmp := t.TempDir()
 	targetDir := filepath.Join(tmp, "dst")
 	payload := []byte("hello")
-	manifestRaw := buildTestManifestRaw("txcopy-metawarn", []string{
-		buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "a.txt"),
-	})
+	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "a.txt")
+	manifestRaw := buildTestManifestRaw("txcopy-metawarn", []string{entry})
 	fileMeta := &tx.FileTrailerMetadata{
 		Size:    int64(len(payload)),
 		MtimeNS: 100,
@@ -3876,6 +3580,8 @@ func TestRunCLICopyMetadataApplyWarningStillRunsVerifyData(t *testing.T) {
 			}
 			_, err := io.WriteString(out, "OK\r\n")
 			return err
+		case intftcp.VerbSYNC:
+			return writeSyncResponse(out, "txcopy-metawarn", []string{entry}, nil)
 		case intftcp.VerbSEND:
 			for _, p := range req.Params[1:] {
 				switch p["fid"] {
