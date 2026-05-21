@@ -9,6 +9,7 @@ import (
 
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	intstore "github.com/jolynch/tx/internal/filexfer/store"
+	"github.com/jolynch/tx/internal/pagecache"
 )
 
 type Transfer = intstore.Transfer
@@ -53,11 +54,22 @@ type Deps interface {
 	MaybeLogTransferProgress(txferID string)
 	MaybeLogTransferComplete(txferID string)
 
+	// EnqueueCacheRestoreBatch hands a slice of cache-restore items to a
+	// server-side producer goroutine that drains them into the worker
+	// pool under a bounded timeout. txferID labels the batch in the
+	// pool's begin/end log lines so cache-restore activity can be
+	// attributed to the SYNC that caused it. The caller does not wait
+	// for completion; items still in the producer's slice when the
+	// timeout (or server shutdown) fires are abandoned. Best-effort, no
+	// feedback to the caller.
+	EnqueueCacheRestoreBatch(txferID string, items []pagecache.TouchEntry)
+
 	Root() string
 }
 
 type runtimeDeps struct {
 	rootDir string
+	pool    *pagecache.RestoreWorkerPool
 }
 
 func NewRuntimeDeps() Deps {
@@ -71,7 +83,27 @@ func NewRuntimeDepsWithRoot(root string) Deps {
 	return runtimeDeps{rootDir: filepath.Clean(root)}
 }
 
+// NewRuntimeDepsWithPool wires both the chroot and a shared cache-restore
+// worker pool into the dependency set so SYNC cache-map=recv has somewhere
+// to enqueue work.
+func NewRuntimeDepsWithPool(root string, pool *pagecache.RestoreWorkerPool) Deps {
+	if root == "" {
+		root = "/"
+	}
+	return runtimeDeps{rootDir: filepath.Clean(root), pool: pool}
+}
+
 func (d runtimeDeps) Root() string { return d.rootDir }
+
+// EnqueueCacheRestoreBatch forwards to the pool's SendBatch, which
+// spawns its own work-scoped producer goroutine and logs the batch's
+// begin/end markers. The caller returns immediately.
+func (d runtimeDeps) EnqueueCacheRestoreBatch(txferID string, items []pagecache.TouchEntry) {
+	if d.pool == nil || len(items) == 0 {
+		return
+	}
+	d.pool.SendBatch(txferID, items)
+}
 
 func (runtimeDeps) NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, error) {
 	return intstore.NewTransfer(directory, numFiles, totalSize)

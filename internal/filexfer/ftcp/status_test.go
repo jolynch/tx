@@ -10,6 +10,7 @@ import (
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
+	"github.com/jolynch/tx/internal/pagecache"
 )
 
 type fakeDeps struct {
@@ -59,6 +60,7 @@ func (f fakeDeps) GetTransferLimiterBps(string) int64               { return 0 }
 func (f fakeDeps) MaybeLogTransferProgress(string)                  {}
 func (f fakeDeps) MaybeLogTransferComplete(string)                  {}
 func (f fakeDeps) Root() string                                     { return "/" }
+func (f fakeDeps) EnqueueCacheRestoreBatch(string, []pagecache.TouchEntry)   {}
 
 func TestHandleSTATUSWritesStatusLine(t *testing.T) {
 	req := Request{Verb: VerbSTATUS, Params: []map[string]string{{"txferid": "tx1"}}}

@@ -3,7 +3,6 @@ package filexfercli
 import (
 	"bufio"
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -14,7 +13,6 @@ import (
 	"time"
 
 	"github.com/jolynch/tx"
-	"github.com/jolynch/tx/internal/cliflags"
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/fsync"
@@ -41,6 +39,19 @@ type syncArgs struct {
 	progressTargets     []filexfer.ProgressTarget
 	progressInterval    time.Duration
 	metadataFailures    *metadataFailureCollector
+
+	// initialOldManifest, when non-nil, is used as the round-0 oldManifest
+	// supplied to SyncManifest instead of scanning the local target dir.
+	// End-of-copy convergence sets this to the saved server manifest.
+	initialOldManifest *tx.Manifest
+	// cacheMap is forwarded to SyncManifest.CacheMap on every round.
+	// Empty / "none" disables cache-map exchange; "recv" asks the server
+	// to restore its page cache from the supplied pc:<hex> snapshots.
+	cacheMap string
+	// logPrefix labels the convergence / progress log lines. Defaults to
+	// "sync"; copy's end-of-transfer call sets "copy-converge" so the
+	// origin is clear.
+	logPrefix string
 }
 
 func confirmSyncProceed(stderr io.Writer, newCount int, staleCount int, rmCount int) bool {
@@ -75,144 +86,11 @@ func confirmSyncProceed(stderr io.Writer, newCount int, staleCount int, rmCount 
 	return false
 }
 
-func runSyncCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
-	cf := cliflags.New("sync")
-	cf.SetOutput(stderr)
-	cf.FlagSet().Usage = func() {
-		fmt.Fprintln(stderr, "usage: tx recv sync [-s <dir>] [flags] <target-dir>")
-		cf.PrintDefaults(stderr)
-	}
-	var sourceDir string
-	var encryptMode string
-	var keysDir string
-	var authTokens []string
-	var concurrency int
-	var ackEveryRaw string
-	var compressRaw string
-	var noSync bool
-	var fsyncIntervalRaw string
-	var skipWrite bool
-	var verbose bool
-	var yes bool
-	var probeSizeRaw string
-	var traceFile string
-	var progressFilePaths []string
-	var progressFormats []string
-	var progressIntervalRaw string
-	cf.StringVar(&sourceDir, "s", "source-directory", "", "Absolute source directory on server (default: manifest root)")
-	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
-	cf.StringVar(&keysDir, "k", "keys", "", "Persistent age keys directory (default: ephemeral)")
-	cf.StringSliceVar(&authTokens, "t", "auth-token", "Client auth token presented in encrypted AUTH blob; repeatable")
-	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
-	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=manifest default)")
-	cf.BoolVar(&yes, "y", "yes", false, "Skip confirmation prompt")
-	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
-	cf.StringSliceVar(&progressFilePaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
-	cf.StringSliceVar(&progressFormats, "f", "progress-format", "Progress format: json|int; 1 applies to all targets, or one per target (default json)")
-	cf.StringVar(&progressIntervalRaw, "", "progress-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
-	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
-	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; 1B, 4KiB, 8MiB")
-	cf.BoolVar(&skipWrite, "", "skip-write", false, "Do not mutate the target directory; fetch bodies to discard instead of writing them")
-	cf.BoolVar(&noSync, "", "skip-fsync", false, "Ack without fdatasync")
-	cf.BoolVar(&noSync, "", "no-sync", false, "Ack without fdatasync")
-	fsyncIntervalRaw = "512MiB"
-	cf.StringVar(&fsyncIntervalRaw, "", "fsync-interval", fsyncIntervalRaw, "Background fsync batch threshold; 0=inline fdatasync, -1=syncfs-only at exit")
-	probeSizeRaw = encoding.HumanBytes(defaultCLIProbeBytes)
-	cf.StringVar(&probeSizeRaw, "", "probe-size", probeSizeRaw, "Probe payload size; 1B, 4KiB, 8MiB")
-	cf.StringVar(&traceFile, "", "trace", "", "Write runtime/trace output to this file")
-	if err := cf.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return 0
-		}
-		return 2
-	}
-	if cf.NArg() != 1 {
-		fmt.Fprintln(stderr, "sync requires exactly one positional argument: <target-dir>")
-		return 2
-	}
-	progressInterval, err := time.ParseDuration(progressIntervalRaw)
-	if err != nil {
-		fmt.Fprintf(stderr, "invalid --progress-interval: %v\n", err)
-		return 2
-	}
-	progressTargets, err := cliflags.ResolveProgressTargets(progressFilePaths, progressFormats)
-	if err != nil {
-		fmt.Fprintf(stderr, "invalid --progress-path/--progress-format: %v\n", err)
-		return 2
-	}
-	ackEvery, err := encoding.ParseByteSize(ackEveryRaw)
-	if err != nil || ackEvery <= 0 {
-		fmt.Fprintf(stderr, "invalid --ack-every: %v\n", err)
-		return 2
-	}
-	var fsyncInterval int64
-	if fsyncIntervalRaw == "-1" {
-		fsyncInterval = -1
-	} else {
-		fsyncInterval, err = encoding.ParseByteSize(fsyncIntervalRaw)
-		if err != nil {
-			fmt.Fprintf(stderr, "invalid --fsync-interval: %v\n", err)
-			return 2
-		}
-		if fsyncInterval < 0 {
-			fmt.Fprintln(stderr, "--fsync-interval must be >= 0 or -1")
-			return 2
-		}
-	}
-	probeBytes, err := encoding.ParseByteSize(probeSizeRaw)
-	if err != nil || probeBytes <= 0 {
-		fmt.Fprintf(stderr, "invalid --probe-size: %v\n", err)
-		return 2
-	}
-	agePublicKey, ageIdentity, resolvedEncMode, err := resolveEncryptionOptionsWithKeys(encryptMode, keysDir)
-	if err != nil {
-		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
-		return 2
-	}
-	if err := validateAuthTokens(authTokens, resolvedEncMode); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 2
-	}
-	compress, err := resolveCompress(compressRaw)
-	if err != nil {
-		fmt.Fprintf(stderr, "invalid --compress: %v\n", err)
-		return 2
-	}
-	concurrencyExplicit := false
-	cf.Visit(func(f *flag.Flag) {
-		if f.Name == "concurrency" {
-			concurrencyExplicit = true
-		}
-	})
-	if concurrencyExplicit && concurrency <= 0 {
-		fmt.Fprintln(stderr, "--concurrency must be > 0")
-		return 2
-	}
-	verbosity := verbosityFromFlags(false, verbose)
-	return runSync(serverURL, syncArgs{
-		sourceDir:           sourceDir,
-		targetDir:           cf.Arg(0),
-		agePublicKey:        agePublicKey,
-		ageIdentity:         ageIdentity,
-		encMode:             resolvedEncMode,
-		authTokens:          authTokens,
-		concurrency:         concurrency,
-		concurrencyExplicit: concurrencyExplicit,
-		ackEvery:            ackEvery,
-		compress:            compress,
-		noSync:              noSync,
-		fsyncInterval:       fsyncInterval,
-		skipWrite:           skipWrite,
-		verbosity:           verbosity,
-		yes:                 yes,
-		probeBytes:          probeBytes,
-		traceFile:           traceFile,
-		progressTargets:     progressTargets,
-		progressInterval:    progressInterval,
-	}, stdout, stderr)
-}
-
 func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer) int {
+	logPrefix := cfg.logPrefix
+	if logPrefix == "" {
+		logPrefix = "sync"
+	}
 	outputMu := &sync.Mutex{}
 	stdout = &synchronizedWriter{mu: outputMu, w: stdout}
 	stderr = &synchronizedWriter{mu: outputMu, w: stderr}
@@ -223,7 +101,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
 		return 2
 	}
-	fmt.Fprintf(stderr, "sync-state: >(%s) <(%s)\n", ps.ManifestPath, ps.TargetDir)
+	fmt.Fprintf(stderr, "%s-state: >(%s) <(%s)\n", logPrefix, ps.ManifestPath, ps.TargetDir)
 
 	outRoot := ps.TargetDir
 
@@ -265,11 +143,18 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 	}
 
 	for round := 0; round < maxSyncRounds; round++ {
-		// Build local manifest by scanning the target directory (what client has on disk).
-		oldManifest, err := scanLocalDir(ps.TargetDir, serverManifest)
-		if err != nil {
-			fmt.Fprintf(stderr, "scan local directory failed: %v\n", err)
-			return 1
+		// Build the oldManifest we hand to SyncManifest. End-of-copy callers
+		// pass the saved server manifest explicitly for round 0; otherwise we
+		// scan the local target dir to see what's already on disk.
+		var oldManifest *tx.Manifest
+		if round == 0 && cfg.initialOldManifest != nil {
+			oldManifest = cfg.initialOldManifest
+		} else {
+			oldManifest, err = scanLocalDir(ps.TargetDir, serverManifest)
+			if err != nil {
+				fmt.Fprintf(stderr, "scan local directory failed: %v\n", err)
+				return 1
+			}
 		}
 
 		// Probe link bandwidth.
@@ -299,6 +184,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			Mode:        loadStrategy,
 			LinkMbps:    probeResult.LinkMbps,
 			Concurrency: probeResult.SuggestedConcurrency,
+			CacheMap:    cfg.cacheMap,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "sync failed: %v\n", err)
@@ -355,7 +241,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		)
 
 		if len(newFiles) == 0 && len(staleFiles) == 0 && len(rmPaths) == 0 {
-			fmt.Fprintln(stderr, "sync: remote and local converged, nothing to do")
+			fmt.Fprintf(stderr, "%s: remote and local converged, nothing to do\n", logPrefix)
 			return 0
 		}
 
@@ -604,6 +490,6 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		}
 	}
 
-	fmt.Fprintf(stderr, "sync: failed to converge after %d rounds\n", maxSyncRounds)
+	fmt.Fprintf(stderr, "%s: remote has not converged after %d sync rounds\n", logPrefix, maxSyncRounds)
 	return 1
 }

@@ -15,14 +15,25 @@ import (
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
+	"github.com/jolynch/tx/internal/pagecache"
 )
 
+type ackCall struct {
+	fileID   uint64
+	ackBytes int64
+}
+
 type txferTestDeps struct {
-	setHintsCalls int
-	setHintsTxID  string
-	setHintsMode  string
-	setHintsMbps  int64
-	setHintsConc  int
+	setHintsCalls       int
+	setHintsTxID        string
+	setHintsMode        string
+	setHintsMbps        int64
+	setHintsConc        int
+	cacheRestoreCh      []pagecache.TouchEntry
+	cacheRestoreCall    int
+	cacheRestoreTxID    string
+	ackCalls            []ackCall
+	completeCalls       int
 }
 
 func (d *txferTestDeps) NewTransfer(string, int, int64) (Transfer, error) {
@@ -73,7 +84,10 @@ func (d *txferTestDeps) SetTransferFileWindowHash(string, uint64, int64, string)
 
 func (d *txferTestDeps) VerifyTransferFileWindowHash(string, uint64, int64, string) bool { return true }
 
-func (d *txferTestDeps) AcknowledgeTransferFile(string, uint64, int64) bool { return true }
+func (d *txferTestDeps) AcknowledgeTransferFile(_ string, fileID uint64, ackBytes int64) bool {
+	d.ackCalls = append(d.ackCalls, ackCall{fileID: fileID, ackBytes: ackBytes})
+	return true
+}
 
 func (d *txferTestDeps) SetTransferPageCache(string, uint64, []byte) bool { return true }
 
@@ -82,8 +96,13 @@ func (d *txferTestDeps) RecordTransferFirstSend(string) (time.Time, bool) { retu
 func (d *txferTestDeps) MarkTransferTooSlow(string) bool                  { return false }
 func (d *txferTestDeps) GetTransferLimiterBps(string) int64               { return 0 }
 func (d *txferTestDeps) MaybeLogTransferProgress(string)                  {}
-func (d *txferTestDeps) MaybeLogTransferComplete(string)                  {}
+func (d *txferTestDeps) MaybeLogTransferComplete(string)                  { d.completeCalls++ }
 func (d *txferTestDeps) Root() string                                     { return "/" }
+func (d *txferTestDeps) EnqueueCacheRestoreBatch(txferID string, items []pagecache.TouchEntry) {
+	d.cacheRestoreCh = append(d.cacheRestoreCh, items...)
+	d.cacheRestoreCall++
+	d.cacheRestoreTxID = txferID
+}
 
 func TestParseTXFERRequestRequiresHints(t *testing.T) {
 	req, err := ParseRequest([]byte(`TXFER "/tmp" mode=fast link-mbps=900 concurrency=12`))
@@ -425,7 +444,7 @@ func TestHandleTXFEREmitsPageCacheWhenRequested(t *testing.T) {
 	}
 	f.Close()
 
-	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=900 concurrency=4 cache-map=1`, root)
+	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=900 concurrency=4 cache-map=send`, root)
 	req, err := ParseRequest([]byte(reqRaw))
 	if err != nil {
 		t.Fatalf("ParseRequest: %v", err)
@@ -480,7 +499,7 @@ func TestEncodeManifestEmitsPageCacheWithRelativeRoot(t *testing.T) {
 }
 
 func TestParseTXFERRequestAcceptsPageCache(t *testing.T) {
-	req, err := ParseRequest([]byte(`TXFER "/tmp" mode=fast link-mbps=900 concurrency=4 cache-map=1`))
+	req, err := ParseRequest([]byte(`TXFER "/tmp" mode=fast link-mbps=900 concurrency=4 cache-map=send`))
 	if err != nil {
 		t.Fatalf("ParseRequest: %v", err)
 	}
@@ -490,6 +509,40 @@ func TestParseTXFERRequestAcceptsPageCache(t *testing.T) {
 	}
 	if !parsed.PageCache {
 		t.Fatalf("expected PageCache=true")
+	}
+	if parsed.CacheMap != "send" {
+		t.Fatalf("expected CacheMap=send, got %q", parsed.CacheMap)
+	}
+}
+
+func TestParseTXFERRequestRejectsLegacyCacheMapValues(t *testing.T) {
+	for _, raw := range []string{"1", "true", "0", "false", "garbage", "recv"} {
+		t.Run(raw, func(t *testing.T) {
+			req, err := ParseRequest([]byte(`TXFER "/tmp" mode=fast link-mbps=900 concurrency=4 cache-map=` + raw))
+			if err != nil {
+				t.Fatalf("ParseRequest: %v", err)
+			}
+			if _, err := parseTXFERRequest(req); err == nil {
+				t.Fatalf("expected parseTXFERRequest to reject cache-map=%q", raw)
+			}
+		})
+	}
+}
+
+func TestParseTXFERRequestAcceptsCacheMapNone(t *testing.T) {
+	req, err := ParseRequest([]byte(`TXFER "/tmp" mode=fast link-mbps=900 concurrency=4 cache-map=none`))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	parsed, err := parseTXFERRequest(req)
+	if err != nil {
+		t.Fatalf("parseTXFERRequest: %v", err)
+	}
+	if parsed.PageCache {
+		t.Fatalf("expected PageCache=false")
+	}
+	if parsed.CacheMap != "none" {
+		t.Fatalf("expected CacheMap=none, got %q", parsed.CacheMap)
 	}
 }
 

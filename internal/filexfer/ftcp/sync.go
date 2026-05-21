@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/pagecache"
 	"github.com/zeebo/xxh3"
 )
 
@@ -21,14 +22,16 @@ type syncRequest struct {
 	Concurrency int
 	DeadlineMS  int64
 	Comp        string
+	CacheMap    string // "none" (default), "send", or "recv"
 }
 
 type oldEntry struct {
-	size   int64
-	mtime  int64
-	mode   os.FileMode
-	fileID uint64
-	seen   bool
+	size    int64
+	mtime   int64
+	mode    os.FileMode
+	fileID  uint64
+	pcBlob  []byte
+	seen    bool
 }
 
 func parseSYNCRequest(req Request) (syncRequest, error) {
@@ -41,7 +44,7 @@ func parseSYNCRequest(req Request) (syncRequest, error) {
 	p := req.Params[0]
 	for key := range p {
 		switch key {
-		case "directory", "mode", "link-mbps", "concurrency", "deadline-ms", "comp":
+		case "directory", "mode", "link-mbps", "concurrency", "deadline-ms", "comp", "cache-map":
 		default:
 			return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "unknown SYNC option"}
 		}
@@ -78,6 +81,15 @@ func parseSYNCRequest(req Request) (syncRequest, error) {
 	default:
 		return syncRequest{}, protocolErr{code: "UNSUPPORTED_COMP", message: "supported comp values: none, zstd"}
 	}
+	cacheMap := strings.ToLower(strings.TrimSpace(p["cache-map"]))
+	if cacheMap == "" {
+		cacheMap = "none"
+	}
+	switch cacheMap {
+	case "none", "send", "recv":
+	default:
+		return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "cache-map must be none, send, or recv"}
+	}
 	return syncRequest{
 		Directory:   directory,
 		Mode:        mode,
@@ -85,6 +97,7 @@ func parseSYNCRequest(req Request) (syncRequest, error) {
 		Concurrency: concurrency,
 		DeadlineMS:  deadlineMS,
 		Comp:        comp,
+		CacheMap:    cacheMap,
 	}, nil
 }
 
@@ -222,12 +235,75 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	prevPath = nextPath
 	prevMtime = nextMtime
 
-	emitSyncEntry := func(entry encoding.ManifestEntry) error {
+	// restoreBatch accumulates {path, decoded snapshot} pairs from the
+	// walk when cache-map=recv is set. After the walk completes the
+	// whole slice is handed to a server-side producer goroutine so the
+	// SYNC handler never blocks on the bounded restore-pool channel.
+	var restoreBatch []pagecache.TouchEntry
+
+	// matchedAcks records F entries the client's old manifest agrees with
+	// (same size + mtime + mode) and will therefore not re-fetch. After
+	// the walk finishes we auto-ack each one so the SYNC's transfer Done
+	// count tracks the deltas the client will actually ACK via SEND.
+	type autoAck struct {
+		fileID uint64
+		size   int64
+	}
+	var matchedAcks []autoAck
+
+	// fullMatch mirrors the client's manifestEntryMatches check for
+	// regular files: identical size + mtime + mode means the client
+	// already has the file and will skip it.
+	fullMatch := func(old *oldEntry, e encoding.ManifestEntry) bool {
+		return old.size == e.Size && old.mtime == e.Mtime && old.mode == e.Mode
+	}
+
+	emitSyncEntry := func(result encoding.WalkResult) error {
+		entry := result.Entry
 		entry.ID = fileID
 		// Mark in pathIndex that this path still exists on disk.
 		pathHash := xxh3.Hash128([]byte(entry.Path))
-		if old, ok := pathIndex[pathHash]; ok {
-			old.seen = true
+		matched, isMatch := pathIndex[pathHash]
+		if isMatch {
+			matched.seen = true
+		}
+
+		// F entries that match in full are "already done" from the
+		// client's perspective; queue them up to be auto-acked once
+		// the file-state goroutine has populated their slots.
+		if entry.Type == encoding.EntryTypeFile && isMatch && fullMatch(matched, entry) {
+			matchedAcks = append(matchedAcks, autoAck{fileID: entry.ID, size: entry.Size})
+		}
+
+		// Attach pc:<hex> per the echo-vs-probe rule when a cache map was
+		// requested. Only F entries carry residency.
+		if entry.Type == encoding.EntryTypeFile && parsed.CacheMap != "none" {
+			fullPath := result.FullPath
+			if fullPath == "" {
+				fullPath = filepath.Clean(filepath.Join(root, entry.Path))
+			}
+			switch parsed.CacheMap {
+			case "send":
+				if blob := probeAndEncodePageCache(fullPath); len(blob) > 0 {
+					entry.PageCache = blob
+				}
+			case "recv":
+				if isMatch && matched.size == entry.Size && len(matched.pcBlob) > 0 {
+					// Echo client's snapshot on the response and remember
+					// the {path, decoded entry} pair so a producer
+					// goroutine can drain the batch into the worker pool
+					// after the walk finishes.
+					entry.PageCache = matched.pcBlob
+					ce := &pagecache.CacheEntry{}
+					if err := encoding.DecodePageCacheEntry(matched.pcBlob, ce); err == nil && !ce.Empty() {
+						restoreBatch = append(restoreBatch, pagecache.TouchEntry{Path: fullPath, Entry: ce})
+					}
+				} else if blob := probeAndEncodePageCache(fullPath); len(blob) > 0 {
+					// New-on-disk file (or size drift); attach the server's
+					// current view so the client can replay it.
+					entry.PageCache = blob
+				}
+			}
 		}
 
 		line, _, mtimeRaw, err := encoding.MarshalManifestEntry(entry, prevPath, prevMtime)
@@ -253,7 +329,7 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	}
 
 	walkErr := encoding.WalkManifestEntries(root, func(result encoding.WalkResult) error {
-		return emitSyncEntry(result.Entry)
+		return emitSyncEntry(result)
 	})
 	if walkErr != nil {
 		if isBrokenPipe(walkErr) {
@@ -283,10 +359,41 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 		}
 		return protocolErr{code: "INTERNAL", message: "flush manifest frames: " + err.Error()}
 	}
+	if len(restoreBatch) > 0 {
+		deps.EnqueueCacheRestoreBatch(transfer.ID, restoreBatch)
+	}
+	// Drain the file-state goroutine before auto-acking so the slots
+	// the acks index into have been populated with their FileSize.
 	closeUpdates()
+	for _, m := range matchedAcks {
+		deps.AcknowledgeTransferFile(transfer.ID, m.fileID, m.size)
+	}
 	deps.ClipTransfer(transfer.ID)
+	// Zero-delta SYNC: Done == NumFiles right now, so this fires the
+	// transfer-complete log and the exit-after wrapper restarts the
+	// shutdown timer. For a delta SYNC this is a no-op; the trailing
+	// SEND+ACK cycle will hit the same path from ack.go.
+	deps.MaybeLogTransferComplete(transfer.ID)
 	cleanupTransfer = false
 	return nil
+}
+
+// probeAndEncodePageCache loads the kernel residency for path and encodes
+// it as a pc:<hex> blob. Returns nil on unsupported platforms, on probe
+// errors, or when the file is empty / has nothing resident.
+func probeAndEncodePageCache(fullPath string) []byte {
+	if !pagecache.TouchSupported() {
+		return nil
+	}
+	var ce pagecache.CacheEntry
+	if err := ce.Load(fullPath); err != nil || ce.Empty() {
+		return nil
+	}
+	blob, err := encoding.EncodePageCacheEntry(&ce)
+	if err != nil {
+		return nil
+	}
+	return blob
 }
 
 // readOldManifest reads FM/1 manifest lines from in until a blank line.
@@ -345,6 +452,7 @@ func readOldManifest(in io.Reader) (map[xxh3.Uint128]*oldEntry, error) {
 			mtime:  entry.Mtime,
 			mode:   entry.Mode,
 			fileID: entry.ID,
+			pcBlob: entry.PageCache,
 		}
 		prevPath = nextPath
 		prevMtime = nextMtime

@@ -16,6 +16,7 @@ import (
 	"github.com/jolynch/tx/internal/aead"
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/limit"
+	"github.com/jolynch/tx/internal/pagecache"
 )
 
 const (
@@ -70,7 +71,9 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 	}
 	deps := opts.Deps
 	if deps == nil {
-		deps = NewRuntimeDepsWithRoot(opts.RootDir)
+		pool := pagecache.NewRestoreWorkerPool(0, 0)
+		defer pool.Close()
+		deps = NewRuntimeDepsWithPool(opts.RootDir, pool)
 	}
 
 	var onTransferCreated func(string)

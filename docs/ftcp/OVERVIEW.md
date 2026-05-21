@@ -116,17 +116,20 @@ Creates a transfer and streams a manifest.
 
 ### Request
 
-`TXFER <path> mode=<fast|gentle> link-mbps=<int> concurrency=<int> [verbose=<0|1|true|false>] [deadline-ms=<int>] [cache-map=<0|1|true|false>] [comp=none|zstd]`
+`TXFER <path> mode=<fast|gentle> link-mbps=<int> concurrency=<int> [verbose=<0|1|true|false>] [deadline-ms=<int>] [cache-map=none|send] [comp=none|zstd]`
 
 - `<path>` must be quoted or length-prefixed.
 - directory must be absolute, existing, and readable.
 - `mode`, `link-mbps`, and `concurrency` are required.
 - `link-mbps` must be `>= 0`.
 - `concurrency` must be `> 0`.
-- `cache-map=1` asks the server to attach a per-file page-cache residency hint
-  (`pc:<hex>` trailing token) to each FM/1 entry; see
-  [MANIFEST.md](./MANIFEST.md). Linux-only on the server; on other platforms
-  the flag is honored but no pagecache tokens are emitted.
+- `cache-map` selects whether per-file page-cache residency is exchanged.
+  `none` (default) sends no hints. `send` asks the server to attach a
+  `pc:<hex>` trailing token to each F entry (see [MANIFEST.md](./MANIFEST.md));
+  Linux-only on the server, no-op on other platforms. `recv` is **not**
+  accepted on TXFER (TXFER has no client-supplied body to carry a map);
+  see SYNC for the recv direction. Legacy boolean values (`1`, `true`,
+  `0`, `false`) are rejected.
 - `comp` selects the per-frame wire compression. Supported values are `none`
   (literal FM/1 bytes per frame) and `zstd` (each frame is an independent
   zstd frame). Default is `zstd`. The framing is unconditional — `comp` only
@@ -194,7 +197,7 @@ manifest comes from the client-supplied body.
 
 ### Request
 
-`SYNC <path> mode=<fast|gentle> link-mbps=<int> concurrency=<int> [deadline-ms=<int>] [comp=none|zstd]`
+`SYNC <path> mode=<fast|gentle> link-mbps=<int> concurrency=<int> [deadline-ms=<int>] [comp=none|zstd] [cache-map=none|send|recv]`
 
 - `<path>` must be quoted or length-prefixed.
 - directory must be absolute, existing, and readable.
@@ -206,6 +209,22 @@ manifest comes from the client-supplied body.
   body's framing is unconditional, and each request frame is self-describing
   via its `comp=` header — the request body may use any supported codec
   independently of the request-line `comp`.
+- `cache-map` controls page-cache residency exchange:
+  - `none` (default): no `pc:<hex>` activity.
+  - `send`: server attaches a fresh `pc:<hex>` token to each F entry in
+    the response, snapshotting the server's current residency. The
+    request body's `pc:<hex>` tokens (if any) are ignored.
+  - `recv`: the request body's `pc:<hex>` tokens are the snapshot the
+    server should converge its page cache to. For each matching F entry
+    (path-hash and size both match an entry already on disk) the server
+    enqueues a fire-and-forget restore task — `posix_fadvise(DONTNEED)`
+    on the whole file followed by `posix_fadvise(WILLNEED)` + a
+    synchronous mmap+read for the resident pages in the snapshot. The
+    work runs asynchronously on a server-tied worker pool; the response
+    is not delayed by it. The response **echoes** the client's
+    `pc:<hex>` blob on each matching F entry and falls back to a fresh
+    server-side probe for new-on-disk entries. No-op on non-Linux
+    platforms.
 
 ### Request body
 

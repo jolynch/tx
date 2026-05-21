@@ -25,6 +25,7 @@ type txferRequest struct {
 	DeadlineMS  int64
 	PageCache   bool
 	Comp        string
+	CacheMap    string // "none" or "send"
 }
 
 func parseTXFERRequest(req Request) (txferRequest, error) {
@@ -52,12 +53,20 @@ func parseTXFERRequest(req Request) (txferRequest, error) {
 			verbose = true
 		}
 	}
-	pageCache := false
-	if raw := p["cache-map"]; raw != "" {
-		if raw == "1" || strings.EqualFold(raw, "true") {
-			pageCache = true
+	cacheMap := "none"
+	if raw := strings.ToLower(strings.TrimSpace(p["cache-map"])); raw != "" {
+		switch raw {
+		case "none":
+			cacheMap = "none"
+		case "send":
+			cacheMap = "send"
+		case "recv":
+			return txferRequest{}, protocolErr{code: "UNSUPPORTED_CACHE_MAP", message: "cache-map=recv not supported on TXFER"}
+		default:
+			return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "cache-map must be none or send"}
 		}
 	}
+	pageCache := cacheMap == "send"
 	mode := strings.ToLower(strings.TrimSpace(p["mode"]))
 	if mode != "fast" && mode != "gentle" {
 		return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "mode must be fast or gentle"}
@@ -94,6 +103,7 @@ func parseTXFERRequest(req Request) (txferRequest, error) {
 		Concurrency: concurrency,
 		DeadlineMS:  deadlineMS,
 		PageCache:   pageCache,
+		CacheMap:    cacheMap,
 		Comp:        comp,
 	}, nil
 }

@@ -174,7 +174,7 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 		LinkMbps:         probeResult.LinkMbps,
 		Concurrency:      probeResult.SuggestedConcurrency,
 		DeadlineMS:       cfg.deadlineMS,
-		PreserveCache:    cfg.cacheLoad,
+		CacheMap:         cacheMapValue(cfg.cacheLoad),
 		RawSink:          rawSink,
 		ManifestProgress: progressCh,
 	})

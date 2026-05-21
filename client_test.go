@@ -2888,7 +2888,7 @@ func TestGetManifestCompZstdStreamingFrames(t *testing.T) {
 	}
 }
 
-func TestGetManifestPreserveCacheSendsCacheMap(t *testing.T) {
+func TestGetManifestCacheMapSendEmitsToken(t *testing.T) {
 	m := &Manifest{
 		TransferID:  "tx-preserve-cache",
 		Root:        "/remote",
@@ -2909,7 +2909,7 @@ func TestGetManifestPreserveCacheSendsCacheMap(t *testing.T) {
 		if req.Verb != intftcp.VerbTXFER {
 			return fmt.Errorf("unexpected verb: %v", req.Verb)
 		}
-		if req.Params[0]["cache-map"] == "1" {
+		if req.Params[0]["cache-map"] == "send" {
 			sawCacheMap.Store(true)
 		}
 		writeStreamingManifest(t, out, rawBody, intencoding.EncodingZstd, len(rawBody))
@@ -2921,16 +2921,16 @@ func TestGetManifestPreserveCacheSendsCacheMap(t *testing.T) {
 	client := NewClient(srv.URL)
 	defer client.Close()
 	if _, err := client.GetManifest(context.Background(), GetManifestRequest{
-		Directory:     "/remote",
-		Mode:          "fast",
-		LinkMbps:      1000,
-		Concurrency:   4,
-		PreserveCache: true,
+		Directory:   "/remote",
+		Mode:        "fast",
+		LinkMbps:    1000,
+		Concurrency: 4,
+		CacheMap:    "send",
 	}); err != nil {
 		t.Fatalf("GetManifest: %v", err)
 	}
 	if !sawCacheMap.Load() {
-		t.Fatalf("expected TXFER cache-map=1")
+		t.Fatalf("expected TXFER cache-map=send")
 	}
 }
 

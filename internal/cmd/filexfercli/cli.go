@@ -287,7 +287,7 @@ func scanLocalDir(targetDir string, meta *tx.Manifest) (*tx.Manifest, error) {
 
 func isKnownCommand(s string) bool {
 	switch s {
-	case "copy", "transfer", "start", "status", "get", "sync":
+	case "copy", "transfer", "start", "status", "get":
 		return true
 	}
 	return false

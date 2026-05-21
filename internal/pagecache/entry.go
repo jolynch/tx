@@ -29,6 +29,13 @@ import (
 // support mincore / posix_fadvise.
 var ErrUnsupported = errors.New("page-cache probing not supported on this platform")
 
+// TouchCacheReserveBytes is the amount of RAM withheld from
+// SystemPageBudget callers so the rest of the process (manifests, zstd
+// encoder pools, verify buffers, etc.) has working memory regardless of
+// host size. Client (cli_copy) and server (cache-restore worker pool)
+// share this constant so their budgets stay in lock-step.
+const TouchCacheReserveBytes int64 = 1 << 30 // 1 GiB
+
 // CacheEntry holds page-cache residency information for one file.
 // Internal representation is opaque to callers; the encoding package uses
 // PageBits / SetPageBits for serialization, while everyone else uses

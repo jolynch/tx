@@ -16,6 +16,7 @@ import (
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
+	"github.com/jolynch/tx/internal/pagecache"
 	"github.com/zeebo/xxh3"
 )
 
@@ -113,6 +114,7 @@ func (d *sendTestDeps) GetTransferLimiterBps(string) int64               { retur
 func (d *sendTestDeps) MaybeLogTransferProgress(string)                  {}
 func (d *sendTestDeps) MaybeLogTransferComplete(string)                  {}
 func (d *sendTestDeps) Root() string                                     { return "/" }
+func (d *sendTestDeps) EnqueueCacheRestoreBatch(string, []pagecache.TouchEntry) {}
 
 func TestParseSENDRequestCompDefaultsAndModes(t *testing.T) {
 	req, err := ParseRequest([]byte(`SEND tx1 fd=1 "/tmp/a.txt"`))

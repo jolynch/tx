@@ -257,7 +257,7 @@ type ManifestEntry struct {
 	LinkTarget int64  // H: target file ID; -1 otherwise
 	LinkPath   string // S: symlink target path; "" otherwise
 	// PageCache is the optional encoded page-cache residency hint emitted
-	// by the server when PreserveCache was set on the manifest request.
+	// by the server when CacheMap=="send" was set on the manifest request.
 	// Decode via internal/filexfer/encoding.DecodePageCacheEntry to recover a
 	// pagecache.CacheEntry usable for Touch.
 	PageCache []byte
@@ -376,10 +376,11 @@ type GetManifestRequest struct {
 	LinkMbps    int64
 	Concurrency int
 	DeadlineMS  int64
-	// PreserveCache, when true, asks the server to attach a per-file
-	// page-cache residency hint to each manifest entry. Decode via
-	// encoding.DecodePageCacheEntry to recover a pagecache.CacheEntry.
-	PreserveCache bool
+	// CacheMap controls cache-residency exchange with the server. "" or
+	// "none" (default) is no cache map. "send" asks the server to attach
+	// pc:<hex> tokens to F entries (decode via
+	// encoding.DecodePageCacheEntry). "recv" is not supported on TXFER.
+	CacheMap string
 	// Comp selects the wire compression for the manifest stream. Empty
 	// defaults to "zstd". Use "none" for an uncompressed FM/1 response.
 	Comp string
@@ -455,6 +456,13 @@ type SyncManifestRequest struct {
 	// manifest stream. Empty defaults to zstd. The client sends its own
 	// request body using the same codec; frames are self-describing.
 	Comp string
+	// CacheMap controls the page-cache residency exchange. "" or "none"
+	// (default) does nothing. "send" asks the server to attach pc:<hex>
+	// tokens to F entries in the response. "recv" ships the OldManifest's
+	// pc:<hex> tokens as the desired residency snapshot; the server then
+	// applies them to its own page cache (asynchronously) and echoes the
+	// client's pc:<hex> back on matching response entries.
+	CacheMap string
 }
 
 type SyncManifestResponse struct {

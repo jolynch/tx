@@ -17,6 +17,7 @@ import (
 
 	"github.com/jolynch/tx"
 	"github.com/jolynch/tx/internal/cliflags"
+	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/pagecache"
 	"github.com/jolynch/tx/internal/sampler"
@@ -105,6 +106,16 @@ type copyCLIConfig struct {
 	verbose             bool
 	progress            bool
 	yes                 bool
+}
+
+// cacheMapValue maps the boolean "did the caller enable --cache-load?"
+// onto the TXFER cache-map wire value. Centralized so the CLI keeps a
+// single source of truth.
+func cacheMapValue(cacheLoad bool) string {
+	if cacheLoad {
+		return "send"
+	}
+	return "none"
 }
 
 func cleanupCopyState(targetDir string, stderr io.Writer) int {
@@ -401,6 +412,26 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		}
 	}
 
+	// When --verify or --cache-load is requested, run an end-of-copy SYNC
+	// to detect drift the server tree may have accumulated mid-transfer.
+	// The same loop also carries the cache-map=recv snapshot back when the
+	// caller asked for cache-load. Up to maxSyncRounds attempts; copy
+	// fails if the remote still has differences after the cap.
+	needConverge := cfg.cacheLoadEnabled ||
+		cfg.verifyMeta || cfg.verifyDataSamplePct > 0 || cfg.verifyBudget > 0
+	if needConverge {
+		if code := runEndOfCopyConvergence(
+			serverURL, cfg,
+			agePublicKey, ageIdentity, encMode,
+			ackEvery, compress, fsyncInterval, probeBytes,
+			progressTargets, progressInterval,
+			metadataFailures,
+			stdout, stderr,
+		); code != 0 {
+			return code
+		}
+	}
+
 	exitCode := 0
 	if cfg.verifyMeta {
 		if code := verifyCopy(serverURL, cfg, stdout, stderr); code != 0 {
@@ -427,11 +458,6 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 	}
 	return 0
 }
-
-// touchCacheReserveBytes is the amount of RAM withheld from the page-cache
-// warming budget so tx itself (manifest, zstd encoder pools, verify buffers)
-// has working memory regardless of host size.
-const touchCacheReserveBytes int64 = 1 << 30 // 1 GiB
 
 // cacheProgressState holds the counters and budgets formatCacheProgressLine
 // renders. Budgets <= 0 indicate "unknown / unlimited" and cause their
@@ -522,6 +548,68 @@ func clampCachePercent(pct float64) float64 {
 	return pct
 }
 
+// runEndOfCopyConvergence drives a closing SYNC loop against the server,
+// repairing any drift the response reveals. When --cache-load is on, the
+// SYNC carries cache-map=recv so the server also restores its page cache
+// from the saved snapshot. Returns 0 on convergence (within
+// maxSyncRounds) and non-zero with a "remote has not converged" log line
+// otherwise.
+func runEndOfCopyConvergence(
+	serverURL string,
+	cfg copyCLIConfig,
+	agePublicKey, ageIdentity, encMode string,
+	ackEvery int64,
+	compress string,
+	fsyncInterval int64,
+	probeBytes int64,
+	progressTargets []filexfer.ProgressTarget,
+	progressInterval time.Duration,
+	metadataFailures *metadataFailureCollector,
+	stdout io.Writer,
+	stderr io.Writer,
+) int {
+	ps, err := newPinchState(cfg.localDst)
+	if err != nil {
+		fmt.Fprintf(stderr, "copy-converge: skip (%v)\n", err)
+		return 0
+	}
+	saved, err := tx.LoadManifest(ps.ServerManifestPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "copy-converge: skip (load manifest: %v)\n", err)
+		return 0
+	}
+	cacheMap := "none"
+	if cfg.cacheLoadEnabled {
+		cacheMap = "recv"
+	}
+	syncCfg := syncArgs{
+		sourceDir:           cfg.remoteSrc,
+		targetDir:           cfg.localDst,
+		agePublicKey:        agePublicKey,
+		ageIdentity:         ageIdentity,
+		encMode:             encMode,
+		authTokens:          cfg.authTokens,
+		concurrency:         cfg.concurrency,
+		concurrencyExplicit: cfg.concurrency > 0,
+		ackEvery:            ackEvery,
+		compress:            compress,
+		noSync:              cfg.skipFsync,
+		fsyncInterval:       fsyncInterval,
+		skipWrite:           cfg.skipWrite,
+		verbosity:           verbosityFromFlags(false, cfg.verbose),
+		yes:                 true, // never prompt — convergence is automatic
+		probeBytes:          probeBytes,
+		traceFile:           cfg.traceFile,
+		progressTargets:     progressTargets,
+		progressInterval:    progressInterval,
+		metadataFailures:    metadataFailures,
+		initialOldManifest:  saved,
+		cacheMap:            cacheMap,
+		logPrefix:           "copy-converge",
+	}
+	return runSync(serverURL, syncCfg, stdout, stderr)
+}
+
 // touchCopyCache decodes per-file page-cache hints from the just-fetched
 // manifest and issues posix_fadvise(WILLNEED) for each file, oldest-mtime
 // first, up to a system-RAM-derived page budget. No-op on platforms where
@@ -564,7 +652,7 @@ func touchCopyCache(cfg copyCLIConfig, progressInterval time.Duration, stderr io
 	})
 	totalFiles := int64(len(candidateIndexes))
 
-	budget := pagecache.SystemPageBudget(touchCacheReserveBytes)
+	budget := pagecache.SystemPageBudget(pagecache.TouchCacheReserveBytes)
 	ctx := context.Background()
 	cancel := func() {}
 	if cfg.cacheLoadBudget > 0 {
