@@ -250,6 +250,10 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintf(stderr, "invalid --mode: %v\n", err)
 		return 2
 	}
+	if loadStrategy == tx.LoadStrategyGentle && cfg.cacheLoadEnabled {
+		fmt.Fprintln(stderr, "--cache-load cannot be used with --mode gentle")
+		return 2
+	}
 	probeBytes, err := encoding.ParseByteSize(cfg.probeSizeRaw)
 	if err != nil || probeBytes <= 0 {
 		fmt.Fprintf(stderr, "invalid --probe-size: %v\n", err)

@@ -2934,6 +2934,43 @@ func TestGetManifestCacheMapSendEmitsToken(t *testing.T) {
 	}
 }
 
+func TestGetManifestRejectsGentleCacheMap(t *testing.T) {
+	client := NewClient("127.0.0.1:1")
+	defer client.Close()
+	_, err := client.GetManifest(context.Background(), GetManifestRequest{
+		Directory:   "/remote",
+		Mode:        LoadStrategyGentle,
+		LinkMbps:    1000,
+		Concurrency: 4,
+		CacheMap:    "send",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cache-map is not supported with gentle mode") {
+		t.Fatalf("expected gentle cache-map validation error, got %v", err)
+	}
+}
+
+func TestSyncManifestRejectsGentleCacheMap(t *testing.T) {
+	client := NewClient("127.0.0.1:1")
+	defer client.Close()
+	_, err := client.SyncManifest(context.Background(), SyncManifestRequest{
+		Directory: "/remote",
+		OldManifest: &Manifest{
+			TransferID:  "old",
+			Root:        "/remote",
+			Mode:        LoadStrategyGentle,
+			LinkMbps:    1000,
+			Concurrency: 4,
+		},
+		Mode:        LoadStrategyGentle,
+		LinkMbps:    1000,
+		Concurrency: 4,
+		CacheMap:    "recv",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cache-map is not supported with gentle mode") {
+		t.Fatalf("expected gentle cache-map validation error, got %v", err)
+	}
+}
+
 func TestGetManifestCompNoneStreamingFrames(t *testing.T) {
 	m := &Manifest{
 		TransferID:  "tx-none",

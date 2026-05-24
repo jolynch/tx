@@ -9,6 +9,10 @@ The architecture sits on top of the FTCP command protocol documented in
 [docs/ftcp/OVERVIEW.md](../ftcp/OVERVIEW.md). Operator-facing command behavior
 and flags live in [docs/pub/CLI.md](../pub/CLI.md).
 
+Mode-specific transfer ordering and source-side load goals are described in
+[TRANSFER.md](./TRANSFER.md), including the difference between `fast` and
+`gentle` transfer/sync paths.
+
 ## Concurrency
 
 A single TCP connection cannot fill a 25 Gbps NIC, and a single thread cannot

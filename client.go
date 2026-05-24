@@ -639,6 +639,10 @@ func (c *Client) GetManifest(ctx context.Context, request GetManifestRequest) (G
 	if request.Mode != LoadStrategyFast && request.Mode != LoadStrategyGentle {
 		return GetManifestResponse{}, errors.New("invalid mode")
 	}
+	cacheMap := strings.ToLower(strings.TrimSpace(request.CacheMap))
+	if request.Mode == LoadStrategyGentle && cacheMap != "" && cacheMap != "none" {
+		return GetManifestResponse{}, errors.New("cache-map is not supported with gentle mode")
+	}
 	if request.LinkMbps < 0 {
 		return GetManifestResponse{}, errors.New("link mbps must be >= 0")
 	}
@@ -663,6 +667,10 @@ func (c *Client) SyncManifest(ctx context.Context, request SyncManifestRequest) 
 	request.Mode = strings.ToLower(strings.TrimSpace(request.Mode))
 	if request.Mode != LoadStrategyFast && request.Mode != LoadStrategyGentle {
 		return SyncManifestResponse{}, errors.New("invalid mode")
+	}
+	cacheMap := strings.ToLower(strings.TrimSpace(request.CacheMap))
+	if request.Mode == LoadStrategyGentle && cacheMap != "" && cacheMap != "none" {
+		return SyncManifestResponse{}, errors.New("cache-map is not supported with gentle mode")
 	}
 	if request.LinkMbps < 0 {
 		return SyncManifestResponse{}, errors.New("link mbps must be >= 0")

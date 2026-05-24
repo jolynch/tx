@@ -2865,7 +2865,6 @@ func TestRunCLICopyConvergeFailsAfterMaxRounds(t *testing.T) {
 	}
 }
 
-
 func TestRunCLICopyStartPath(t *testing.T) {
 	tmp := t.TempDir()
 	targetDir := filepath.Join(tmp, "dst")
@@ -3861,6 +3860,13 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "invalid --cache-load") {
 		t.Fatalf("expected invalid --cache-load error, got: %s", stderr.String())
+	}
+	stderr.Reset()
+	if code := runCopyCLI("127.0.0.1:1", []string{"--mode", "gentle", "--cache-load", "full", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for gentle cache-load combo, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "--cache-load cannot be used with --mode gentle") {
+		t.Fatalf("expected invalid gentle/cache-load combo error, got: %s", stderr.String())
 	}
 	stderr.Reset()
 	if code := runCopyCLI("127.0.0.1:1", []string{"--verify", "5%data", "--skip-fetch", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {

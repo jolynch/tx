@@ -24,16 +24,16 @@ type ackCall struct {
 }
 
 type txferTestDeps struct {
-	setHintsCalls       int
-	setHintsTxID        string
-	setHintsMode        string
-	setHintsMbps        int64
-	setHintsConc        int
-	cacheRestoreCh      []pagecache.TouchEntry
-	cacheRestoreCall    int
-	cacheRestoreTxID    string
-	ackCalls            []ackCall
-	completeCalls       int
+	setHintsCalls    int
+	setHintsTxID     string
+	setHintsMode     string
+	setHintsMbps     int64
+	setHintsConc     int
+	cacheRestoreCh   []pagecache.TouchEntry
+	cacheRestoreCall int
+	cacheRestoreTxID string
+	ackCalls         []ackCall
+	completeCalls    int
 }
 
 func (d *txferTestDeps) NewTransfer(string, int, int64) (Transfer, error) {
@@ -543,6 +543,18 @@ func TestParseTXFERRequestAcceptsCacheMapNone(t *testing.T) {
 	}
 	if parsed.CacheMap != "none" {
 		t.Fatalf("expected CacheMap=none, got %q", parsed.CacheMap)
+	}
+}
+
+func TestParseTXFERRequestRejectsGentleCacheMap(t *testing.T) {
+	req, err := ParseRequest([]byte(`TXFER "/tmp" mode=gentle link-mbps=900 concurrency=4 cache-map=send`))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	if _, err := parseTXFERRequest(req); err == nil {
+		t.Fatalf("expected parseTXFERRequest to reject gentle cache-map")
+	} else if !strings.Contains(err.Error(), "cache-map is not supported with gentle mode") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

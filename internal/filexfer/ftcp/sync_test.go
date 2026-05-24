@@ -57,6 +57,22 @@ func TestParseSYNCRequest(t *testing.T) {
 	}
 }
 
+func TestParseSYNCRequestRejectsGentleCacheMap(t *testing.T) {
+	for _, cacheMap := range []string{"send", "recv"} {
+		t.Run(cacheMap, func(t *testing.T) {
+			req, err := ParseRequest([]byte(`SYNC "/tmp" mode=gentle link-mbps=900 concurrency=12 cache-map=` + cacheMap))
+			if err != nil {
+				t.Fatalf("ParseRequest failed: %v", err)
+			}
+			if _, err := parseSYNCRequest(req); err == nil {
+				t.Fatalf("expected parseSYNCRequest to reject gentle cache-map=%s", cacheMap)
+			} else if !strings.Contains(err.Error(), "cache-map is not supported with gentle mode") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestHandleSYNCEmptyOldManifest(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, root, "a.txt", "hello")
