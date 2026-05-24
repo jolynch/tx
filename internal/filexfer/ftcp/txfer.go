@@ -71,6 +71,9 @@ func parseTXFERRequest(req Request) (txferRequest, error) {
 	if mode != "fast" && mode != "gentle" {
 		return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "mode must be fast or gentle"}
 	}
+	if mode == "gentle" && cacheMap != "none" {
+		return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "cache-map is not supported with gentle mode"}
+	}
 	linkMbps, err := strconv.ParseInt(strings.TrimSpace(p["link-mbps"]), 10, 64)
 	if err != nil || linkMbps < 0 {
 		return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "link-mbps must be >= 0"}

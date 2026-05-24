@@ -26,12 +26,12 @@ type syncRequest struct {
 }
 
 type oldEntry struct {
-	size    int64
-	mtime   int64
-	mode    os.FileMode
-	fileID  uint64
-	pcBlob  []byte
-	seen    bool
+	size   int64
+	mtime  int64
+	mode   os.FileMode
+	fileID uint64
+	pcBlob []byte
+	seen   bool
 }
 
 func parseSYNCRequest(req Request) (syncRequest, error) {
@@ -89,6 +89,9 @@ func parseSYNCRequest(req Request) (syncRequest, error) {
 	case "none", "send", "recv":
 	default:
 		return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "cache-map must be none, send, or recv"}
+	}
+	if mode == "gentle" && cacheMap != "none" {
+		return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "cache-map is not supported with gentle mode"}
 	}
 	return syncRequest{
 		Directory:   directory,
