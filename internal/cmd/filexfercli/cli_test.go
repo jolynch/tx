@@ -386,16 +386,16 @@ func checksumTargetsFromRequest(t *testing.T, req intftcp.Request) []tx.Checksum
 	return targets
 }
 
-// setupPinchState creates the .tx directory structure for tests and writes
+// setupTxState creates the .tx directory structure for tests and writes
 // a manifest (and optional progress) file. Returns the target directory path.
-func setupPinchState(t *testing.T, tmp string, manifestRaw string, progressRaw string) string {
+func setupTxState(t *testing.T, tmp string, manifestRaw string, progressRaw string) string {
 	t.Helper()
 	targetDir := filepath.Join(tmp, "dst")
-	pinchDir := filepath.Join(tmp, ".tx", "dst")
-	if err := os.MkdirAll(pinchDir, 0o755); err != nil {
+	stateDir := filepath.Join(tmp, ".tx", "dst")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		t.Fatalf("mkdir .tx: %v", err)
 	}
-	serverManifestPath := filepath.Join(pinchDir, "manifest.server.zst")
+	serverManifestPath := filepath.Join(stateDir, "manifest.server.zst")
 	if manifestRaw != "" {
 		// Parse and re-save via SaveManifest so the on-disk format matches
 		// what production writes (zstd-compressed FM/1).
@@ -419,7 +419,7 @@ func setupPinchState(t *testing.T, tmp string, manifestRaw string, progressRaw s
 			}
 			body = fmt.Sprintf("%s%s\n%s", progressFingerprintHeaderPrefix, tx.ManifestFingerprint(m), progressRaw)
 		}
-		if err := os.WriteFile(filepath.Join(pinchDir, "manifest.progress"), []byte(body), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(stateDir, "manifest.progress"), []byte(body), 0o644); err != nil {
 			t.Fatalf("write progress: %v", err)
 		}
 	}
@@ -916,7 +916,7 @@ func TestRunCLIStartDownloadsAll(t *testing.T) {
 		"F2 4 0:101 0644 0:5:b.txt",
 		"",
 	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "")
+	targetDir := setupTxState(t, tmp, manifestRaw, "")
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
@@ -1146,7 +1146,7 @@ func TestRunCLIStartPrintsResumeProgress(t *testing.T) {
 		"F1 10 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "1 5 0\n")
+	targetDir := setupTxState(t, tmp, manifestRaw, "1 5 0\n")
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)
@@ -1209,7 +1209,7 @@ func TestRunCLIStartPrintsSkippedResumeProgress(t *testing.T) {
 		"F2 10 0:101 0644 0:5:b.txt",
 		"",
 	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "1 5 1\n2 5 0\n")
+	targetDir := setupTxState(t, tmp, manifestRaw, "1 5 1\n2 5 0\n")
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)
@@ -1266,7 +1266,7 @@ func TestRunCLIStartUsesManifestConcurrencyDefault(t *testing.T) {
 		"F1 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "")
+	targetDir := setupTxState(t, tmp, manifestRaw, "")
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
@@ -1317,7 +1317,7 @@ func TestRunCLIStartDiscardSkipsTargetMutationAndLocalManifest(t *testing.T) {
 		"F1 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "")
+	targetDir := setupTxState(t, tmp, manifestRaw, "")
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		t.Fatalf("mkdir target: %v", err)
 	}
@@ -1380,7 +1380,7 @@ func TestRunCLIStartDiscardSkipsCompletedMetadataRefresh(t *testing.T) {
 		"F1 5 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "1 5 0\n")
+	targetDir := setupTxState(t, tmp, manifestRaw, "1 5 0\n")
 
 	srv := newUnexpectedVerbFTCPTestServer(t)
 	defer srv.Close()
@@ -1410,7 +1410,7 @@ func TestRunCLIStartDirectoryOnlyDoesNotTransfer(t *testing.T) {
 		manifestRaw := buildTestManifestRaw("txdironly", []string{
 			buildTestDirManifestEntry(1, 100, 0o750, "sub"),
 		})
-		targetDir := setupPinchState(t, tmp, manifestRaw, "")
+		targetDir := setupTxState(t, tmp, manifestRaw, "")
 
 		rootFID := strconv.FormatUint(tx.RootFileID, 10)
 		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
@@ -1463,7 +1463,7 @@ func TestRunCLIStartDirectoryOnlyDoesNotTransfer(t *testing.T) {
 		manifestRaw := buildTestManifestRaw("txdironlydiscard", []string{
 			buildTestDirManifestEntry(1, 100, 0o750, "sub"),
 		})
-		targetDir := setupPinchState(t, tmp, manifestRaw, "")
+		targetDir := setupTxState(t, tmp, manifestRaw, "")
 
 		srv := newUnexpectedVerbFTCPTestServer(t)
 		defer srv.Close()
@@ -1491,7 +1491,7 @@ func TestRunCLIStartHardlinkDedup(t *testing.T) {
 		"H2 0 0:1 0644 0:5:b.txt",
 		"",
 	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "")
+	targetDir := setupTxState(t, tmp, manifestRaw, "")
 
 	var sentFIDs []string
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
@@ -1570,7 +1570,7 @@ func TestRunCLIStartSymlinks(t *testing.T) {
 		"S2 0 0:100 0777 0:8:link.txt 5:a.txt",
 		"",
 	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "")
+	targetDir := setupTxState(t, tmp, manifestRaw, "")
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
@@ -1633,7 +1633,7 @@ func TestRunCLIStartDirectories(t *testing.T) {
 		"F2 5 1:00 0644 3:6:/a.txt",
 		"",
 	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "")
+	targetDir := setupTxState(t, tmp, manifestRaw, "")
 	rootFID := strconv.FormatUint(tx.RootFileID, 10)
 	rootMeta := testOwnershipMetadata(0, 200, "0755")
 	dirMeta := testOwnershipMetadata(0, 100, "1750")
@@ -1710,7 +1710,7 @@ func TestRunCLIStartMixedManifestTypes(t *testing.T) {
 		buildTestHardlinkManifestEntry(3, 2, 0o644, "sub/b.txt"),
 		buildTestSymlinkManifestEntry(4, 100, 0o777, "sub/link.txt", "a.txt"),
 	})
-	targetDir := setupPinchState(t, tmp, manifestRaw, "")
+	targetDir := setupTxState(t, tmp, manifestRaw, "")
 	meta := testOwnershipMetadata(int64(len(payload)), 100, "0644")
 	rootFID := strconv.FormatUint(tx.RootFileID, 10)
 	rootMeta := testOwnershipMetadata(0, 300, "0755")
@@ -2984,8 +2984,8 @@ func TestRunCLICopyResumeFromPriorStateUnchanged(t *testing.T) {
 	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "a.txt")
 	manifestRaw := buildTestManifestRaw("txcopy-resume", []string{entry})
 	// Seed prior state: manifest.server, manifest.progress (auto-fingerprinted
-	// by setupPinchState), and a partially-written staging file.
-	targetDir := setupPinchState(t, tmp, manifestRaw, "1 5 0\n")
+	// by setupTxState), and a partially-written staging file.
+	targetDir := setupTxState(t, tmp, manifestRaw, "1 5 0\n")
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)
@@ -3061,7 +3061,7 @@ func TestRunCLICopyResumeFromPriorStateChangedFile(t *testing.T) {
 	payload := []byte("helloworld!!")
 	priorEntry := buildTestManifestEntry(1, 10, 100, 0o644, "a.txt")
 	priorManifestRaw := buildTestManifestRaw("txcopy-resume", []string{priorEntry})
-	targetDir := setupPinchState(t, tmp, priorManifestRaw, "1 5 0\n")
+	targetDir := setupTxState(t, tmp, priorManifestRaw, "1 5 0\n")
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)
@@ -3123,7 +3123,7 @@ func TestRunCLICopyResumeRemovedPathDropsStaging(t *testing.T) {
 	rmEntry := buildTestManifestEntry(2, 5, 100, 0o644, "gone.txt")
 	priorManifestRaw := buildTestManifestRaw("txcopy-rm", []string{keepEntry, rmEntry})
 	// Seed progress for both files.
-	targetDir := setupPinchState(t, tmp, priorManifestRaw, "1 5 1\n2 3 0\n")
+	targetDir := setupTxState(t, tmp, priorManifestRaw, "1 5 1\n2 3 0\n")
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)
@@ -3187,7 +3187,7 @@ func TestRunCLICopyCleanWipesStateDir(t *testing.T) {
 	payload := []byte("hello")
 	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "new.txt")
 	priorManifestRaw := buildTestManifestRaw("txcopy-prior", []string{entry})
-	targetDir := setupPinchState(t, tmp, priorManifestRaw, "1 3 0\n")
+	targetDir := setupTxState(t, tmp, priorManifestRaw, "1 3 0\n")
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)
@@ -3260,9 +3260,9 @@ func TestRunCLICopyResumeFingerprintMismatch(t *testing.T) {
 	entry := buildTestManifestEntry(1, int64(len(payload)), 100, 0o644, "a.txt")
 	priorManifestRaw := buildTestManifestRaw("txcopy-fpmismatch", []string{entry})
 	// Hand-craft a progress file with a clearly-wrong fingerprint header so
-	// setupPinchState's auto-fingerprint logic does not overwrite it.
+	// setupTxState's auto-fingerprint logic does not overwrite it.
 	rawProgress := progressFingerprintHeaderPrefix + "deadbeefdeadbeefdeadbeefdeadbeef\n1 5 0\n"
-	targetDir := setupPinchState(t, tmp, priorManifestRaw, rawProgress)
+	targetDir := setupTxState(t, tmp, priorManifestRaw, rawProgress)
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)
@@ -4143,7 +4143,7 @@ func TestRunCLIStartProgressFileShowsResumedBytes(t *testing.T) {
 		"F1 10 0:100 0644 0:5:a.txt",
 		"",
 	}, "\n")
-	targetDir := setupPinchState(t, tmp, manifestRaw, "1 5 0\n")
+	targetDir := setupTxState(t, tmp, manifestRaw, "1 5 0\n")
 	stagingDir := filepath.Join(tmp, ".tx", "dst", "remote")
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		t.Fatalf("mkdir staging: %v", err)

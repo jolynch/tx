@@ -96,7 +96,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 	stderr = &synchronizedWriter{mu: outputMu, w: stderr}
 	stopTracing := startTracing(cfg.traceFile, stderr)
 	defer stopTracing()
-	ps, err := newPinchState(cfg.targetDir)
+	ps, err := newTxState(cfg.targetDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
 		return 2

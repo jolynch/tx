@@ -45,7 +45,7 @@ Options:
                                    concurrency (default "25%")
       --gentle-bw string           Percent of observed link bandwidth used for gentle
                                    limiting (default "25%")
-  -k, --keys string                Age keys directory (default "/var/lib/pinch/keys")
+  -k, --keys string                Age keys directory (default "/var/lib/tx/keys")
       --require-auth               Require AUTH before commands (default false)
       --require-auth-token string  Allowlisted auth token (opaque string >8 bytes,
                                    repeatable); implies --require-auth (default "")
@@ -240,13 +240,13 @@ and files restart from offset zero.
 Common examples:
 
 ```bash
-tx recv copy /srv/data /var/lib/pinch/data
-tx recv copy --clean /srv/data /var/lib/pinch/data
-tx recv copy --mode gentle /srv/data /var/lib/pinch/data
-tx recv copy --verify meta /srv/data /var/lib/pinch/data
-tx recv copy --verify 5%data /srv/data /var/lib/pinch/data
-tx recv copy --verify 30s /srv/data /var/lib/pinch/data
-tx recv copy --deadline 30m /srv/data /var/lib/pinch/data
+tx recv copy /srv/data /var/lib/tx/data
+tx recv copy --clean /srv/data /var/lib/tx/data
+tx recv copy --mode gentle /srv/data /var/lib/tx/data
+tx recv copy --verify meta /srv/data /var/lib/tx/data
+tx recv copy --verify 5%data /srv/data /var/lib/tx/data
+tx recv copy --verify 30s /srv/data /var/lib/tx/data
+tx recv copy --deadline 30m /srv/data /var/lib/tx/data
 ```
 
 ### Convergence Workflow
@@ -259,13 +259,13 @@ Typical pattern:
 1. Run a bounded first pass:
 
    ```bash
-   tx recv copy --deadline 30m --mode gentle /srv/data /var/lib/pinch/data
+   tx recv copy --deadline 30m --mode gentle /srv/data /var/lib/tx/data
    ```
 
 2. Run the same command again in fast mode to get deltas:
 
    ```bash
-   tx recv copy /srv/data /var/lib/pinch/data
+   tx recv copy /srv/data /var/lib/tx/data
    ```
 
 3. Keep rerunning until the sync phase reports:

@@ -63,7 +63,7 @@ func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.W
 	// Mode 1: LOCAL_DST given — discover transfer from .tx/ state.
 	if cf.NArg() == 1 {
 		localDst := cf.Arg(0)
-		ps, err := newPinchState(localDst)
+		ps, err := newTxState(localDst)
 		if err != nil {
 			fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
 			return 2

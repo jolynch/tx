@@ -216,15 +216,15 @@ func startTransferProbeReporter(ctx context.Context, client *tx.Client, transfer
 const defaultFileListener = "127.0.0.1:3453"
 const maxSyncRounds = 3
 
-// pinchState computes all state file paths from a target output directory.
-// Given targetDir="/var/lib/pinch/dst", state lives in a per-target subdir
+// txState computes all state file paths from a target output directory.
+// Given targetDir="/var/lib/tx/dst", state lives in a per-target subdir
 // of the parent's .tx directory so sibling transfers don't collide:
 //
-//	/var/lib/pinch/.tx/dst/manifest.zst         ← client state: what's on disk (written by start/sync)
-//	/var/lib/pinch/.tx/dst/manifest.server.zst  ← server state: written by transfer, read by start/get
-//	/var/lib/pinch/.tx/dst/manifest.progress
-//	/var/lib/pinch/.tx/dst/remote/              (staging for start)
-type pinchState struct {
+//	/var/lib/tx/.tx/dst/manifest.zst         ← client state: what's on disk (written by start/sync)
+//	/var/lib/tx/.tx/dst/manifest.server.zst  ← server state: written by transfer, read by start/get
+//	/var/lib/tx/.tx/dst/manifest.progress
+//	/var/lib/tx/.tx/dst/remote/              (staging for start)
+type txState struct {
 	TargetDir          string // the user-facing output directory
 	StateDir           string // parent/.tx/<basename>
 	ManifestPath       string // StateDir/manifest.zst        (client state: what's on disk)
@@ -233,14 +233,14 @@ type pinchState struct {
 	StagingDir         string // StateDir/remote
 }
 
-func newPinchState(targetDir string) (*pinchState, error) {
+func newTxState(targetDir string) (*txState, error) {
 	targetDir = filepath.Clean(targetDir)
 	parent := filepath.Dir(targetDir)
 	if parent == targetDir {
 		return nil, fmt.Errorf("target directory %q has no distinct parent", targetDir)
 	}
 	stateDir := filepath.Join(parent, ".tx", filepath.Base(targetDir))
-	return &pinchState{
+	return &txState{
 		TargetDir:          targetDir,
 		StateDir:           stateDir,
 		ManifestPath:       filepath.Join(stateDir, "manifest.zst"),
@@ -250,8 +250,8 @@ func newPinchState(targetDir string) (*pinchState, error) {
 	}, nil
 }
 
-func (ps *pinchState) ensureStateDir() error   { return os.MkdirAll(ps.StateDir, 0o755) }
-func (ps *pinchState) ensureStagingDir() error { return os.MkdirAll(ps.StagingDir, 0o755) }
+func (ps *txState) ensureStateDir() error   { return os.MkdirAll(ps.StateDir, 0o755) }
+func (ps *txState) ensureStagingDir() error { return os.MkdirAll(ps.StagingDir, 0o755) }
 
 // scanLocalDir walks targetDir and returns a tx.Manifest representing the entries
 // currently on disk, using meta for header fields (Root, Mode, etc.).
