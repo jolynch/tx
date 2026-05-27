@@ -231,7 +231,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 
 	stopTracing := startTracing(cfg.traceFile, stderr)
 	defer stopTracing()
-	ps, err := newPinchState(cfg.targetDir)
+	ps, err := newTxState(cfg.targetDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
 		return 2

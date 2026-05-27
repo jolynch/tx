@@ -26,7 +26,7 @@ import (
 const defaultFileListener = "127.0.0.1:3453"
 
 var (
-	keysDir     = "/var/lib/pinch/keys"
+	keysDir     = "/var/lib/tx/keys"
 	serverKey   *age.X25519Identity
 	fsFileRate  = ""
 	fsFileBurst = "1MiB"

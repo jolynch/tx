@@ -119,7 +119,7 @@ func cacheMapValue(cacheLoad bool) string {
 }
 
 func cleanupCopyState(targetDir string, stderr io.Writer) int {
-	ps, err := newPinchState(targetDir)
+	ps, err := newTxState(targetDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
 		return 1
@@ -307,7 +307,7 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintln(stderr, "--verify with --skip-fetch requires an existing LOCAL_DST")
 		return 2
 	}
-	ps, err := newPinchState(cfg.localDst)
+	ps, err := newTxState(cfg.localDst)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid local destination: %v\n", err)
 		return 2
@@ -572,7 +572,7 @@ func runEndOfCopyConvergence(
 	stdout io.Writer,
 	stderr io.Writer,
 ) int {
-	ps, err := newPinchState(cfg.localDst)
+	ps, err := newTxState(cfg.localDst)
 	if err != nil {
 		fmt.Fprintf(stderr, "copy-converge: skip (%v)\n", err)
 		return 0
@@ -627,7 +627,7 @@ func touchCopyCache(cfg copyCLIConfig, progressInterval time.Duration, stderr io
 	if !pagecache.TouchSupported() {
 		return
 	}
-	ps, err := newPinchState(cfg.localDst)
+	ps, err := newTxState(cfg.localDst)
 	if err != nil {
 		fmt.Fprintf(stderr, "cache-touch: skip (%v)\n", err)
 		return
@@ -813,7 +813,7 @@ func countManifestEntryTypes(entries []tx.ManifestEntry) (files, hardlinks, syml
 }
 
 func verifyCopy(serverURL string, cfg copyCLIConfig, stdout io.Writer, stderr io.Writer) int {
-	ps, err := newPinchState(cfg.localDst)
+	ps, err := newTxState(cfg.localDst)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
 		return 2

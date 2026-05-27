@@ -7,7 +7,7 @@ import (
 )
 
 func TestWrapDecompressedReaderSequentialDecode(t *testing.T) {
-	payload := bytes.Repeat([]byte("pinch-filexfer-pool-test-"), 4096)
+	payload := bytes.Repeat([]byte("tx-filexfer-pool-test-"), 4096)
 	for _, comp := range []string{EncodingZstd, EncodingLz4} {
 		encoded := encodeForCodecPoolTest(t, comp, payload)
 		for i := 0; i < 32; i++ {
@@ -31,7 +31,7 @@ func TestWrapDecompressedReaderSequentialDecode(t *testing.T) {
 }
 
 func TestWrapDecompressedReaderCloseIdempotent(t *testing.T) {
-	payload := bytes.Repeat([]byte("pinch-filexfer-close-test-"), 1024)
+	payload := bytes.Repeat([]byte("tx-filexfer-close-test-"), 1024)
 	for _, comp := range []string{EncodingZstd, EncodingLz4} {
 		encoded := encodeForCodecPoolTest(t, comp, payload)
 		reader, err := WrapDecompressedReader(bytes.NewReader(encoded), comp)

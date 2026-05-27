@@ -109,7 +109,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 }
 
 func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io.Writer) int {
-	ps, err := newPinchState(cfg.targetDir)
+	ps, err := newTxState(cfg.targetDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
 		return 2
@@ -258,7 +258,7 @@ func makeStableEntryKey(e tx.ManifestEntry) stableEntryKey {
 // fingerprint header) atomically. Used by `copy` when a prior .tx/<dst>/
 // state exists but LOCAL_DST is not yet in place.
 func runResumeRefresh(serverURL string, cfg transferArgs, stderr io.Writer) int {
-	ps, err := newPinchState(cfg.targetDir)
+	ps, err := newTxState(cfg.targetDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
 		return 2
