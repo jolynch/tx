@@ -332,7 +332,7 @@ start_server() {
   read -r host port < <(split_host_port "${SERVER_URL}")
   mkdir -p "${SERVER_IN}" "${SERVER_OUT}" "${SERVER_KEYS}"
   echo "Starting server in background..."
-  local server_args=(send "${SERVER_URL}" serve -k "${SERVER_KEYS}")
+  local server_args=(send tree --listen "${SERVER_URL}" -k "${SERVER_KEYS}")
   if [[ -n "${SERVER_TOKEN_FILE}" ]]; then
     server_args+=(--require-auth-token "$(<"${SERVER_TOKEN_FILE}")")
   fi
@@ -377,7 +377,7 @@ echo "bench: source=${SOURCE_DIRECTORY} target=${TARGET_DIR}"
 echo "Cleaning prior benchmark output..."
 rm -rf "${TARGET_DIR}/" "${STATE_DIR}/"
 
-COPY_CMD=("${TX_BIN}" recv "${SERVER_URL}" copy)
+COPY_CMD=("${TX_BIN}" recv copy)
 if [[ -n "${CONCURRENCY}" ]]; then
   COPY_CMD+=(--concurrency "${CONCURRENCY}")
 fi
@@ -399,7 +399,7 @@ fi
 if [[ "${TRACE}" == "true" ]]; then
   COPY_CMD+=(--trace "${CLIENT_TRACE}")
 fi
-COPY_CMD+=("${SOURCE_DIRECTORY}" "${TARGET_DIR}")
+COPY_CMD+=("tx://${SERVER_URL}${SOURCE_DIRECTORY}" "${TARGET_DIR}")
 
 if [[ "$FLAMEGRAPH" != "true" ]]; then
   echo "Running timed copy benchmark..."

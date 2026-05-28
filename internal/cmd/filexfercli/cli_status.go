@@ -6,34 +6,39 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/jolynch/tx"
 	"github.com/jolynch/tx/internal/cliflags"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/utils"
 )
 
-func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
+func runStatusCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	cf := cliflags.New("status")
 	cf.SetOutput(stderr)
 	cf.FlagSet().Usage = func() {
-		fmt.Fprintln(stderr, "usage: tx recv [addr] status [--tid <id>] [LOCAL_DST]")
+		fmt.Fprintln(stderr, "usage: tx recv status [--tid <id>] [--all] [REMOTE_HOST] [LOCAL_DST]")
 		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "Query and monitor transfer progress.")
+		fmt.Fprintln(stderr, "Query and monitor transfer progress. REMOTE_HOST is host:port (default")
+		fmt.Fprintf(stderr, "%s); LOCAL_DST defaults to the current directory.\n", defaultFileListener)
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Modes:")
-		fmt.Fprintln(stderr, "  status LOCAL_DST       Discover transfer from .tx/ state and poll until complete")
+		fmt.Fprintln(stderr, "  status [host] [dst]    Discover transfer from dst's .tx/ state and poll")
 		fmt.Fprintln(stderr, "  status --tid <id>      Poll a transfer by ID (server-side progress only)")
-		fmt.Fprintln(stderr, "  status                 List all active transfers on the server")
+		fmt.Fprintln(stderr, "  status --all [host]    List all active transfers on the server")
 		fmt.Fprintln(stderr)
 		cf.PrintDefaults(stderr)
 	}
 	var txferID string
+	var listAll bool
 	var encryptMode string
 	var keysDir string
 	var authTokens []string
 	cf.StringVar(&txferID, "", "tid", "", "Transfer ID")
+	cf.BoolVar(&listAll, "", "all", false, "List all active transfers on REMOTE_HOST")
 	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&keysDir, "k", "keys", "", "Persistent age keys directory (default: ephemeral)")
 	cf.StringSliceVar(&authTokens, "t", "auth-token", "Client auth token presented in encrypted AUTH blob; repeatable")
@@ -43,8 +48,13 @@ func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.W
 		}
 		return 2
 	}
-	if cf.NArg() > 1 {
-		fmt.Fprintln(stderr, "status accepts at most one positional argument: LOCAL_DST")
+	if cf.NArg() > 2 {
+		fmt.Fprintln(stderr, "status accepts at most two positional arguments: REMOTE_HOST LOCAL_DST")
+		return 2
+	}
+	remoteHost, localDst, ok := parseStatusPositionals(cf.Args())
+	if !ok {
+		fmt.Fprintln(stderr, "status REMOTE_HOST must be a host:port address")
 		return 2
 	}
 	agePublicKey, ageIdentity, resolvedEncMode, err := resolveEncryptionOptionsWithKeys(encryptMode, keysDir)
@@ -57,36 +67,61 @@ func runStatusCLI(serverURL string, args []string, stdout io.Writer, stderr io.W
 		return 2
 	}
 
-	client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(resolvedEncMode), tx.WithClientAuthTokens(authTokens...))
+	client := tx.NewClient(remoteHost, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(resolvedEncMode), tx.WithClientAuthTokens(authTokens...))
 	defer client.Close()
 
-	// Mode 1: LOCAL_DST given — discover transfer from .tx/ state.
-	if cf.NArg() == 1 {
-		localDst := cf.Arg(0)
-		ps, err := newTxState(localDst)
-		if err != nil {
-			fmt.Fprintf(stderr, "invalid target directory: %v\n", err)
-			return 2
-		}
-		if _, err := os.Stat(ps.ServerManifestPath); os.IsNotExist(err) {
-			fmt.Fprintf(stderr, "No active transfer for %s\n", localDst)
-			return 0
-		}
-		manifest, err := tx.LoadManifest(ps.ServerManifestPath)
-		if err != nil {
-			fmt.Fprintf(stderr, "load manifest failed: %v\n", err)
-			return 1
-		}
-		txferID = manifest.TransferID
-		return pollTransferStatus(client, txferID, manifest, ps.ProgressPath, stdout, stderr)
+	if listAll {
+		return listAllStatuses(client, stdout, stderr)
 	}
 
-	// Mode 2: --tid given — poll by transfer ID (no local progress).
-	if txferID != "" {
-		return pollTransferStatus(client, txferID, nil, "", stdout, stderr)
+	// Load local .tx/ state from LOCAL_DST if present, for combined progress.
+	var manifest *tx.Manifest
+	var progressPath string
+	if localAbs, absErr := filepath.Abs(localDst); absErr == nil {
+		if ps, psErr := newTxState(localAbs); psErr == nil {
+			if _, statErr := os.Stat(ps.ServerManifestPath); statErr == nil {
+				if m, loadErr := tx.LoadManifest(ps.ServerManifestPath); loadErr == nil {
+					manifest = m
+					progressPath = ps.ProgressPath
+					if txferID == "" {
+						txferID = m.TransferID
+					}
+				}
+			}
+		}
 	}
 
-	// Mode 3: no args — list all active transfers.
+	if txferID == "" {
+		fmt.Fprintf(stderr, "No active transfer for %s\n", localDst)
+		return 0
+	}
+	return pollTransferStatus(client, txferID, manifest, progressPath, stdout, stderr)
+}
+
+// parseStatusPositionals resolves the optional [REMOTE_HOST] [LOCAL_DST]
+// positionals. A single positional is auto-detected: a valid host:port is
+// REMOTE_HOST, otherwise it is LOCAL_DST. Missing values fall back to the
+// default listener address and the current directory.
+func parseStatusPositionals(args []string) (remoteHost string, localDst string, ok bool) {
+	remoteHost = defaultFileListener
+	localDst = "."
+	switch len(args) {
+	case 0:
+		return remoteHost, localDst, true
+	case 1:
+		if utils.IsHostPort(args[0]) {
+			return args[0], localDst, true
+		}
+		return remoteHost, args[0], true
+	default:
+		if err := utils.ValidateHostPort(args[0]); err != nil {
+			return "", "", false
+		}
+		return args[0], args[1], true
+	}
+}
+
+func listAllStatuses(client *tx.Client, stdout io.Writer, stderr io.Writer) int {
 	listResp, err := client.ListStatuses(context.Background(), tx.ListStatusesRequest{})
 	if err != nil {
 		fmt.Fprintf(stderr, "status failed: %v\n", err)

@@ -20,18 +20,19 @@ import (
 	"github.com/jolynch/tx/internal/pagecache"
 )
 
-func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
+func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	cf := cliflags.New("get")
 	cf.SetOutput(stderr)
 	cf.FlagSet().Usage = func() {
-		fmt.Fprintln(stderr, "usage: tx recv [addr] get [flags] REMOTE_PATH")
+		fmt.Fprintln(stderr, "usage: tx recv get [flags] REMOTE_SRC [LOCAL_DST]")
 		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "Download a single remote file. REMOTE_PATH must be an absolute path to a file")
-		fmt.Fprintln(stderr, "on the server. Output defaults to the file's basename in the current directory.")
+		fmt.Fprintln(stderr, "Download a single remote file. REMOTE_SRC is tx://host:port/abs/path (for")
+		fmt.Fprintln(stderr, "example tx://1.2.3.4:3453/srv/big.tar); host:port may be omitted to use")
+		fmt.Fprintln(stderr, "127.0.0.1:3453. LOCAL_DST defaults to the file's basename in the current")
+		fmt.Fprintln(stderr, "directory.")
 		fmt.Fprintln(stderr)
 		cf.PrintDefaults(stderr)
 	}
-	var outFile string
 	var encryptMode string
 	var keysDir string
 	var authTokens []string
@@ -51,7 +52,6 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	var cacheLoadRaw string
 	var cacheLoadEnabled bool
 	var cacheLoadBudget time.Duration
-	cf.StringVar(&outFile, "o", "", "", "Output file path, or '-' for stdout")
 	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&keysDir, "k", "keys", "", "Persistent age keys directory (default: ephemeral)")
 	cf.StringSliceVar(&authTokens, "t", "auth-token", "Client auth token presented in encrypted AUTH blob; repeatable")
@@ -80,15 +80,16 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	}
 	stopTracing := startTracing(traceFile, stderr)
 	defer stopTracing()
-	if cf.NArg() != 1 {
-		fmt.Fprintln(stderr, "get requires exactly one positional argument: REMOTE_PATH")
+	if cf.NArg() < 1 || cf.NArg() > 2 {
+		fmt.Fprintln(stderr, "get requires REMOTE_SRC and an optional LOCAL_DST")
 		return 2
 	}
-	remotePath := cf.Arg(0)
-	if !filepath.IsAbs(remotePath) {
-		fmt.Fprintln(stderr, "get requires REMOTE_PATH to be an absolute server path")
+	serverURL, remotePath, err := parseRemoteSrc(cf.Arg(0))
+	if err != nil {
+		fmt.Fprintln(stderr, err)
 		return 2
 	}
+	localDst := cf.Arg(1)
 	{
 		enabled, budget, err := parseCacheLoadFlag(cacheLoadRaw)
 		if err != nil {
@@ -151,8 +152,8 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 		deadlineMS = d.Milliseconds()
 	}
 
-	// Resolve output path: -o overrides, default is basename in cwd.
-	outputPath := strings.TrimSpace(outFile)
+	// Resolve output path: LOCAL_DST overrides, default is basename in cwd.
+	outputPath := strings.TrimSpace(localDst)
 	if outputPath == "" {
 		outputPath = filepath.Base(remotePath)
 	}
@@ -171,11 +172,11 @@ func runGetCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writ
 	// Fetch manifest for the single file (skip full probe).
 	fmt.Fprintf(stderr, "get(addr=[%s], path=[%s])\n", serverURL, remotePath)
 	manifestResp, err := client.GetManifest(context.Background(), tx.GetManifestRequest{
-		Directory:     remotePath,
-		Mode:          tx.LoadStrategyFast,
-		LinkMbps:      0,
-		Concurrency:   effectiveConcurrency,
-		DeadlineMS:    deadlineMS,
+		Directory:   remotePath,
+		Mode:        tx.LoadStrategyFast,
+		LinkMbps:    0,
+		Concurrency: effectiveConcurrency,
+		DeadlineMS:  deadlineMS,
 		CacheMap:    cacheMapValue(cacheLoadEnabled),
 	})
 	if err != nil {

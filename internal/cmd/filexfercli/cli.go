@@ -285,12 +285,44 @@ func scanLocalDir(targetDir string, meta *tx.Manifest) (*tx.Manifest, error) {
 	return out, err
 }
 
-func isKnownCommand(s string) bool {
-	switch s {
-	case "copy", "transfer", "start", "status", "get":
-		return true
+// parseRemoteSrc parses a source URL into a server address and absolute server
+// path. The grammar is "tx://[host:port]/abs/path": the tx:// scheme is required
+// for network transfers and host:port defaults to defaultFileListener when
+// omitted. A file:// source or a bare path with no scheme denotes a local
+// daemonless transfer, which is not yet implemented and returns an instructive
+// error.
+func parseRemoteSrc(remoteSrc string) (hostPort string, serverPath string, err error) {
+	if rest, ok := strings.CutPrefix(remoteSrc, "tx://"); ok {
+		idx := strings.IndexByte(rest, '/')
+		if idx < 0 {
+			return "", "", fmt.Errorf("source %q must contain an absolute path (tx://host:port/abs/path)", remoteSrc)
+		}
+		hostPort = rest[:idx]
+		serverPath = rest[idx:]
+		if hostPort == "" {
+			hostPort = defaultFileListener
+		}
+		if err := utils.ValidateHostPort(hostPort); err != nil {
+			return "", "", fmt.Errorf("source %q has invalid host:port: %w", remoteSrc, err)
+		}
+		if !strings.HasPrefix(serverPath, "/") {
+			return "", "", fmt.Errorf("source %q must contain an absolute path (tx://host:port/abs/path)", remoteSrc)
+		}
+		return hostPort, serverPath, nil
 	}
-	return false
+	if rest, ok := strings.CutPrefix(remoteSrc, "file://"); ok {
+		return "", "", errLocalSrcNotImplemented(rest)
+	}
+	return "", "", errLocalSrcNotImplemented(remoteSrc)
+}
+
+// errLocalSrcNotImplemented reports that a local (daemonless) source was given
+// and points the user at the equivalent tx:// form on the default listener.
+func errLocalSrcNotImplemented(localPath string) error {
+	if !strings.HasPrefix(localPath, "/") {
+		localPath = "/" + localPath
+	}
+	return fmt.Errorf("local daemonless transfers are not yet implemented; pass an explicit remote source like tx://%s%s", defaultFileListener, localPath)
 }
 
 func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -305,35 +337,16 @@ func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		return 0
 	}
 
-	// If first arg is a known command, default the server address.
-	serverURL := args[0]
-	cmdStart := 1
-	if isKnownCommand(args[0]) {
-		serverURL = defaultFileListener
-		cmdStart = 0
-	} else {
-		if err := utils.ValidateHostPort(serverURL); err != nil {
-			fmt.Fprintf(stderr, "invalid server-url: %v\n", err)
-			printCLIUsage(stderr)
-			return 2
-		}
-	}
-
-	if cmdStart >= len(args) {
-		printCLIUsage(stderr)
-		return 2
-	}
-
-	cmd := args[cmdStart]
-	cmdArgs := args[cmdStart+1:]
+	cmd := args[0]
+	cmdArgs := args[1:]
 
 	switch cmd {
 	case "copy":
-		return runCopyCLI(serverURL, cmdArgs, stdout, stderr)
+		return runCopyCLI(cmdArgs, stdout, stderr)
 	case "status":
-		return runStatusCLI(serverURL, cmdArgs, stdout, stderr)
+		return runStatusCLI(cmdArgs, stdout, stderr)
 	case "get":
-		return runGetCLI(serverURL, cmdArgs, stdout, stderr)
+		return runGetCLI(cmdArgs, stdout, stderr)
 	case "--help", "-h", "help":
 		printCLIUsage(stderr)
 		return 0
@@ -345,15 +358,17 @@ func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 }
 
 func printCLIUsage(w io.Writer) {
-	fmt.Fprintf(w, `usage: tx recv [<addr>] <command> [options]
+	fmt.Fprintf(w, `usage: tx recv <command> [options]
 
 Commands:
   copy       Copy REMOTE_SRC to LOCAL_DST
   status     Query and monitor transfer progress
   get        Download a single remote file
 
+REMOTE_SRC is tx://host:port/abs/path (for example tx://1.2.3.4:3453/srv/data);
+host:port may be omitted to use the default server address below.
 State is stored in <local-dst>/../.tx/ (manifest, progress, staging).
-Default server address: %s
+Default status server address: %s
 Run 'tx recv <command> --help' for command-specific options.
 `, defaultFileListener)
 }

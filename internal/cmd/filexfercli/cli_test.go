@@ -611,7 +611,7 @@ func TestRunCLITransferAndGet(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = RunCLI([]string{srv.URL, "get", "--progress=false", "-a", "1KiB", "-o", filepath.Join(targetDir, "a.txt"), "/remote/a.txt"}, &stdout, &stderr)
+	code = RunCLI([]string{"get", "--progress=false", "-a", "1KiB", "tx://" + srv.URL + "/remote/a.txt", filepath.Join(targetDir, "a.txt")}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("get: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -654,7 +654,7 @@ func TestRunCLIGetSkipWriteDiscardsOutput(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "get", "--skip-write", "--progress=false", "-a", "1KiB", "/remote/a.txt"}, &stdout, &stderr)
+	code := RunCLI([]string{"get", "--skip-write", "--progress=false", "-a", "1KiB", "tx://" + srv.URL + "/remote/a.txt"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("get skip-write: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -713,7 +713,7 @@ func TestRunCLIGetCacheLoadRequestsAndTouchesHint(t *testing.T) {
 	outputPath := filepath.Join(tmp, "a.txt")
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "get", "--cache-load=full", "--progress=false", "-a", "1KiB", "-o", outputPath, "/remote/a.txt"}, &stdout, &stderr)
+	code := RunCLI([]string{"get", "--cache-load=full", "--progress=false", "-a", "1KiB", "tx://" + srv.URL + "/remote/a.txt", outputPath}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("get cache-load: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -758,11 +758,11 @@ func TestRunCLIGetProgressFileWritesStatusAndPct(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	code := RunCLI([]string{
-		srv.URL, "get", "--progress=false",
+		"get", "--progress=false",
 		"--progress-path", progressPath,
 		"--progress-interval", "1h",
-		"-o", outputPath,
-		"/remote/a.txt",
+		"tx://" + srv.URL + "/remote/a.txt",
+		outputPath,
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("get with progress file: expected 0, got %d stderr=%s", code, stderr.String())
@@ -2730,7 +2730,7 @@ func TestRunCLICopyConvergeNoDrift(t *testing.T) {
 	defer srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify=meta", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{"copy", "--progress=false", "--verify=meta", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy converge no-drift: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -2785,7 +2785,7 @@ func TestRunCLICopyConvergeCacheMapSendsRecv(t *testing.T) {
 	defer srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify=none", "--cache-load=full", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{"copy", "--progress=false", "--verify=none", "--cache-load=full", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy converge cache-load: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -2853,7 +2853,7 @@ func TestRunCLICopyConvergeFailsAfterMaxRounds(t *testing.T) {
 	defer srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify=meta", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{"copy", "--progress=false", "--verify=meta", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code == 0 {
 		t.Fatalf("copy should fail when the remote never converges, stderr=%s", stderr.String())
 	}
@@ -2899,7 +2899,7 @@ func TestRunCLICopyStartPath(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{"copy", "--progress=false", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy start path: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -2956,7 +2956,7 @@ func TestRunCLICopySyncPath(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{"copy", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy sync path: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -3027,7 +3027,7 @@ func TestRunCLICopyResumeFromPriorStateUnchanged(t *testing.T) {
 	defer srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{"copy", "--progress=false", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy resume: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -3101,7 +3101,7 @@ func TestRunCLICopyResumeFromPriorStateChangedFile(t *testing.T) {
 	defer srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{"copy", "--progress=false", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy resume changed: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -3161,7 +3161,7 @@ func TestRunCLICopyResumeRemovedPathDropsStaging(t *testing.T) {
 	defer srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify=none", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{"copy", "--progress=false", "--verify=none", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy resume rm: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -3236,7 +3236,7 @@ func TestRunCLICopyCleanWipesStateDir(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	// --verify=none suppresses the end-of-copy convergence SYNC; the test
 	// here is about the resume path, not convergence.
-	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify=none", "--clean", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{"copy", "--progress=false", "--verify=none", "--clean", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy --clean: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -3298,7 +3298,7 @@ func TestRunCLICopyResumeFingerprintMismatch(t *testing.T) {
 	defer srv.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{"copy", "--progress=false", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy fingerprint mismatch: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -3429,7 +3429,7 @@ func TestRunCLICopySkipFetchVerifyMeta(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "--skip-fetch", "--verify", "meta", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{"copy", "--skip-fetch", "--verify", "meta", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy skip-fetch verify-meta: expected 0, got %d stderr=%s", code, stderr.String())
 	}
@@ -3503,14 +3503,14 @@ func TestRunCLICopyMixedManifestTypesConverges(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{"copy", "--progress=false", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy mixed first run: expected 0, got %d stderr=%s", code, stderr.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
-	code = RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify", "meta", "/remote", targetDir}, &stdout, &stderr)
+	code = RunCLI([]string{"copy", "--progress=false", "--verify", "meta", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("copy mixed second run: expected 0, got %d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
 	}
@@ -3620,7 +3620,7 @@ func TestRunCLICopyMetadataApplyWarningStillRunsVerifyData(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--skip-fsync", "--verify", "full", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{"copy", "--progress=false", "--skip-fsync", "--verify", "full", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code == 0 {
 		t.Fatalf("copy should fail when metadata mirroring fails\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
 	}
@@ -3666,7 +3666,7 @@ func TestRunCLICopySendFailureReturnsNonzero(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{srv.URL, "copy", "--progress=false", "--verify", "none", "/remote", targetDir}, &stdout, &stderr)
+	code := RunCLI([]string{"copy", "--progress=false", "--verify", "none", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code == 0 {
 		t.Fatalf("copy should fail when SEND fails\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
 	}
@@ -3688,7 +3688,7 @@ func TestRunCLIStatus(t *testing.T) {
 
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		code := RunCLI([]string{srv.URL, "status"}, &stdout, &stderr)
+		code := RunCLI([]string{"status", "--all", srv.URL}, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("status list-all: expected 0, got %d stderr=%s", code, stderr.String())
 		}
@@ -3713,7 +3713,7 @@ func TestRunCLIStatus(t *testing.T) {
 
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		code := RunCLI([]string{srv.URL, "status", "--tid", "done1"}, &stdout, &stderr)
+		code := RunCLI([]string{"status", "--tid", "done1", srv.URL}, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("status poll: expected 0, got %d stderr=%s", code, stderr.String())
 		}
@@ -3730,40 +3730,48 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	if code := RunCLI([]string{}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2, got %d", code)
 	}
-	if code := RunCLI([]string{"127.0.0.1:1", "bogus"}, &stdout, &stderr); code != 2 {
+	if code := RunCLI([]string{"bogus"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for unknown cmd, got %d", code)
 	}
-	// get requires exactly one REMOTE_PATH
-	if code := RunCLI([]string{"127.0.0.1:1", "get"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for missing REMOTE_PATH on get, got %d", code)
+	// get requires at least a REMOTE_SRC
+	if code := RunCLI([]string{"get"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for missing REMOTE_SRC on get, got %d", code)
 	}
-	// get requires REMOTE_PATH to be absolute
-	if code := RunCLI([]string{"127.0.0.1:1", "get", "relative/path"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for relative REMOTE_PATH, got %d", code)
+	// a schemeless source is a local transfer, which is not yet implemented
+	if code := RunCLI([]string{"get", "relative/path"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for schemeless REMOTE_SRC, got %d", code)
+	}
+	// a file:// source is a local transfer, which is not yet implemented
+	if code := RunCLI([]string{"get", "file:///srv/x"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for file:// REMOTE_SRC, got %d", code)
+	}
+	// copy with a schemeless (local) source is not yet implemented
+	if code := RunCLI([]string{"copy", "/no-host/path", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for schemeless copy REMOTE_SRC, got %d", code)
 	}
 	stderr.Reset()
-	if code := RunCLI([]string{"127.0.0.1:1", "transfer", "--directory", "/tmp"}, &stdout, &stderr); code != 2 {
+	if code := RunCLI([]string{"transfer", "--directory", "/tmp"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for removed transfer command, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "unknown command: transfer") {
 		t.Fatalf("expected unknown transfer command, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := RunCLI([]string{"127.0.0.1:1", "start", "--probe-size", "bad"}, &stdout, &stderr); code != 2 {
+	if code := RunCLI([]string{"start", "--probe-size", "bad"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for removed start command, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "unknown command: start") {
 		t.Fatalf("expected unknown start command, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := RunCLI([]string{"127.0.0.1:1", "sync", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := RunCLI([]string{"sync", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for removed sync command, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "unknown command: sync") {
 		t.Fatalf("expected unknown sync command, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--help"}, &stdout, &stderr); code != 0 {
+	if code := runCopyCLI([]string{"--help"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("expected copy help exit 0, got %d", code)
 	}
 	copyHelp := stderr.String()
@@ -3792,109 +3800,109 @@ func TestRunCLIUsageErrors(t *testing.T) {
 		t.Fatalf("expected old cache flags to be absent from copy help, got: %s", copyHelp)
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--preserve-cache", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI([]string{"--preserve-cache", "tx://127.0.0.1:1/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for removed --preserve-cache flag, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "flag provided but not defined: -preserve-cache") {
 		t.Fatalf("expected removed --preserve-cache flag error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--with-cache-map", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI([]string{"--with-cache-map", "tx://127.0.0.1:1/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for removed --with-cache-map flag, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "flag provided but not defined: -with-cache-map") {
 		t.Fatalf("expected removed --with-cache-map flag error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--with-page-map", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI([]string{"--with-page-map", "tx://127.0.0.1:1/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for removed --with-page-map flag, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "flag provided but not defined: -with-page-map") {
 		t.Fatalf("expected removed --with-page-map flag error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--compress", "bogus", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI([]string{"--compress", "bogus", "tx://127.0.0.1:1/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for invalid --compress, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "invalid --compress: unsupported --compress value") {
 		t.Fatalf("expected invalid --compress error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--comp", "lz4", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI([]string{"--comp", "lz4", "tx://127.0.0.1:1/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for removed --comp flag, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "flag provided but not defined: -comp") {
 		t.Fatalf("expected removed --comp flag error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--per-file", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI([]string{"--per-file", "tx://127.0.0.1:1/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for removed --per-file flag, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "flag provided but not defined: -per-file") {
 		t.Fatalf("expected removed --per-file flag error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--probe-bytes", "1B", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI([]string{"--probe-bytes", "1B", "tx://127.0.0.1:1/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for removed --probe-bytes flag, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "flag provided but not defined: -probe-bytes") {
 		t.Fatalf("expected removed --probe-bytes flag error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--probe-size", "bad", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI([]string{"--probe-size", "bad", "tx://127.0.0.1:1/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for invalid --probe-size, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "invalid --probe-size") {
 		t.Fatalf("expected invalid --probe-size error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--progress-interval", "bad", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI([]string{"--progress-interval", "bad", "tx://127.0.0.1:1/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for invalid --progress-interval, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "invalid --progress-interval") {
 		t.Fatalf("expected invalid --progress-interval error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--cache-load", "0s", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI([]string{"--cache-load", "0s", "tx://127.0.0.1:1/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for invalid --cache-load, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "invalid --cache-load") {
 		t.Fatalf("expected invalid --cache-load error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--mode", "gentle", "--cache-load", "full", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI([]string{"--mode", "gentle", "--cache-load", "full", "tx://127.0.0.1:1/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for gentle cache-load combo, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "--cache-load cannot be used with --mode gentle") {
 		t.Fatalf("expected invalid gentle/cache-load combo error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--verify", "5%data", "--skip-fetch", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI([]string{"--verify", "5%data", "--skip-fetch", "tx://127.0.0.1:1/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for invalid verify/skip-fetch combo, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "--verify N%data/full cannot be used with --skip-fetch or --skip-write") {
 		t.Fatalf("expected invalid verify data error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--verify", "0s", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI([]string{"--verify", "0s", "tx://127.0.0.1:1/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for zero duration verify, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "invalid --verify") {
 		t.Fatalf("expected invalid --verify error for 0s, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := runCopyCLI("127.0.0.1:1", []string{"--verify", "30s", "--skip-fetch", "/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
+	if code := runCopyCLI([]string{"--verify", "30s", "--skip-fetch", "tx://127.0.0.1:1/remote", "/tmp/dst"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for verify duration with skip-fetch, got %d", code)
 	}
 	if !strings.Contains(stderr.String(), "--verify N%data/full cannot be used with --skip-fetch or --skip-write") {
 		t.Fatalf("expected invalid verify/skip-fetch combo error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := RunCLI([]string{"--tid", "tx", "get"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for missing server address, got %d", code)
+	if code := RunCLI([]string{"get", "/abs/path"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("expected usage exit 2 for schemeless REMOTE_SRC, got %d", code)
 	}
-	if !strings.Contains(stderr.String(), "host:port address") {
-		t.Fatalf("expected explicit server address error, got: %s", stderr.String())
+	if !strings.Contains(stderr.String(), "not yet implemented") || !strings.Contains(stderr.String(), "tx://") {
+		t.Fatalf("expected local-not-implemented error pointing at tx://, got: %s", stderr.String())
 	}
 	stderr.Reset()
 	if code := RunCLI([]string{"help"}, &stdout, &stderr); code != 0 {

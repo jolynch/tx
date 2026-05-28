@@ -39,17 +39,17 @@ See [docs/README.md](docs/README.md) for the documentation index and
 
 ```bash
 # Serve the current directory on the default port (127.0.0.1:3453)
-tx send serve
+tx send tree
 
 # Serve a specific directory on all interfaces
-tx send 0.0.0.0:3453 serve /srv/data
+tx send tree --listen 0.0.0.0:3453 /srv/data
 ```
 
 ### Copy a directory
 
 ```bash
 # Copy /srv/data from a remote server to a local directory
-tx recv 10.0.0.1:3453 copy /srv/data /var/lib/data
+tx recv copy tx://10.0.0.1:3453/srv/data /var/lib/data
 ```
 
 Rerun the same command to sync deltas — `copy` detects an existing destination
@@ -60,10 +60,10 @@ add `--verify 5%data` for sampled data checks.
 
 ```bash
 # Server — keys are generated automatically on first run
-tx send 0.0.0.0:3453 serve -k /var/lib/tx/keys /srv/data
+tx send tree --listen 0.0.0.0:3453 -k /var/lib/tx/keys /srv/data
 
 # Client — ephemeral keys by default, auto-negotiates cipher
-tx recv 10.0.0.1:3453 copy --encrypt auto /srv/data /var/lib/data
+tx recv copy --encrypt auto tx://10.0.0.1:3453/srv/data /var/lib/data
 ```
 
 ### With authorization
@@ -77,12 +77,12 @@ TOKEN=$(head -c 16 /dev/random | xxd -p)
 echo "$TOKEN"  # share this with authorized clients
 
 # Server — only clients presenting this token are allowed
-tx send 0.0.0.0:3453 serve -k /var/lib/tx/keys \
+tx send tree --listen 0.0.0.0:3453 -k /var/lib/tx/keys \
   --require-auth-token "$TOKEN" /srv/data
 
 # Client — present the token inside the encrypted AUTH blob
-tx recv 10.0.0.1:3453 copy --encrypt auto -t "$TOKEN" \
-  /srv/data /var/lib/data
+tx recv copy --encrypt auto -t "$TOKEN" \
+  tx://10.0.0.1:3453/srv/data /var/lib/data
 ```
 
 Tokens are sent inside the encrypted AUTH blob, so they are never visible on

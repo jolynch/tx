@@ -176,19 +176,19 @@ The `Client` struct holds connection config (`ServerAddr`, `ServerAgePublicKey`)
 
 ## CLI
 
-Both `send` and `recv` follow the same shape: `tx <side> [<addr>] <command> [options]`.
+Both sides take the command first: `tx send <command> [options]` and `tx recv <command> [options]`. The server address is no longer a leading positional — `tx send tree` takes a `--listen <addr>` flag, and `tx recv copy/get` embed it in a `REMOTE_SRC` URL of the form `tx://host:port/abs/path` (host:port may be omitted to use `127.0.0.1:3453`). The `file://` scheme and bare/schemeless (local daemonless) sources are reserved but not yet implemented — `parseRemoteSrc` in `cli.go` rejects them with an instructive error.
 
 Full flag reference with `--help` output lives in `docs/pub/CLI.md`. **Any time you change flags in either CLI or `internal/cliflags/cliflags.go`, update `docs/pub/CLI.md` to match.**
 
 ### `tx send` (`cmd/tx/main.go`)
 
-- **`serve`**: starts the file transfer TCP server. Takes an optional positional `CHROOT` (defaults to cwd).
+- **`tree`**: starts the file transfer TCP server. Binds the `--listen <addr>` flag (default `127.0.0.1:3453`) and takes an optional positional `CHROOT` (defaults to cwd).
 
 ### `tx recv` (`internal/cmd/filexfercli/cli.go`)
 
 - **`copy`**: full directory download with probes, manifest fetch, parallel SEND batches, ACK, optional verify. Writes `.tx/` state (manifest + progress file) for resume.
 - **`get`**: single-file download. Skips probes and `.tx/` state.
-- **`status`**: monitors a transfer. With `LOCAL_DST` reads `.tx/manifest.server.zst` for the transfer ID and polls with combined server+client progress. With `--tid` polls server only. With no args lists all active transfers.
+- **`status [REMOTE_HOST] [LOCAL_DST]`**: monitors a transfer. `REMOTE_HOST` defaults to `127.0.0.1:3453`, `LOCAL_DST` to cwd (a single positional is auto-detected as host:port vs path). Reads `.tx/manifest.server.zst` from `LOCAL_DST` for the transfer ID and polls combined server+client progress; `--tid` polls server only; `--all` lists all active transfers on `REMOTE_HOST`.
 
 ### Shared flag helpers (`internal/cliflags/`)
 
