@@ -132,11 +132,15 @@ func cleanupCopyState(targetDir string, stderr io.Writer) int {
 	return 0
 }
 
-func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
+func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	cf := cliflags.New("copy")
 	cf.SetOutput(stderr)
 	cf.FlagSet().Usage = func() {
-		fmt.Fprintln(stderr, "usage: tx recv [addr] copy [flags] REMOTE_SRC LOCAL_DST")
+		fmt.Fprintln(stderr, "usage: tx recv copy [flags] REMOTE_SRC LOCAL_DST")
+		fmt.Fprintln(stderr)
+		fmt.Fprintln(stderr, "REMOTE_SRC is tx://host:port/abs/path (for example tx://1.2.3.4:3453/srv/data);")
+		fmt.Fprintln(stderr, "host:port may be omitted (tx:///srv/data) to use 127.0.0.1:3453. file:// and")
+		fmt.Fprintln(stderr, "local (daemonless) sources are not yet supported.")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Copy REMOTE_SRC from the remote to LOCAL_DST on the local machine.")
 		fmt.Fprintln(stderr)
@@ -192,12 +196,13 @@ func runCopyCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintln(stderr, "copy requires exactly two positional arguments: REMOTE_SRC LOCAL_DST")
 		return 2
 	}
-	cfg.remoteSrc = cf.Arg(0)
-	cfg.localDst = cf.Arg(1)
-	if !filepath.IsAbs(cfg.remoteSrc) {
-		fmt.Fprintln(stderr, "copy requires REMOTE_SRC to be an absolute server path")
+	serverURL, remoteSrc, err := parseRemoteSrc(cf.Arg(0))
+	if err != nil {
+		fmt.Fprintln(stderr, err)
 		return 2
 	}
+	cfg.remoteSrc = remoteSrc
+	cfg.localDst = cf.Arg(1)
 	{
 		meta, dataPct, budget, err := parseVerifyFlag(cfg.verifyRaw)
 		if err != nil {

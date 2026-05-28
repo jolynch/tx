@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -31,8 +30,6 @@ var (
 	fsFileRate  = ""
 	fsFileBurst = "1MiB"
 )
-
-var errMissingSendCommand = errors.New("missing send command")
 
 func parsePercentFlag(raw string, name string) (int, error) {
 	raw = strings.TrimSpace(raw)
@@ -90,39 +87,14 @@ func main() {
 	}
 }
 
-func isSendSubcommand(s string) bool {
-	switch s {
-	case "serve":
-		return true
-	}
-	return false
-}
-
 func printSendUsage(w io.Writer) {
-	fmt.Fprintf(w, `usage: tx send [<addr>] <command> [options]
+	fmt.Fprint(w, `usage: tx send <command> [options]
 
 Commands:
-  serve      Start the file transfer TCP server
+  tree       Start the file transfer TCP server
 
-Default listen address: %s
 Run 'tx send <command> --help' for command-specific options.
-`, defaultFileListener)
-}
-
-func splitSendCommand(args []string) (addr, cmd string, rest []string, err error) {
-	if len(args) == 0 {
-		return "", "", nil, errMissingSendCommand
-	}
-	if isSendSubcommand(args[0]) {
-		return defaultFileListener, args[0], args[1:], nil
-	}
-	if err := utils.ValidateHostPort(args[0]); err != nil {
-		return "", "", nil, fmt.Errorf("invalid server-addr: %w", err)
-	}
-	if len(args) == 1 {
-		return "", "", nil, errMissingSendCommand
-	}
-	return args[0], args[1], args[2:], nil
+`)
 }
 
 func runSendCLI(args []string, stdout, stderr io.Writer) int {
@@ -136,21 +108,12 @@ func runSendCLI(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	addr, cmd, cmdArgs, err := splitSendCommand(args)
-	if err != nil {
-		if !errors.Is(err, errMissingSendCommand) {
-			fmt.Fprintln(stderr, err)
-		}
-		printSendUsage(stderr)
-		return 2
-	}
+	cmd := args[0]
+	cmdArgs := args[1:]
 
 	switch cmd {
-	case "serve":
-		return runSendServeCLI(addr, cmdArgs, stdout, stderr)
-	case "--help", "-h", "help":
-		printSendUsage(stderr)
-		return 0
+	case "tree":
+		return runSendTreeCLI(cmdArgs, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", cmd)
 		printSendUsage(stderr)
@@ -158,14 +121,15 @@ func runSendCLI(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-func runSendServeCLI(addr string, args []string, _ io.Writer, stderr io.Writer) int {
-	cf := cliflags.New("serve")
+func runSendTreeCLI(args []string, _ io.Writer, stderr io.Writer) int {
+	cf := cliflags.New("tree")
 	cf.SetOutput(stderr)
 
 	gentleCPUDefault := fmt.Sprintf("%d%%", limit.DefaultGentleCPUPct)
 	gentleBWDefault := fmt.Sprintf("%d%%", limit.DefaultGentleBWPct)
 
 	var (
+		listenAddr        string
 		rate              string
 		burst             string
 		gentleCPURaw      string
@@ -182,6 +146,7 @@ func runSendServeCLI(addr string, args []string, _ io.Writer, stderr io.Writer) 
 		progressIntervalR string
 	)
 
+	cf.StringVar(&listenAddr, "", "listen", defaultFileListener, "Listen address (host:port)")
 	cf.StringVar(&rate, "b", "bwlimit", "", "Response rate limit for gentle transfers only; fast transfers do not respect it (e.g. 100MiB, 1000mbps)")
 	cf.StringVar(&burst, "", "bwlimit-burst", fsFileBurst, "Rate limit burst size")
 	cf.StringVar(&gentleCPURaw, "", "gentle-cpu", gentleCPUDefault, "Percent of server CPUs advertised for gentle concurrency")
@@ -198,11 +163,10 @@ func runSendServeCLI(addr string, args []string, _ io.Writer, stderr io.Writer) 
 	cf.StringVar(&progressIntervalR, "", "progress-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
 
 	cf.FlagSet().Usage = func() {
-		fmt.Fprintln(stderr, "usage: tx send [addr] serve [options] [CHROOT]")
+		fmt.Fprintln(stderr, "usage: tx send tree [--listen <addr>] [options] [CHROOT]")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Start the file transfer TCP server.")
 		fmt.Fprintln(stderr)
-		fmt.Fprintf(stderr, "  addr      listen address (default %q)\n", defaultFileListener)
 		fmt.Fprintln(stderr, "  CHROOT    server root directory (default: current working directory)")
 		fmt.Fprintln(stderr)
 		cf.PrintDefaults(stderr)
@@ -215,13 +179,18 @@ func runSendServeCLI(addr string, args []string, _ io.Writer, stderr io.Writer) 
 		return 2
 	}
 
+	if err := utils.ValidateHostPort(listenAddr); err != nil {
+		fmt.Fprintf(stderr, "invalid --listen: %v\n", err)
+		return 2
+	}
+
 	chroot := ""
 	switch positional := cf.Args(); len(positional) {
 	case 0:
 	case 1:
 		chroot = positional[0]
 	default:
-		fmt.Fprintf(stderr, "serve accepts at most one positional argument: CHROOT (got %d)\n", len(positional))
+		fmt.Fprintf(stderr, "tree accepts at most one positional argument: CHROOT (got %d)\n", len(positional))
 		cf.FlagSet().Usage()
 		return 2
 	}
@@ -311,13 +280,13 @@ func runSendServeCLI(addr string, args []string, _ io.Writer, stderr io.Writer) 
 	socketWriteBufBytes := utils.MaxSocketWriteBufferBytes()
 	log.Printf("Detected ideal socket write buffer of size %d", socketWriteBufBytes)
 
-	fileLn, err := net.Listen("tcp", addr)
+	fileLn, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Fatalf("Failed to bind file listener at %s: %v", addr, err)
+		log.Fatalf("Failed to bind file listener at %s: %v", listenAddr, err)
 	}
 	defer fileLn.Close()
 
-	log.Printf("File transfer listener at %s (root=%s)", addr, chroot)
+	log.Printf("File transfer listener at %s (root=%s)", listenAddr, chroot)
 	if serveErr := ftcp.Serve(fileLn, ftcp.ServerOptions{
 		RequireAuth:            requireAuth,
 		AllowedAuthTokens:      authTokenVals,

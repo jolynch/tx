@@ -17,29 +17,29 @@ Run 'tx <command> --help' for command-specific options.
 
 ```text
 $ tx send --help
-usage: tx send [<addr>] <command> [options]
+usage: tx send <command> [options]
 
 Commands:
-  serve      Start the file transfer TCP server
+  tree       Start the file transfer TCP server
 
-Default listen address: 127.0.0.1:3453
 Run 'tx send <command> --help' for command-specific options.
 ```
 
-#### `tx send serve`
+#### `tx send tree`
 
 ```text
-$ tx send serve --help
-usage: tx send [addr] serve [options] [CHROOT]
+$ tx send tree --help
+usage: tx send tree [--listen <addr>] [options] [CHROOT]
 
 Start the file transfer TCP server.
 
-  addr      listen address (default "127.0.0.1:3453")
   CHROOT    server root directory (default: current working directory)
 
 Options:
+      --listen string              Listen address (host:port) (default "127.0.0.1:3453")
   -b, --bwlimit string             Response rate limit for gentle transfers only; fast
                                    transfers do not respect it (e.g. 100MiB, 1000mbps)
+                                   (default "")
       --bwlimit-burst string       Rate limit burst size (default "1MiB")
       --gentle-cpu string          Percent of server CPUs advertised for gentle
                                    concurrency (default "25%")
@@ -68,15 +68,17 @@ Options:
 
 ```text
 $ tx recv --help
-usage: tx recv [<addr>] <command> [options]
+usage: tx recv <command> [options]
 
 Commands:
   copy       Copy REMOTE_SRC to LOCAL_DST
   status     Query and monitor transfer progress
   get        Download a single remote file
 
+REMOTE_SRC is tx://host:port/abs/path (for example tx://1.2.3.4:3453/srv/data);
+host:port may be omitted to use the default server address below.
 State is stored in <local-dst>/../.tx/ (manifest, progress, staging).
-Default server address: 127.0.0.1:3453
+Default status server address: 127.0.0.1:3453
 Run 'tx recv <command> --help' for command-specific options.
 ```
 
@@ -84,7 +86,11 @@ Run 'tx recv <command> --help' for command-specific options.
 
 ```text
 $ tx recv copy --help
-usage: tx recv [addr] copy [flags] REMOTE_SRC LOCAL_DST
+usage: tx recv copy [flags] REMOTE_SRC LOCAL_DST
+
+REMOTE_SRC is tx://host:port/abs/path (for example tx://1.2.3.4:3453/srv/data);
+host:port may be omitted (tx:///srv/data) to use 127.0.0.1:3453. file:// and
+local (daemonless) sources are not yet supported.
 
 Copy REMOTE_SRC from the remote to LOCAL_DST on the local machine.
 
@@ -96,14 +102,6 @@ Behavior:
   - --skip-fetch fetches and writes manifest state only; no start/sync
   - --skip-write fetches bodies to a discard sink and never mutates LOCAL_DST
   - --verify=MODE post-copy verification: none|meta|N%data|full|<dur>
-  - When --verify (any non-none value, including the default meta) or
-    --cache-load is set, copy issues a closing SYNC to detect drift the
-    server tree may have accumulated mid-transfer, repairs any new/changed/
-    removed files the response reveals, and retries up to 3 rounds. Copy
-    fails with "remote has not converged" if the tree still has differences
-    after the cap. When --cache-load is set, the closing SYNC also carries
-    cache-map=recv so the server can converge its page cache back to the
-    pre-transfer snapshot.
 
 Options:
       --clean                     Remove LOCAL_DST first, then force a clean transfer
@@ -150,13 +148,14 @@ Options:
 
 ```text
 $ tx recv get --help
-usage: tx recv [addr] get [flags] REMOTE_PATH
+usage: tx recv get [flags] REMOTE_SRC [LOCAL_DST]
 
-Download a single remote file. REMOTE_PATH must be an absolute path to a file
-on the server. Output defaults to the file's basename in the current directory.
+Download a single remote file. REMOTE_SRC is tx://host:port/abs/path (for
+example tx://1.2.3.4:3453/srv/big.tar); host:port may be omitted to use
+127.0.0.1:3453. LOCAL_DST defaults to the file's basename in the current
+directory.
 
 Options:
-  -o string                       Output file path, or '-' for stdout (default "")
       --encrypt string            Encryption algorithm: none|auto|aes|chacha20 (default:
                                   none)
   -k, --keys string               Persistent age keys directory (default: ephemeral)
@@ -190,17 +189,19 @@ Options:
 
 ```text
 $ tx recv status --help
-usage: tx recv [addr] status [--tid <id>] [LOCAL_DST]
+usage: tx recv status [--tid <id>] [--all] [REMOTE_HOST] [LOCAL_DST]
 
-Query and monitor transfer progress.
+Query and monitor transfer progress. REMOTE_HOST is host:port (default
+127.0.0.1:3453); LOCAL_DST defaults to the current directory.
 
 Modes:
-  status LOCAL_DST       Discover transfer from .tx/ state and poll until complete
+  status [host] [dst]    Discover transfer from dst's .tx/ state and poll
   status --tid <id>      Poll a transfer by ID (server-side progress only)
-  status                 List all active transfers on the server
+  status --all [host]    List all active transfers on the server
 
 Options:
       --tid string         Transfer ID (default "")
+      --all                List all active transfers on REMOTE_HOST (default false)
       --encrypt string     Encryption algorithm: none|auto|aes|chacha20 (default: none)
   -k, --keys string        Persistent age keys directory (default: ephemeral)
   -t, --auth-token string  Client auth token presented in encrypted AUTH blob;
@@ -237,16 +238,24 @@ for via an `xxh3-128` fingerprint header; if the on-disk progress does not match
 the current manifest fingerprint, the saved progress is discarded with a warning
 and files restart from offset zero.
 
+When `--verify` is set to any non-`none` value (including the default `meta`) or
+`--cache-load` is set, `copy` issues a closing `SYNC` to detect drift the server
+tree may have accumulated mid-transfer, repairs any new/changed/removed files the
+response reveals, and retries up to 3 rounds. It fails with
+`remote has not converged` if differences remain after the cap. With
+`--cache-load`, the closing `SYNC` also carries `cache-map=recv` so the server
+can converge its page cache back to the pre-transfer snapshot.
+
 Common examples:
 
 ```bash
-tx recv copy /srv/data /var/lib/tx/data
-tx recv copy --clean /srv/data /var/lib/tx/data
-tx recv copy --mode gentle /srv/data /var/lib/tx/data
-tx recv copy --verify meta /srv/data /var/lib/tx/data
-tx recv copy --verify 5%data /srv/data /var/lib/tx/data
-tx recv copy --verify 30s /srv/data /var/lib/tx/data
-tx recv copy --deadline 30m /srv/data /var/lib/tx/data
+tx recv copy tx://1.2.3.4:3453/srv/data /var/lib/tx/data
+tx recv copy --clean tx://1.2.3.4:3453/srv/data /var/lib/tx/data
+tx recv copy --mode gentle tx://1.2.3.4:3453/srv/data /var/lib/tx/data
+tx recv copy --verify meta tx://1.2.3.4:3453/srv/data /var/lib/tx/data
+tx recv copy --verify 5%data tx://1.2.3.4:3453/srv/data /var/lib/tx/data
+tx recv copy --verify 30s tx://1.2.3.4:3453/srv/data /var/lib/tx/data
+tx recv copy --deadline 30m tx://1.2.3.4:3453/srv/data /var/lib/tx/data
 ```
 
 ### Convergence Workflow
@@ -259,13 +268,13 @@ Typical pattern:
 1. Run a bounded first pass:
 
    ```bash
-   tx recv copy --deadline 30m --mode gentle /srv/data /var/lib/tx/data
+   tx recv copy --deadline 30m --mode gentle tx://1.2.3.4:3453/srv/data /var/lib/tx/data
    ```
 
 2. Run the same command again in fast mode to get deltas:
 
    ```bash
-   tx recv copy /srv/data /var/lib/tx/data
+   tx recv copy tx://1.2.3.4:3453/srv/data /var/lib/tx/data
    ```
 
 3. Keep rerunning until the sync phase reports:
@@ -290,11 +299,11 @@ budget.
 ### Send Server Examples
 
 ```bash
-tx send serve                              # serve cwd on default addr
-tx send serve /srv/data                    # serve /srv/data
-tx send 0.0.0.0:4000 serve /srv/data      # custom addr + chroot
-tx send serve --require-auth /srv/data     # auto-generate token
-tx send serve --bwlimit 100MiB /srv/data   # rate limit gentle transfers
+tx send tree                                       # serve cwd on default addr
+tx send tree /srv/data                              # serve /srv/data
+tx send tree --listen 0.0.0.0:4000 /srv/data       # custom addr + chroot
+tx send tree --require-auth /srv/data               # auto-generate token
+tx send tree --bwlimit 100MiB /srv/data             # rate limit gentle transfers
 ```
 
 ### Transfer Strategies: `fast` and `gentle`
@@ -333,7 +342,8 @@ The manifest files are standalone zstd archives — `zstdcat` works on them.
 
 ## Notes
 
-- `REMOTE_SRC` must be an absolute path on the remote server
+- `REMOTE_SRC` is a `tx://host:port/abs/path` URL; its path component must be
+  absolute on the remote server (host:port may be omitted to use 127.0.0.1:3453)
 - `LOCAL_DST` is local filesystem state on the client machine
 - human-readable byte sizes are accepted for flags such as `--ack-every`,
   `--probe-size`, `--bwlimit`

@@ -1,8 +1,7 @@
 package main
 
 import (
-	"slices"
-	"strings"
+	"bytes"
 	"testing"
 )
 
@@ -42,81 +41,23 @@ func TestParsePercentFlag(t *testing.T) {
 	}
 }
 
-func TestSplitSendCommand(t *testing.T) {
+func TestRunSendCLI(t *testing.T) {
 	tests := []struct {
-		name            string
-		args            []string
-		wantAddr        string
-		wantCmd         string
-		wantRest        []string
-		wantErrContains string
+		name     string
+		args     []string
+		wantCode int
 	}{
-		{
-			name:     "default addr serve",
-			args:     []string{"serve"},
-			wantAddr: defaultFileListener,
-			wantCmd:  "serve",
-		},
-		{
-			name:     "default addr serve with chroot",
-			args:     []string{"serve", "/tmp"},
-			wantAddr: defaultFileListener,
-			wantCmd:  "serve",
-			wantRest: []string{"/tmp"},
-		},
-		{
-			name:     "explicit addr serve",
-			args:     []string{"127.0.0.1:4000", "serve"},
-			wantAddr: "127.0.0.1:4000",
-			wantCmd:  "serve",
-		},
-		{
-			name:     "explicit addr serve with remaining args",
-			args:     []string{"127.0.0.1:4000", "serve", "/tmp"},
-			wantAddr: "127.0.0.1:4000",
-			wantCmd:  "serve",
-			wantRest: []string{"/tmp"},
-		},
-		{
-			name:            "invalid addr token",
-			args:            []string{"bogus-flag"},
-			wantErrContains: "invalid server-addr",
-		},
-		{
-			name:            "missing command after addr",
-			args:            []string{"127.0.0.1:4000"},
-			wantErrContains: errMissingSendCommand.Error(),
-		},
-		{
-			name:            "empty args",
-			args:            nil,
-			wantErrContains: errMissingSendCommand.Error(),
-		},
+		{name: "bad listen address", args: []string{"tree", "--listen", "bogus"}, wantCode: 2},
+		{name: "tree help", args: []string{"tree", "--help"}, wantCode: 0},
+		{name: "unknown command", args: []string{"bogus"}, wantCode: 2},
+		{name: "no args", args: nil, wantCode: 2},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			gotAddr, gotCmd, gotRest, err := splitSendCommand(tc.args)
-			if tc.wantErrContains != "" {
-				if err == nil {
-					t.Fatalf("expected error containing %q", tc.wantErrContains)
-				}
-				if !strings.Contains(err.Error(), tc.wantErrContains) {
-					t.Fatalf("expected error containing %q, got %q", tc.wantErrContains, err)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if gotAddr != tc.wantAddr {
-				t.Fatalf("addr: got %q want %q", gotAddr, tc.wantAddr)
-			}
-			if gotCmd != tc.wantCmd {
-				t.Fatalf("cmd: got %q want %q", gotCmd, tc.wantCmd)
-			}
-			if !slices.Equal(gotRest, tc.wantRest) {
-				t.Fatalf("rest: got %v want %v", gotRest, tc.wantRest)
+			var stdout, stderr bytes.Buffer
+			if got := runSendCLI(tc.args, &stdout, &stderr); got != tc.wantCode {
+				t.Fatalf("runSendCLI(%v) = %d, want %d (stderr=%q)", tc.args, got, tc.wantCode, stderr.String())
 			}
 		})
 	}
