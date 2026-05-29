@@ -107,13 +107,13 @@ func (d *sendTestDeps) AcknowledgeTransferFile(string, uint64, int64) bool { ret
 
 func (d *sendTestDeps) SetTransferPageCache(string, uint64, []byte) bool { return false }
 
-func (d *sendTestDeps) SetTransferDeadline(string, int64) bool           { return false }
-func (d *sendTestDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }
-func (d *sendTestDeps) MarkTransferTooSlow(string) bool                  { return false }
-func (d *sendTestDeps) GetTransferLimiterBps(string) int64               { return 0 }
-func (d *sendTestDeps) MaybeLogTransferProgress(string)                  {}
-func (d *sendTestDeps) MaybeLogTransferComplete(string)                  {}
-func (d *sendTestDeps) Root() string                                     { return "/" }
+func (d *sendTestDeps) SetTransferDeadline(string, int64) bool                  { return false }
+func (d *sendTestDeps) RecordTransferFirstSend(string) (time.Time, bool)        { return time.Time{}, false }
+func (d *sendTestDeps) MarkTransferTooSlow(string) bool                         { return false }
+func (d *sendTestDeps) GetTransferLimiterBps(string) int64                      { return 0 }
+func (d *sendTestDeps) MaybeLogTransferProgress(string)                         {}
+func (d *sendTestDeps) MaybeLogTransferComplete(string)                         {}
+func (d *sendTestDeps) Root() string                                            { return "/" }
 func (d *sendTestDeps) EnqueueCacheRestoreBatch(string, []pagecache.TouchEntry) {}
 
 func TestParseSENDRequestCompDefaultsAndModes(t *testing.T) {

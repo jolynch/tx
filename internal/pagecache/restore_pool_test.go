@@ -161,7 +161,7 @@ func TestRestoreWorkerPoolNilSafe(t *testing.T) {
 		t.Fatalf("nil pool Send should be a no-op returning false")
 	}
 	p.SendBatch("tx-nil", []TouchEntry{{Path: "/x"}}) // must not panic
-	p.Close()                                        // must not panic
+	p.Close()                                         // must not panic
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() { defer wg.Done(); p.Close() }()
