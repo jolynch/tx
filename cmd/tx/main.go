@@ -62,7 +62,7 @@ func printUsage() {
 
 Commands:
   send       File transfer server
-  recv       File transfer CLI client
+  recv       File transfer client
 
 Run 'tx <command> --help' for command-specific options.
 `)
@@ -91,7 +91,7 @@ func printSendUsage(w io.Writer) {
 	fmt.Fprint(w, `usage: tx send <command> [options]
 
 Commands:
-  tree       Start the file transfer TCP server
+  tree       Offer a tree (directory) via a FTCP server
 
 Run 'tx send <command> --help' for command-specific options.
 `)
@@ -165,7 +165,7 @@ func runSendTreeCLI(args []string, _ io.Writer, stderr io.Writer) int {
 	cf.FlagSet().Usage = func() {
 		fmt.Fprintln(stderr, "usage: tx send tree [--listen <addr>] [options] [CHROOT]")
 		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "Start the file transfer TCP server.")
+		fmt.Fprintln(stderr, "Offer a tree (directory) via a FTCP server.")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "  CHROOT    server root directory (default: current working directory)")
 		fmt.Fprintln(stderr)

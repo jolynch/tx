@@ -8,7 +8,7 @@ usage: tx <command> [options]
 
 Commands:
   send       File transfer server
-  recv       File transfer CLI client
+  recv       File transfer client
 
 Run 'tx <command> --help' for command-specific options.
 ```
@@ -20,7 +20,7 @@ $ tx send --help
 usage: tx send <command> [options]
 
 Commands:
-  tree       Start the file transfer TCP server
+  tree       Offer a tree (directory) via a FTCP server
 
 Run 'tx send <command> --help' for command-specific options.
 ```
@@ -31,7 +31,7 @@ Run 'tx send <command> --help' for command-specific options.
 $ tx send tree --help
 usage: tx send tree [--listen <addr>] [options] [CHROOT]
 
-Start the file transfer TCP server.
+Offer a tree (directory) via a FTCP server.
 
   CHROOT    server root directory (default: current working directory)
 
