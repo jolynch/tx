@@ -1,8 +1,9 @@
 # `tx`: Fast file transfer for the cloud
 
 `tx` copies directories and files at line rate by fully saturating modern cloud
-hardware - SSD, network, and CPU - simultaneously. On large servers it achieves
-up to 10x the throughput of a simple `rsync`.
+hardware - SSD, NIC, and CPU - simultaneously. On large servers it achieves
+up to 10x the throughput of a simple `rsync --fsync` + [`happycache`](https://github.com/hashbrowncipher/happycache) while providing above line-rate encryption, compression,
+and page cache transfer.
 
 Four capabilities make this possible:
 
@@ -31,7 +32,12 @@ Four capabilities make this possible:
   on slow network attached drives.
 
 See [docs/README.md](docs/README.md) for the documentation index and
-[docs/arch/OVERVIEW.md](docs/arch/OVERVIEW.md) for a deeper dive.
+[docs/arch/OVERVIEW.md](docs/arch/OVERVIEW.md) for a deeper dive. If you
+are curious about benchmarking on your own setup check out
+[bench/README.md](bench/README.md) which has a data generator that can both
+generate incompressible (random) and
+compressible ([Selesia](https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia))
+test datasets as well as run `tx` or alternative `rsync` commands.
 
 ## Quick start
 
@@ -54,7 +60,8 @@ tx recv copy tx://10.0.0.1:3453/srv/data /var/lib/data
 
 Rerun the same command to sync deltas — `copy` detects an existing destination
 and only transfers new or changed files. Metadata verification runs by default;
-add `--verify 5%data` for sampled data checks.
+add `--verify 5%data` for sampled data checks or `--verify 30s` to verify as
+much as you can in a 30s budget.
 
 ### With encryption
 
@@ -62,14 +69,17 @@ add `--verify 5%data` for sampled data checks.
 # Server — keys are generated automatically on first run
 tx send tree --listen 0.0.0.0:3453 -k /var/lib/tx/keys /srv/data
 
-# Client — ephemeral keys by default, auto-negotiates cipher
+# Client — ephemeral keys by default, auto-negotiates optimal cipher
 tx recv copy --encrypt auto tx://10.0.0.1:3453/srv/data /var/lib/data
 ```
 
 ### With authorization
 
-Shared-secret tokens restrict who can download. Generate a token securely and
-share it out-of-band (e.g. a secrets manager or `scp`):
+Shared-secret tokens restrict who can download from the server.
+Generate a token securely and share it out-of-band via invoking the
+command. Treat these tokens as short lived session credentials, not
+long lived keys (for long lived just use an `age` public key as
+the token).
 
 ```bash
 # Generate a token
