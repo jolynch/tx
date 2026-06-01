@@ -285,44 +285,62 @@ func scanLocalDir(targetDir string, meta *tx.Manifest) (*tx.Manifest, error) {
 	return out, err
 }
 
-// parseRemoteSrc parses a source URL into a server address and absolute server
-// path. The grammar is "tx://[host:port]/abs/path": the tx:// scheme is required
-// for network transfers and host:port defaults to defaultFileListener when
-// omitted. A file:// source or a bare path with no scheme denotes a local
-// daemonless transfer, which is not yet implemented and returns an instructive
-// error.
-func parseRemoteSrc(remoteSrc string) (hostPort string, serverPath string, err error) {
-	if rest, ok := strings.CutPrefix(remoteSrc, "tx://"); ok {
+// parsedSource is a parsed copy/get source argument: either a local
+// filesystem path (daemonless) or a tx:// network location.
+type parsedSource struct {
+	// IsLocal is true for file:// and bare/relative paths.
+	IsLocal bool
+	// LocalPath is the absolute, cleaned source path (set when IsLocal).
+	LocalPath string
+	// HostPort is the server address (set when !IsLocal).
+	HostPort string
+	// ServerPath is the absolute remote path (set when !IsLocal).
+	ServerPath string
+}
+
+// parseSource parses a copy/get source argument. The grammar is:
+//
+//	tx://[host:port]/abs/path   network source; host:port defaults to defaultFileListener
+//	file:///abs/path            local (daemonless) source
+//	/abs/path or relative/path  local (daemonless) source
+//
+// Local sources are copied in-kernel with copy_file_range; see cli_local.go.
+// Only copy and get accept local sources.
+func parseSource(src string) (parsedSource, error) {
+	if rest, ok := strings.CutPrefix(src, "tx://"); ok {
 		idx := strings.IndexByte(rest, '/')
 		if idx < 0 {
-			return "", "", fmt.Errorf("source %q must contain an absolute path (tx://host:port/abs/path)", remoteSrc)
+			return parsedSource{}, fmt.Errorf("source %q must contain an absolute path (tx://host:port/abs/path)", src)
 		}
-		hostPort = rest[:idx]
-		serverPath = rest[idx:]
+		hostPort := rest[:idx]
+		serverPath := rest[idx:]
 		if hostPort == "" {
 			hostPort = defaultFileListener
 		}
 		if err := utils.ValidateHostPort(hostPort); err != nil {
-			return "", "", fmt.Errorf("source %q has invalid host:port: %w", remoteSrc, err)
+			return parsedSource{}, fmt.Errorf("source %q has invalid host:port: %w", src, err)
 		}
 		if !strings.HasPrefix(serverPath, "/") {
-			return "", "", fmt.Errorf("source %q must contain an absolute path (tx://host:port/abs/path)", remoteSrc)
+			return parsedSource{}, fmt.Errorf("source %q must contain an absolute path (tx://host:port/abs/path)", src)
 		}
-		return hostPort, serverPath, nil
+		return parsedSource{HostPort: hostPort, ServerPath: serverPath}, nil
 	}
-	if rest, ok := strings.CutPrefix(remoteSrc, "file://"); ok {
-		return "", "", errLocalSrcNotImplemented(rest)
+	// Local source: file:// scheme or a bare/relative path.
+	local := src
+	if rest, ok := strings.CutPrefix(src, "file://"); ok {
+		if !strings.HasPrefix(rest, "/") {
+			return parsedSource{}, fmt.Errorf("source %q must be of the form file:///abs/path (a host component is not supported)", src)
+		}
+		local = rest
 	}
-	return "", "", errLocalSrcNotImplemented(remoteSrc)
-}
-
-// errLocalSrcNotImplemented reports that a local (daemonless) source was given
-// and points the user at the equivalent tx:// form on the default listener.
-func errLocalSrcNotImplemented(localPath string) error {
-	if !strings.HasPrefix(localPath, "/") {
-		localPath = "/" + localPath
+	if strings.TrimSpace(local) == "" {
+		return parsedSource{}, errors.New("empty source path")
 	}
-	return fmt.Errorf("local daemonless transfers are not yet implemented; pass an explicit remote source like tx://%s%s", defaultFileListener, localPath)
+	abs, err := filepath.Abs(local)
+	if err != nil {
+		return parsedSource{}, fmt.Errorf("resolve local source %q: %w", src, err)
+	}
+	return parsedSource{IsLocal: true, LocalPath: filepath.Clean(abs)}, nil
 }
 
 func RunCLI(args []string, stdout io.Writer, stderr io.Writer) int {

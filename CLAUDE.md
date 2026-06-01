@@ -176,7 +176,7 @@ The `Client` struct holds connection config (`ServerAddr`, `ServerAgePublicKey`)
 
 ## CLI
 
-Both sides take the command first: `tx send <command> [options]` and `tx recv <command> [options]`. The server address is no longer a leading positional — `tx send tree` takes a `--listen <addr>` flag, and `tx recv copy/get` embed it in a `REMOTE_SRC` URL of the form `tx://host:port/abs/path` (host:port may be omitted to use `127.0.0.1:3453`). The `file://` scheme and bare/schemeless (local daemonless) sources are reserved but not yet implemented — `parseRemoteSrc` in `cli.go` rejects them with an instructive error.
+Both sides take the command first: `tx send <command> [options]` and `tx recv <command> [options]`. The server address is no longer a leading positional — `tx send tree` takes a `--listen <addr>` flag, and `tx recv copy/get` embed it in a `REMOTE_SRC` URL of the form `tx://host:port/abs/path` (host:port may be omitted to use `127.0.0.1:3453`). `parseSource` in `cli.go` also accepts a local source (`file:///abs/path`, `/abs/path`, or a relative path); copy/get then take a daemonless same-machine path (`cli_local.go`) that copies in-kernel with `copy_file_range` instead of going over FTCP. `parseRemoteSrc` is replaced by `parseSource`.
 
 Full flag reference with `--help` output lives in `docs/pub/CLI.md`. **Any time you change flags in either CLI or `internal/cliflags/cliflags.go`, update `docs/pub/CLI.md` to match.**
 
@@ -186,8 +186,8 @@ Full flag reference with `--help` output lives in `docs/pub/CLI.md`. **Any time 
 
 ### `tx recv` (`internal/cmd/filexfercli/cli.go`)
 
-- **`copy`**: full directory download with probes, manifest fetch, parallel SEND batches, ACK, optional verify. Writes `.tx/` state (manifest + progress file) for resume.
-- **`get`**: single-file download. Skips probes and `.tx/` state.
+- **`copy`**: full directory download with probes, manifest fetch, parallel SEND batches, ACK, optional verify. Writes `.tx/` state (manifest + progress file) for resume. A **local** source instead runs `runLocalCopyCLI` (`cli_local.go`): a daemonless `copy_file_range` copy, fast mode only, no `.tx/` state. A non-existing destination is staged + atomically renamed; an existing destination is brought in line via an in-place delta (`runLocalSync`/`localApplyDelta`, reusing `compareManifestEntries` + `confirmSyncProceed`) — additions auto-proceed, overwrites/removals prompt unless `-y`.
+- **`get`**: single-file download. Skips probes and `.tx/` state. A **local** source instead runs `runLocalGetCLI` (`cli_local.go`): a single-file `copy_file_range` copy.
 - **`status [REMOTE_HOST] [LOCAL_DST]`**: monitors a transfer. `REMOTE_HOST` defaults to `127.0.0.1:3453`, `LOCAL_DST` to cwd (a single positional is auto-detected as host:port vs path). Reads `.tx/manifest.server.zst` from `LOCAL_DST` for the transfer ID and polls combined server+client progress; `--tid` polls server only; `--all` lists all active transfers on `REMOTE_HOST`.
 
 ### Shared flag helpers (`internal/cliflags/`)

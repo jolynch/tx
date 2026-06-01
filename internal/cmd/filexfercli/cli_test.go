@@ -3737,17 +3737,16 @@ func TestRunCLIUsageErrors(t *testing.T) {
 	if code := RunCLI([]string{"get"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("expected usage exit 2 for missing REMOTE_SRC on get, got %d", code)
 	}
-	// a schemeless source is a local transfer, which is not yet implemented
-	if code := RunCLI([]string{"get", "relative/path"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for schemeless REMOTE_SRC, got %d", code)
+	// A schemeless or file:// source is now a local (daemonless) copy; a
+	// nonexistent source fails with exit 1, not the old "not implemented" 2.
+	if code := RunCLI([]string{"get", "/no/such/tx/local/src/xyz"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("expected exit 1 for nonexistent local get source, got %d", code)
 	}
-	// a file:// source is a local transfer, which is not yet implemented
-	if code := RunCLI([]string{"get", "file:///srv/x"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for file:// REMOTE_SRC, got %d", code)
+	if code := RunCLI([]string{"get", "file:///no/such/tx/local/src/xyz"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("expected exit 1 for nonexistent file:// get source, got %d", code)
 	}
-	// copy with a schemeless (local) source is not yet implemented
-	if code := RunCLI([]string{"copy", "/no-host/path", "/tmp/dst"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for schemeless copy REMOTE_SRC, got %d", code)
+	if code := RunCLI([]string{"copy", "/no/such/tx/local/src/xyz", "/tmp/tx-local-dst-xyz"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("expected exit 1 for nonexistent local copy source, got %d", code)
 	}
 	stderr.Reset()
 	if code := RunCLI([]string{"transfer", "--directory", "/tmp"}, &stdout, &stderr); code != 2 {
@@ -3898,11 +3897,8 @@ func TestRunCLIUsageErrors(t *testing.T) {
 		t.Fatalf("expected invalid verify/skip-fetch combo error, got: %s", stderr.String())
 	}
 	stderr.Reset()
-	if code := RunCLI([]string{"get", "/abs/path"}, &stdout, &stderr); code != 2 {
-		t.Fatalf("expected usage exit 2 for schemeless REMOTE_SRC, got %d", code)
-	}
-	if !strings.Contains(stderr.String(), "not yet implemented") || !strings.Contains(stderr.String(), "tx://") {
-		t.Fatalf("expected local-not-implemented error pointing at tx://, got: %s", stderr.String())
+	if code := RunCLI([]string{"get", "/abs/path/that/does/not/exist/xyz"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("expected exit 1 for nonexistent local get source, got %d", code)
 	}
 	stderr.Reset()
 	if code := RunCLI([]string{"help"}, &stdout, &stderr); code != 0 {

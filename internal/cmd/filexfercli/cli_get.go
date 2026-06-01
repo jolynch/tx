@@ -26,9 +26,10 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	cf.FlagSet().Usage = func() {
 		fmt.Fprintln(stderr, "usage: tx recv get [flags] REMOTE_SRC [LOCAL_DST]")
 		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "Download a single remote file. REMOTE_SRC is tx://host:port/abs/path (for")
-		fmt.Fprintln(stderr, "example tx://1.2.3.4:3453/srv/big.tar); host:port may be omitted to use")
-		fmt.Fprintln(stderr, "127.0.0.1:3453. LOCAL_DST defaults to the file's basename in the current")
+		fmt.Fprintln(stderr, "Download a single file. REMOTE_SRC is tx://host:port/abs/path (for example")
+		fmt.Fprintln(stderr, "tx://1.2.3.4:3453/srv/big.tar); host:port may be omitted to use 127.0.0.1:3453.")
+		fmt.Fprintln(stderr, "A local path (file:///abs/path, /abs/path, or relative) copies one file locally")
+		fmt.Fprintln(stderr, "via copy_file_range. LOCAL_DST defaults to the file's basename in the current")
 		fmt.Fprintln(stderr, "directory.")
 		fmt.Fprintln(stderr)
 		cf.PrintDefaults(stderr)
@@ -84,10 +85,17 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "get requires REMOTE_SRC and an optional LOCAL_DST")
 		return 2
 	}
-	serverURL, remotePath, err := parseRemoteSrc(cf.Arg(0))
+	src, err := parseSource(cf.Arg(0))
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
+	}
+	var serverURL, remotePath string
+	if src.IsLocal {
+		remotePath = src.LocalPath
+	} else {
+		serverURL = src.HostPort
+		remotePath = src.ServerPath
 	}
 	localDst := cf.Arg(1)
 	{
@@ -159,6 +167,17 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	}
 	if skipWrite {
 		outputPath = os.DevNull
+	}
+
+	if src.IsLocal {
+		return runLocalGetCLI(localGetArgs{
+			srcPath:          src.LocalPath,
+			outputPath:       outputPath,
+			skipFsync:        skipFsync,
+			cacheLoadEnabled: cacheLoadEnabled,
+			cacheLoadBudget:  cacheLoadBudget,
+			progressInterval: progressInterval,
+		}, stdout, stderr)
 	}
 
 	effectiveConcurrency := tx.DefaultClientConcurrency()
