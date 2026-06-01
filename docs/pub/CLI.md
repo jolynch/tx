@@ -89,8 +89,9 @@ $ tx recv copy --help
 usage: tx recv copy [flags] REMOTE_SRC LOCAL_DST
 
 REMOTE_SRC is tx://host:port/abs/path (for example tx://1.2.3.4:3453/srv/data);
-host:port may be omitted (tx:///srv/data) to use 127.0.0.1:3453. file:// and
-local (daemonless) sources are not yet supported.
+host:port may be omitted (tx:///srv/data) to use 127.0.0.1:3453. A local path
+(file:///abs/path, /abs/path, or relative) does a daemonless same-machine copy
+via copy_file_range (fast mode only).
 
 Copy REMOTE_SRC from the remote to LOCAL_DST on the local machine.
 
@@ -150,9 +151,10 @@ Options:
 $ tx recv get --help
 usage: tx recv get [flags] REMOTE_SRC [LOCAL_DST]
 
-Download a single remote file. REMOTE_SRC is tx://host:port/abs/path (for
-example tx://1.2.3.4:3453/srv/big.tar); host:port may be omitted to use
-127.0.0.1:3453. LOCAL_DST defaults to the file's basename in the current
+Download a single file. REMOTE_SRC is tx://host:port/abs/path (for example
+tx://1.2.3.4:3453/srv/big.tar); host:port may be omitted to use 127.0.0.1:3453.
+A local path (file:///abs/path, /abs/path, or relative) copies one file locally
+via copy_file_range. LOCAL_DST defaults to the file's basename in the current
 directory.
 
 Options:
@@ -329,6 +331,42 @@ Use `gentle` when:
 Both `copy` (`--mode fast|gentle`) and the lower-level transfer phase support
 strategy selection.
 
+### Local (daemonless) copy
+
+When `REMOTE_SRC` is a local path instead of a `tx://` URL, `copy` and `get`
+skip the network entirely and copy files in-kernel with `copy_file_range(2)`,
+which becomes a metadata-only reflink on copy-on-write filesystems (btrfs, XFS):
+
+```bash
+tx recv copy /srv/data /srv/data.copy             # bare path
+tx recv copy file:///srv/data /backup/data        # file:// scheme
+tx recv copy ./build /tmp/build-snapshot          # relative path
+tx recv get  /srv/big.tar /tmp/big.tar            # single file
+```
+
+Local copies:
+
+- only support `fast` mode (`--mode gentle` is rejected); the "probe" is just
+  the local CPU count (io-depth x cores) used to size copy workers
+- when the destination does not exist, copy the tree into a sibling staging
+  directory, then atomically rename it into place; `get` writes its file directly
+- when the destination already exists, bring it in line with the source via an
+  in-place delta (the local analogue of the remote sync): new files are added,
+  changed files overwritten, and files no longer in the source removed. A delta
+  of only new files proceeds automatically; a delta that overwrites or removes
+  prompts for confirmation (skip it with `-y/--yes`, or non-interactively).
+  `--clean` removes the destination first to force a fresh copy instead.
+- honor `--verify` (meta compares source vs destination; `N%data`/`full` sample
+  and compare content hashes), `--skip-write`, `--skip-fsync`, `--concurrency`,
+  `--progress*`, and `--cache-load`
+- with `--cache-load`, replicate the source files' page-cache residency onto the
+  new files (there is no network send-back — the local process is both ends)
+- ignore wire-only flags (`--encrypt`, `--auth-token`, `--compress`,
+  `--probe-size`, `--ack-every`) with no effect
+
+`.tx/` state (resume, persisted manifests) is not used for local copies — they
+are fast and simply re-run.
+
 ## State Directory
 
 State is stored in `<LOCAL_DST>/../.tx/`:
@@ -344,6 +382,9 @@ The manifest files are standalone zstd archives — `zstdcat` works on them.
 
 - `REMOTE_SRC` is a `tx://host:port/abs/path` URL; its path component must be
   absolute on the remote server (host:port may be omitted to use 127.0.0.1:3453)
+- `REMOTE_SRC` may instead be a local path (`file:///abs/path`, `/abs/path`, or
+  a relative path) for a daemonless same-machine copy via `copy_file_range`; see
+  "Local (daemonless) copy" above
 - `LOCAL_DST` is local filesystem state on the client machine
 - human-readable byte sizes are accepted for flags such as `--ack-every`,
   `--probe-size`, `--bwlimit`

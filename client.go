@@ -2188,6 +2188,19 @@ func clampConcurrency(v int) int {
 	return v
 }
 
+// DefaultTargetIODepth is the per-CPU IO depth tx advertises in PROBE by
+// default (mirrors `tx send tree --target-io-depth`). A local daemonless copy
+// acts as both client and server, so it uses this to size its worker pool.
+const DefaultTargetIODepth = 4
+
+// LocalSuggestedConcurrency returns the fast-mode worker count tx would pick
+// for a server advertising the given CPU count and per-CPU IO depth — the same
+// formula the PROBE path uses, clamped to the auto-start range. It is exposed
+// for local daemonless copies, which have no network probe to advertise these.
+func LocalSuggestedConcurrency(cpu, ioDepth int) int {
+	return clampConcurrency(suggestedConcurrencyFromProbe(cpu, ioDepth, LoadStrategyFast, 0))
+}
+
 func (c *Client) ProbeLink(ctx context.Context, req ProbeRequest) (ProbeResponse, error) {
 	ctx, task := trace.NewTask(ctx, "probe-link")
 	defer task.End()

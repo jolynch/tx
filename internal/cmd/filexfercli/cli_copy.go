@@ -139,8 +139,9 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: tx recv copy [flags] REMOTE_SRC LOCAL_DST")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "REMOTE_SRC is tx://host:port/abs/path (for example tx://1.2.3.4:3453/srv/data);")
-		fmt.Fprintln(stderr, "host:port may be omitted (tx:///srv/data) to use 127.0.0.1:3453. file:// and")
-		fmt.Fprintln(stderr, "local (daemonless) sources are not yet supported.")
+		fmt.Fprintln(stderr, "host:port may be omitted (tx:///srv/data) to use 127.0.0.1:3453. A local path")
+		fmt.Fprintln(stderr, "(file:///abs/path, /abs/path, or relative) does a daemonless same-machine copy")
+		fmt.Fprintln(stderr, "via copy_file_range (fast mode only).")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Copy REMOTE_SRC from the remote to LOCAL_DST on the local machine.")
 		fmt.Fprintln(stderr)
@@ -196,13 +197,17 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "copy requires exactly two positional arguments: REMOTE_SRC LOCAL_DST")
 		return 2
 	}
-	serverURL, remoteSrc, err := parseRemoteSrc(cf.Arg(0))
+	src, err := parseSource(cf.Arg(0))
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	cfg.remoteSrc = remoteSrc
 	cfg.localDst = cf.Arg(1)
+	if src.IsLocal {
+		cfg.remoteSrc = src.LocalPath
+	} else {
+		cfg.remoteSrc = src.ServerPath
+	}
 	{
 		meta, dataPct, budget, err := parseVerifyFlag(cfg.verifyRaw)
 		if err != nil {
@@ -236,6 +241,10 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "--verify meta cannot be used with --skip-write")
 		return 2
 	}
+	if src.IsLocal {
+		return runLocalCopyCLI(src.LocalPath, cfg.localDst, cfg, stdout, stderr)
+	}
+	serverURL := src.HostPort
 	agePublicKey, ageIdentity, encMode, err := resolveEncryptionOptionsWithKeys(cfg.encryptMode, cfg.keysDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)

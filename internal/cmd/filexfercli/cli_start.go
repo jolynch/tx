@@ -600,6 +600,29 @@ func printStartFileSummary(stdout io.Writer, fileID uint64, path string, meta tx
 	io.WriteString(stdout, sb.String())
 }
 
+// formatTxferProgressLine renders the shared "txfer-progress:" line used by both
+// the remote transfer poller and local copies. probeSuffix is the trailing
+// link-utilization segment (empty for local copies, which have no network link).
+func formatTxferProgressLine(doneFiles, totalFiles uint64, copied, totalBytes int64, rateBps float64, etaDisplay, probeSuffix string) string {
+	var pctBytes float64
+	if totalBytes > 0 {
+		pctBytes = float64(copied) * 100 / float64(totalBytes)
+	}
+	var pctFiles float64
+	if totalFiles > 0 {
+		pctFiles = float64(doneFiles) * 100 / float64(totalFiles)
+	}
+	return fmt.Sprintf(
+		"txfer-progress:[%6s/%6s](%5.1f%%) [%s/%s](%5.1f%%) [eta:%s]@[%s]%s",
+		encoding.HumanCount(doneFiles, 6), encoding.HumanCount(totalFiles, 6),
+		pctFiles,
+		encoding.HumanBytesFixedWidth(copied, fixedWidthProgressBytesWidth),
+		encoding.HumanBytesFixedWidth(totalBytes, fixedWidthProgressBytesWidth),
+		pctBytes,
+		etaDisplay, encoding.HumanRateFixedWidth(rateBps, fixedWidthProgressRateWidth), probeSuffix,
+	)
+}
+
 func startVerboseStatusPolling(txferID string, client *tx.Client, localCopied *atomic.Int64, localTotalBytes int64, localDoneFiles *atomic.Uint64, localTotalFiles uint64, probe *probeReporter, stderr io.Writer) func() {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -648,14 +671,6 @@ func startVerboseStatusPolling(txferID string, client *tx.Client, localCopied *a
 				prevCopied = copied
 				prevTime = now
 
-				var pctBytes float64
-				if totalBytes > 0 {
-					pctBytes = float64(copied) * 100 / float64(totalBytes)
-				}
-				var pctFiles float64
-				if totalFiles > 0 {
-					pctFiles = float64(doneFiles) * 100 / float64(totalFiles)
-				}
 				etaDisplay := fixedWidthETANA()
 				if rateBps > 0 && totalBytes > copied {
 					remaining := float64(totalBytes - copied)
@@ -663,16 +678,7 @@ func startVerboseStatusPolling(txferID string, client *tx.Client, localCopied *a
 					etaDisplay = fixedWidthETA(time.Duration(etaSec * float64(time.Second)))
 				}
 				probePart := formatProbeRateSuffix(now, rateBps, probe)
-				fmt.Fprintf(
-					stderr,
-					"txfer-progress:[%6s/%6s](%5.1f%%) [%s/%s](%5.1f%%) [eta:%s]@[%s]%s\n",
-					encoding.HumanCount(doneFiles, 6), encoding.HumanCount(totalFiles, 6),
-					pctFiles,
-					encoding.HumanBytesFixedWidth(copied, fixedWidthProgressBytesWidth),
-					encoding.HumanBytesFixedWidth(totalBytes, fixedWidthProgressBytesWidth),
-					pctBytes,
-					etaDisplay, encoding.HumanRateFixedWidth(rateBps, fixedWidthProgressRateWidth), probePart,
-				)
+				fmt.Fprintln(stderr, formatTxferProgressLine(doneFiles, totalFiles, copied, totalBytes, rateBps, etaDisplay, probePart))
 			}
 			select {
 			case <-ctx.Done():
