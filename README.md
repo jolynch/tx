@@ -28,8 +28,10 @@ Four capabilities make this possible:
 
 - **Lightweight verification.** Metadata checks (size, mtime, permissions) run
   by default after every copy. Sampled data verification (`--verify 5%data`)
-  reads 5% of bytes and catches corruption without a full re-read - practical
-  on slow network attached drives.
+  reads 5% of bytes and catches corruption without a full re-read *or* time
+  budget verification (`--verify 30s`) verifies all metadata and as much
+  sampled data as it can in the time budget - practical on slow network
+  attached drives such as EBS.
 
 See [docs/README.md](docs/README.md) for the documentation index and
 [docs/arch/OVERVIEW.md](docs/arch/OVERVIEW.md) for a deeper dive. If you
