@@ -58,7 +58,10 @@ Three forms:
 - `AUTH aes <blob>` — encrypted session setup using AES-GCM.
 - `AUTH chacha20 <blob>` — encrypted session setup using ChaCha20-Poly1305.
 
-`<blob>` is length-prefixed (`<len>:<bytes>`).
+`<blob>` is a single token containing standard base64 of the AEAD-encrypted
+payload (base64 keeps the line-oriented protocol free of raw newline bytes).
+Bare, quoted (`"..."`), and length-prefixed (`<len>:<bytes>`) token forms are
+all accepted; the current client sends a bare base64 token.
 
 ### Key Exchange Flow
 
@@ -76,8 +79,8 @@ After `AUTH aes <blob>` or `AUTH chacha20 <blob>`:
 
 - Server treats the first AUTH token (`aes` or `chacha20`) as the session
   cipher.
-- Server decrypts `<blob>` using its identity and the selected AEAD algorithm
-  to recover the client's identity material.
+- Server base64-decodes `<blob>`, then decrypts it using its identity and the
+  selected AEAD algorithm to recover the client's identity material.
 - Decrypted plaintext is a space-delimited sequence:
 
   ```
@@ -134,6 +137,8 @@ Creates a transfer and streams a manifest.
   (literal FM/1 bytes per frame) and `zstd` (each frame is an independent
   zstd frame). Default is `zstd`. The framing is unconditional — `comp` only
   affects per-frame compression, not whether framing is present.
+- unknown `key=value` options are rejected with `ERR BAD_REQUEST` (unlike
+  `SEND`/`ACK`/`PROBE`, which ignore unknown fields).
 
 ### Response
 
@@ -225,6 +230,7 @@ manifest comes from the client-supplied body.
     `pc:<hex>` blob on each matching F entry and falls back to a fresh
     server-side probe for new-on-disk entries. No-op on non-Linux
     platforms.
+- unknown `key=value` options are rejected with `ERR BAD_REQUEST`.
 
 ### Request body
 
