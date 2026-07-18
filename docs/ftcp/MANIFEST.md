@@ -26,16 +26,21 @@ Empty lines and `#` comments are ignored.
 Format:
 
 ```text
-FM/1 <transfer_id> mode=<fast|gentle> link-mbps=<int> concurrency=<int>
+FM/1 <transfer_id> [<len>:<root>] mode=<fast|gentle> link-mbps=<int> concurrency=<int> [deadline-ms=<int>]
 ```
 
-Header fields are required.
+Fields are required unless marked optional.
 
 - `FM/1`: manifest version token.
 - `<transfer_id>`: transfer identifier.
+- `<len>:<root>` (optional): length-prefixed absolute root path. Accepted on
+  parse for compatibility; current servers do not emit it (the root travels
+  in the `D0` entry).
 - `mode`: transfer mode (`fast` or `gentle`).
 - `link-mbps`: client-reported link estimate in Mbps (`>= 0`).
 - `concurrency`: planned client concurrency (`> 0`).
+- `deadline-ms` (optional): transfer deadline in milliseconds (`>= 0`);
+  emitted only when a deadline is set.
 
 Any unknown header option is invalid.
 
