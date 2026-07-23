@@ -45,11 +45,26 @@ From these measurements the client computes:
 
 Once the probe completes, the client pre-warms a TCP connection pool sized to
 `concurrency × 1.25` (25 % headroom). Every connection in the pool has already
-completed the AUTH handshake, so SEND requests start immediately. When a
-connection is returned to the pool after use, it is closed and a background
-goroutine opens and authenticates a fresh replacement — the pool is
-continuously refilled without blocking the data path. If the pool is empty when
-a worker needs a connection it falls back to a synchronous dial.
+completed the AUTH handshake, so SEND requests start immediately.
+
+When the server grants keep-alive (negotiated on the discovery probe via
+`keep-alive=auto` / `keep-alive-ms`), pool connections are long-lived sessions:
+each is upgraded with a zero-payload keep-alive PROBE at warm time, and a
+connection whose response was cleanly consumed returns to the pool for reuse
+instead of being closed. Reused connections skip the TCP and AUTH handshakes
+and keep their congestion window warm across batches. Two guardrails keep
+silently dead connections out of the pool: a background loop heartbeats every
+idle pooled connection at one quarter of the granted idle window with a
+zero-payload PROBE round trip (a failed heartbeat evicts the connection and
+triggers a refill, and borrowers peek for a pending EOF before reuse), and
+the server independently reaps connections that send nothing for the
+keep-alive window (`--idle-timeout`, default 60s).
+
+Against servers without keep-alive, or after a dirty response (error
+mid-stream), a connection is closed after one use and a background goroutine
+opens and authenticates a fresh replacement — the pool is continuously
+refilled without blocking the data path. If the pool is empty when a worker
+needs a connection it falls back to a synchronous single-use dial.
 
 ### Windowing and batching
 

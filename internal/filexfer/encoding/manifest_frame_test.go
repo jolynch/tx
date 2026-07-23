@@ -324,3 +324,17 @@ func parseAllFrames(t *testing.T, wire []byte) []testFrame {
 	}
 	return frames
 }
+
+func TestChunkedManifestReaderSurfacesServerErr(t *testing.T) {
+	r := NewChunkedManifestReader(strings.NewReader("ERR UNPROCESSABLE path does not exist\r\n"), ChunkedManifestReaderOpts{})
+	_, err := io.ReadAll(r)
+	if err == nil {
+		t.Fatalf("expected error for ERR status line")
+	}
+	if !strings.Contains(err.Error(), "UNPROCESSABLE path does not exist") {
+		t.Fatalf("server ERR not surfaced: %v", err)
+	}
+	if strings.Contains(err.Error(), "invalid FX/1 header") {
+		t.Fatalf("server ERR masked as frame parse error: %v", err)
+	}
+}

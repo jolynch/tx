@@ -55,6 +55,8 @@ Options:
                                    false)
       --exit-after string          Exit duration after transfer completes; 'never' to
                                    run forever (e.g. 5s, 1m) (default "60s")
+      --idle-timeout string        Close kept-alive connections idle for this duration;
+                                   0 disables keep-alive (e.g. 10s, 1m) (default "60s")
       --trace string               Write runtime/trace output to this file (default "")
   -p, --progress-path string       Progress output target; repeatable, use - for stdout
                                    (default "")
