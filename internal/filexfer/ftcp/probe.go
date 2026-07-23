@@ -25,6 +25,7 @@ type probeRequest struct {
 	ClientTS0        int64
 	TransferID       string
 	ObservedLinkMbps int64
+	KeepAlive        bool
 }
 
 func handlePROBECommand(context.Context, Request, io.Writer, Deps) error {
@@ -65,16 +66,20 @@ func parsePROBERequest(req Request) (probeRequest, error) {
 			return probeRequest{}, protocolErr{code: "BAD_REQUEST", message: "PROBE obs-link-mbps requires txferid"}
 		}
 	}
+	if raw := strings.ToLower(strings.TrimSpace(p["keep-alive"])); raw != "" && raw != "auto" {
+		return probeRequest{}, protocolErr{code: "BAD_REQUEST", message: "keep-alive must be auto"}
+	}
 	return probeRequest{
 		ClientCPU:        clientCPU,
 		ProbeBytes:       probeBytes,
 		ClientTS0:        clientTS0,
 		TransferID:       transferID,
 		ObservedLinkMbps: observedLinkMbps,
+		KeepAlive:        probeRequestsKeepAlive(p),
 	}, nil
 }
 
-func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.Writer, deps Deps, ioDepth int, gentleCPUPct int, gentleBWPct int, gentleBurstBytes int64) error {
+func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.Writer, deps Deps, ioDepth int, gentleCPUPct int, gentleBWPct int, gentleBurstBytes int64, keepAliveMS int64) error {
 	parsed, err := parsePROBERequest(req)
 	if err != nil {
 		return err
@@ -111,7 +116,7 @@ func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.W
 		limiterBps = deps.GetTransferLimiterBps(parsed.TransferID)
 	}
 	respLine := fmt.Sprintf(
-		"PROBE cpu=%d io-depth=%d cts0=%d sts0=%d sts1=%d probe-bytes=%d wmem=%d gentle-cpu-pct=%d gentle-bw-pct=%d limiter-bps=%d\n",
+		"PROBE cpu=%d io-depth=%d cts0=%d sts0=%d sts1=%d probe-bytes=%d wmem=%d gentle-cpu-pct=%d gentle-bw-pct=%d limiter-bps=%d",
 		runtime.NumCPU(),
 		ioDepth,
 		parsed.ClientTS0,
@@ -123,6 +128,10 @@ func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.W
 		gentleBWPct,
 		limiterBps,
 	)
+	if parsed.KeepAlive && keepAliveMS > 0 {
+		respLine += " keep-alive-ms=" + strconv.FormatInt(keepAliveMS, 10)
+	}
+	respLine += "\n"
 	if _, err := io.WriteString(out, respLine); err != nil {
 		return err
 	}

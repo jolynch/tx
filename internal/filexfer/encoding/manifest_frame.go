@@ -225,6 +225,14 @@ func (r *ChunkedManifestReader) readNextFrame() error {
 	if err != nil {
 		return fmt.Errorf("read frame header: %w", err)
 	}
+	// A status line here means the server aborted before (or instead of)
+	// streaming frames — surface its message rather than a frame parse error.
+	if rest, ok := strings.CutPrefix(headerLine, "ERR "); ok {
+		return fmt.Errorf("server error: %s", strings.TrimSpace(rest))
+	}
+	if headerLine == "OK" || strings.HasPrefix(headerLine, "OK ") {
+		return fmt.Errorf("unexpected status line before manifest frame: %q", headerLine)
+	}
 	meta, err := ParseFXHeader(headerLine)
 	if err != nil {
 		return fmt.Errorf("invalid frame header: %w", err)

@@ -43,7 +43,7 @@ func TestHandlePROBERoundTrip(t *testing.T) {
 	payload := bytes.Repeat([]byte{0x5a}, 1024)
 	in := bytes.NewReader(payload)
 	var out bytes.Buffer
-	if err := handlePROBEWithInput(context.Background(), req, in, &out, &probeTestDeps{}, 8, 25, 25, 1*1024*1024); err != nil {
+	if err := handlePROBEWithInput(context.Background(), req, in, &out, &probeTestDeps{}, 8, 25, 25, 1*1024*1024, 0); err != nil {
 		t.Fatalf("handlePROBEWithInput failed: %v", err)
 	}
 
@@ -89,7 +89,7 @@ func TestHandlePROBEDefaultIODepth(t *testing.T) {
 		t.Fatalf("ParseRequest failed: %v", err)
 	}
 	var out bytes.Buffer
-	if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, &probeTestDeps{}, 0, 30, 25, 1*1024*1024); err != nil {
+	if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, &probeTestDeps{}, 0, 30, 25, 1*1024*1024, 0); err != nil {
 		t.Fatalf("handlePROBEWithInput failed: %v", err)
 	}
 	line, err := bufio.NewReader(bytes.NewReader(out.Bytes())).ReadString('\n')
@@ -118,7 +118,7 @@ func TestHandlePROBERejectsShortPayload(t *testing.T) {
 	}
 	in := bytes.NewReader([]byte{1, 2, 3})
 	var out bytes.Buffer
-	err = handlePROBEWithInput(context.Background(), req, in, &out, &probeTestDeps{}, 8, 25, 25, 1*1024*1024)
+	err = handlePROBEWithInput(context.Background(), req, in, &out, &probeTestDeps{}, 8, 25, 25, 1*1024*1024, 0)
 	if err == nil {
 		t.Fatalf("expected payload validation error")
 	}
@@ -134,7 +134,7 @@ func TestHandlePROBEReportsObservedLink(t *testing.T) {
 		reportReturnOK: true,
 	}
 	var out bytes.Buffer
-	if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, deps, 8, 25, 25, 2*1024*1024); err != nil {
+	if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, deps, 8, 25, 25, 2*1024*1024, 0); err != nil {
 		t.Fatalf("handlePROBEWithInput failed: %v", err)
 	}
 	if !deps.reportCalled {
@@ -148,6 +148,62 @@ func TestHandlePROBEReportsObservedLink(t *testing.T) {
 	}
 	if deps.reportEMAAlpha != 0.2 {
 		t.Fatalf("unexpected EMA alpha: %.2f", deps.reportEMAAlpha)
+	}
+}
+
+func TestParsePROBERequestKeepAlive(t *testing.T) {
+	req, err := ParseRequest([]byte(`PROBE cpu=2 probe-bytes=0 cts0=5 keep-alive=auto`))
+	if err != nil {
+		t.Fatalf("ParseRequest failed: %v", err)
+	}
+	parsed, err := parsePROBERequest(req)
+	if err != nil {
+		t.Fatalf("parsePROBERequest failed: %v", err)
+	}
+	if !parsed.KeepAlive {
+		t.Fatalf("expected KeepAlive to be parsed from keep-alive=auto")
+	}
+
+	// Only "auto" is a valid request value; anything else is rejected.
+	req, err = ParseRequest([]byte(`PROBE cpu=2 probe-bytes=0 cts0=5 keep-alive=1`))
+	if err != nil {
+		t.Fatalf("ParseRequest failed: %v", err)
+	}
+	if _, err := parsePROBERequest(req); err == nil {
+		t.Fatalf("expected keep-alive=1 to be rejected")
+	}
+}
+
+func TestHandlePROBEKeepAliveGrant(t *testing.T) {
+	cases := []struct {
+		name        string
+		cmd         string
+		keepAliveMS int64
+		wantToken   bool
+	}{
+		{"requested and enabled", `PROBE cpu=2 probe-bytes=0 cts0=5 keep-alive=auto`, 60000, true},
+		{"requested but disabled", `PROBE cpu=2 probe-bytes=0 cts0=5 keep-alive=auto`, 0, false},
+		{"not requested", `PROBE cpu=2 probe-bytes=0 cts0=5`, 60000, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := ParseRequest([]byte(tc.cmd))
+			if err != nil {
+				t.Fatalf("ParseRequest failed: %v", err)
+			}
+			var out bytes.Buffer
+			if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, &probeTestDeps{}, 8, 25, 25, 1*1024*1024, tc.keepAliveMS); err != nil {
+				t.Fatalf("handlePROBEWithInput failed: %v", err)
+			}
+			line, err := bufio.NewReader(bytes.NewReader(out.Bytes())).ReadString('\n')
+			if err != nil {
+				t.Fatalf("read response line: %v", err)
+			}
+			gotToken := strings.Contains(line, "keep-alive-ms=60000")
+			if gotToken != tc.wantToken {
+				t.Fatalf("keep-alive-ms token presence = %v, want %v (line %q)", gotToken, tc.wantToken, line)
+			}
+		})
 	}
 }
 

@@ -5,8 +5,10 @@ This document defines the TCP file-transfer command protocol implemented by tx.
 ## Transport
 
 - Listener: `-file-listen` (for example `127.0.0.1:3453`)
-- One connection serves at most one command (optionally preceded by `AUTH`)
-- Server closes the connection after command completion (or on error)
+- By default one connection serves one command (optionally preceded by
+  `AUTH`) and the server closes after completion (or on error)
+- A `PROBE` carrying `keep-alive=auto` upgrades its connection to a kept-alive
+  session that serves multiple commands (see [Keep-Alive](#keep-alive))
 
 ## Line Protocol
 
@@ -36,6 +38,39 @@ Maximum command line size is 4 MiB.
 4. Server closes connection.
 
 If `-fs-require-auth=true`, first line must be `AUTH`.
+
+## Keep-Alive
+
+One TCP connection per command pays a fresh handshake (and AUTH, when
+encrypted) per batch and restarts TCP slow-start every time. A client may
+instead request connection reuse via PROBE:
+
+- **Request**: any `PROBE` may carry `keep-alive=auto`.
+- **Grant**: when keep-alive is enabled server-side, the PROBE response line
+  carries `keep-alive-ms=<n>` — the idle window in milliseconds. Old servers
+  ignore the request key and old clients ignore the grant token, so the
+  exchange is backward compatible in both directions.
+- After the grant, the server keeps the connection open after each
+  successful command and reads the next command from it. Encrypted (`AUTH`)
+  sessions carry each command and each response in its own self-delimiting
+  AEAD stream.
+- Any handler error still writes `ERR ...` and closes the connection.
+
+Two guardrails keep silently dead connections from lingering:
+
+1. **Client heartbeats**: clients probe every idle kept-alive connection at
+   one quarter of the granted window (`keep-alive-ms / 4`) with a minimal
+   probe (`PROBE cpu=<n> probe-bytes=0 cts0=<ms> keep-alive=auto`) — a
+   zero-payload round trip that both proves the server end is alive and
+   takes a fresh latency sample. A failed heartbeat evicts the connection
+   from the client's pool, and borrowers additionally peek for a pending
+   EOF before reusing a pooled connection.
+2. **Server idle reaping**: the server closes a kept-alive connection that
+   receives no bytes for the keep-alive window (`--idle-timeout`, default
+   60s; `0` disables keep-alive entirely). Every completed command —
+   heartbeats included — extends the connection by a fresh window, but
+   heartbeats do not count as activity for `--exit-after`, so a lingering
+   idle client cannot block server shutdown.
 
 ## Token Encoding
 
@@ -410,25 +445,33 @@ server's observed link estimate for gentle limiting.
 
 ### Request
 
-`PROBE cpu=<client-cpu> probe-bytes=<n> cts0=<unix-ms> [txferid=<id>] [obs-link-mbps=<int>]`
+`PROBE cpu=<client-cpu> probe-bytes=<n> cts0=<unix-ms> [txferid=<id>] [obs-link-mbps=<int>] [keep-alive=auto]`
 
 - request line is followed by exactly `probe-bytes` raw bytes.
-- `probe-bytes` must be `<= 32 MiB`.
+- `probe-bytes` must be `<= 32 MiB`; `0` is valid and makes the probe a pure
+  latency round trip (the keep-alive heartbeat form).
 - `txferid` is optional and scopes periodic reprobe updates to an existing transfer.
 - `obs-link-mbps` is optional and reports the client's last measured link bandwidth.
   When provided, the server uses it to refresh the per-transfer observed link estimate
   for gentle limiting.
+- `keep-alive=auto` requests server-tuned connection reuse — like `comp` and
+  cipher resolution, the client asks and the server picks the idle window,
+  echoing it via `keep-alive-ms` (see [Keep-Alive](#keep-alive)). `auto` is
+  the only accepted value; others are rejected with `ERR BAD_REQUEST`.
 
 ### Response
 
 - first line:
-  - `PROBE cpu=<server-cpu> cts0=<echo-client-cts0> sts0=<unix-ms> sts1=<unix-ms> probe-bytes=<n> [io-depth=<int>] [wmem=<bytes>] gentle-cpu-pct=<int> gentle-bw-pct=<int> [limiter-bps=<bytes/sec>]`
+  - `PROBE cpu=<server-cpu> cts0=<echo-client-cts0> sts0=<unix-ms> sts1=<unix-ms> probe-bytes=<n> [io-depth=<int>] [wmem=<bytes>] gentle-cpu-pct=<int> gentle-bw-pct=<int> [limiter-bps=<bytes/sec>] [keep-alive-ms=<int>]`
 - then exactly `probe-bytes` raw bytes.
 - terminal status line: `OK` or `ERR ...`.
 - `gentle-cpu-pct` is the server-advertised CPU budget clients use when computing
   gentle suggested concurrency.
 - `gentle-bw-pct` is the server-advertised share of observed link bandwidth used
   to derive gentle transfer rate limits.
+- `keep-alive-ms` is present only when the request carried `keep-alive=auto`
+  and the server granted it; the connection is now a kept-alive session
+  (see [Keep-Alive](#keep-alive)).
 - `PROBE` traffic itself is not rate-limited.
 
 Clients typically run 3 probes, compute a rounded link estimate, choose mode/concurrency, then issue `TXFER` with those required hints.

@@ -3335,3 +3335,319 @@ func removeTokenWithPrefix(s string, prefix string) string {
 	}
 	return strings.Join(kept, " ")
 }
+
+// startRealKeepAliveServer runs the real FTCP Serve loop for keep-alive
+// integration tests and returns its address.
+func startRealKeepAliveServer(t *testing.T, opts intftcp.ServerOptions) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() { _ = intftcp.Serve(ln, opts) }()
+	t.Cleanup(func() { _ = ln.Close() })
+	return ln.Addr().String()
+}
+
+func TestClientKeepAliveSessionConnReuse(t *testing.T) {
+	addr := startRealKeepAliveServer(t, intftcp.ServerOptions{KeepAliveTimeout: 5 * time.Second})
+	c := &Client{FileAddr: addr}
+	ctx := context.Background()
+	conn, err := c.dialTCP(ctx)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	for i := 0; i < 3; i++ {
+		granted, _, err := c.probeKeepAliveSessionConn(conn, tcpAuthState{})
+		if err != nil {
+			t.Fatalf("keep-alive probe %d on same conn failed: %v", i, err)
+		}
+		if !granted {
+			t.Fatalf("keep-alive probe %d: keep-alive not granted", i)
+		}
+	}
+	snap := c.MetricSnapshot()
+	if snap.HeartbeatCount != 0 || snap.LastHeartbeatRTTMillis != 0 {
+		t.Fatalf("warm-up probes changed heartbeat metrics: %+v", snap)
+	}
+	if c.sessionKeepAliveMS() != 5000 {
+		t.Fatalf("expected cached 5000ms grant, got %d", c.sessionKeepAliveMS())
+	}
+}
+
+func TestClientKeepAliveEncryptedSessionReuse(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	addr := startRealKeepAliveServer(t, intftcp.ServerOptions{
+		ServerIdentity:   id,
+		KeepAliveTimeout: 5 * time.Second,
+	})
+	c := &Client{FileAddr: addr, EncryptMode: "auto"}
+	ctx := context.Background()
+	state, err := c.resolveTCPAuthState(ctx)
+	if err != nil {
+		t.Fatalf("resolve auth state: %v", err)
+	}
+	conn, err := c.dialAndAuthWithState(ctx, state)
+	if err != nil {
+		t.Fatalf("dial and auth: %v", err)
+	}
+	defer conn.Close()
+	// Each heartbeat is a fresh AEAD stream in both directions on the same
+	// TCP connection — the core requirement for encrypted keep-alive.
+	for i := 0; i < 3; i++ {
+		granted, _, err := c.probeKeepAliveSessionConn(conn, state)
+		if err != nil {
+			t.Fatalf("encrypted heartbeat %d failed: %v", i, err)
+		}
+		if !granted {
+			t.Fatalf("encrypted heartbeat %d: keep-alive not granted", i)
+		}
+	}
+}
+
+func TestClientScheduledHeartbeatMetrics(t *testing.T) {
+	addr := startRealKeepAliveServer(t, intftcp.ServerOptions{KeepAliveTimeout: 5 * time.Second})
+	c := &Client{FileAddr: addr}
+	conn, err := c.dialTCP(context.Background())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	granted, _, err := c.probeKeepAliveSessionConn(conn, tcpAuthState{})
+	if err != nil {
+		_ = conn.Close()
+		t.Fatalf("warm-up probe: %v", err)
+	}
+	if !granted {
+		_ = conn.Close()
+		t.Fatal("keep-alive not granted")
+	}
+
+	pool := newTCPConnPool(tcpAuthState{}, 1, 5000)
+	defer pool.stop()
+	session := &sessionTCPConn{
+		Conn:       conn,
+		lastActive: time.Now().Add(-time.Second),
+	}
+	if !pool.enqueue(session) {
+		_ = conn.Close()
+		t.Fatal("enqueue session")
+	}
+
+	pool.heartbeatIdleConns(c, 100*time.Millisecond)
+	snap := c.MetricSnapshot()
+	if snap.HeartbeatCount != 1 {
+		t.Fatalf("scheduled heartbeat count = %d, want 1", snap.HeartbeatCount)
+	}
+}
+
+func TestClientScheduledHeartbeatFailureMetrics(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	_ = serverConn.Close()
+
+	c := &Client{}
+	pool := &tcpConnPool{
+		ctx:       context.Background(),
+		target:    0,
+		ready:     make(chan net.Conn, 1),
+		hbSem:     make(chan struct{}, keepAliveHeartbeatConcurrency),
+		authState: tcpAuthState{},
+	}
+	session := &sessionTCPConn{
+		Conn:       clientConn,
+		lastActive: time.Now().Add(-time.Second),
+	}
+	if !pool.enqueue(session) {
+		t.Fatal("enqueue closed session")
+	}
+
+	pool.heartbeatIdleConns(c, 100*time.Millisecond)
+	snap := c.MetricSnapshot()
+	if snap.HeartbeatFailureCount != 1 {
+		t.Fatalf("scheduled heartbeat failures = %d, want 1", snap.HeartbeatFailureCount)
+	}
+	if snap.HeartbeatCount != 0 {
+		t.Fatalf("successful heartbeat count = %d, want 0", snap.HeartbeatCount)
+	}
+}
+
+func TestClientKeepAlivePoolRecycling(t *testing.T) {
+	addr := startRealKeepAliveServer(t, intftcp.ServerOptions{KeepAliveTimeout: 5 * time.Second})
+	c := &Client{FileAddr: addr}
+	defer c.Close()
+	ctx := context.Background()
+
+	if _, err := c.probeTCP(ctx, ProbeRequest{}, 1); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if got := c.sessionKeepAliveMS(); got != 5000 {
+		t.Fatalf("expected probe to cache the 5000ms grant, got %d", got)
+	}
+
+	c.ensureTCPPool(tcpAuthState{}, 2)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		c.tcpPoolMu.Lock()
+		pool := c.tcpPool
+		c.tcpPoolMu.Unlock()
+		if pool != nil && len(pool.ready) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session pool never warmed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := c.listStatusesTCP(ctx, ListStatusesRequest{}); err != nil {
+			t.Fatalf("list statuses %d: %v", i, err)
+		}
+	}
+	snap := c.MetricSnapshot()
+	if snap.ConnectionReuseCount == 0 {
+		t.Fatalf("expected recycled session connections, metrics: %+v", snap)
+	}
+}
+
+func TestHeartbeatIntervalForGrant(t *testing.T) {
+	if got := heartbeatIntervalForGrant(60000); got != 15*time.Second {
+		t.Fatalf("expected 15s for 60s grant, got %v", got)
+	}
+	if got := heartbeatIntervalForGrant(2000); got != 500*time.Millisecond {
+		t.Fatalf("expected 500ms for 2s grant, got %v", got)
+	}
+	if got := heartbeatIntervalForGrant(100); got != minKeepAliveHeartbeatInterval {
+		t.Fatalf("expected floor for tiny grant, got %v", got)
+	}
+}
+
+// warmKeepAlivePool probes for the keep-alive grant, builds a session pool,
+// and waits for at least one warmed connection.
+func warmKeepAlivePool(t *testing.T, c *Client) *tcpConnPool {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := c.probeTCP(ctx, ProbeRequest{}, 1); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	c.ensureTCPPool(tcpAuthState{}, 2)
+	c.tcpPoolMu.Lock()
+	pool := c.tcpPool
+	c.tcpPoolMu.Unlock()
+	deadline := time.Now().Add(3 * time.Second)
+	for pool == nil || len(pool.ready) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("session pool never warmed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return pool
+}
+
+func TestClientKeepAliveEvictsDeadConnsAtBorrow(t *testing.T) {
+	addr := startRealKeepAliveServer(t, intftcp.ServerOptions{KeepAliveTimeout: 5 * time.Second})
+	c := NewClient(addr)
+	defer c.Close()
+	pool := warmKeepAlivePool(t, c)
+
+	// Drain the pool and provoke a server-side ERR + close on every
+	// connection (garbage command), leaving each socket with pending data
+	// and a FIN — the state a borrower must detect and evict.
+	var conns []net.Conn
+	for {
+		conn, ok := pool.borrow()
+		if !ok {
+			break
+		}
+		conns = append(conns, conn)
+	}
+	if len(conns) == 0 {
+		t.Fatalf("expected warmed connections to drain")
+	}
+	for _, conn := range conns {
+		_, _ = conn.Write([]byte("BOGUS\r\n"))
+	}
+	time.Sleep(200 * time.Millisecond)
+	for _, conn := range conns {
+		if !pool.enqueue(conn) {
+			t.Fatalf("re-enqueue failed")
+		}
+	}
+
+	// The next command must still succeed: dead sessions evicted at borrow
+	// time, then the sync-dial fallback kicks in.
+	if _, err := c.listStatusesTCP(context.Background(), ListStatusesRequest{}); err != nil {
+		t.Fatalf("list statuses after poisoning pool: %v", err)
+	}
+}
+
+func TestClientKeepAliveMetadataRecycling(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	addr := startRealKeepAliveServer(t, intftcp.ServerOptions{KeepAliveTimeout: 5 * time.Second})
+	c := NewClient(addr)
+	defer c.Close()
+	warmKeepAlivePool(t, c)
+	ctx := context.Background()
+
+	mresp, err := c.GetManifest(ctx, GetManifestRequest{Directory: dir, Mode: "fast", LinkMbps: 100, Concurrency: 2})
+	if err != nil {
+		t.Fatalf("manifest: %v", err)
+	}
+	before := c.MetricSnapshot().ConnectionReuseCount
+	meta, err := c.GetEntryMetadata(ctx, mresp.Manifest.TransferID, map[uint64]string{0: dir})
+	if err != nil {
+		t.Fatalf("entry metadata: %v", err)
+	}
+	if len(meta) != 1 {
+		t.Fatalf("expected 1 metadata entry, got %d", len(meta))
+	}
+	after := c.MetricSnapshot().ConnectionReuseCount
+	if after <= before {
+		t.Fatalf("expected GetEntryMetadata to recycle its connection: before=%d after=%d", before, after)
+	}
+}
+
+// reuseMarkerCloser records whether the stream layer marked the underlying
+// connection reusable.
+type reuseMarkerCloser struct{ marked bool }
+
+func (m *reuseMarkerCloser) Close() error  { return nil }
+func (m *reuseMarkerCloser) markReusable() { m.marked = true }
+
+func TestFileStreamRecyclesOnlyAfterTerminalOK(t *testing.T) {
+	frame := "FX/1 5 offset=0 size=3 wsize=3 comp=none ts=1\n" + "abc" + "FXT/1 5 status=ok ts=1 next=0\n"
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"terminal OK", frame + "OK\r\n", true},
+		{"bare EOF without status", frame, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewClient("127.0.0.1:1")
+			marker := &reuseMarkerCloser{}
+			respBody := &readerWithCloser{Reader: strings.NewReader(tc.body), Closer: marker}
+			stream, _, err := c.newFileStream(respBody, "", 3)
+			if err != nil {
+				t.Fatalf("newFileStream: %v", err)
+			}
+			if _, err := io.ReadAll(stream); err != nil {
+				t.Fatalf("read stream: %v", err)
+			}
+			if err := stream.Close(); err != nil {
+				t.Fatalf("close stream: %v", err)
+			}
+			if marker.marked != tc.want {
+				t.Fatalf("marked=%v, want %v", marker.marked, tc.want)
+			}
+		})
+	}
+}

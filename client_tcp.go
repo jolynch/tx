@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"filippo.io/age"
@@ -22,9 +23,32 @@ import (
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	ftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	intlimit "github.com/jolynch/tx/internal/filexfer/limit"
+	"golang.org/x/sys/unix"
 )
 
 const maxTCPLineBytes = 4 * 1024 * 1024
+
+const (
+	// minKeepAliveHeartbeatInterval floors the heartbeat cadence so tiny
+	// server grants cannot busy-loop the pool.
+	minKeepAliveHeartbeatInterval = 100 * time.Millisecond
+	// keepAliveHeartbeatTimeout bounds one heartbeat round trip.
+	keepAliveHeartbeatTimeout = 5 * time.Second
+	// keepAliveHeartbeatConcurrency caps concurrent heartbeat probes so a
+	// tick never drains the whole pool at once.
+	keepAliveHeartbeatConcurrency = 16
+)
+
+// heartbeatIntervalForGrant returns how often idle session connections are
+// probed: one quarter of the server's granted idle window, so a healthy
+// connection is always refreshed well before the server-side reaper fires.
+func heartbeatIntervalForGrant(grantMS int64) time.Duration {
+	interval := time.Duration(grantMS) * time.Millisecond / 4
+	if interval < minKeepAliveHeartbeatInterval {
+		return minKeepAliveHeartbeatInterval
+	}
+	return interval
+}
 
 type tcpAuthState struct {
 	publicKey      string // client's age public key
@@ -47,6 +71,7 @@ type probeResponse struct {
 	ProbeBytes      int64
 	ServerWmemBytes int64
 	LimiterBps      int64
+	KeepAliveMS     int64
 }
 
 type tcpConnPool struct {
@@ -56,8 +81,28 @@ type tcpConnPool struct {
 	target    int
 	ready     chan net.Conn
 
+	// sessionMS is the server's keep-alive grant in milliseconds when the
+	// pool warms reusable session connections; zero selects legacy
+	// single-use warm connections.
+	sessionMS atomic.Int64
 	refilling atomic.Int64
 	stopped   atomic.Bool
+
+	// hbSem bounds concurrent heartbeat probes; pool-lifetime so ticks don't
+	// reallocate it.
+	hbSem chan struct{}
+}
+
+// sessionTCPConn marks a pooled connection that negotiated keep-alive via
+// PROBE. Only session connections are recycled back into the pool; sync
+// fallback dials stay single-use because the server closes them after one
+// command.
+type sessionTCPConn struct {
+	net.Conn
+	// lastActive is touched whenever the connection completes a command or
+	// heartbeat. Owned by whichever goroutine currently holds the
+	// connection (it is never in the ready channel at the same time).
+	lastActive time.Time
 }
 
 type managedTCPConnCloser struct {
@@ -65,10 +110,24 @@ type managedTCPConnCloser struct {
 	conn   net.Conn
 	pool   *tcpConnPool
 
-	once sync.Once
-	err  error
+	reusable atomic.Bool
+	once     sync.Once
+	err      error
 }
 
+func (c *managedTCPConnCloser) markReusable() {
+	if c == nil {
+		return
+	}
+	c.reusable.Store(true)
+}
+
+// contextManagedTCPReadCloser wraps a managed connection read-closer with
+// context-cancellation cleanup (stopWatch) for streaming reads (CXSUM). It
+// deliberately never marks the underlying connection reusable: a CXSUM stream
+// may be cancelled mid-response by the verifier's context, leaving the
+// connection at an indeterminate boundary, so on Close the connection is
+// always released (single-use) rather than recycled into the keep-alive pool.
 type contextManagedTCPReadCloser struct {
 	io.ReadCloser
 	stopWatch func()
@@ -82,7 +141,11 @@ func (c *managedTCPConnCloser) Close() error {
 		return nil
 	}
 	c.once.Do(func() {
-		c.err = c.client.releaseManagedTCPConn(c.conn, c.pool)
+		if c.reusable.Load() {
+			c.err = c.client.recycleManagedTCPConn(c.conn, c.pool)
+		} else {
+			c.err = c.client.releaseManagedTCPConn(c.conn, c.pool)
+		}
 	})
 	return c.err
 }
@@ -110,18 +173,21 @@ func warmTCPPoolTarget(suggestedConcurrency int) int {
 	return max(1, (suggestedConcurrency*5+3)/4)
 }
 
-func newTCPConnPool(state tcpAuthState, target int) *tcpConnPool {
+func newTCPConnPool(state tcpAuthState, target int, sessionMS int64) *tcpConnPool {
 	if target <= 0 {
 		return nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &tcpConnPool{
+	p := &tcpConnPool{
 		ctx:       ctx,
 		cancel:    cancel,
 		authState: state,
 		target:    target,
 		ready:     make(chan net.Conn, target),
+		hbSem:     make(chan struct{}, keepAliveHeartbeatConcurrency),
 	}
+	p.sessionMS.Store(sessionMS)
+	return p
 }
 
 func (p *tcpConnPool) borrow() (net.Conn, bool) {
@@ -212,9 +278,132 @@ func (c *Client) fillTCPPoolConn(pool *tcpConnPool, ctx context.Context, state t
 	if err != nil {
 		return
 	}
+	if pool.sessionMS.Load() > 0 {
+		granted, _, probeErr := c.probeKeepAliveSessionConn(conn, state)
+		if probeErr != nil {
+			_ = conn.Close()
+			return
+		}
+		if !granted {
+			// The server stopped granting keep-alive (e.g. restarted with
+			// it disabled) and will close this connection after the probe;
+			// fall back to single-use warm connections.
+			pool.sessionMS.Store(0)
+			_ = conn.Close()
+			return
+		}
+		conn = &sessionTCPConn{Conn: conn, lastActive: time.Now()}
+	}
 	if !pool.enqueue(conn) {
 		_ = conn.Close()
 	}
+}
+
+// startHeartbeats launches the pool's keep-alive loop: idle pooled session
+// connections get a zero-payload PROBE round trip at least once per
+// interval, so a silently dead connection is evicted here instead of
+// failing a borrower mid-transfer.
+func (p *tcpConnPool) startHeartbeats(c *Client) {
+	if p == nil || p.sessionMS.Load() <= 0 {
+		return
+	}
+	interval := heartbeatIntervalForGrant(p.sessionMS.Load())
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-ticker.C:
+				p.heartbeatIdleConns(c, interval)
+			}
+		}
+	}()
+}
+
+// heartbeatIdleConns is only ever called from the single ticker goroutine in
+// startHeartbeats, serially, and it wg.Wait()s for all probe goroutines (each
+// of which releases its p.hbSem slot) before returning — so p.hbSem is fully
+// drained at the start of every tick, making pool-lifetime reuse safe.
+func (p *tcpConnPool) heartbeatIdleConns(c *Client, interval time.Duration) {
+	n := len(p.ready)
+	if n == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	// Each tick momentarily borrows all ready connections to check lastActive
+	// and re-enqueues those that don't need probing, briefly draining the
+	// pool — acceptable because a concurrent borrower racing the tick simply
+	// falls through to the sync-dial fallback.
+	for i := 0; i < n; i++ {
+		conn, ok := p.borrow()
+		if !ok {
+			break
+		}
+		sc, isSession := conn.(*sessionTCPConn)
+		if !isSession || time.Since(sc.lastActive) < interval {
+			// Legacy warm connection, or one that just carried traffic —
+			// no probe needed this tick.
+			if !p.enqueue(conn) {
+				_ = conn.Close()
+			}
+			continue
+		}
+		wg.Add(1)
+		p.hbSem <- struct{}{}
+		go func(sc *sessionTCPConn) {
+			defer wg.Done()
+			defer func() { <-p.hbSem }()
+			_, rttMillis, err := c.probeKeepAliveSessionConn(sc, p.authState)
+			if err != nil {
+				c.clientMetrics.IncHeartbeatFailure()
+				_ = sc.Close()
+				p.triggerRefill(c)
+				return
+			}
+			c.clientMetrics.ObserveHeartbeat(rttMillis)
+			sc.lastActive = time.Now()
+			if !p.enqueue(sc) {
+				_ = sc.Close()
+			}
+		}(sc)
+	}
+	wg.Wait()
+}
+
+// probeKeepAliveSessionConn sends a zero-payload keep-alive PROBE on conn and
+// reads the full response. Callers decide whether the probe is pool warm-up
+// negotiation or a scheduled heartbeat and record metrics accordingly.
+func (c *Client) probeKeepAliveSessionConn(conn net.Conn, state tcpAuthState) (bool, int64, error) {
+	_ = conn.SetDeadline(time.Now().Add(keepAliveHeartbeatTimeout))
+	defer func() { _ = conn.SetDeadline(time.Time{}) }()
+	start := time.Now()
+	cmd := fmt.Sprintf("PROBE cpu=%d probe-bytes=0 cts0=%d keep-alive=auto", runtime.NumCPU(), start.UnixMilli())
+	br, err := c.sendAndReadTCP(conn, state, cmd)
+	if err != nil {
+		return false, 0, err
+	}
+	line, err := readTCPLine(br, maxTCPLineBytes)
+	if err != nil {
+		return false, 0, err
+	}
+	if err := parseErrControlFrame(line); err != nil {
+		return false, 0, err
+	}
+	resp, err := parseProbeResponseLine(line)
+	if err != nil {
+		return false, 0, err
+	}
+	if _, err := readTCPStatus(br); err != nil {
+		return false, 0, err
+	}
+	rttMillis := time.Since(start).Milliseconds()
+	if resp.KeepAliveMS > 0 {
+		c.keepAliveMS.Store(resp.KeepAliveMS)
+		return true, rttMillis, nil
+	}
+	return false, rttMillis, nil
 }
 
 func (c *Client) ensureTCPPool(state tcpAuthState, suggestedConcurrency int) int {
@@ -228,11 +417,21 @@ func (c *Client) ensureTCPPool(state tcpAuthState, suggestedConcurrency int) int
 		c.tcpPoolMu.Unlock()
 		return target
 	}
-	pool := newTCPConnPool(state, target)
+	pool := newTCPConnPool(state, target, c.sessionKeepAliveMS())
 	c.tcpPool = pool
 	c.tcpPoolMu.Unlock()
+	pool.startHeartbeats(c)
 	pool.triggerRefill(c)
 	return target
+}
+
+// sessionKeepAliveMS returns the cached server keep-alive grant, or zero
+// when reuse is disabled or no probe has observed support yet.
+func (c *Client) sessionKeepAliveMS() int64 {
+	if c == nil || c.DisableKeepAlive {
+		return 0
+	}
+	return c.keepAliveMS.Load()
 }
 
 func (c *Client) acquireManagedTCPConn(ctx context.Context) (net.Conn, tcpAuthState, *tcpConnPool, error) {
@@ -240,8 +439,19 @@ func (c *Client) acquireManagedTCPConn(ctx context.Context) (net.Conn, tcpAuthSt
 	pool := c.tcpPool
 	c.tcpPoolMu.Unlock()
 	if pool != nil {
-		if conn, ok := pool.borrow(); ok {
-			return conn, pool.authState, pool, nil
+		for {
+			conn, ok := pool.borrow()
+			if !ok {
+				break
+			}
+			sc, isSession := conn.(*sessionTCPConn)
+			if !isSession || sessionConnAlive(sc) {
+				return conn, pool.authState, pool, nil
+			}
+			// Dead session (e.g. server restarted since the last
+			// heartbeat) — evict and try the next pooled connection.
+			_ = sc.Close()
+			pool.triggerRefill(c)
 		}
 		c.clientMetrics.IncSyncConnectionFallback()
 		conn, err := c.dialAndAuthWithState(ctx, pool.authState)
@@ -269,6 +479,64 @@ func (c *Client) releaseManagedTCPConn(conn net.Conn, pool *tcpConnPool) error {
 		pool.triggerRefill(c)
 	}
 	return err
+}
+
+// sessionConnAlive does a non-blocking peek on an idle session connection: a
+// healthy idle connection has nothing to read (EAGAIN), a server-closed one
+// has a pending EOF/RST, and pending data means protocol desync. This closes
+// the borrow-time race where the server went away after the last heartbeat.
+func sessionConnAlive(sc *sessionTCPConn) bool {
+	syscallConn, ok := sc.Conn.(syscall.Conn)
+	if !ok {
+		// Cannot peek this transport (custom dialer); assume alive rather
+		// than evicting every pooled connection.
+		return true
+	}
+	raw, err := syscallConn.SyscallConn()
+	if err != nil {
+		return true
+	}
+	alive := true
+	// The closure runs synchronously inside raw.Read before this function
+	// returns, so capturing the stack array by reference keeps the peek
+	// buffer off-heap on this per-borrow hot path.
+	var peek [1]byte
+	ctrlErr := raw.Read(func(fd uintptr) bool {
+		_, _, recvErr := unix.Recvfrom(int(fd), peek[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
+		alive = recvErr == unix.EAGAIN || recvErr == unix.EWOULDBLOCK
+		return true // never block waiting for readability
+	})
+	if ctrlErr != nil {
+		return true
+	}
+	return alive
+}
+
+// recycleManagedTCPConn returns a session connection to the pool for reuse;
+// non-session connections (sync fallback dials, legacy warm connections)
+// close as before. Callers must only recycle a connection whose response was
+// consumed through its terminal status line.
+func (c *Client) recycleManagedTCPConn(conn net.Conn, pool *tcpConnPool) error {
+	sc, ok := conn.(*sessionTCPConn)
+	if !ok || pool == nil {
+		return c.releaseManagedTCPConn(conn, pool)
+	}
+	sc.lastActive = time.Now()
+	if !pool.enqueue(sc) {
+		return c.releaseManagedTCPConn(conn, pool)
+	}
+	c.clientMetrics.IncConnectionReuse()
+	return nil
+}
+
+// finishManagedTCPConn recycles conn into the pool when the response was
+// cleanly consumed, otherwise closes it.
+func (c *Client) finishManagedTCPConn(conn net.Conn, pool *tcpConnPool, clean bool) {
+	if clean {
+		_ = c.recycleManagedTCPConn(conn, pool)
+		return
+	}
+	_ = c.releaseManagedTCPConn(conn, pool)
 }
 
 func (c *Client) newManagedTCPReadCloser(reader io.Reader, conn net.Conn, pool *tcpConnPool) io.ReadCloser {
@@ -546,23 +814,35 @@ func aeadOptionsForMode(mode string) aead.Options {
 	}
 }
 
-func (c *Client) sendTCPCommand(conn net.Conn, state tcpAuthState, payload string) error {
+// newTCPRequestWriter returns a writer for one outbound command plus a close
+// function that finalizes it. Encrypted sessions get a fresh AEAD stream per
+// command (each command self-delimiting on a kept-alive connection); plain
+// sessions write straight to the conn. Mirrors the server's newResponseWriter.
+func (c *Client) newTCPRequestWriter(conn net.Conn, state tcpAuthState) (io.Writer, func() error, error) {
 	if !state.hasAuth {
-		return writeTCPLine(conn, payload)
+		return conn, func() error { return nil }, nil
 	}
 	recipient, err := age.ParseX25519Recipient(state.serverKey)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	ew, err := aead.Encrypt(conn, recipient, aeadOptionsForMode(state.encMode))
 	if err != nil {
+		return nil, nil, err
+	}
+	return ew, ew.Close, nil
+}
+
+func (c *Client) sendTCPCommand(conn net.Conn, state tcpAuthState, payload string) error {
+	w, closeRequest, err := c.newTCPRequestWriter(conn, state)
+	if err != nil {
 		return err
 	}
-	if err := writeTCPLine(ew, payload); err != nil {
-		_ = ew.Close()
+	if err := writeTCPLine(w, payload); err != nil {
+		_ = closeRequest()
 		return err
 	}
-	return ew.Close()
+	return closeRequest()
 }
 
 func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Reader, error) {
@@ -624,7 +904,8 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 	if err != nil {
 		return GetManifestResponse{}, err
 	}
-	defer func() { _ = c.releaseManagedTCPConn(conn, pool) }()
+	clean := false
+	defer func() { c.finishManagedTCPConn(conn, pool, clean) }()
 
 	comp := request.Comp
 	if comp == "" {
@@ -683,6 +964,7 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 		}
 		return GetManifestResponse{}, fmt.Errorf("unexpected TXFER terminator: %q", statusLine)
 	}
+	clean = true
 	manifest, err := parseManifest(raw)
 	if err != nil {
 		return GetManifestResponse{}, err
@@ -695,7 +977,8 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 	if err != nil {
 		return SyncManifestResponse{}, err
 	}
-	defer func() { _ = c.releaseManagedTCPConn(conn, pool) }()
+	clean := false
+	defer func() { c.finishManagedTCPConn(conn, pool, clean) }()
 
 	comp := request.Comp
 	if comp == "" {
@@ -715,7 +998,16 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 	if cacheMap != "" && cacheMap != "none" {
 		cmd += " cache-map=" + cacheMap
 	}
-	if err := c.sendTCPCommand(conn, state, cmd); err != nil {
+	// The command line and the framed manifest body must travel in the same
+	// AEAD stream on encrypted sessions (the server reads both through one
+	// per-command decrypt reader), mirroring how sendTCPProbe carries the
+	// probe payload.
+	requestDst, closeRequest, err := c.newTCPRequestWriter(conn, state)
+	if err != nil {
+		return SyncManifestResponse{}, err
+	}
+	if err := writeTCPLine(requestDst, cmd); err != nil {
+		_ = closeRequest()
 		return SyncManifestResponse{}, fmt.Errorf("send SYNC: %w", err)
 	}
 
@@ -723,14 +1015,20 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 	// response framing so the server can validate the body chunk-by-chunk.
 	oldManifestBytes, err := marshalManifest(request.OldManifest)
 	if err != nil {
+		_ = closeRequest()
 		return SyncManifestResponse{}, fmt.Errorf("marshal old manifest: %w", err)
 	}
-	requestWriter := intencoding.NewChunkedManifestWriter(conn, comp, intencoding.DefaultManifestChunkSize, intencoding.DefaultManifestFlushInterval)
+	requestWriter := intencoding.NewChunkedManifestWriter(requestDst, comp, intencoding.DefaultManifestChunkSize, intencoding.DefaultManifestFlushInterval)
 	if _, err := requestWriter.Write(oldManifestBytes); err != nil {
+		_ = closeRequest()
 		return SyncManifestResponse{}, fmt.Errorf("write old manifest: %w", err)
 	}
 	if err := requestWriter.Close(); err != nil {
+		_ = closeRequest()
 		return SyncManifestResponse{}, fmt.Errorf("flush old manifest frames: %w", err)
+	}
+	if err := closeRequest(); err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("finalize SYNC request stream: %w", err)
 	}
 
 	// Build ID→path index from the old manifest so we can resolve RM fileIDs.
@@ -789,6 +1087,7 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 		}
 		return SyncManifestResponse{}, fmt.Errorf("unexpected SYNC terminator: %q", statusLine)
 	}
+	clean = true
 
 	manifest, parseErr := parseManifest(manifestBuf.Bytes())
 	if parseErr != nil {
@@ -798,71 +1097,6 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 		Manifest:     manifest,
 		RemovedPaths: rmPaths,
 	}, nil
-}
-
-func (c *Client) fetchFileWindowTCP(
-	ctx context.Context,
-	txferID string,
-	fileID uint64,
-	fullPath string,
-	offset int64,
-	size int64,
-) (io.ReadCloser, *FileFrameMeta, error) {
-	if txferID == "" {
-		return nil, nil, errors.New("missing transfer id")
-	}
-	if fullPath == "" {
-		return nil, nil, errors.New("missing full path")
-	}
-	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	effectiveSize := size
-	if effectiveSize < 0 {
-		effectiveSize = 0
-	}
-	loadStrategy := normalizeLoadStrategy(c.LoadStrategy)
-	var cmd strings.Builder
-	cmd.WriteString("SEND ")
-	cmd.WriteString(txferID)
-	cmd.WriteString(" fd=")
-	cmd.WriteString(strconv.FormatUint(fileID, 10))
-	cmd.WriteString(" ")
-	cmd.WriteString(makeLenToken(fullPath))
-	cmd.WriteString(" mode=")
-	cmd.WriteString(loadStrategy)
-	if offset != 0 {
-		cmd.WriteString(" offset=")
-		cmd.WriteString(strconv.FormatInt(offset, 10))
-	}
-	if effectiveSize > 0 {
-		cmd.WriteString(" size=")
-		cmd.WriteString(strconv.FormatInt(effectiveSize, 10))
-	}
-	br, err := c.sendAndReadTCP(conn, state, cmd.String())
-	if err != nil {
-		_ = c.releaseManagedTCPConn(conn, pool)
-		return nil, nil, fmt.Errorf("SEND: %w", err)
-	}
-	firstLine, err := readSENDFirstLine(br)
-	if err != nil {
-		_ = c.releaseManagedTCPConn(conn, pool)
-		return nil, nil, err
-	}
-
-	prefixed := io.MultiReader(strings.NewReader(firstLine), br)
-	stream, meta, streamErr := c.newFileStream(c.newManagedTCPReadCloser(prefixed, conn, pool), "", effectiveSize)
-	if streamErr != nil {
-		_ = c.releaseManagedTCPConn(conn, pool)
-		return nil, nil, streamErr
-	}
-	if meta.FileID != fileID {
-		_ = stream.Close()
-		return nil, nil, fmt.Errorf("file id mismatch: expected %d got %d", fileID, meta.FileID)
-	}
-	return stream, meta, nil
 }
 
 func (c *Client) fetchFileBatchTCP(
@@ -983,6 +1217,9 @@ func (c *Client) probeTCP(ctx context.Context, req ProbeRequest, probeBytes int6
 	cts0 := time.Now().UnixMilli()
 	localCPU := runtime.NumCPU()
 	cmd := fmt.Sprintf("PROBE cpu=%d probe-bytes=%d cts0=%d", localCPU, probeBytes, cts0)
+	if !c.DisableKeepAlive {
+		cmd += " keep-alive=auto"
+	}
 	if txferID := strings.TrimSpace(req.TransferID); txferID != "" {
 		cmd += " txferid=" + txferID
 		if req.ObservedLinkMbps > 0 {
@@ -1023,34 +1260,26 @@ func (c *Client) probeTCP(ctx context.Context, req ProbeRequest, probeBytes int6
 	if probeResp.CTS1 == 0 {
 		probeResp.CTS1 = time.Now().UnixMilli()
 	}
+	if probeResp.KeepAliveMS > 0 {
+		c.keepAliveMS.Store(probeResp.KeepAliveMS)
+	}
 	return probeResp, nil
 }
 
 func (c *Client) sendTCPProbe(conn net.Conn, state tcpAuthState, cmd string, probeBytes int64) error {
-	if !state.hasAuth {
-		if err := writeTCPLine(conn, cmd); err != nil {
-			return err
-		}
-		_, err := io.CopyN(conn, rand.Reader, probeBytes)
-		return err
-	}
-	recipient, err := age.ParseX25519Recipient(state.serverKey)
+	w, closeRequest, err := c.newTCPRequestWriter(conn, state)
 	if err != nil {
 		return err
 	}
-	ew, err := aead.Encrypt(conn, recipient, aeadOptionsForMode(state.encMode))
-	if err != nil {
+	if err := writeTCPLine(w, cmd); err != nil {
+		_ = closeRequest()
 		return err
 	}
-	if err := writeTCPLine(ew, cmd); err != nil {
-		_ = ew.Close()
+	if _, err := io.CopyN(w, rand.Reader, probeBytes); err != nil {
+		_ = closeRequest()
 		return err
 	}
-	if _, err := io.CopyN(ew, rand.Reader, probeBytes); err != nil {
-		_ = ew.Close()
-		return err
-	}
-	return ew.Close()
+	return closeRequest()
 }
 
 type firstReadTimestampReader struct {
@@ -1118,6 +1347,10 @@ func parseProbeResponseLine(line string) (probeResponse, error) {
 	if limiterBps < 0 {
 		limiterBps = 0
 	}
+	keepAliveMS, _ := strconv.ParseInt(strings.TrimSpace(p["keep-alive-ms"]), 10, 64)
+	if keepAliveMS < 0 {
+		keepAliveMS = 0
+	}
 	return probeResponse{
 		ServerCPU:       serverCPU,
 		ServerIODepth:   ioDepth,
@@ -1129,6 +1362,7 @@ func parseProbeResponseLine(line string) (probeResponse, error) {
 		ProbeBytes:      probeBytes,
 		ServerWmemBytes: wmemBytes,
 		LimiterBps:      limiterBps,
+		KeepAliveMS:     keepAliveMS,
 	}, nil
 }
 
@@ -1150,7 +1384,8 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 	if err != nil {
 		return AcknowledgeFileProgressResponse{}, err
 	}
-	defer func() { _ = c.releaseManagedTCPConn(conn, pool) }()
+	clean := false
+	defer func() { c.finishManagedTCPConn(conn, pool, clean) }()
 
 	var cmd strings.Builder
 	cmd.WriteString("ACK ")
@@ -1182,6 +1417,7 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 	if _, err := readTCPStatus(br); err != nil {
 		return AcknowledgeFileProgressResponse{}, fmt.Errorf("read ACK response: %w", err)
 	}
+	clean = true
 	return AcknowledgeFileProgressResponse{}, nil
 }
 
@@ -1190,7 +1426,8 @@ func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (Ge
 	if err != nil {
 		return GetStatusResponse{}, err
 	}
-	defer func() { _ = c.releaseManagedTCPConn(conn, pool) }()
+	clean := false
+	defer func() { c.finishManagedTCPConn(conn, pool, clean) }()
 
 	br, err := c.sendAndReadTCP(conn, state, "STATUS "+request.TransferID)
 	if err != nil {
@@ -1200,6 +1437,7 @@ func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (Ge
 	if err != nil {
 		return GetStatusResponse{}, fmt.Errorf("read STATUS response: %w", err)
 	}
+	clean = true
 	if strings.TrimSpace(message) == "" {
 		return GetStatusResponse{}, errors.New("missing STATUS JSON payload")
 	}
@@ -1215,7 +1453,8 @@ func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesReques
 	if err != nil {
 		return ListStatusesResponse{}, err
 	}
-	defer func() { _ = c.releaseManagedTCPConn(conn, pool) }()
+	clean := false
+	defer func() { c.finishManagedTCPConn(conn, pool, clean) }()
 
 	br, err := c.sendAndReadTCP(conn, state, "STATUS")
 	if err != nil {
@@ -1241,6 +1480,7 @@ func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesReques
 		}
 		statuses = append(statuses, s)
 	}
+	clean = true
 	return ListStatusesResponse{Statuses: statuses}, nil
 }
 

@@ -482,9 +482,6 @@ func canZeroCopy(args frameStreamArgs) bool {
 }
 
 func extractTCPConn(w io.Writer) *net.TCPConn {
-	if cw, ok := w.(*countingWriter); ok {
-		w = cw.w
-	}
 	if tc, ok := w.(*net.TCPConn); ok {
 		return tc
 	}

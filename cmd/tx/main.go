@@ -141,6 +141,7 @@ func runSendTreeCLI(args []string, _ io.Writer, stderr io.Writer) int {
 		disableZeroCopy   bool
 		traceFile         string
 		exitAfterRaw      string
+		idleTimeoutRaw    string
 		progressPaths     []string
 		progressFormats   []string
 		progressIntervalR string
@@ -157,6 +158,7 @@ func runSendTreeCLI(args []string, _ io.Writer, stderr io.Writer) int {
 	cf.IntVar(&targetIODepth, "", "target-io-depth", 4, "Target IO depth per CPU advertised in PROBE")
 	cf.BoolVar(&disableZeroCopy, "", "disable-zero-copy", false, "Force buffered send path (for benchmarking)")
 	cf.StringVar(&exitAfterRaw, "", "exit-after", "60s", "Exit duration after transfer completes; 'never' to run forever (e.g. 5s, 1m)")
+	cf.StringVar(&idleTimeoutRaw, "", "idle-timeout", "60s", "Close kept-alive connections idle for this duration; 0 disables keep-alive (e.g. 10s, 1m)")
 	cf.StringVar(&traceFile, "", "trace", "", "Write runtime/trace output to this file")
 	cf.StringSliceVar(&progressPaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
 	cf.StringSliceVar(&progressFormats, "f", "progress-format", "Progress format: json|int; 1 applies to all targets, or one per target (default json)")
@@ -208,6 +210,15 @@ func runSendTreeCLI(args []string, _ io.Writer, stderr io.Writer) int {
 		exitAfter, parseErr = time.ParseDuration(exitAfterRaw)
 		if parseErr != nil {
 			log.Fatalf("Invalid --exit-after: %v", parseErr)
+		}
+	}
+
+	var idleTimeout time.Duration
+	if idleTimeoutRaw != "0" {
+		var parseErr error
+		idleTimeout, parseErr = time.ParseDuration(idleTimeoutRaw)
+		if parseErr != nil || idleTimeout < 0 {
+			log.Fatalf("Invalid --idle-timeout: %v", parseErr)
 		}
 	}
 
@@ -301,6 +312,7 @@ func runSendTreeCLI(args []string, _ io.Writer, stderr io.Writer) int {
 		DisableZeroCopy:        disableZeroCopy,
 		TargetIODepth:          targetIODepth,
 		ExitAfter:              exitAfter,
+		KeepAliveTimeout:       idleTimeout,
 	}); serveErr != nil {
 		log.Fatalf("File transfer listener stopped: %v", serveErr)
 	}

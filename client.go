@@ -176,6 +176,7 @@ type Client struct {
 	ClientAgeIdentity       string
 	EncryptMode             string   // "auto", "aes", or "chacha20" — selects post-AUTH stream cipher
 	ClientAuthTokens        []string // tokens presented in the encrypted AUTH blob
+	DisableKeepAlive        bool     // opt out of PROBE keep-alive connection reuse
 
 	// Context dialer allows clients to setup custom connections
 	// For example injecting TLS
@@ -199,6 +200,11 @@ type Client struct {
 	// clientMetrics owns all counters for this client. Mutate via its methods
 	// (e.g. IncSyncConnectionFallback) and read via MetricSnapshot.
 	clientMetrics metrics.ClientMetrics
+
+	// keepAliveMS caches the server's keep-alive grant (keep-alive-ms from a
+	// PROBE response). Zero until a probe observes support; pools created
+	// after that point warm keep-alive session connections.
+	keepAliveMS atomic.Int64
 }
 
 type Manifest struct {
@@ -932,6 +938,7 @@ func (c *Client) GetEntryMetadata(ctx context.Context, transferID string, pathsB
 	if _, ok := parseOKStatusLine(statusLine); !ok {
 		return nil, fmt.Errorf("unexpected metadata terminal status: %s", strings.TrimSpace(statusLine))
 	}
+	markStreamReusable(stream)
 	return results, nil
 }
 
@@ -1382,6 +1389,7 @@ func (c *Client) downloadManifestGroupSequential(
 		if _, ok := parseOKStatusLine(statusLine); !ok {
 			return nil, nil, nil, fmt.Errorf("unexpected batch terminal response: %s", statusLine)
 		}
+		markStreamReusable(stream)
 	}
 
 	return results, pendingAcks, ackProgresses, nil
@@ -2652,8 +2660,12 @@ func (c *Client) releaseScratchBuffer(buf *bytes.Buffer) {
 }
 
 func (c *Client) acquireLineReader(r io.Reader) *bufio.Reader {
-	raw := c.lineReaderPool.Get()
-	br := raw.(*bufio.Reader)
+	// The pool's New is installed by NewClient; guard for zero-value
+	// Clients constructed as struct literals.
+	br, ok := c.lineReaderPool.Get().(*bufio.Reader)
+	if !ok {
+		return bufio.NewReaderSize(r, defaultClientLineReaderBytes)
+	}
 	br.Reset(r)
 	return br
 }
@@ -2910,14 +2922,39 @@ type fileStream struct {
 
 	pendingErr error
 	finished   bool
-	closed     bool
-	pending    *FileFrameMeta
-	releaseBr  func()
+	// sawTerminalOK is set only when the stream ended with a parsed terminal
+	// OK status line. A bare EOF (server closed without terminal status) also
+	// finishes the stream but must not recycle the connection.
+	sawTerminalOK bool
+	closed        bool
+	pending       *FileFrameMeta
+	releaseBr     func()
 }
 
 type readerWithCloser struct {
 	io.Reader
 	io.Closer
+}
+
+// connReuseMarker is implemented by closers that can return their connection
+// to the keep-alive pool instead of closing it. Callers mark a stream
+// reusable only once the response has been consumed through its terminal
+// status line, so the connection is provably at a command boundary.
+type connReuseMarker interface {
+	markReusable()
+}
+
+func (r *readerWithCloser) markReusable() {
+	if m, ok := r.Closer.(connReuseMarker); ok {
+		m.markReusable()
+	}
+}
+
+// markStreamReusable flags rc for pool recycling if its closer supports it.
+func markStreamReusable(rc io.Closer) {
+	if m, ok := rc.(connReuseMarker); ok {
+		m.markReusable()
+	}
 }
 
 type frameLineReader interface {
@@ -3104,6 +3141,11 @@ func (s *fileStream) Close() error {
 	if !s.finished {
 		_, _ = io.Copy(io.Discard, s)
 	}
+	if s.sawTerminalOK {
+		// Stream consumed through the terminal OK line — the underlying
+		// connection is at a command boundary and safe to recycle.
+		markStreamReusable(s.respBody)
+	}
 	logicalErr := error(nil)
 	if s.logical != nil {
 		logicalErr = s.logical.Close()
@@ -3144,6 +3186,7 @@ func (s *fileStream) openNextFrame() error {
 				return err
 			}
 			if _, ok := parseOKStatusLine(trimmedHeader); ok {
+				s.sawTerminalOK = true
 				return io.EOF
 			}
 			return errors.New("unexpected terminal status line")
