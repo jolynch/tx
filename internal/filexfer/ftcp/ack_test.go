@@ -18,7 +18,7 @@ func TestHandleACKLogsCompleteAfterFinalProgress(t *testing.T) {
 		t.Fatalf("write test file: %v", err)
 	}
 
-	deps := NewRuntimeDepsWithRoot("/")
+	deps := realDeps(t, "/")
 	var txferID string
 	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8 comp=none`, root)
 	req, err := ParseRequest([]byte(reqRaw))
@@ -34,9 +34,6 @@ func TestHandleACKLogsCompleteAfterFinalProgress(t *testing.T) {
 	defer func() {
 		log.SetFlags(oldFlags)
 		log.SetOutput(oldWriter)
-		if txferID != "" {
-			deps.DeleteTransfer(txferID)
-		}
 	}()
 
 	var manifestOut bytes.Buffer

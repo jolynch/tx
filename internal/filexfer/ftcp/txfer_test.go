@@ -11,97 +11,39 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
-	"github.com/jolynch/tx/internal/filexfer/limit"
-	"github.com/jolynch/tx/internal/pagecache"
+	"github.com/jolynch/tx/internal/filexfer/store"
 )
 
-type ackCall struct {
-	fileID   uint64
-	ackBytes int64
-}
+// TestHandleTXFERUsesInjectedStore proves handler state actually lands in
+// the store the deps were built around. Without this, an injection bug would
+// be invisible — everything would keep working against the wrong store.
+func TestHandleTXFERUsesInjectedStore(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "a.txt", "hello")
 
-type txferTestDeps struct {
-	setHintsCalls    int
-	setHintsTxID     string
-	setHintsMode     string
-	setHintsMbps     int64
-	setHintsConc     int
-	cacheRestoreCh   []pagecache.TouchEntry
-	cacheRestoreCall int
-	cacheRestoreTxID string
-	ackCalls         []ackCall
-	completeCalls    int
-}
+	st := store.NewStore()
+	t.Cleanup(st.Close)
+	deps := NewRuntimeDeps(st, WithRoot("/"))
 
-func (d *txferTestDeps) NewTransfer(string, int, int64) (Transfer, error) {
-	return Transfer{ID: "tx123"}, nil
-}
+	req, err := ParseRequest([]byte(fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8 comp=none`, root)))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
 
-func (d *txferTestDeps) DeleteTransfer(string) bool { return true }
+	var txferID string
+	var out bytes.Buffer
+	if err := handleTXFERWithCallback(context.Background(), req, &out, deps, func(id string) { txferID = id }); err != nil {
+		t.Fatalf("handleTXFERWithCallback: %v", err)
+	}
+	if txferID == "" {
+		t.Fatalf("expected a transfer ID callback")
+	}
 
-func (d *txferTestDeps) RegisterTransferFileState(string, <-chan TransferFileStateUpdate, uint8) <-chan struct{} {
-	done := make(chan struct{})
-	close(done)
-	return done
-}
-
-func (d *txferTestDeps) ClipTransfer(string) bool { return true }
-
-func (d *txferTestDeps) GetTransfer(string) (Transfer, bool) { return Transfer{}, false }
-func (d *txferTestDeps) ListTransfers() []Transfer           { return nil }
-
-func (d *txferTestDeps) SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
-	d.setHintsCalls++
-	d.setHintsTxID = txferID
-	d.setHintsMode = mode
-	d.setHintsMbps = linkMbps
-	d.setHintsConc = concurrency
-	return true
-}
-
-func (d *txferTestDeps) GetTransferGentleLimiter(string, int64, int, int64) *limit.Limiter {
-	return nil
-}
-
-func (d *txferTestDeps) ReportTransferObservedLink(string, int64, int, int64, float64) (TransferObservedLinkUpdate, bool) {
-	return TransferObservedLinkUpdate{}, false
-}
-
-func (d *txferTestDeps) GetFile(string, uint64, string) (*os.File, FileRef, error) {
-	return nil, FileRef{}, nil
-}
-
-func (d *txferTestDeps) GetFileRef(string, uint64, string) (FileRef, error) {
-	return FileRef{}, nil
-}
-
-func (d *txferTestDeps) SetTransferFileState(string, uint64, uint8) bool { return true }
-
-func (d *txferTestDeps) SetTransferFileWindowHash(string, uint64, int64, string) bool { return true }
-
-func (d *txferTestDeps) VerifyTransferFileWindowHash(string, uint64, int64, string) bool { return true }
-
-func (d *txferTestDeps) AcknowledgeTransferFile(_ string, fileID uint64, ackBytes int64) bool {
-	d.ackCalls = append(d.ackCalls, ackCall{fileID: fileID, ackBytes: ackBytes})
-	return true
-}
-
-func (d *txferTestDeps) SetTransferPageCache(string, uint64, []byte) bool { return true }
-
-func (d *txferTestDeps) SetTransferDeadline(string, int64) bool           { return false }
-func (d *txferTestDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }
-func (d *txferTestDeps) MarkTransferTooSlow(string) bool                  { return false }
-func (d *txferTestDeps) GetTransferLimiterBps(string) int64               { return 0 }
-func (d *txferTestDeps) MaybeLogTransferProgress(string)                  {}
-func (d *txferTestDeps) MaybeLogTransferComplete(string)                  { d.completeCalls++ }
-func (d *txferTestDeps) Root() string                                     { return "/" }
-func (d *txferTestDeps) EnqueueCacheRestoreBatch(txferID string, items []pagecache.TouchEntry) {
-	d.cacheRestoreCh = append(d.cacheRestoreCh, items...)
-	d.cacheRestoreCall++
-	d.cacheRestoreTxID = txferID
+	if _, ok := st.GetTransfer(txferID); !ok {
+		t.Fatalf("transfer %q missing from the injected store", txferID)
+	}
 }
 
 func TestParseTXFERRequestRequiresHints(t *testing.T) {
@@ -148,7 +90,7 @@ func TestHandleTXFERStoresHintsAndEmitsFM2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseRequest failed: %v", err)
 	}
-	deps := &txferTestDeps{}
+	deps := &mockDeps{}
 	var out bytes.Buffer
 	if err := handleTXFER(context.Background(), req, &out, deps); err != nil {
 		t.Fatalf("handleTXFER failed: %v", err)
@@ -310,7 +252,7 @@ func TestHandleTXFERLogsStartWithSeparateEntryAndFileCounts(t *testing.T) {
 	}
 	writeTestFile(t, root, "sub/data.txt", "hello")
 
-	deps := NewRuntimeDepsWithRoot("/")
+	deps := realDeps(t, "/")
 	var txferID string
 	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8`, root)
 	req, err := ParseRequest([]byte(reqRaw))
@@ -326,9 +268,6 @@ func TestHandleTXFERLogsStartWithSeparateEntryAndFileCounts(t *testing.T) {
 	defer func() {
 		log.SetFlags(oldFlags)
 		log.SetOutput(oldWriter)
-		if txferID != "" {
-			deps.DeleteTransfer(txferID)
-		}
 	}()
 
 	var out bytes.Buffer
@@ -361,7 +300,7 @@ func TestHandleTXFERDirectoryOnlyLogsImmediateComplete(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	deps := NewRuntimeDepsWithRoot("/")
+	deps := realDeps(t, "/")
 	var txferID string
 	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8`, root)
 	req, err := ParseRequest([]byte(reqRaw))
@@ -377,9 +316,6 @@ func TestHandleTXFERDirectoryOnlyLogsImmediateComplete(t *testing.T) {
 	defer func() {
 		log.SetFlags(oldFlags)
 		log.SetOutput(oldWriter)
-		if txferID != "" {
-			deps.DeleteTransfer(txferID)
-		}
 	}()
 
 	var out bytes.Buffer
@@ -417,7 +353,7 @@ func TestHandleTXFEROmitsPageCacheByDefault(t *testing.T) {
 		t.Fatalf("ParseRequest: %v", err)
 	}
 	var out bytes.Buffer
-	if err := handleTXFER(context.Background(), req, &out, &txferTestDeps{}); err != nil {
+	if err := handleTXFER(context.Background(), req, &out, &mockDeps{}); err != nil {
 		t.Fatalf("handleTXFER: %v", err)
 	}
 	if strings.Contains(out.String(), "pc:") {
@@ -450,7 +386,7 @@ func TestHandleTXFEREmitsPageCacheWhenRequested(t *testing.T) {
 		t.Fatalf("ParseRequest: %v", err)
 	}
 	var out bytes.Buffer
-	if err := handleTXFER(context.Background(), req, &out, &txferTestDeps{}); err != nil {
+	if err := handleTXFER(context.Background(), req, &out, &mockDeps{}); err != nil {
 		t.Fatalf("handleTXFER: %v", err)
 	}
 	if !strings.Contains(out.String(), " pc:") {
@@ -490,7 +426,7 @@ func TestEncodeManifestEmitsPageCacheWithRelativeRoot(t *testing.T) {
 	t.Chdir(parent)
 
 	var out bytes.Buffer
-	if err := encodeManifest(&out, "tx-rel", rootDirName, "fast", 900, 4, 0, false, true, &txferTestDeps{}); err != nil {
+	if err := encodeManifest(&out, "tx-rel", rootDirName, "fast", 900, 4, 0, false, true, &mockDeps{}); err != nil {
 		t.Fatalf("encodeManifest: %v", err)
 	}
 	if !strings.Contains(out.String(), " pc:") {
@@ -568,7 +504,7 @@ func TestHandleTXFERCompZstdEmitsStreamingFrames(t *testing.T) {
 		t.Fatalf("ParseRequest: %v", err)
 	}
 	var out bytes.Buffer
-	if err := handleTXFER(context.Background(), req, &out, &syncTestDeps{}); err != nil {
+	if err := handleTXFER(context.Background(), req, &out, &mockDeps{}); err != nil {
 		t.Fatalf("handleTXFER: %v", err)
 	}
 
@@ -618,7 +554,7 @@ func TestHandleTXFERCompNoneEmitsStreamingFrames(t *testing.T) {
 		t.Fatalf("ParseRequest: %v", err)
 	}
 	var out bytes.Buffer
-	if err := handleTXFER(context.Background(), req, &out, &syncTestDeps{}); err != nil {
+	if err := handleTXFER(context.Background(), req, &out, &mockDeps{}); err != nil {
 		t.Fatalf("handleTXFER: %v", err)
 	}
 	frames := parseManifestFrames(t, out.Bytes())

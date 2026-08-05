@@ -168,6 +168,13 @@ func (p *RestoreWorkerPool) Close() {
 func (p *RestoreWorkerPool) run() {
 	defer p.wg.Done()
 	for {
+		// If shutdown happened while apply was running, do not randomly select
+		// another buffered item alongside the now-ready done case below.
+		select {
+		case <-p.done:
+			return
+		default:
+		}
 		select {
 		case item := <-p.in:
 			p.apply(item)

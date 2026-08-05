@@ -18,7 +18,7 @@ func TestHandleCXSUMMultipleRanges(t *testing.T) {
 	if err := os.WriteFile(filePath, []byte("hello world"), 0o644); err != nil {
 		t.Fatalf("write test file: %v", err)
 	}
-	deps := &sendTestDeps{filePath: filePath}
+	deps := &mockDeps{filePath: filePath}
 	req, err := ParseRequest([]byte(`CXSUM tx1 fd=1 "/tmp/a.txt" offset=0 size=5 algo=xxh128 fd=1 "/tmp/a.txt" offset=6 size=5 algo=xxh64`))
 	if err != nil {
 		t.Fatalf("ParseRequest err: %v", err)

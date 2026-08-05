@@ -207,15 +207,16 @@ func TestRestoreWorkerPoolCloseAbandonsBuffered(t *testing.T) {
 		}
 	}
 
-	// Close cuts the worker loose; whatever's still in the channel at
-	// that moment is abandoned. We close release after Close starts so
-	// the worker's in-flight apply doesn't keep draining the buffer
-	// before it sees p.done.
+	// Close cuts the worker loose; release the in-flight apply only after the
+	// shutdown signal is closed, so the remaining buffer must be abandoned.
+	closed := make(chan struct{})
 	go func() {
-		time.Sleep(20 * time.Millisecond)
-		close(release)
+		p.Close()
+		close(closed)
 	}()
-	p.Close()
+	<-p.done
+	close(release)
+	<-closed
 
 	if got := p.dropped.Load(); got == 0 {
 		t.Fatalf("expected at least one buffered item to be abandoned, got dropped=0")

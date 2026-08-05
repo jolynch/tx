@@ -104,7 +104,7 @@ func TestHandleConnInitialHeartbeatDoesNotCountAsActivity(t *testing.T) {
 	go handleConn(
 		serverConn,
 		ServerOptions{KeepAliveTimeout: time.Second},
-		NewRuntimeDeps(),
+		realDeps(t, "/"),
 		nil,
 		func() { activityCount <- struct{}{} },
 	)
