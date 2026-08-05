@@ -3,56 +3,29 @@ package ftcp
 import (
 	"errors"
 	"net/http"
-	"os"
 	"path/filepath"
-	"time"
 
-	"github.com/jolynch/tx/internal/filexfer/limit"
-	intstore "github.com/jolynch/tx/internal/filexfer/store"
+	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/pagecache"
 )
 
-type Transfer = intstore.Transfer
-type TransferFileState = intstore.TransferFileState
-type TransferFileStateUpdate = intstore.TransferFileStateUpdate
-type FileRef = intstore.FileRef
-type FileLookupError = intstore.FileLookupError
-type TransferObservedLinkUpdate = intstore.TransferObservedLinkUpdate
+type Transfer = store.Transfer
+type TransferFileStateUpdate = store.TransferFileStateUpdate
+type FileRef = store.FileRef
+type FileLookupError = store.FileLookupError
+type TransferObservedLinkUpdate = store.TransferObservedLinkUpdate
 
 const (
-	TransferStateStarted = intstore.TransferStateStarted
-	TransferStateRunning = intstore.TransferStateRunning
-	TransferStateDone    = intstore.TransferStateDone
-	TransferStateMissing = intstore.TransferStateMissing
+	TransferStateStarted = store.TransferStateStarted
+	TransferStateRunning = store.TransferStateRunning
+	TransferStateDone    = store.TransferStateDone
+	TransferStateMissing = store.TransferStateMissing
 )
 
+// Deps is everything a handler needs: the transfer store, plus the two
+// server-side concerns that are not the store's business.
 type Deps interface {
-	NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, error)
-	DeleteTransfer(txferID string) bool
-	RegisterTransferFileState(txferID string, updatesCh <-chan TransferFileStateUpdate, state uint8) <-chan struct{}
-	ClipTransfer(txferID string) bool
-
-	GetTransfer(txferID string) (Transfer, bool)
-	ListTransfers() []Transfer
-	SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool
-	GetTransferGentleLimiter(txferID string, fallbackLinkMbps int64, gentleBWPct int, burstBytes int64) *limit.Limiter
-	ReportTransferObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool)
-	GetTransferLimiterBps(txferID string) int64
-	GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error)
-	GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error)
-
-	SetTransferFileState(txferID string, fileID uint64, state uint8) bool
-	SetTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool
-	VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool
-	AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool
-	SetTransferPageCache(txferID string, fileID uint64, blob []byte) bool
-
-	SetTransferDeadline(txferID string, deadlineMS int64) bool
-	RecordTransferFirstSend(txferID string) (time.Time, bool)
-	MarkTransferTooSlow(txferID string) bool
-
-	MaybeLogTransferProgress(txferID string)
-	MaybeLogTransferComplete(txferID string)
+	store.Interface
 
 	// EnqueueCacheRestoreBatch hands a slice of cache-restore items to a
 	// server-side producer goroutine that drains them into the worker
@@ -67,30 +40,43 @@ type Deps interface {
 	Root() string
 }
 
+// runtimeDeps embeds the store, so every store method is promoted rather
+// than forwarded by hand. Only the two non-store responsibilities below
+// need implementing.
 type runtimeDeps struct {
+	store.Interface
 	rootDir string
 	pool    *pagecache.RestoreWorkerPool
 }
 
-func NewRuntimeDeps() Deps {
-	return runtimeDeps{rootDir: "/"}
+// RuntimeDepsOption configures the dependency set built by NewRuntimeDeps.
+type RuntimeDepsOption func(*runtimeDeps)
+
+// WithRoot sets the chroot that file paths are resolved against.
+func WithRoot(root string) RuntimeDepsOption {
+	return func(d *runtimeDeps) {
+		if root == "" {
+			root = "/"
+		}
+		d.rootDir = filepath.Clean(root)
+	}
 }
 
-func NewRuntimeDepsWithRoot(root string) Deps {
-	if root == "" {
-		root = "/"
-	}
-	return runtimeDeps{rootDir: filepath.Clean(root)}
+// WithPool wires a shared cache-restore worker pool in so SYNC
+// cache-map=recv has somewhere to enqueue work.
+func WithPool(pool *pagecache.RestoreWorkerPool) RuntimeDepsOption {
+	return func(d *runtimeDeps) { d.pool = pool }
 }
 
-// NewRuntimeDepsWithPool wires both the chroot and a shared cache-restore
-// worker pool into the dependency set so SYNC cache-map=recv has somewhere
-// to enqueue work.
-func NewRuntimeDepsWithPool(root string, pool *pagecache.RestoreWorkerPool) Deps {
-	if root == "" {
-		root = "/"
+// NewRuntimeDeps builds the dependency set around st. The store is a
+// required argument rather than an option because there is no process-wide
+// fallback: whoever builds the deps owns the store and closes it.
+func NewRuntimeDeps(st store.Interface, opts ...RuntimeDepsOption) Deps {
+	d := runtimeDeps{Interface: st, rootDir: "/"}
+	for _, opt := range opts {
+		opt(&d)
 	}
-	return runtimeDeps{rootDir: filepath.Clean(root), pool: pool}
+	return d
 }
 
 func (d runtimeDeps) Root() string { return d.rootDir }
@@ -105,99 +91,11 @@ func (d runtimeDeps) EnqueueCacheRestoreBatch(txferID string, items []pagecache.
 	d.pool.SendBatch(txferID, items)
 }
 
-func (runtimeDeps) NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, error) {
-	return intstore.NewTransfer(directory, numFiles, totalSize)
-}
-
-func (runtimeDeps) DeleteTransfer(txferID string) bool {
-	return intstore.DeleteTransfer(txferID)
-}
-
-func (runtimeDeps) RegisterTransferFileState(txferID string, updatesCh <-chan TransferFileStateUpdate, state uint8) <-chan struct{} {
-	return intstore.RegisterTransferFileState(txferID, updatesCh, state)
-}
-
-func (runtimeDeps) ClipTransfer(txferID string) bool {
-	return intstore.ClipTransfer(txferID)
-}
-
-func (runtimeDeps) GetTransfer(txferID string) (Transfer, bool) {
-	return intstore.GetTransfer(txferID)
-}
-
-func (runtimeDeps) ListTransfers() []Transfer {
-	return intstore.ListTransfers()
-}
-
-func (runtimeDeps) SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
-	return intstore.SetTransferHints(txferID, mode, linkMbps, concurrency)
-}
-
-func (runtimeDeps) GetTransferGentleLimiter(txferID string, fallbackLinkMbps int64, gentleBWPct int, burstBytes int64) *limit.Limiter {
-	return intstore.GetTransferGentleLimiter(txferID, fallbackLinkMbps, gentleBWPct, burstBytes)
-}
-
-func (runtimeDeps) ReportTransferObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool) {
-	return intstore.ReportTransferObservedLink(txferID, observedLinkMbps, gentleBWPct, burstBytes, emaAlpha)
-}
-
-func (runtimeDeps) GetTransferLimiterBps(txferID string) int64 {
-	return intstore.GetTransferLimiterBps(txferID)
-}
-
-func (runtimeDeps) GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error) {
-	return intstore.GetFile(txferID, fileID, fullPathRaw)
-}
-
-func (runtimeDeps) GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {
-	return intstore.GetFileRef(txferID, fileID, fullPathRaw)
-}
-
-func (runtimeDeps) SetTransferFileState(txferID string, fileID uint64, state uint8) bool {
-	return intstore.SetTransferFileState(txferID, fileID, state)
-}
-
-func (runtimeDeps) SetTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool {
-	return intstore.SetTransferFileWindowHash(txferID, fileID, endBytes, hashToken)
-}
-
-func (runtimeDeps) VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool {
-	return intstore.VerifyTransferFileWindowHash(txferID, fileID, endBytes, hashToken)
-}
-
-func (runtimeDeps) AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool {
-	return intstore.AcknowledgeTransferFile(txferID, fileID, ackBytes)
-}
-
-func (runtimeDeps) SetTransferPageCache(txferID string, fileID uint64, blob []byte) bool {
-	return intstore.SetTransferPageCache(txferID, fileID, blob)
-}
-
-func (runtimeDeps) SetTransferDeadline(txferID string, deadlineMS int64) bool {
-	return intstore.SetTransferDeadline(txferID, deadlineMS)
-}
-
-func (runtimeDeps) RecordTransferFirstSend(txferID string) (time.Time, bool) {
-	return intstore.RecordTransferFirstSend(txferID)
-}
-
-func (runtimeDeps) MarkTransferTooSlow(txferID string) bool {
-	return intstore.MarkTransferTooSlow(txferID)
-}
-
-func (runtimeDeps) MaybeLogTransferProgress(txferID string) {
-	intstore.MaybeLogTransferProgress(txferID)
-}
-
-func (runtimeDeps) MaybeLogTransferComplete(txferID string) {
-	intstore.MaybeLogTransferComplete(txferID)
-}
-
 func mapLookupError(err error) error {
 	if err == nil {
 		return nil
 	}
-	var lookupErr *intstore.FileLookupError
+	var lookupErr *store.FileLookupError
 	if errors.As(err, &lookupErr) {
 		return protocolErr{code: mapHTTPErrorCode(lookupErr.Code), message: lookupErr.Msg}
 	}

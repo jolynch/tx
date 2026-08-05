@@ -11,13 +11,14 @@ import (
 )
 
 func BenchmarkTransferStoreConcurrentHotPaths(b *testing.B) {
-	store.ResetTransferStoreForTest()
+	s := store.NewStore()
+	b.Cleanup(s.Close)
 
 	const numTransfers = 32
 	const filesPerTransfer = 8
 	transferIDs := make([]string, 0, numTransfers)
 	for i := 0; i < numTransfers; i++ {
-		transfer, err := store.NewTransfer("/tmp/bench-"+strconv.Itoa(i), filesPerTransfer, int64(filesPerTransfer*1024))
+		transfer, err := s.NewTransfer("/tmp/bench-"+strconv.Itoa(i), filesPerTransfer, int64(filesPerTransfer*1024))
 		if err != nil {
 			b.Fatalf("NewTransfer failed: %v", err)
 		}
@@ -29,7 +30,7 @@ func BenchmarkTransferStoreConcurrentHotPaths(b *testing.B) {
 				FileSize: 1024,
 			})
 		}
-		store.RegisterTransferFileStates(transfer.ID, updates, store.TransferStateRunning)
+		s.RegisterTransferFileStates(transfer.ID, updates, store.TransferStateRunning)
 		transferIDs = append(transferIDs, transfer.ID)
 	}
 
@@ -43,13 +44,13 @@ func BenchmarkTransferStoreConcurrentHotPaths(b *testing.B) {
 			endBytes := int64((n%8)+1) * 64
 			token := "xxh128:" + strconv.FormatUint(n, 16)
 
-			if !store.SetTransferFileState(txferID, fileID, store.TransferStateRunning) {
+			if !s.SetTransferFileState(txferID, fileID, store.TransferStateRunning) {
 				b.Fatalf("SetTransferFileState returned false")
 			}
-			if !store.SetTransferFileWindowHash(txferID, fileID, endBytes, token) {
+			if !s.SetTransferFileWindowHash(txferID, fileID, endBytes, token) {
 				b.Fatalf("SetTransferFileWindowHash returned false")
 			}
-			if !store.AcknowledgeTransferFiles([]store.AckEntry{{TxferID: txferID, FileID: fileID, AckBytes: endBytes}}) {
+			if !s.AcknowledgeTransferFiles([]store.AckEntry{{TxferID: txferID, FileID: fileID, AckBytes: endBytes}}) {
 				b.Fatalf("AcknowledgeTransferFiles returned false")
 			}
 		}

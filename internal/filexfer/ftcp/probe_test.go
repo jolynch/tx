@@ -8,32 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 )
-
-type probeTestDeps struct {
-	sendTestDeps
-	reportTxferID  string
-	reportObserved int64
-	reportBWPct    int
-	reportBurst    int64
-	reportEMAAlpha float64
-	reportCalled   bool
-	reportReturn   TransferObservedLinkUpdate
-	reportReturnOK bool
-}
-
-func (d *probeTestDeps) ReportTransferObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool) {
-	d.reportCalled = true
-	d.reportTxferID = txferID
-	d.reportObserved = observedLinkMbps
-	d.reportBWPct = gentleBWPct
-	d.reportBurst = burstBytes
-	d.reportEMAAlpha = emaAlpha
-	return d.reportReturn, d.reportReturnOK
-}
-
-func (d *probeTestDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }
 
 func TestHandlePROBERoundTrip(t *testing.T) {
 	req, err := ParseRequest([]byte(`PROBE cpu=8 probe-bytes=1024 cts0=100`))
@@ -43,7 +18,7 @@ func TestHandlePROBERoundTrip(t *testing.T) {
 	payload := bytes.Repeat([]byte{0x5a}, 1024)
 	in := bytes.NewReader(payload)
 	var out bytes.Buffer
-	if err := handlePROBEWithInput(context.Background(), req, in, &out, &probeTestDeps{}, 8, 25, 25, 1*1024*1024, 0); err != nil {
+	if err := handlePROBEWithInput(context.Background(), req, in, &out, &mockDeps{}, 8, 25, 25, 1*1024*1024, 0); err != nil {
 		t.Fatalf("handlePROBEWithInput failed: %v", err)
 	}
 
@@ -89,7 +64,7 @@ func TestHandlePROBEDefaultIODepth(t *testing.T) {
 		t.Fatalf("ParseRequest failed: %v", err)
 	}
 	var out bytes.Buffer
-	if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, &probeTestDeps{}, 0, 30, 25, 1*1024*1024, 0); err != nil {
+	if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, &mockDeps{}, 0, 30, 25, 1*1024*1024, 0); err != nil {
 		t.Fatalf("handlePROBEWithInput failed: %v", err)
 	}
 	line, err := bufio.NewReader(bytes.NewReader(out.Bytes())).ReadString('\n')
@@ -118,7 +93,7 @@ func TestHandlePROBERejectsShortPayload(t *testing.T) {
 	}
 	in := bytes.NewReader([]byte{1, 2, 3})
 	var out bytes.Buffer
-	err = handlePROBEWithInput(context.Background(), req, in, &out, &probeTestDeps{}, 8, 25, 25, 1*1024*1024, 0)
+	err = handlePROBEWithInput(context.Background(), req, in, &out, &mockDeps{}, 8, 25, 25, 1*1024*1024, 0)
 	if err == nil {
 		t.Fatalf("expected payload validation error")
 	}
@@ -129,7 +104,7 @@ func TestHandlePROBEReportsObservedLink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseRequest failed: %v", err)
 	}
-	deps := &probeTestDeps{
+	deps := &mockDeps{
 		reportReturn:   TransferObservedLinkUpdate{ObservedLinkMbps: 900, EMALinkMbps: 900, OldRateBps: 0, NewRateBps: 28125000},
 		reportReturnOK: true,
 	}
@@ -192,7 +167,7 @@ func TestHandlePROBEKeepAliveGrant(t *testing.T) {
 				t.Fatalf("ParseRequest failed: %v", err)
 			}
 			var out bytes.Buffer
-			if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, &probeTestDeps{}, 8, 25, 25, 1*1024*1024, tc.keepAliveMS); err != nil {
+			if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, &mockDeps{}, 8, 25, 25, 1*1024*1024, tc.keepAliveMS); err != nil {
 				t.Fatalf("handlePROBEWithInput failed: %v", err)
 			}
 			line, err := bufio.NewReader(bytes.NewReader(out.Bytes())).ReadString('\n')

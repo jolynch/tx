@@ -17,27 +17,21 @@ import (
 
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
-	"github.com/jolynch/tx/internal/filexfer/policy"
 	"github.com/zeebo/xxh3"
 )
 
 const (
 	defaultTransferTTL = 10 * time.Minute
-	// State enum for transfer lifecycle.
+	// State enum for transfer lifecycle. Note this block is iota-based:
+	// inserting a line above TransferStateStarted shifts every state value.
 	TransferStateStarted uint8 = iota
 	TransferStateRunning
 	TransferStateDone
 	TransferStateMissing
 )
 
-type CompressionMode = policy.CompressionMode
-
-const (
-	CompressionModeZstdDefault = policy.CompressionModeZstdDefault
-	CompressionModeZstdLevel1  = policy.CompressionModeZstdLevel1
-	CompressionModeLz4         = policy.CompressionModeLz4
-	CompressionModeNone        = policy.CompressionModeNone
-)
+// minReapInterval bounds how often the expiry goroutine wakes.
+const minReapInterval = 10 * time.Millisecond
 
 type Transfer struct {
 	ID              string
@@ -65,11 +59,6 @@ type Transfer struct {
 	LastLogPct      int       // last byte-percent bucket logged (0, 10, ...)
 	LastLogTime     time.Time // wall time of last progress log
 	LastLogDoneSize int64     // DoneSize at last log (detect stalled transfers)
-}
-
-type TransferFileState struct {
-	State    uint8
-	PathHash xxh3.Uint128
 }
 
 type TransferFileStateUpdate struct {
@@ -104,27 +93,22 @@ type managedTransfer struct {
 	mu           sync.RWMutex
 	deleted      bool
 	transfer     Transfer
-	fileHashes   map[uint64]fileHashState
 	windowHashes map[windowHashKey]*windowHashState
 	observedEMA  float64
 	limiterBps   int64
 	limiter      atomic.Pointer[limit.Limiter]
 }
 
-type transferStore struct {
+// Store holds transfer state for a server. There is no process-wide
+// instance: whoever runs a server owns a Store and closes it, and tests
+// build their own so they cannot see each other's transfers.
+type Store struct {
 	mu        sync.RWMutex
 	transfers map[string]*managedTransfer
-}
-
-type fileHashState struct {
-	hasher        *xxh3.Hasher128
-	hashedSize    int64
-	hashToken     string
-	valid         bool
-	finalized     bool
-	latestComp    uint8
-	hasLatestComp bool
-	expiresAt     time.Time
+	ttl       time.Duration
+	done      chan struct{}
+	stopped   chan struct{}
+	closeOnce sync.Once
 }
 
 type windowHashKey struct {
@@ -152,25 +136,48 @@ type AckEntry struct {
 	AckBytes int64
 }
 
-var (
-	ttl     = defaultTransferTTL
-	manager = newTransferStore()
-)
+// StoreOption configures a Store built by NewStore.
+type StoreOption func(*Store)
 
-func init() {
-	go manager.reapExpiredLoop()
+// WithTTL overrides how long transfers and their hash state survive past
+// their last update. Chiefly useful to tests, which otherwise cannot reach
+// the expiry paths inside the default ten minute window.
+func WithTTL(d time.Duration) StoreOption {
+	return func(s *Store) {
+		if d > 0 {
+			s.ttl = d
+		}
+	}
 }
 
-func newTransferStore() *transferStore {
-	return &transferStore{
+// NewStore returns an isolated store with its own expiry goroutine. Callers
+// are responsible for calling Close to stop that goroutine.
+func NewStore(opts ...StoreOption) *Store {
+	s := &Store{
 		transfers: make(map[string]*managedTransfer),
+		ttl:       defaultTransferTTL,
+		done:      make(chan struct{}),
+		stopped:   make(chan struct{}),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	go s.reapExpiredLoop()
+	return s
+}
+
+// Close waits for the store's expiry goroutine to stop. It is safe to call
+// repeatedly. Reads and writes still work afterwards; only reaping stops.
+func (s *Store) Close() {
+	s.closeOnce.Do(func() {
+		close(s.done)
+		<-s.stopped
+	})
 }
 
 func newManagedTransfer(transfer Transfer) *managedTransfer {
 	return &managedTransfer{
 		transfer:     transfer,
-		fileHashes:   make(map[uint64]fileHashState),
 		windowHashes: make(map[windowHashKey]*windowHashState),
 	}
 }
@@ -212,7 +219,7 @@ func logTransferComplete(t *Transfer) {
 	)
 }
 
-func (s *transferStore) maybeLogTransferComplete(txferID string) {
+func (s *Store) MaybeLogTransferComplete(txferID string) {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return
@@ -231,14 +238,14 @@ func (s *transferStore) maybeLogTransferComplete(txferID string) {
 	logTransferComplete(t)
 }
 
-func (s *transferStore) getManagedTransfer(txferID string) (*managedTransfer, bool) {
+func (s *Store) getManagedTransfer(txferID string) (*managedTransfer, bool) {
 	s.mu.RLock()
 	managed, ok := s.transfers[txferID]
 	s.mu.RUnlock()
 	return managed, ok
 }
 
-func (s *transferStore) create(transfer Transfer) bool {
+func (s *Store) create(transfer Transfer) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.transfers[transfer.ID]; exists {
@@ -248,26 +255,7 @@ func (s *transferStore) create(transfer Transfer) bool {
 	return true
 }
 
-func (s *transferStore) setState(txferID string, state uint8) bool {
-	managed, ok := s.getManagedTransfer(txferID)
-	if !ok {
-		return false
-	}
-
-	managed.mu.Lock()
-	defer managed.mu.Unlock()
-	if managed.deleted {
-		return false
-	}
-	for i := range managed.transfer.State {
-		if shouldAdvanceState(managed.transfer.State[i], state) {
-			managed.transfer.State[i] = state
-		}
-	}
-	return true
-}
-
-func (s *transferStore) setTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
+func (s *Store) SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
@@ -294,7 +282,7 @@ func deriveGentleRateBps(linkMbps int64, gentleBWPct int) int64 {
 	return (((linkMbps * 1_000_000) / 8) * int64(gentleBWPct)) / 100
 }
 
-func (s *transferStore) getOrInitGentleLimiter(txferID string, fallbackLinkMbps int64, gentleBWPct int, burstBytes int64) *limit.Limiter {
+func (s *Store) GetTransferGentleLimiter(txferID string, fallbackLinkMbps int64, gentleBWPct int, burstBytes int64) *limit.Limiter {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return nil
@@ -339,7 +327,7 @@ func (s *transferStore) getOrInitGentleLimiter(txferID string, fallbackLinkMbps 
 	return limiter
 }
 
-func (s *transferStore) getTransferLimiterBps(txferID string) int64 {
+func (s *Store) GetTransferLimiterBps(txferID string) int64 {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return 0
@@ -349,7 +337,7 @@ func (s *transferStore) getTransferLimiterBps(txferID string) int64 {
 	return managed.limiterBps
 }
 
-func (s *transferStore) reportObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool) {
+func (s *Store) ReportTransferObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool) {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return TransferObservedLinkUpdate{}, false
@@ -401,7 +389,7 @@ func (s *transferStore) reportObservedLink(txferID string, observedLinkMbps int6
 	return update, true
 }
 
-func (s *transferStore) setTransferDeadline(txferID string, deadlineMS int64) bool {
+func (s *Store) SetTransferDeadline(txferID string, deadlineMS int64) bool {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
@@ -416,7 +404,7 @@ func (s *transferStore) setTransferDeadline(txferID string, deadlineMS int64) bo
 	return true
 }
 
-func (s *transferStore) recordFirstSend(txferID string) (time.Time, bool) {
+func (s *Store) RecordTransferFirstSend(txferID string) (time.Time, bool) {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return time.Time{}, false
@@ -433,7 +421,7 @@ func (s *transferStore) recordFirstSend(txferID string) (time.Time, bool) {
 	return managed.transfer.FirstSendAt, true
 }
 
-func (s *transferStore) markTooSlow(txferID string) bool {
+func (s *Store) MarkTransferTooSlow(txferID string) bool {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
@@ -448,7 +436,7 @@ func (s *transferStore) markTooSlow(txferID string) bool {
 	return true
 }
 
-func (s *transferStore) appendFileStates(txferID string, updates []TransferFileStateUpdate, state uint8) {
+func (s *Store) RegisterTransferFileStates(txferID string, updates []TransferFileStateUpdate, state uint8) {
 	if len(updates) == 0 {
 		return
 	}
@@ -511,153 +499,7 @@ func (s *transferStore) appendFileStates(txferID string, updates []TransferFileS
 	}
 }
 
-func (s *transferStore) appendFileHashChunk(txferID string, fileID uint64, offset int64, chunk []byte) bool {
-	managed, ok := s.getManagedTransfer(txferID)
-	if !ok {
-		return false
-	}
-
-	managed.mu.Lock()
-	defer managed.mu.Unlock()
-	if managed.deleted {
-		return false
-	}
-	if fileID >= uint64(len(managed.transfer.State)) || offset < 0 {
-		return false
-	}
-
-	state, exists := managed.fileHashes[fileID]
-	if !exists || offset == 0 {
-		state = fileHashState{
-			hasher:    xxh3.New128(),
-			valid:     true,
-			finalized: false,
-		}
-	}
-	if !state.valid || state.finalized {
-		state.expiresAt = time.Now().Add(ttl)
-		managed.fileHashes[fileID] = state
-		return true
-	}
-	if offset != state.hashedSize {
-		state.valid = false
-		state.expiresAt = time.Now().Add(ttl)
-		managed.fileHashes[fileID] = state
-		return true
-	}
-
-	if len(chunk) > 0 {
-		if _, err := state.hasher.Write(chunk); err != nil {
-			state.valid = false
-			state.expiresAt = time.Now().Add(ttl)
-			managed.fileHashes[fileID] = state
-			return true
-		}
-	}
-	state.hashedSize += int64(len(chunk))
-	state.hashToken = ""
-	state.expiresAt = time.Now().Add(ttl)
-	managed.fileHashes[fileID] = state
-	return true
-}
-
-func (s *transferStore) finalizeFileHash(txferID string, fileID uint64) (string, bool) {
-	managed, ok := s.getManagedTransfer(txferID)
-	if !ok {
-		return "", false
-	}
-
-	managed.mu.Lock()
-	defer managed.mu.Unlock()
-	if managed.deleted {
-		return "", false
-	}
-	state, ok := managed.fileHashes[fileID]
-	if !ok || !state.valid || state.hasher == nil {
-		return "", false
-	}
-	state.hashToken = formatXXH128HashToken(state.hasher.Sum128())
-	state.finalized = true
-	state.hasher = nil
-	state.expiresAt = time.Now().Add(ttl)
-	managed.fileHashes[fileID] = state
-	return state.hashToken, true
-}
-
-func (s *transferStore) getFileCompressionMode(txferID string, fileID uint64) (CompressionMode, bool) {
-	managed, ok := s.getManagedTransfer(txferID)
-	if !ok {
-		return CompressionModeLz4, false
-	}
-
-	managed.mu.RLock()
-	defer managed.mu.RUnlock()
-	if managed.deleted {
-		return CompressionModeLz4, false
-	}
-	state, ok := managed.fileHashes[fileID]
-	if !ok || !state.hasLatestComp {
-		return CompressionModeLz4, false
-	}
-	return policy.CompressionModeFromStored(state.latestComp), true
-}
-
-func (s *transferStore) setFileCompressionMode(txferID string, fileID uint64, mode CompressionMode) bool {
-	managed, ok := s.getManagedTransfer(txferID)
-	if !ok {
-		return false
-	}
-
-	managed.mu.Lock()
-	defer managed.mu.Unlock()
-	if managed.deleted {
-		return false
-	}
-
-	state, ok := managed.fileHashes[fileID]
-	if !ok {
-		state = fileHashState{
-			hasher:    xxh3.New128(),
-			valid:     true,
-			finalized: false,
-		}
-	}
-	state.latestComp = uint8(mode)
-	state.hasLatestComp = true
-	state.expiresAt = time.Now().Add(ttl)
-	managed.fileHashes[fileID] = state
-	return true
-}
-
-func (s *transferStore) verifyFileHashToken(txferID string, fileID uint64, expectedBytes int64, token string) bool {
-	managed, ok := s.getManagedTransfer(txferID)
-	if !ok {
-		return false
-	}
-
-	managed.mu.Lock()
-	defer managed.mu.Unlock()
-	if managed.deleted {
-		return false
-	}
-
-	state, ok := managed.fileHashes[fileID]
-	if !ok || !state.valid || !state.finalized {
-		return false
-	}
-	if expectedBytes >= 0 && state.hashedSize != expectedBytes {
-		return false
-	}
-	expectedToken := strings.ToLower(strings.TrimSpace(state.hashToken))
-	actualToken := strings.ToLower(strings.TrimSpace(token))
-	if expectedToken == "" || expectedToken != actualToken {
-		return false
-	}
-	delete(managed.fileHashes, fileID)
-	return true
-}
-
-func (s *transferStore) delete(txferID string) bool {
+func (s *Store) DeleteTransfer(txferID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -672,7 +514,7 @@ func (s *transferStore) delete(txferID string) bool {
 	return true
 }
 
-func (s *transferStore) get(txferID string) (Transfer, bool) {
+func (s *Store) GetTransfer(txferID string) (Transfer, bool) {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return Transfer{}, false
@@ -686,28 +528,7 @@ func (s *transferStore) get(txferID string) (Transfer, bool) {
 	return cloneTransfer(managed.transfer), true
 }
 
-func (s *transferStore) getFileStates(txferID string) ([]TransferFileState, bool) {
-	managed, ok := s.getManagedTransfer(txferID)
-	if !ok {
-		return nil, false
-	}
-
-	managed.mu.RLock()
-	defer managed.mu.RUnlock()
-	if managed.deleted {
-		return nil, false
-	}
-	states := make([]TransferFileState, len(managed.transfer.State))
-	for i := range managed.transfer.State {
-		states[i] = TransferFileState{
-			State:    managed.transfer.State[i],
-			PathHash: managed.transfer.PathHash[i],
-		}
-	}
-	return states, true
-}
-
-func (s *transferStore) resolveFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {
+func (s *Store) GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {
 	fullPath := filepath.Clean(fullPathRaw)
 	if !filepath.IsAbs(fullPath) {
 		return FileRef{}, &FileLookupError{Code: http.StatusBadRequest, Msg: "path must be absolute"}
@@ -769,19 +590,7 @@ func (s *transferStore) resolveFileRef(txferID string, fileID uint64, fullPathRa
 	}, nil
 }
 
-func (s *transferStore) resetForTest() {
-	s.mu.Lock()
-	s.transfers = make(map[string]*managedTransfer)
-	s.mu.Unlock()
-}
-
-func (s *transferStore) countForTest() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.transfers)
-}
-
-func (s *transferStore) listForTest() []Transfer {
+func (s *Store) ListTransfers() []Transfer {
 	s.mu.RLock()
 	transfers := make([]*managedTransfer, 0, len(s.transfers))
 	for _, managed := range s.transfers {
@@ -800,7 +609,7 @@ func (s *transferStore) listForTest() []Transfer {
 	return out
 }
 
-func (s *transferStore) setPageCache(txferID string, fileID uint64, blob []byte) bool {
+func (s *Store) SetTransferPageCache(txferID string, fileID uint64, blob []byte) bool {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
@@ -822,25 +631,7 @@ func (s *transferStore) setPageCache(txferID string, fileID uint64, blob []byte)
 	return true
 }
 
-func (s *transferStore) getPageCache(txferID string, fileID uint64) ([]byte, bool) {
-	managed, ok := s.getManagedTransfer(txferID)
-	if !ok {
-		return nil, false
-	}
-
-	managed.mu.RLock()
-	defer managed.mu.RUnlock()
-	if managed.deleted {
-		return nil, false
-	}
-	idx := int(fileID)
-	if idx >= len(managed.transfer.PageCache) {
-		return nil, false
-	}
-	return managed.transfer.PageCache[idx], managed.transfer.PageCache[idx] != nil
-}
-
-func (s *transferStore) setFileState(txferID string, fileID uint64, state uint8) bool {
+func (s *Store) SetTransferFileState(txferID string, fileID uint64, state uint8) bool {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
@@ -862,7 +653,7 @@ func (s *transferStore) setFileState(txferID string, fileID uint64, state uint8)
 	return true
 }
 
-func (s *transferStore) acknowledgeFiles(entries []AckEntry) bool {
+func (s *Store) AcknowledgeTransferFiles(entries []AckEntry) bool {
 	grouped := make(map[string][]AckEntry)
 	order := make([]string, 0)
 	for _, entry := range entries {
@@ -896,7 +687,7 @@ func (s *transferStore) acknowledgeFiles(entries []AckEntry) bool {
 	return ok
 }
 
-func (s *transferStore) acknowledgeFileLocked(managed *managedTransfer, fileID uint64, ackBytes int64) bool {
+func (s *Store) acknowledgeFileLocked(managed *managedTransfer, fileID uint64, ackBytes int64) bool {
 	if managed == nil || managed.deleted {
 		return false
 	}
@@ -953,7 +744,7 @@ func (s *transferStore) acknowledgeFileLocked(managed *managedTransfer, fileID u
 	return true
 }
 
-func (s *transferStore) clipTransfer(txferID string) bool {
+func (s *Store) ClipTransfer(txferID string) bool {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
@@ -988,15 +779,27 @@ func (s *transferStore) clipTransfer(txferID string) bool {
 	return true
 }
 
-func (s *transferStore) reapExpiredLoop() {
-	interval := ttl / 2
-	if interval < 30*time.Second {
-		interval = 30 * time.Second
+func (s *Store) reapExpiredLoop() {
+	defer close(s.stopped)
+
+	// Reap at half the TTL. The floor only guards against a pathologically
+	// small WithTTL spinning the goroutine; the default ten minute TTL
+	// yields a five minute interval either way.
+	interval := s.ttl / 2
+	if interval < minReapInterval {
+		interval = minReapInterval
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	for now := range ticker.C {
+	for {
+		var now time.Time
+		select {
+		case <-s.done:
+			return
+		case now = <-ticker.C:
+		}
+
 		s.mu.Lock()
 		survivors := make([]*managedTransfer, 0, len(s.transfers))
 		for txferID, managed := range s.transfers {
@@ -1019,11 +822,6 @@ func (s *transferStore) reapExpiredLoop() {
 			if managed.deleted {
 				managed.mu.Unlock()
 				continue
-			}
-			for fileID, state := range managed.fileHashes {
-				if !state.expiresAt.After(now) {
-					delete(managed.fileHashes, fileID)
-				}
 			}
 			for key, state := range managed.windowHashes {
 				if !state.expiresAt.After(now) {
@@ -1048,7 +846,7 @@ func normalizeHashToken(raw string) string {
 	return strings.ToLower(strings.TrimSpace(raw))
 }
 
-func (s *transferStore) setWindowHashToken(txferID string, fileID uint64, endBytes int64, token string) bool {
+func (s *Store) SetTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, token string) bool {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
@@ -1067,12 +865,12 @@ func (s *transferStore) setWindowHashToken(txferID string, fileID uint64, endByt
 	}
 	managed.windowHashes[windowHashKey{fileID: fileID, endBytes: endBytes}] = &windowHashState{
 		hashToken: normalizeHashToken(token),
-		expiresAt: time.Now().Add(ttl),
+		expiresAt: time.Now().Add(s.ttl),
 	}
 	return true
 }
 
-func (s *transferStore) verifyWindowHashToken(txferID string, fileID uint64, endBytes int64, token string) bool {
+func (s *Store) VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, token string) bool {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
@@ -1090,7 +888,7 @@ func (s *transferStore) verifyWindowHashToken(txferID string, fileID uint64, end
 	return state.hashToken == normalizeHashToken(token)
 }
 
-func NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, error) {
+func (s *Store) NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, error) {
 	for attempts := 0; attempts < 5; attempts++ {
 		txferID, err := transferID()
 		if err != nil {
@@ -1114,24 +912,20 @@ func NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, err
 			FileSize:    make([]int64, numFiles),
 			AckedSize:   make([]int64, numFiles),
 			CreatedAt:   now,
-			ExpiresAt:   now.Add(ttl),
+			ExpiresAt:   now.Add(s.ttl),
 		}
 		for i := range transfer.State {
 			transfer.State[i] = TransferStateStarted
 			transfer.EntryType[i] = intencoding.EntryTypeFile
 		}
-		if manager.create(transfer) {
+		if s.create(transfer) {
 			return transfer, nil
 		}
 	}
 	return Transfer{}, fmt.Errorf("failed to allocate unique transfer id")
 }
 
-func SetTransferState(txferID string, state uint8) bool {
-	return manager.setState(txferID, state)
-}
-
-func RegisterTransferFileState(txferID string, updatesCh <-chan TransferFileStateUpdate, state uint8) <-chan struct{} {
+func (s *Store) RegisterTransferFileState(txferID string, updatesCh <-chan TransferFileStateUpdate, state uint8) <-chan struct{} {
 	done := make(chan struct{})
 	if updatesCh == nil {
 		close(done)
@@ -1146,7 +940,7 @@ func RegisterTransferFileState(txferID string, updatesCh <-chan TransferFileStat
 			if len(batch) == 0 {
 				return
 			}
-			manager.appendFileStates(txferID, batch, state)
+			s.RegisterTransferFileStates(txferID, batch, state)
 			batch = batch[:0]
 		}
 
@@ -1161,52 +955,8 @@ func RegisterTransferFileState(txferID string, updatesCh <-chan TransferFileStat
 	return done
 }
 
-func RegisterTransferFileStates(txferID string, updates []TransferFileStateUpdate, state uint8) {
-	manager.appendFileStates(txferID, updates, state)
-}
-
-func DeleteTransfer(txferID string) bool {
-	return manager.delete(txferID)
-}
-
-func GetTransfer(txferID string) (Transfer, bool) {
-	return manager.get(txferID)
-}
-
-func SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
-	return manager.setTransferHints(txferID, mode, linkMbps, concurrency)
-}
-
-func GetTransferGentleLimiter(txferID string, fallbackLinkMbps int64, gentleBWPct int, burstBytes int64) *limit.Limiter {
-	return manager.getOrInitGentleLimiter(txferID, fallbackLinkMbps, gentleBWPct, burstBytes)
-}
-
-func ReportTransferObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool) {
-	return manager.reportObservedLink(txferID, observedLinkMbps, gentleBWPct, burstBytes, emaAlpha)
-}
-
-func GetTransferLimiterBps(txferID string) int64 {
-	return manager.getTransferLimiterBps(txferID)
-}
-
-func SetTransferDeadline(txferID string, deadlineMS int64) bool {
-	return manager.setTransferDeadline(txferID, deadlineMS)
-}
-
-func RecordTransferFirstSend(txferID string) (time.Time, bool) {
-	return manager.recordFirstSend(txferID)
-}
-
-func MarkTransferTooSlow(txferID string) bool {
-	return manager.markTooSlow(txferID)
-}
-
-func GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {
-	return manager.resolveFileRef(txferID, fileID, fullPathRaw)
-}
-
-func GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error) {
-	ref, err := manager.resolveFileRef(txferID, fileID, fullPathRaw)
+func (s *Store) GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error) {
+	ref, err := s.GetFileRef(txferID, fileID, fullPathRaw)
 	if err != nil {
 		return nil, FileRef{}, err
 	}
@@ -1220,60 +970,8 @@ func GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileR
 	return fd, ref, nil
 }
 
-func GetTransferFileStates(txferID string) ([]TransferFileState, bool) {
-	return manager.getFileStates(txferID)
-}
-
-func AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool {
-	return manager.acknowledgeFiles([]AckEntry{{TxferID: txferID, FileID: fileID, AckBytes: ackBytes}})
-}
-
-func AcknowledgeTransferFiles(entries []AckEntry) bool {
-	return manager.acknowledgeFiles(entries)
-}
-
-func UpdateTransferFileHash(txferID string, fileID uint64, offset int64, chunk []byte) bool {
-	return manager.appendFileHashChunk(txferID, fileID, offset, chunk)
-}
-
-func VerifyTransferFileHash(txferID string, fileID uint64, expectedBytes int64, hashToken string) bool {
-	return manager.verifyFileHashToken(txferID, fileID, expectedBytes, hashToken)
-}
-
-func SetTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool {
-	return manager.setWindowHashToken(txferID, fileID, endBytes, hashToken)
-}
-
-func VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool {
-	return manager.verifyWindowHashToken(txferID, fileID, endBytes, hashToken)
-}
-
-func FinalizeTransferFileHash(txferID string, fileID uint64) (string, bool) {
-	return manager.finalizeFileHash(txferID, fileID)
-}
-
-func GetTransferFileCompressionMode(txferID string, fileID uint64) (CompressionMode, bool) {
-	return manager.getFileCompressionMode(txferID, fileID)
-}
-
-func SetTransferFileCompressionMode(txferID string, fileID uint64, mode CompressionMode) bool {
-	return manager.setFileCompressionMode(txferID, fileID, mode)
-}
-
-func SetTransferFileState(txferID string, fileID uint64, state uint8) bool {
-	return manager.setFileState(txferID, fileID, state)
-}
-
-func SetTransferPageCache(txferID string, fileID uint64, blob []byte) bool {
-	return manager.setPageCache(txferID, fileID, blob)
-}
-
-func GetTransferPageCache(txferID string, fileID uint64) ([]byte, bool) {
-	return manager.getPageCache(txferID, fileID)
-}
-
-func ClipTransfer(txferID string) bool {
-	return manager.clipTransfer(txferID)
+func (s *Store) AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool {
+	return s.AcknowledgeTransferFiles([]AckEntry{{TxferID: txferID, FileID: fileID, AckBytes: ackBytes}})
 }
 
 const progressLogPctInterval = 10
@@ -1282,15 +980,7 @@ const progressLogCountWidth = 6
 const progressLogBytesWidth = 10
 const progressLogRateWidth = 13
 
-func MaybeLogTransferProgress(txferID string) {
-	manager.maybeLogProgress(txferID)
-}
-
-func MaybeLogTransferComplete(txferID string) {
-	manager.maybeLogTransferComplete(txferID)
-}
-
-func (s *transferStore) maybeLogProgress(txferID string) {
+func (s *Store) MaybeLogTransferProgress(txferID string) {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return
@@ -1345,44 +1035,12 @@ func (s *transferStore) maybeLogProgress(txferID string) {
 	)
 }
 
-func resetTransferStoreForTest() {
-	manager.resetForTest()
-}
-
-func transferCountForTest() int {
-	return manager.countForTest()
-}
-
-func listTransfersForTest() []Transfer {
-	return manager.listForTest()
-}
-
-func ResetTransferStoreForTest() {
-	resetTransferStoreForTest()
-}
-
-func TransferCountForTest() int {
-	return transferCountForTest()
-}
-
-func ListTransfersForTest() []Transfer {
-	return listTransfersForTest()
-}
-
-func ListTransfers() []Transfer {
-	return manager.listForTest()
-}
-
 func transferID() (string, error) {
 	buf := make([]byte, 4)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("generate transfer id: %w", err)
 	}
 	return hex.EncodeToString(buf), nil
-}
-
-func formatXXH128HashToken(v xxh3.Uint128) string {
-	return intencoding.FormatXXH128HashToken(v)
 }
 
 func pathWithinRoot(root string, p string) bool {

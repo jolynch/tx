@@ -15,106 +15,8 @@ import (
 	"time"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
-	"github.com/jolynch/tx/internal/filexfer/limit"
-	"github.com/jolynch/tx/internal/pagecache"
 	"github.com/zeebo/xxh3"
 )
-
-type sendTestDeps struct {
-	filePath       string
-	entryType      byte
-	windowHashEnd  int64
-	windowHash     string
-	setStateCalls  int
-	setWindowCalls int
-}
-
-func (d *sendTestDeps) NewTransfer(string, int, int64) (Transfer, error) {
-	return Transfer{}, errors.New("not implemented")
-}
-
-func (d *sendTestDeps) DeleteTransfer(string) bool { return false }
-
-func (d *sendTestDeps) RegisterTransferFileState(string, <-chan TransferFileStateUpdate, uint8) <-chan struct{} {
-	ch := make(chan struct{})
-	close(ch)
-	return ch
-}
-
-func (d *sendTestDeps) ClipTransfer(string) bool { return false }
-
-func (d *sendTestDeps) GetTransfer(string) (Transfer, bool) { return Transfer{}, false }
-func (d *sendTestDeps) ListTransfers() []Transfer           { return nil }
-
-func (d *sendTestDeps) SetTransferHints(string, string, int64, int) bool { return true }
-func (d *sendTestDeps) GetTransferGentleLimiter(string, int64, int, int64) *limit.Limiter {
-	return nil
-}
-func (d *sendTestDeps) ReportTransferObservedLink(string, int64, int, int64, float64) (TransferObservedLinkUpdate, bool) {
-	return TransferObservedLinkUpdate{}, false
-}
-
-func (d *sendTestDeps) GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error) {
-	fd, err := os.Open(d.filePath)
-	if err != nil {
-		return nil, FileRef{}, err
-	}
-	info, err := fd.Stat()
-	if err != nil {
-		_ = fd.Close()
-		return nil, FileRef{}, err
-	}
-	return fd, FileRef{
-		TransferID: txferID,
-		FileID:     fileID,
-		Path:       d.filePath,
-		Directory:  filepath.Dir(d.filePath),
-		FileSize:   info.Size(),
-		EntryType:  d.entryType,
-	}, nil
-}
-
-func (d *sendTestDeps) GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {
-	info, err := os.Stat(d.filePath)
-	if err != nil {
-		return FileRef{}, err
-	}
-	return FileRef{
-		TransferID: txferID,
-		FileID:     fileID,
-		Path:       d.filePath,
-		Directory:  filepath.Dir(d.filePath),
-		FileSize:   info.Size(),
-		EntryType:  d.entryType,
-	}, nil
-}
-
-func (d *sendTestDeps) SetTransferFileState(string, uint64, uint8) bool {
-	d.setStateCalls++
-	return true
-}
-
-func (d *sendTestDeps) SetTransferFileWindowHash(_ string, _ uint64, endBytes int64, hashToken string) bool {
-	d.setWindowCalls++
-	d.windowHashEnd = endBytes
-	d.windowHash = hashToken
-	return true
-}
-
-func (d *sendTestDeps) VerifyTransferFileWindowHash(string, uint64, int64, string) bool { return false }
-
-func (d *sendTestDeps) AcknowledgeTransferFile(string, uint64, int64) bool { return false }
-
-func (d *sendTestDeps) SetTransferPageCache(string, uint64, []byte) bool { return false }
-
-func (d *sendTestDeps) SetTransferDeadline(string, int64) bool                  { return false }
-func (d *sendTestDeps) RecordTransferFirstSend(string) (time.Time, bool)        { return time.Time{}, false }
-func (d *sendTestDeps) MarkTransferTooSlow(string) bool                         { return false }
-func (d *sendTestDeps) GetTransferLimiterBps(string) int64                      { return 0 }
-func (d *sendTestDeps) MaybeLogTransferProgress(string)                         {}
-func (d *sendTestDeps) MaybeLogTransferComplete(string)                         {}
-func (d *sendTestDeps) Root() string                                            { return "/" }
-func (d *sendTestDeps) EnqueueCacheRestoreBatch(string, []pagecache.TouchEntry) {}
 
 func TestParseSENDRequestCompDefaultsAndModes(t *testing.T) {
 	req, err := ParseRequest([]byte(`SEND tx1 fd=1 "/tmp/a.txt"`))
@@ -221,7 +123,7 @@ func TestStreamSendItemRoundTripCompressionModes(t *testing.T) {
 	for _, comp := range []string{"none", encoding.EncodingLz4, encoding.EncodingZstd} {
 		t.Run(comp, func(t *testing.T) {
 			tmp := writeTempSendFile(t, data)
-			deps := &sendTestDeps{filePath: tmp}
+			deps := &mockDeps{filePath: tmp}
 			var out bytes.Buffer
 
 			err := streamSendItem(context.Background(), &out, deps, "tx1", sendItem{FileID: 7, Offset: 0, Size: 0, Comp: comp, Path: tmp}, false)
@@ -264,7 +166,7 @@ func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
 	data := bytes.Repeat([]byte("compress-me-"), int(size/int64(len("compress-me-")))+1)
 	data = data[:size]
 	tmp := writeTempSendFile(t, data)
-	deps := &sendTestDeps{filePath: tmp}
+	deps := &mockDeps{filePath: tmp}
 
 	var rawOut bytes.Buffer
 	slowOut := delayedWriter{w: &rawOut, delay: 25 * time.Millisecond}
@@ -308,7 +210,7 @@ func TestStreamSendItemDirectoryMetadataOnly(t *testing.T) {
 		t.Fatalf("Stat: %v", err)
 	}
 	wantMode := encoding.FormatManifestMode(info.Mode())
-	deps := &sendTestDeps{filePath: dir, entryType: encoding.EntryTypeDir}
+	deps := &mockDeps{filePath: dir, entryType: encoding.EntryTypeDir}
 
 	var out bytes.Buffer
 	if err := streamSendItem(context.Background(), &out, deps, "tx-dir", sendItem{FileID: 11, Offset: 0, Size: 0, Comp: "adapt", Path: dir}, false); err != nil {
@@ -452,7 +354,7 @@ func (d *delayedWriter) Write(p []byte) (int, error) {
 func TestHandleSENDBasic(t *testing.T) {
 	data := []byte("hello send")
 	tmp := writeTempSendFile(t, data)
-	deps := &sendTestDeps{filePath: tmp}
+	deps := &mockDeps{filePath: tmp}
 	payload := []byte(`SEND tx1 fd=1 ` + strconv.Quote(tmp))
 	req, err := ParseRequest(payload)
 	if err != nil {

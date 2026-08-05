@@ -18,10 +18,6 @@ import (
 	"github.com/jolynch/tx/internal/pagecache"
 )
 
-type syncTestDeps struct {
-	txferTestDeps
-}
-
 func TestParseSYNCRequest(t *testing.T) {
 	good := fmt.Sprintf(`SYNC %q mode=fast link-mbps=900 concurrency=12`, "/tmp/test")
 	req, err := ParseRequest([]byte(good))
@@ -346,7 +342,7 @@ func runTXFERTest(t *testing.T, root string) string {
 	if err != nil {
 		t.Fatalf("ParseRequest: %v", err)
 	}
-	deps := &syncTestDeps{}
+	deps := &mockDeps{}
 	var out bytes.Buffer
 	if err := handleTXFER(context.Background(), req, &out, deps); err != nil {
 		t.Fatalf("handleTXFER: %v", err)
@@ -391,7 +387,7 @@ func runSYNCTestWithComp(t *testing.T, root string, oldManifest string, comp str
 	return entries, rmPaths
 }
 
-func runSYNCTestFull(t *testing.T, root string, oldManifest string, comp string, cacheMap string) ([]encoding.ManifestEntry, []string, *syncTestDeps) {
+func runSYNCTestFull(t *testing.T, root string, oldManifest string, comp string, cacheMap string) ([]encoding.ManifestEntry, []string, *mockDeps) {
 	t.Helper()
 
 	// Build ID→path index from old manifest for RM resolution.
@@ -424,7 +420,7 @@ func runSYNCTestFull(t *testing.T, root string, oldManifest string, comp string,
 		t.Fatalf("close framed old manifest: %v", err)
 	}
 
-	deps := &syncTestDeps{}
+	deps := &mockDeps{}
 	var out bytes.Buffer
 	if err := handleSYNCWithInput(context.Background(), req, &input, &out, deps, nil); err != nil {
 		t.Fatalf("handleSYNCWithInput: %v", err)
