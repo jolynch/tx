@@ -111,8 +111,7 @@ type managedTCPConnCloser struct {
 	pool   *tcpConnPool
 
 	reusable atomic.Bool
-	once     sync.Once
-	err      error
+	closed   atomic.Bool
 }
 
 func (c *managedTCPConnCloser) markReusable() {
@@ -120,6 +119,29 @@ func (c *managedTCPConnCloser) markReusable() {
 		return
 	}
 	c.reusable.Store(true)
+}
+
+// Close recycles the connection when it was marked reusable, otherwise
+// releases it. It acts exactly once; later calls are no-ops returning nil, as
+// idempotent io.Closer semantics allow. A caller that loses the race with a
+// concurrent Close therefore returns before the connection is actually closed,
+// and does not observe the closing caller's error.
+//
+// Deliberately closure-free: a sync.Once here makes Close leak its receiver
+// (the closure passed to doSlow captures it), which forces the guard onto the
+// heap and costs an allocation per command on the synchronous command paths
+// that hold it as a stack value.
+func (c *managedTCPConnCloser) Close() error {
+	if c == nil {
+		return nil
+	}
+	if c.closed.Swap(true) {
+		return nil
+	}
+	if c.reusable.Load() {
+		return c.client.recycleManagedTCPConn(c.conn, c.pool)
+	}
+	return c.client.releaseManagedTCPConn(c.conn, c.pool)
 }
 
 // contextManagedTCPReadCloser wraps a managed connection read-closer with
@@ -134,20 +156,6 @@ type contextManagedTCPReadCloser struct {
 
 	once sync.Once
 	err  error
-}
-
-func (c *managedTCPConnCloser) Close() error {
-	if c == nil {
-		return nil
-	}
-	c.once.Do(func() {
-		if c.reusable.Load() {
-			c.err = c.client.recycleManagedTCPConn(c.conn, c.pool)
-		} else {
-			c.err = c.client.releaseManagedTCPConn(c.conn, c.pool)
-		}
-	})
-	return c.err
 }
 
 func (r *contextManagedTCPReadCloser) Close() error {
@@ -529,24 +537,14 @@ func (c *Client) recycleManagedTCPConn(conn net.Conn, pool *tcpConnPool) error {
 	return nil
 }
 
-// finishManagedTCPConn recycles conn into the pool when the response was
-// cleanly consumed, otherwise closes it.
-func (c *Client) finishManagedTCPConn(conn net.Conn, pool *tcpConnPool, clean bool) {
-	if clean {
-		_ = c.recycleManagedTCPConn(conn, pool)
-		return
-	}
-	_ = c.releaseManagedTCPConn(conn, pool)
-}
-
-func (c *Client) newManagedTCPReadCloser(reader io.Reader, conn net.Conn, pool *tcpConnPool) io.ReadCloser {
+// newManagedTCPReadCloser hands a connection's lifecycle to the caller: the
+// returned ReadCloser owns closer, which recycles or releases the connection
+// exactly once. Callers pass in the same guard they used for their error
+// paths, so a connection is never owned by two guards.
+func newManagedTCPReadCloser(reader io.Reader, closer *managedTCPConnCloser) io.ReadCloser {
 	return &readerWithCloser{
 		Reader: reader,
-		Closer: &managedTCPConnCloser{
-			client: c,
-			conn:   conn,
-			pool:   pool,
-		},
+		Closer: closer,
 	}
 }
 
@@ -904,8 +902,8 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 	if err != nil {
 		return GetManifestResponse{}, err
 	}
-	clean := false
-	defer func() { c.finishManagedTCPConn(conn, pool, clean) }()
+	closer := managedTCPConnCloser{client: c, conn: conn, pool: pool}
+	defer closer.Close()
 
 	comp := request.Comp
 	if comp == "" {
@@ -964,7 +962,7 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 		}
 		return GetManifestResponse{}, fmt.Errorf("unexpected TXFER terminator: %q", statusLine)
 	}
-	clean = true
+	closer.markReusable()
 	manifest, err := parseManifest(raw)
 	if err != nil {
 		return GetManifestResponse{}, err
@@ -977,8 +975,8 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 	if err != nil {
 		return SyncManifestResponse{}, err
 	}
-	clean := false
-	defer func() { c.finishManagedTCPConn(conn, pool, clean) }()
+	closer := managedTCPConnCloser{client: c, conn: conn, pool: pool}
+	defer closer.Close()
 
 	comp := request.Comp
 	if comp == "" {
@@ -1087,7 +1085,7 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 		}
 		return SyncManifestResponse{}, fmt.Errorf("unexpected SYNC terminator: %q", statusLine)
 	}
-	clean = true
+	closer.markReusable()
 
 	manifest, parseErr := parseManifest(manifestBuf.Bytes())
 	if parseErr != nil {
@@ -1115,13 +1113,17 @@ func (c *Client) fetchFileBatchTCP(
 		return nil, err
 	}
 
+	// Pointer guard: ownership passes to the returned ReadCloser on success,
+	// so it must outlive this call.
+	closer := &managedTCPConnCloser{client: c, conn: conn, pool: pool}
+
 	var b strings.Builder
 	loadStrategy := normalizeLoadStrategy(c.LoadStrategy)
 	b.WriteString("SEND ")
 	b.WriteString(txferID)
 	for _, t := range targets {
 		if strings.TrimSpace(t.FullPath) == "" {
-			_ = c.releaseManagedTCPConn(conn, pool)
+			_ = closer.Close()
 			return nil, errors.New("missing full path")
 		}
 		b.WriteString(" fd=")
@@ -1145,15 +1147,15 @@ func (c *Client) fetchFileBatchTCP(
 	}
 	br, err := c.sendAndReadTCP(conn, state, b.String())
 	if err != nil {
-		_ = c.releaseManagedTCPConn(conn, pool)
+		_ = closer.Close()
 		return nil, fmt.Errorf("SEND batch: %w", err)
 	}
 	firstLine, err := readSENDFirstLine(br)
 	if err != nil {
-		_ = c.releaseManagedTCPConn(conn, pool)
+		_ = closer.Close()
 		return nil, err
 	}
-	return c.newManagedTCPReadCloser(io.MultiReader(strings.NewReader(firstLine), br), conn, pool), nil
+	return newManagedTCPReadCloser(io.MultiReader(strings.NewReader(firstLine), br), closer), nil
 }
 
 func readTCPStatus(br *bufio.Reader) (string, error) {
@@ -1384,8 +1386,8 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 	if err != nil {
 		return AcknowledgeFileProgressResponse{}, err
 	}
-	clean := false
-	defer func() { c.finishManagedTCPConn(conn, pool, clean) }()
+	closer := managedTCPConnCloser{client: c, conn: conn, pool: pool}
+	defer closer.Close()
 
 	var cmd strings.Builder
 	cmd.WriteString("ACK ")
@@ -1417,7 +1419,7 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 	if _, err := readTCPStatus(br); err != nil {
 		return AcknowledgeFileProgressResponse{}, fmt.Errorf("read ACK response: %w", err)
 	}
-	clean = true
+	closer.markReusable()
 	return AcknowledgeFileProgressResponse{}, nil
 }
 
@@ -1426,8 +1428,8 @@ func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (Ge
 	if err != nil {
 		return GetStatusResponse{}, err
 	}
-	clean := false
-	defer func() { c.finishManagedTCPConn(conn, pool, clean) }()
+	closer := managedTCPConnCloser{client: c, conn: conn, pool: pool}
+	defer closer.Close()
 
 	br, err := c.sendAndReadTCP(conn, state, "STATUS "+request.TransferID)
 	if err != nil {
@@ -1437,7 +1439,7 @@ func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (Ge
 	if err != nil {
 		return GetStatusResponse{}, fmt.Errorf("read STATUS response: %w", err)
 	}
-	clean = true
+	closer.markReusable()
 	if strings.TrimSpace(message) == "" {
 		return GetStatusResponse{}, errors.New("missing STATUS JSON payload")
 	}
@@ -1453,8 +1455,8 @@ func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesReques
 	if err != nil {
 		return ListStatusesResponse{}, err
 	}
-	clean := false
-	defer func() { c.finishManagedTCPConn(conn, pool, clean) }()
+	closer := managedTCPConnCloser{client: c, conn: conn, pool: pool}
+	defer closer.Close()
 
 	br, err := c.sendAndReadTCP(conn, state, "STATUS")
 	if err != nil {
@@ -1480,7 +1482,7 @@ func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesReques
 		}
 		statuses = append(statuses, s)
 	}
-	clean = true
+	closer.markReusable()
 	return ListStatusesResponse{Statuses: statuses}, nil
 }
 
@@ -1490,6 +1492,8 @@ func (c *Client) getChecksumTCP(ctx context.Context, request GetChecksumRequest)
 		return nil, err
 	}
 	stopWatch := watchManagedTCPConnContext(ctx, conn)
+	// Pointer guard: ownership passes to the returned ReadCloser on success.
+	closer := &managedTCPConnCloser{client: c, conn: conn, pool: pool}
 
 	var cmd strings.Builder
 	cmd.WriteString("CXSUM ")
@@ -1515,17 +1519,17 @@ func (c *Client) getChecksumTCP(ctx context.Context, request GetChecksumRequest)
 	br, err := c.sendAndReadTCP(conn, state, cmd.String())
 	if err != nil {
 		stopWatch()
-		_ = c.releaseManagedTCPConn(conn, pool)
+		_ = closer.Close()
 		return nil, fmt.Errorf("CXSUM: %w", err)
 	}
 	firstLine, err := readStreamFirstLine(br, "CXSUM")
 	if err != nil {
 		stopWatch()
-		_ = c.releaseManagedTCPConn(conn, pool)
+		_ = closer.Close()
 		return nil, err
 	}
 	return &contextManagedTCPReadCloser{
-		ReadCloser: c.newManagedTCPReadCloser(io.MultiReader(strings.NewReader(firstLine), br), conn, pool),
+		ReadCloser: newManagedTCPReadCloser(io.MultiReader(strings.NewReader(firstLine), br), closer),
 		stopWatch:  stopWatch,
 	}, nil
 }
