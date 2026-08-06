@@ -3651,3 +3651,237 @@ func TestFileStreamRecyclesOnlyAfterTerminalOK(t *testing.T) {
 		})
 	}
 }
+
+// closeCountConn counts Close calls so a test can prove a connection has
+// exactly one lifecycle owner.
+type closeCountConn struct {
+	net.Conn
+	closes atomic.Int64
+}
+
+func (c *closeCountConn) Close() error {
+	c.closes.Add(1)
+	return c.Conn.Close()
+}
+
+// scriptedSessionConn seeds c's pool with one keep-alive session connection
+// whose peer replies with script once a command arrives, so the recycle
+// decision can be observed without a real server. Returns the pool (check
+// len(pool.ready) for a recycle) and the close counter (a release closes the
+// connection exactly once).
+//
+// net.Pipe is unbuffered, so the peer's write blocks until the client has
+// consumed every byte; closing afterwards cannot truncate the response.
+func scriptedSessionConn(t *testing.T, c *Client, script string) (*tcpConnPool, *closeCountConn) {
+	t.Helper()
+	clientSide, serverSide := net.Pipe()
+	counted := &closeCountConn{Conn: clientSide}
+
+	pool := newTCPConnPool(tcpAuthState{}, 1, 5000)
+	if pool == nil {
+		t.Fatalf("newTCPConnPool returned nil")
+	}
+	t.Cleanup(pool.stop)
+	pool.ready <- &sessionTCPConn{Conn: counted, lastActive: time.Now()}
+
+	c.tcpPoolMu.Lock()
+	c.tcpPool = pool
+	c.tcpPoolMu.Unlock()
+
+	go func() {
+		defer serverSide.Close()
+		if _, err := bufio.NewReader(serverSide).ReadString('\n'); err != nil {
+			return
+		}
+		_, _ = io.WriteString(serverSide, script)
+	}()
+	return pool, counted
+}
+
+// TestGetStatusRecyclesAfterCompleteResponseWithBadJSON pins the semantic that
+// makes the recycle flag subtle: it means "the response was consumed through
+// its terminal line", not "the call succeeded". A STATUS reply that is well
+// framed but carries unparseable JSON leaves the connection at a known
+// boundary, so it must still go back to the pool.
+func TestGetStatusRecyclesAfterCompleteResponseWithBadJSON(t *testing.T) {
+	c := &Client{FileAddr: "127.0.0.1:1"}
+	defer c.Close()
+	pool, counted := scriptedSessionConn(t, c, "OK {not-json}\r\n")
+
+	if _, err := c.getStatusTCP(context.Background(), GetStatusRequest{TransferID: "tx1"}); err == nil {
+		t.Fatalf("expected a JSON decode error")
+	}
+	if got := c.MetricSnapshot().ConnectionReuseCount; got != 1 {
+		t.Fatalf("ConnectionReuseCount = %d, want 1: a fully consumed response must recycle even when its payload fails to parse", got)
+	}
+	if got := counted.closes.Load(); got != 0 {
+		t.Fatalf("connection closed %d times, want 0 (it should have been pooled)", got)
+	}
+	if len(pool.ready) != 1 {
+		t.Fatalf("pool.ready = %d, want the connection returned", len(pool.ready))
+	}
+}
+
+// TestListStatusesDoesNotRecycleWhenEntriesRemainUnread is the deliberate
+// opposite of the test above: STATUS declares a record count, so failing on
+// entry index 1 of 3 leaves unread lines on the wire. The connection is at an
+// unknown boundary and must be closed rather than pooled.
+func TestListStatusesDoesNotRecycleWhenEntriesRemainUnread(t *testing.T) {
+	c := &Client{FileAddr: "127.0.0.1:1"}
+	defer c.Close()
+	script := "OK 3\r\n" + "{}\r\n" + "{bad json\r\n"
+	pool, counted := scriptedSessionConn(t, c, script)
+
+	if _, err := c.listStatusesTCP(context.Background(), ListStatusesRequest{}); err == nil {
+		t.Fatalf("expected a decode error on entry 1")
+	}
+	if got := c.MetricSnapshot().ConnectionReuseCount; got != 0 {
+		t.Fatalf("ConnectionReuseCount = %d, want 0: an undrained response must not be recycled", got)
+	}
+	if got := counted.closes.Load(); got != 1 {
+		t.Fatalf("connection closed %d times, want exactly 1", got)
+	}
+	if len(pool.ready) != 0 {
+		t.Fatalf("pool.ready = %d, want the connection discarded", len(pool.ready))
+	}
+}
+
+// TestFetchFileBatchConnClosesExactlyOnce covers the hand-off path, where the
+// connection outlives the call and ownership passes to the returned
+// ReadCloser. TestFileStreamRecyclesOnlyAfterTerminalOK checks reuse *marking*
+// against a stand-in closer; this checks the real connection is released or
+// recycled exactly once per path, including under repeated Close.
+//
+// Note this does not prove the connection has only one guard: a second,
+// independent guard that nothing ever closes is invisible here. That invariant
+// is structural — fetchFileBatchTCP holds one guard and newManagedTCPReadCloser
+// takes it as a parameter, so it cannot mint a second one.
+func TestFetchFileBatchConnClosesExactlyOnce(t *testing.T) {
+	frame := "FX/1 5 offset=0 size=3 wsize=3 comp=none ts=1\n" + "abc" + "FXT/1 5 status=ok ts=1 next=0\n"
+	targets := []FetchFileTarget{{FileID: 5, FullPath: "/tmp/a"}}
+
+	t.Run("setup failure releases once", func(t *testing.T) {
+		c := &Client{FileAddr: "127.0.0.1:1"}
+		defer c.Close()
+		// A server-side rejection: the stream never starts, so the guard must
+		// release the connection before returning.
+		pool, counted := scriptedSessionConn(t, c, "ERR INTERNAL boom\r\n")
+
+		if _, err := c.fetchFileBatchTCP(context.Background(), "tx1", targets); err == nil {
+			t.Fatalf("expected the ERR control frame to surface as an error")
+		}
+		if got := counted.closes.Load(); got != 1 {
+			t.Fatalf("connection closed %d times, want exactly 1", got)
+		}
+		if got := c.MetricSnapshot().ConnectionReuseCount; got != 0 {
+			t.Fatalf("ConnectionReuseCount = %d, want 0", got)
+		}
+		if len(pool.ready) != 0 {
+			t.Fatalf("pool.ready = %d, want the connection discarded", len(pool.ready))
+		}
+	})
+
+	t.Run("successful hand-off recycles once", func(t *testing.T) {
+		c := &Client{FileAddr: "127.0.0.1:1"}
+		defer c.Close()
+		pool, counted := scriptedSessionConn(t, c, frame+"OK\r\n")
+
+		body, err := c.fetchFileBatchTCP(context.Background(), "tx1", targets)
+		if err != nil {
+			t.Fatalf("fetchFileBatchTCP: %v", err)
+		}
+		stream, _, err := c.newFileStream(body, "", 3)
+		if err != nil {
+			t.Fatalf("newFileStream: %v", err)
+		}
+		if _, err := io.ReadAll(stream); err != nil {
+			t.Fatalf("read stream: %v", err)
+		}
+		if err := stream.Close(); err != nil {
+			t.Fatalf("close stream: %v", err)
+		}
+		if got := c.MetricSnapshot().ConnectionReuseCount; got != 1 {
+			t.Fatalf("ConnectionReuseCount = %d, want 1", got)
+		}
+		if got := counted.closes.Load(); got != 0 {
+			t.Fatalf("connection closed %d times, want 0 (it should have been pooled)", got)
+		}
+		if len(pool.ready) != 1 {
+			t.Fatalf("pool.ready = %d, want the connection returned", len(pool.ready))
+		}
+	})
+
+	// Close the ReadCloser the guard owns directly rather than going through
+	// fileStream: fileStream.Close has its own `closed` flag, so closing via it
+	// would exercise that guard instead of this one.
+	repeatCases := []struct {
+		name       string
+		reusable   bool
+		wantReuse  int64
+		wantCloses int64
+		wantReady  int
+	}{
+		{name: "recycled", reusable: true, wantReuse: 1, wantCloses: 0, wantReady: 1},
+		{name: "released", reusable: false, wantReuse: 0, wantCloses: 1, wantReady: 0},
+	}
+	for _, tc := range repeatCases {
+		t.Run("repeated Close acts once/"+tc.name, func(t *testing.T) {
+			c := &Client{FileAddr: "127.0.0.1:1"}
+			defer c.Close()
+			pool, counted := scriptedSessionConn(t, c, frame+"OK\r\n")
+
+			body, err := c.fetchFileBatchTCP(context.Background(), "tx1", targets)
+			if err != nil {
+				t.Fatalf("fetchFileBatchTCP: %v", err)
+			}
+			if _, err := io.ReadAll(body); err != nil {
+				t.Fatalf("drain body: %v", err)
+			}
+			if tc.reusable {
+				markStreamReusable(body)
+			}
+			for i := 0; i < 3; i++ {
+				if err := body.Close(); err != nil {
+					t.Fatalf("close %d: %v", i, err)
+				}
+			}
+			if got := c.MetricSnapshot().ConnectionReuseCount; got != tc.wantReuse {
+				t.Fatalf("ConnectionReuseCount = %d after 3 closes, want %d", got, tc.wantReuse)
+			}
+			if got := counted.closes.Load(); got != tc.wantCloses {
+				t.Fatalf("connection closed %d times after 3 closes, want %d", got, tc.wantCloses)
+			}
+			if len(pool.ready) != tc.wantReady {
+				t.Fatalf("pool.ready = %d after 3 closes, want %d", len(pool.ready), tc.wantReady)
+			}
+		})
+	}
+}
+
+// TestChecksumStreamNeverMarksConnReusable pins the one property the CXSUM
+// hand-off depends on: a CXSUM stream can be cancelled mid-response by the
+// verifier's context, so its connection is never provably at a command
+// boundary and must never return to the keep-alive pool.
+//
+// This holds only because contextManagedTCPReadCloser embeds io.ReadCloser as
+// an *interface*, which promotes Read and Close but not markReusable. Embedding
+// the concrete type instead would silently start recycling desynced
+// connections, and nothing else in the suite would notice.
+func TestChecksumStreamNeverMarksConnReusable(t *testing.T) {
+	var rc io.ReadCloser = &contextManagedTCPReadCloser{}
+	if _, ok := rc.(connReuseMarker); ok {
+		t.Fatalf("contextManagedTCPReadCloser must not expose markReusable: CXSUM connections are never at a known protocol boundary")
+	}
+
+	// markStreamReusable is the path callers actually use; through a CXSUM
+	// stream it must not reach the underlying connection guard.
+	guard := &managedTCPConnCloser{}
+	stream := &contextManagedTCPReadCloser{
+		ReadCloser: newManagedTCPReadCloser(strings.NewReader(""), guard),
+		stopWatch:  func() {},
+	}
+	markStreamReusable(stream)
+	if guard.reusable.Load() {
+		t.Fatalf("markStreamReusable reached the connection guard through a CXSUM stream")
+	}
+}
