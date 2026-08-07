@@ -1,4 +1,7 @@
-tx
+# Anchored to the repo root: a bare "tx" also matches the cmd/tx/ directory,
+# which hides it from any tool that honours .gitignore (ripgrep, ugrep, most
+# editor search). Only the built binary here should be ignored.
+/tx
 .codex
 **/testdata/fuzz/
 **/testdata/fuzz/**
