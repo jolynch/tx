@@ -213,12 +213,25 @@ func serveFTCPConn(conn net.Conn, serverID *age.X25519Identity, handler func(int
 		}
 	}
 	if cmdReq.Verb == intftcp.VerbSYNC {
-		mr := encoding.NewChunkedManifestReader(br, encoding.ChunkedManifestReaderOpts{})
+		mr := encoding.NewFramedBodyReader(br, encoding.FramedBodyReaderOpts{})
 		if _, drainErr := io.Copy(io.Discard, mr); drainErr != nil {
 			_, _ = io.WriteString(out, "ERR BAD_REQUEST invalid sync manifest\r\n")
 			_ = closeOut()
 			return
 		}
+	}
+	// SEND, ACK, and CXSUM carry their per-file items in a framed request body,
+	// which must be drained before anything is written back: the real server
+	// keeps the exchange strictly request-then-response, and a fake that
+	// replied early would deadlock or break the pipe.
+	if intftcp.VerbHasRequestItems(cmdReq.Verb) {
+		items, itemErr := intftcp.ReadRequestItems(br, cmdReq.Verb)
+		if itemErr != nil {
+			_, _ = io.WriteString(out, "ERR BAD_REQUEST "+itemErr.Error()+"\r\n")
+			_ = closeOut()
+			return
+		}
+		cmdReq.Params = mergeCLIRequestItems(cmdReq.Verb, cmdReq.Params, items)
 	}
 	if handled, handleErr := maybeWriteCLIRootMetadataOnlySEND(cmdReq, out); handled {
 		if handleErr != nil {
@@ -232,6 +245,29 @@ func serveFTCPConn(conn net.Conn, serverID *age.X25519Identity, handler func(int
 		_, _ = io.WriteString(out, "ERR INTERNAL "+err.Error()+"\r\n")
 	}
 	_ = closeOut()
+}
+
+// mergeCLIRequestItems folds a framed body's items back into Request.Params so
+// the test handlers below can read a whole request from one place, copying
+// transfer-level fields from the command line onto each item.
+func mergeCLIRequestItems(verb intftcp.Verb, header []map[string]string, items []map[string]string) []map[string]string {
+	if len(header) == 0 {
+		return items
+	}
+	txferID := header[0]["txferid"]
+	mode := header[0]["mode"]
+	for _, item := range items {
+		if txferID != "" {
+			item["txferid"] = txferID
+		}
+		if verb == intftcp.VerbSEND && mode != "" {
+			item["mode"] = mode
+		}
+	}
+	if verb == intftcp.VerbACK {
+		return items
+	}
+	return append(header, items...)
 }
 
 func maybeWriteCLIRootMetadataOnlySEND(req intftcp.Request, out io.Writer) (bool, error) {
@@ -496,7 +532,7 @@ func buildTestManifestEntryFromDisk(t *testing.T, fullPath string, relPath strin
 // FX/1+FXT/1 streaming frames (file_id=0), matching the live TXFER
 // wire format. Used by fake TXFER servers in tests.
 func writeManifestResponse(out io.Writer, manifestRaw string) error {
-	cw := encoding.NewChunkedManifestWriter(out, encoding.EncodingZstd, 32, 0)
+	cw := encoding.NewFramedBodyWriter(out, encoding.EncodingZstd, 32, 0)
 	if _, err := io.WriteString(cw, manifestRaw); err != nil {
 		return err
 	}
@@ -504,7 +540,7 @@ func writeManifestResponse(out io.Writer, manifestRaw string) error {
 }
 
 func writeSyncResponse(out io.Writer, transferID string, entries []string, removedIDs []uint64) error {
-	cw := encoding.NewChunkedManifestWriter(out, encoding.EncodingZstd, 32, 0)
+	cw := encoding.NewFramedBodyWriter(out, encoding.EncodingZstd, 32, 0)
 	if _, err := io.WriteString(cw, buildTestManifestRaw(transferID, entries)); err != nil {
 		return err
 	}
@@ -3675,14 +3711,30 @@ func TestRunCLICopySendFailureReturnsNonzero(t *testing.T) {
 	}
 }
 
+// writeCLIStatusList frames STATUS list entries the way the server does.
+func writeCLIStatusList(out io.Writer, entries ...string) error {
+	bw := encoding.NewFramedBodyWriter(out, encoding.EncodingZstd, encoding.DefaultBodyChunkSize, 0)
+	for _, entry := range entries {
+		if _, err := io.WriteString(bw, entry+"\n"); err != nil {
+			return err
+		}
+	}
+	if err := bw.Close(); err != nil {
+		return err
+	}
+	_, err := io.WriteString(out, "OK\r\n")
+	return err
+}
+
 func TestRunCLIStatus(t *testing.T) {
 	t.Run("list-all", func(t *testing.T) {
 		srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 			if req.Verb != intftcp.VerbSTATUS {
 				return fmt.Errorf("unexpected verb: %v", req.Verb)
 			}
-			_, err := io.WriteString(out, "OK 1\r\n{\"transfer_id\":\"abc\",\"directory\":\"/r\",\"num_files\":10,\"total_size\":1000,\"done\":3,\"done_size\":200,\"percent_files\":30.0,\"percent_bytes\":20.0,\"download_status\":{\"started\":5,\"running\":2,\"done\":3,\"missing\":0}}\r\n")
-			return err
+			// A bare STATUS answers with a framed body of one JSON object
+			// per line, then the verb-level OK.
+			return writeCLIStatusList(out, `{"transfer_id":"abc","directory":"/r","num_files":10,"total_size":1000,"done":3,"done_size":200,"percent_files":30.0,"percent_bytes":20.0,"download_status":{"started":5,"running":2,"done":3,"missing":0}}`)
 		})
 		defer srv.Close()
 

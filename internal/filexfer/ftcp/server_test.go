@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -102,6 +104,27 @@ func TestConnSessionNoteClientActivity(t *testing.T) {
 	}
 }
 
+// drainSTATUSList consumes the framed body of a bare STATUS response followed
+// by its verb-level OK line, and returns how many transfers it listed.
+func drainSTATUSList(t *testing.T, br *bufio.Reader) int {
+	t.Helper()
+	body, err := io.ReadAll(encoding.NewFramedBodyReader(br, encoding.FramedBodyReaderOpts{}))
+	if err != nil {
+		t.Fatalf("read STATUS body: %v", err)
+	}
+	okLine := readLineOrFatal(t, br, "STATUS terminator")
+	if !strings.HasPrefix(okLine, "OK") {
+		t.Fatalf("expected OK after STATUS body, got %q", okLine)
+	}
+	count := 0
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.TrimSpace(line) != "" {
+			count++
+		}
+	}
+	return count
+}
+
 func TestHandleConnInitialHeartbeatDoesNotCountAsActivity(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
@@ -131,14 +154,7 @@ func TestHandleConnInitialHeartbeatDoesNotCountAsActivity(t *testing.T) {
 	if _, err := clientConn.Write([]byte("STATUS\r\n")); err != nil {
 		t.Fatalf("write STATUS: %v", err)
 	}
-	statusLine := readLineOrFatal(t, br, "STATUS response")
-	count, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(statusLine, "OK")))
-	if err != nil {
-		t.Fatalf("parse STATUS count from %q: %v", statusLine, err)
-	}
-	for i := 0; i < count; i++ {
-		readLineOrFatal(t, br, "STATUS entry")
-	}
+	drainSTATUSList(t, br)
 	select {
 	case <-activityCount:
 	case <-time.After(time.Second):
@@ -191,19 +207,9 @@ func TestServeKeepAliveReusesConnection(t *testing.T) {
 	if _, err := conn.Write([]byte("STATUS\r\n")); err != nil {
 		t.Fatalf("write STATUS on kept-alive conn: %v", err)
 	}
-	statusOK := readLineOrFatal(t, br, "STATUS response")
-	if !strings.HasPrefix(statusOK, "OK") {
-		t.Fatalf("expected OK for STATUS on kept-alive conn, got %q", statusOK)
-	}
-	// Drain the per-transfer JSON lines (the store is global, so other
-	// tests in this package may have left transfers behind).
-	count, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(statusOK, "OK")))
-	if err != nil {
-		t.Fatalf("parse STATUS count from %q: %v", statusOK, err)
-	}
-	for i := 0; i < count; i++ {
-		readLineOrFatal(t, br, "STATUS entry")
-	}
+	// Drains the framed body and its terminal OK; the store may already hold
+	// transfers left by other tests, so the count is not asserted.
+	drainSTATUSList(t, br)
 
 	if _, err := conn.Write([]byte("PROBE cpu=1 probe-bytes=0 cts0=2 keep-alive=auto\r\n")); err != nil {
 		t.Fatalf("write heartbeat PROBE: %v", err)
@@ -261,7 +267,7 @@ func TestServeKeepAliveClearsSyncWriteDeadline(t *testing.T) {
 		t.Fatalf("marshal root entry: %v", err)
 	}
 	var framed bytes.Buffer
-	cw := encoding.NewChunkedManifestWriter(&framed, "none", encoding.DefaultManifestChunkSize, 0)
+	cw := encoding.NewFramedBodyWriter(&framed, "none", encoding.DefaultBodyChunkSize, 0)
 	if _, err := cw.Write([]byte(hdr + "\n" + rootLine + "\n")); err != nil {
 		t.Fatalf("write manifest body: %v", err)
 	}
@@ -291,9 +297,7 @@ func TestServeKeepAliveClearsSyncWriteDeadline(t *testing.T) {
 	if _, err := conn.Write([]byte("STATUS\r\n")); err != nil {
 		t.Fatalf("write STATUS: %v", err)
 	}
-	if ok := readLineOrFatal(t, br, "STATUS response"); !strings.HasPrefix(ok, "OK") {
-		t.Fatalf("expected OK for STATUS after sync deadline elapsed, got %q", ok)
-	}
+	drainSTATUSList(t, br)
 }
 
 // TestServeKeepAliveMidSessionGarbageReportsError proves that garbage sent
@@ -431,11 +435,34 @@ func FuzzServeZeroCopySEND(f *testing.F) {
 					}
 					return raw
 				}
+				// SEND carries its per-file items in a framed request body, so
+				// the command line and the body go out together.
+				exchangeWithItems := func(command string, items ...string) []byte {
+					t.Helper()
+					conn, err := net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer conn.Close()
+					_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+					if _, err := io.WriteString(conn, command+"\r\n"); err != nil {
+						t.Fatal(err)
+					}
+					body := framedItemBody(t, items...)
+					if _, err := io.Copy(conn, body); err != nil {
+						t.Fatal(err)
+					}
+					raw, err := io.ReadAll(cappedTCPReader{conn, readLimit})
+					if err != nil {
+						t.Fatalf("%s: %v", strings.Fields(command)[0], err)
+					}
+					return raw
+				}
 				raw := exchange(fmt.Sprintf("TXFER %q mode=fast link-mbps=1000 concurrency=1 comp=none", filepath.Dir(path)))
 				if !bytes.HasSuffix(raw, []byte("OK\r\n")) {
 					t.Fatalf("TXFER failed: %q", raw)
 				}
-				manifest, err := io.ReadAll(encoding.NewChunkedManifestReader(bytes.NewReader(raw), encoding.ChunkedManifestReaderOpts{}))
+				manifest, err := io.ReadAll(encoding.NewFramedBodyReader(bytes.NewReader(raw), encoding.FramedBodyReaderOpts{}))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -448,7 +475,10 @@ func FuzzServeZeroCopySEND(f *testing.F) {
 					t.Fatalf("unexpected manifest: %s", manifest)
 				}
 				fid, tid := entries[0].ID, header.TransferID
-				raw = exchange(fmt.Sprintf("SEND %s fd=%d %q mode=fast comp=none offset=%d size=%d", tid, fid, path, offset, length))
+				raw = exchangeWithItems(
+					fmt.Sprintf("SEND %s mode=fast", tid),
+					fmt.Sprintf("fd=%d %q comp=none offset=%d size=%d", fid, path, offset, length),
+				)
 				if !bytes.HasSuffix(raw, []byte("OK\r\n")) {
 					t.Fatal("SEND missing terminal OK")
 				}
@@ -491,8 +521,8 @@ func FuzzServeZeroCopySEND(f *testing.F) {
 				if !deps.VerifyTransferFileWindowHash(tid, fid, offset+length, hash) {
 					t.Fatal("server did not store the window hash at its end offset")
 				}
-				ack := fmt.Sprintf("ACK %s fd=%d %q ack-token=%d@1@", tid, fid, path, offset+length)
-				bad := exchange(ack + "xxh128:00000000000000000000000000000000")
+				ackItem := fmt.Sprintf("fd=%d %q ack-token=%d@1@", fid, path, offset+length)
+				bad := exchangeWithItems("ACK "+tid, ackItem+"xxh128:00000000000000000000000000000000")
 				if !bytes.HasPrefix(bad, []byte("ERR CONFLICT ")) {
 					t.Fatalf("bad ACK accepted: %q", bad)
 				}
@@ -500,7 +530,7 @@ func FuzzServeZeroCopySEND(f *testing.F) {
 				if before.DoneSize != 0 {
 					t.Fatal("bad ACK advanced progress")
 				}
-				if got := string(exchange(ack + hash)); got != "OK\r\n" {
+				if got := string(exchangeWithItems("ACK "+tid, ackItem+hash)); got != "OK\r\n" {
 					t.Fatalf("valid ACK rejected: %q", got)
 				}
 				var status encoding.TransferStatus
@@ -526,4 +556,175 @@ type cappedTCPReader struct {
 
 func (r cappedTCPReader) Read(p []byte) (int, error) {
 	return r.Reader.Read(p[:min(len(p), r.limit)])
+}
+
+// countingReader reports how many bytes a reader actually pulled, so a test can
+// distinguish "gave up at the cap" from "buffered everything then complained".
+type countingReader struct {
+	served int64
+	fill   byte
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = r.fill
+	}
+	r.served += int64(len(p))
+	return len(p), nil
+}
+
+// The regression: readCommandLine used to call ReadBytes, which grows without
+// bound and could only be size-checked after the allocation. A peer that never
+// sends '\n' must be cut off, and must be told why in the protocol's own error
+// vocabulary rather than the doubled "ERR ERR" a bare error produced.
+func TestReadCommandLineBoundsHostileInput(t *testing.T) {
+	src := &countingReader{fill: 'A'}
+	_, err := readCommandLine(bufio.NewReader(src), maxCommandLineBytes)
+	if err == nil {
+		t.Fatal("endless command line was accepted")
+	}
+	var pe protocolErr
+	if !errors.As(err, &pe) || pe.code != "BAD_REQUEST" {
+		t.Fatalf("want BAD_REQUEST protocolErr, got %v (%T)", err, err)
+	}
+	if src.served > int64(maxCommandLineBytes)*4 {
+		t.Fatalf("consumed %d bytes enforcing a %d byte cap", src.served, maxCommandLineBytes)
+	}
+
+	// And the wire form is a single well-formed ERR line.
+	var out bytes.Buffer
+	if writeErr := writeErrFrame(&out, err); writeErr != nil {
+		t.Fatalf("writeErrFrame: %v", writeErr)
+	}
+	if got := out.String(); got != "ERR BAD_REQUEST command line too large\r\n" {
+		t.Fatalf("unexpected error line: %q", got)
+	}
+}
+
+func TestReadCommandLineAcceptsFullLengthCommand(t *testing.T) {
+	// A command exactly at the cap is legal; one byte past it is not.
+	body := strings.Repeat("x", maxCommandLineBytes-len("STATUS \r\n"))
+	line := "STATUS " + body + "\r\n"
+	got, err := readCommandLine(bufio.NewReader(strings.NewReader(line)), maxCommandLineBytes)
+	if err != nil {
+		t.Fatalf("command at the cap was rejected: %v", err)
+	}
+	if string(got) != "STATUS "+body {
+		t.Fatalf("unexpected command payload of %d bytes", len(got))
+	}
+	if _, err := readCommandLine(bufio.NewReader(strings.NewReader("STATUS "+body+"y\r\n")), maxCommandLineBytes); err == nil {
+		t.Fatal("command one byte past the cap was accepted")
+	}
+}
+
+// panicDeps injects one mid-request panic to test connection isolation.
+type panicDeps struct {
+	Deps
+	panicked chan struct{}
+	fired    atomic.Bool
+}
+
+// Panic once so a later request can prove the listener survived.
+func (d *panicDeps) GetTransfer(txferID string) (Transfer, bool) {
+	if d.fired.CompareAndSwap(false, true) {
+		close(d.panicked)
+		panic("injected panic from a handler")
+	}
+	return d.Deps.GetTransfer(txferID)
+}
+
+func TestServePanicDropsOnlyItsConnection(t *testing.T) {
+	root := t.TempDir()
+	deps := &panicDeps{Deps: realDeps(t, "/"), panicked: make(chan struct{})}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() { _ = Serve(ln, ServerOptions{Deps: deps, RootDir: root}) }()
+
+	// Trigger the handler panic.
+	victim, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = victim.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(victim, "SEND tx1 mode=fast\r\n"); err != nil {
+		t.Fatalf("write SEND: %v", err)
+	}
+	body := framedItemBody(t, `fd=1 "/tmp/a.txt"`)
+	if _, err := io.Copy(victim, body); err != nil {
+		t.Fatalf("write body: %v", err)
+	}
+	// The connection should close after the panic.
+	_, _ = io.ReadAll(victim)
+	_ = victim.Close()
+
+	select {
+	case <-deps.panicked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never reached the injected panic")
+	}
+
+	// Confirm the listener still serves new connections.
+	survivor, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("server stopped accepting after a handler panic: %v", err)
+	}
+	defer survivor.Close()
+	_ = survivor.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(survivor, "STATUS nonexistent\r\n"); err != nil {
+		t.Fatalf("write STATUS: %v", err)
+	}
+	line, err := bufio.NewReader(survivor).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read STATUS after panic: %v", err)
+	}
+	if !strings.HasPrefix(line, "ERR NOT_FOUND") {
+		t.Fatalf("unexpected reply after a handler panic: %q", line)
+	}
+}
+
+// A rejected header must yield ERR even while the client writes its body.
+func TestServeSENDHeaderErrorIsReadableNotBrokenPipe(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() { _ = Serve(ln, ServerOptions{Deps: realDeps(t, "/"), RootDir: t.TempDir()}) }()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	// mode=slow is rejected by parseSENDHeader, before the body is looked at.
+	if _, err := io.WriteString(conn, "SEND tx1 mode=slow\r\n"); err != nil {
+		t.Fatalf("write SEND: %v", err)
+	}
+	// A body large enough that it cannot sit entirely in socket buffers.
+	items := make([]string, 20000)
+	for i := range items {
+		items[i] = fmt.Sprintf(`fd=%d %d:/remote/some/reasonably/long/path/file-%06d.bin`, i+1, 46, i)
+	}
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(conn, framedItemBody(t, items...))
+		writeErr <- err
+	}()
+
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read ERR after a rejected header: %v", err)
+	}
+	if !strings.HasPrefix(line, "ERR BAD_REQUEST") {
+		t.Fatalf("expected a BAD_REQUEST explanation, got %q", line)
+	}
+	if err := <-writeErr; err != nil {
+		t.Errorf("client body write failed instead of completing: %v", err)
+	}
 }

@@ -47,6 +47,9 @@ fuzz-short:
 # End-to-end properties driving the whole system. These are still finding new
 # coverage past 10s, so CI gives them a larger budget to keep exploring.
 fuzz-long:
+	go test -race ./internal/filexfer/encoding -run=^$$ -fuzz=FuzzManifestEntryRoundTrip -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
+	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzFramedItemRoundTrip -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
+	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzFramedBodyHeader -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
 	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzSync -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
 	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzServeZeroCopySEND -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG) -parallel=1
 

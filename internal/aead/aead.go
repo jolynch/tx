@@ -338,6 +338,8 @@ func writeFull(w io.Writer, p []byte) error {
 	return nil
 }
 
+// Keep AEAD buffers separate from bufpool: they hold plaintext and are zeroed
+// on release. Their fixed chunk sizes do not need bucketing.
 func aeadBufferPool(size int) *sync.Pool {
 	if existing, ok := aeadBufferPools.Load(size); ok {
 		return existing.(*sync.Pool)

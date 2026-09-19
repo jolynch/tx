@@ -1,11 +1,14 @@
 package ftcp
 
 import (
+	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/pagecache"
@@ -181,4 +184,44 @@ func (m *mockDeps) EnqueueCacheRestoreBatch(txferID string, items []pagecache.To
 	m.cacheRestoreCh = append(m.cacheRestoreCh, items...)
 	m.cacheRestoreCall++
 	m.cacheRestoreTxID = txferID
+}
+
+// framedItemBody encodes item lines as an FX/1 + FXT/1 request body, the way a
+// client sends the per-file arguments for SEND, ACK, and CXSUM. Handler tests
+// pair it with a header-only Request.
+func framedItemBody(t *testing.T, items ...string) *bytes.Reader {
+	t.Helper()
+	var buf bytes.Buffer
+	w := encoding.NewFramedBodyWriter(&buf, encoding.EncodingZstd, encoding.DefaultBodyChunkSize, 0)
+	for _, item := range items {
+		if _, err := io.WriteString(w, item+"\n"); err != nil {
+			t.Fatalf("write item %q: %v", item, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close framed body: %v", err)
+	}
+	return bytes.NewReader(buf.Bytes())
+}
+
+// parseOneSENDItem is the test shorthand for "parse this command line plus this
+// single item body", replacing the old single-call parseSENDRequest.
+func parseOneSENDItem(t *testing.T, cmd string, item string) (sendItem, error) {
+	t.Helper()
+	req, err := ParseRequest([]byte(cmd))
+	if err != nil {
+		t.Fatalf("ParseRequest(%q) failed: %v", cmd, err)
+	}
+	header, err := parseSENDHeader(req)
+	if err != nil {
+		return sendItem{}, err
+	}
+	raw, err := readItemBody(framedItemBody(t, item), sendItemKeys, "SEND")
+	if err != nil {
+		return sendItem{}, err
+	}
+	if len(raw) != 1 {
+		t.Fatalf("expected exactly one item, got %d", len(raw))
+	}
+	return parseSENDItem(raw[0], header.Mode)
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jolynch/tx"
+	"github.com/jolynch/tx/internal/bufpool"
 	"github.com/jolynch/tx/internal/cliflags"
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
@@ -808,7 +809,11 @@ func discardLocalFile(le localEntry, onBytes func(int64)) error {
 // assumes both fds are positioned at offset 0 (true when invoked with nothing
 // copied yet).
 func localCopyFileBuffered(dst, src *os.File, onBytes func(int64)) (int64, error) {
-	buf := make([]byte, localCopyBufferBytes)
+	buf, release, err := bufpool.Acquire(localCopyBufferBytes)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	var copied int64
 	for {
 		n, rerr := src.Read(buf)
@@ -991,6 +996,7 @@ func verifyLocalCopyData(srcRoot, dstRoot string, entries []localEntry, pct int,
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// Samples are smaller than the pool's 4 KiB minimum.
 			scratch := make([]byte, verifySampleBytes)
 			for t := range jobs {
 				if ctx.Err() != nil {
@@ -1202,7 +1208,12 @@ func runLocalGetCLI(a localGetArgs, stdout, stderr io.Writer) int {
 
 	start := time.Now()
 	if a.outputPath == "-" {
-		buf := make([]byte, localCopyBufferBytes)
+		buf, release, acqErr := bufpool.Acquire(localCopyBufferBytes)
+		if acqErr != nil {
+			fmt.Fprintf(stderr, "get failed: %v\n", acqErr)
+			return 1
+		}
+		defer release()
 		if _, err := io.CopyBuffer(stdout, src, buf); err != nil {
 			fmt.Fprintf(stderr, "get failed: %v\n", err)
 			return 1

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/jolynch/tx/internal/bufpool"
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
 	"github.com/zeebo/xxh3"
@@ -39,7 +41,9 @@ var lz4ReaderPool sync.Pool
 
 func (c *zstdMaxEncodedSizeCache) maxEncodedSize(n int) (int, error) {
 	c.once.Do(func() {
-		c.enc, c.err = zstd.NewWriter(io.Discard)
+		// Same configuration as acquirePooledZstdEncoder: a bound measured on a
+		// differently-tuned encoder does not bound this one's output.
+		c.enc, c.err = zstd.NewWriter(io.Discard, zstdEncoderOptions()...)
 		if c.err == nil {
 			c.size = make(map[int]int)
 			defaultMax := c.enc.MaxEncodedSize(defaultZstdFrameSize)
@@ -248,6 +252,22 @@ func releasePooledZstdDecoder(decoder *zstd.Decoder) {
 	zstdDecoderPool.Put(decoder)
 }
 
+// zstdEncoderOptions is the single definition of how this package configures a
+// zstd encoder.
+//
+// It exists so the encoder and the worst-case size bound cannot drift apart.
+// They did: the bound was measured on a default encoder while the data was
+// written by a SpeedFastest one, and SpeedFastest emits smaller blocks and so
+// more block headers. For a 4 MiB chunk the default bound is 4,194,417 bytes
+// while real output reached 4,194,509 — an underestimate, which silently costs
+// callers that size a buffer from it an extra grow and copy.
+func zstdEncoderOptions() []zstd.EOption {
+	return []zstd.EOption{
+		zstd.WithEncoderLevel(zstd.SpeedFastest),
+		zstd.WithEncoderConcurrency(1),
+	}
+}
+
 func acquirePooledZstdEncoder(dst io.Writer) (*zstd.Encoder, error) {
 	if raw := zstdEncoderPool.Get(); raw != nil {
 		if encoder, ok := raw.(*zstd.Encoder); ok && encoder != nil {
@@ -255,7 +275,7 @@ func acquirePooledZstdEncoder(dst io.Writer) (*zstd.Encoder, error) {
 			return encoder, nil
 		}
 	}
-	return zstd.NewWriter(dst, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
+	return zstd.NewWriter(dst, zstdEncoderOptions()...)
 }
 
 func releasePooledZstdEncoder(encoder *zstd.Encoder) {
@@ -266,30 +286,63 @@ func releasePooledZstdEncoder(encoder *zstd.Encoder) {
 	zstdEncoderPool.Put(encoder)
 }
 
-// CompressZstd returns src compressed as a single zstd frame.
+// CompressZstd returns an owned zstd frame. Use CompressZstdPooled when the
+// caller can release the output promptly.
 func CompressZstd(src []byte) ([]byte, error) {
-	hint, err := MaxEncodedFrameSizeBytes(EncodingZstd, int64(len(src)))
-	if err != nil || hint <= 0 {
-		hint = int64(len(src)) + 64
-	}
-	buf := bytes.NewBuffer(make([]byte, 0, hint))
-	enc, err := acquirePooledZstdEncoder(buf)
+	out, release, err := CompressZstdPooled(src)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
+	return bytes.Clone(out), nil
+}
+
+// CompressZstdPooled returns a zstd frame valid until release is called.
+//
+// The buffer grows with the output the encoder actually produces rather than
+// being reserved from the worst-case bound. That bound is the point: for a
+// 4 MiB chunk it is 4 MiB + 113 bytes, which rounds up to the 8 MiB bucket,
+// while real manifest chunks are front-coded text compressing to a small
+// fraction of that. Reserving the worst case would double the output buffer for
+// every full chunk to serve a case that almost never happens.
+//
+// The size here is our own chunk size rather than anything a peer declares, so
+// this is about the garbage a per-frame reservation would generate, not about
+// bounding hostile input.
+// zstdEmptyFrameOverheadBytes covers the frame header and checksum a zstd
+// frame carries even for empty input, so a tiny chunk's hint is not zero.
+const zstdEmptyFrameOverheadBytes = 64
+
+func CompressZstdPooled(src []byte) ([]byte, func(), error) {
+	// Hint from the input so a small chunk starts in a small bucket rather
+	// than the 64 KiB default. NewGrowing caps the hint at that default, so a
+	// full chunk still starts modestly and grows with the output.
+	out, err := bufpool.NewGrowing(int64(len(src)) + zstdEmptyFrameOverheadBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	enc, err := acquirePooledZstdEncoder(out)
+	if err != nil {
+		out.Release()
+		return nil, nil, err
+	}
 	if _, err := enc.Write(src); err != nil {
 		releasePooledZstdEncoder(enc)
-		return nil, err
+		out.Release()
+		return nil, nil, err
 	}
 	if err := enc.Close(); err != nil {
 		releasePooledZstdEncoder(enc)
-		return nil, err
+		out.Release()
+		return nil, nil, err
 	}
 	releasePooledZstdEncoder(enc)
-	return buf.Bytes(), nil
+	return out.Bytes(), out.Release, nil
 }
 
-// DecompressZstd returns the decompressed bytes of a single zstd frame.
+// DecompressZstd returns the decompressed bytes of a single zstd frame. It
+// reads to EOF, so the output size is whatever the frame expands to — only use
+// it on locally trusted input. Network input must use DecompressZstdN.
 func DecompressZstd(src []byte) ([]byte, error) {
 	dec, err := acquirePooledZstdDecoder(bytes.NewReader(src))
 	if err != nil {
@@ -301,6 +354,58 @@ func DecompressZstd(src []byte) ([]byte, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// DecompressZstdN decompresses a single zstd frame that must expand to exactly
+// maxOut bytes, returning a pooled buffer and the func that releases it.
+//
+// Framed wire formats declare their logical size in the frame header, so the
+// expected size is known before decoding, and checking during the read rather
+// than decompressing to EOF and comparing afterwards is what stops a small
+// adversarial frame from expanding without bound.
+//
+// Two properties matter for memory safety, because maxOut comes from a peer:
+//
+//   - It is bounded here against the frame ceiling rather than trusted. Callers
+//     decoding network input are expected to have bounded it already, but the
+//     guarantee cannot rest on every caller remembering to.
+//   - The buffer grows with bytes actually decoded, never by sizing an
+//     allocation from maxOut. Pooling alone would not give this: acquiring a
+//     pooled buffer of the declared size still lets a four-byte payload commit
+//     the largest permitted size, repeatedly.
+func DecompressZstdN(src []byte, maxOut int64) ([]byte, func(), error) {
+	if maxOut < 0 {
+		return nil, nil, errors.New("invalid decompressed size bound")
+	}
+	if ceiling := DefaultMaxFrameLogicalBytes(); maxOut > ceiling {
+		return nil, nil, fmt.Errorf("decompressed size bound %d exceeds maximum %d", maxOut, ceiling)
+	}
+	dec, err := acquirePooledZstdDecoder(bytes.NewReader(src))
+	if err != nil {
+		return nil, nil, err
+	}
+	defer releasePooledZstdDecoder(dec)
+
+	out, err := bufpool.NewGrowing(maxOut)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Reading one byte past maxOut is what detects a frame that expands beyond
+	// what it declared.
+	n, err := out.ReadFrom(io.LimitReader(dec, maxOut+1))
+	if err != nil {
+		out.Release()
+		return nil, nil, err
+	}
+	if n > maxOut {
+		out.Release()
+		return nil, nil, fmt.Errorf("decompressed frame exceeds declared %d bytes", maxOut)
+	}
+	if n < maxOut {
+		out.Release()
+		return nil, nil, fmt.Errorf("decompressed frame shorter than declared %d bytes", maxOut)
+	}
+	return out.Bytes(), out.Release, nil
 }
 
 func acquirePooledLZ4Reader(src io.Reader) *lz4.Reader {

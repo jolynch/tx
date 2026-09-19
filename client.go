@@ -22,6 +22,7 @@ import (
 	"unsafe"
 
 	"filippo.io/age"
+	"github.com/jolynch/tx/internal/bufpool"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	intlimit "github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/metrics"
@@ -186,7 +187,6 @@ type Client struct {
 	tcpPool   *tcpConnPool
 
 	// bufferPool caches reusable frame-read buffers keyed by bucketed size.
-	bufferPool sync.Map // map[int]*sync.Pool
 
 	// lineReaderPool caches reusable *bufio.Reader objects for protocol header reading.
 	// bufio.Reader is pooled (not its []byte) because Reset() reuses the internal allocation
@@ -590,7 +590,6 @@ func NewClient(fileAddr string, opts ...ClientOption) *Client {
 		}
 		opt.apply(c)
 	}
-	c.bufferPool = sync.Map{}
 	c.lineReaderPool = sync.Pool{
 		New: func() any {
 			return bufio.NewReaderSize(nil, defaultClientLineReaderBytes)
@@ -2573,6 +2572,13 @@ func effectiveFrameReadBufferSize(baseSize int, maxWireHint int64, capSize int) 
 	if capSize < minClientFrameReadBufferBytes {
 		capSize = minClientFrameReadBufferBytes
 	}
+	if capSize > bufpool.MaxBucket {
+		// WithMaxFrameReadBufferBytes is caller-settable, so clamp it to the
+		// largest pooled bucket. Frames on the wire are bounded well below this
+		// anyway, and without the clamp a configured value above it would ask
+		// the pool for a buffer it cannot serve.
+		capSize = bufpool.MaxBucket
+	}
 
 	target := baseSize
 	if maxWireHint > 0 {
@@ -2582,52 +2588,21 @@ func effectiveFrameReadBufferSize(baseSize int, maxWireHint int64, capSize int) 
 			target = int(maxWireHint)
 		}
 	}
-	target = max(minClientFrameReadBufferBytes, min(capSize, frameReadBucketSize(target)))
+	target = max(minClientFrameReadBufferBytes, min(capSize, bufpool.BucketSize(int64(target))))
 	return target
-}
-
-func frameReadBucketSize(target int) int {
-	const mib = 1024 * 1024
-	for _, bucket := range []int{
-		1 * mib,
-		2 * mib,
-		4 * mib,
-		8 * mib,
-		16 * mib,
-		32 * mib,
-		64 * mib,
-	} {
-		if target <= bucket {
-			return bucket
-		}
-	}
-	return 64 * mib
 }
 
 func (c *Client) acquireFrameReadBuffer(maxWireHint int64) ([]byte, func()) {
 	size := effectiveFrameReadBufferSize(c.FrameBufferBytes, maxWireHint, c.MaxFrameReadBufferBytes)
-	pool := (*sync.Pool)(nil)
-	if existing, ok := c.bufferPool.Load(size); ok {
-		pool = existing.(*sync.Pool)
-	} else {
-		sz := size
-		created := &sync.Pool{
-			New: func() any {
-				return make([]byte, sz)
-			},
-		}
-		actual, _ := c.bufferPool.LoadOrStore(size, created)
-		pool = actual.(*sync.Pool)
+	buf, release, err := bufpool.Acquire(size)
+	if err != nil {
+		// Unreachable: effectiveFrameReadBufferSize floors the size above zero
+		// and clamps it to bufpool.MaxBucket. Kept so a future change to either
+		// bound degrades to an unpooled buffer rather than failing every frame
+		// read.
+		return make([]byte, size), func() {}
 	}
-	raw := pool.Get()
-	buf, ok := raw.([]byte)
-	if !ok || cap(buf) < size {
-		buf = make([]byte, size)
-	}
-	buf = buf[:size]
-	return buf, func() {
-		pool.Put(buf[:size])
-	}
+	return buf, release
 }
 
 func (c *Client) acquireScratchBuffer(sizeHint int) *bytes.Buffer {
@@ -2697,10 +2672,17 @@ func parseManifest(raw []byte) (*Manifest, error) {
 			return nil, fmt.Errorf("read manifest line: %w", err)
 		}
 		line = strings.TrimRight(line, "\r\n")
+		// Only the line terminator is stripped from what the parsers see:
+		// path tokens are length-prefixed, so trimming spaces would eat bytes
+		// the prefix already counted and break names with trailing whitespace.
+		// The space-trimmed copy is used solely to classify the line.
+		// Leading whitespace is still tolerated; only the trailing side was
+		// destructive.
 		trimmed := strings.TrimSpace(line)
+		parseLine := strings.TrimLeft(line, " \t")
 		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
 			if strings.HasPrefix(trimmed, "FM/1 ") {
-				hdr, parseErr := intencoding.ParseManifestHeader(trimmed)
+				hdr, parseErr := intencoding.ParseManifestHeader(parseLine)
 				if parseErr != nil {
 					return nil, parseErr
 				}
@@ -2721,7 +2703,7 @@ func parseManifest(raw []byte) (*Manifest, error) {
 				if !seenHeader {
 					return nil, errors.New("manifest entry before header")
 				}
-				raw, nextPath, nextMtime, parseErr := intencoding.ParseManifestEntry(trimmed, prevPath, prevMtime)
+				raw, nextPath, nextMtime, parseErr := intencoding.ParseManifestEntry(parseLine, prevPath, prevMtime)
 				if parseErr != nil {
 					return nil, parseErr
 				}

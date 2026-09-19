@@ -162,7 +162,7 @@ func handleTXFERWithCallback(ctx context.Context, req Request, out io.Writer, de
 		}
 	}()
 
-	cw := encoding.NewChunkedManifestWriter(out, parsed.Comp, encoding.DefaultManifestChunkSize, encoding.DefaultManifestFlushInterval)
+	cw := encoding.NewFramedBodyWriter(out, parsed.Comp, encoding.DefaultBodyChunkSize, encoding.DefaultBodyFlushInterval)
 	var encodeErr error
 	if singleFileName != "" {
 		encodeErr = encodeSingleFileManifest(cw, transfer.ID, root, singleFileName, manifestMode, manifestLinkMbps, manifestConcurrency, parsed.DeadlineMS, parsed.PageCache, deps)

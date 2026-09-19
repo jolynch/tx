@@ -19,14 +19,18 @@ func TestHandleCXSUMMultipleRanges(t *testing.T) {
 		t.Fatalf("write test file: %v", err)
 	}
 	deps := &mockDeps{filePath: filePath}
-	req, err := ParseRequest([]byte(`CXSUM tx1 fd=1 "/tmp/a.txt" offset=0 size=5 algo=xxh128 fd=1 "/tmp/a.txt" offset=6 size=5 algo=xxh64`))
+	req, err := ParseRequest([]byte(`CXSUM tx1`))
 	if err != nil {
 		t.Fatalf("ParseRequest err: %v", err)
 	}
+	body := framedItemBody(t,
+		`fd=1 "/tmp/a.txt" offset=0 size=5 algo=xxh128`,
+		`fd=1 "/tmp/a.txt" offset=6 size=5 algo=xxh64`,
+	)
 
 	var out bytes.Buffer
-	if err := handleCXSUM(context.Background(), req, &out, deps); err != nil {
-		t.Fatalf("handleCXSUM err: %v", err)
+	if err := handleCXSUMWithInput(context.Background(), req, body, &out, deps); err != nil {
+		t.Fatalf("handleCXSUMWithInput err: %v", err)
 	}
 
 	raw := out.String()

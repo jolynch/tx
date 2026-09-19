@@ -515,7 +515,7 @@ func TestHandleTXFERCompZstdEmitsStreamingFrames(t *testing.T) {
 	var decoded bytes.Buffer
 	var sawFileHash bool
 	for i, fr := range frames {
-		if fr.Meta.FileID != encoding.ManifestFrameFileID {
+		if fr.Meta.FileID != encoding.FramedBodyFileID {
 			t.Fatalf("frame %d: unexpected file_id %d", i, fr.Meta.FileID)
 		}
 		if fr.Meta.Comp != encoding.EncodingZstd {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"runtime/debug"
 	"runtime/trace"
 	"strings"
 	"sync"
@@ -19,10 +20,25 @@ import (
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/pagecache"
+	"github.com/jolynch/tx/internal/utils"
 )
 
 const (
-	maxCommandLineBytes = 4 * 1024 * 1024
+	// maxCommandLineBytes bounds a command line. Command lines carry headers
+	// only — a verb, at most one path, and a few short options — since every
+	// argument list that grows with the transfer now travels in a framed body.
+	// PATH_MAX is 4096, so this is an order of magnitude past the longest
+	// legitimate command and exists only to stop a hostile peer.
+	maxCommandLineBytes = 64 * 1024
+
+	// defaultMaxSyncBodyBytes bounds the prior manifest a SYNC may upload.
+	//
+	// Unlike the item bodies, this one cannot be streamed away: readOldManifest
+	// must hold the whole prior manifest indexed before it can walk the tree
+	// and decide what changed. The limit is therefore a memory bound on that
+	// index, not a wire-format limit. At roughly 100 front-coded bytes per
+	// entry this allows a manifest of about ten million files.
+	defaultMaxSyncBodyBytes int64 = 1 << 30
 )
 
 func gentleLimiterBurstBytes(limiter *limit.Limiter) int64 {
@@ -46,6 +62,7 @@ type ServerOptions struct {
 	GentleBWPct            int
 	SocketWriteBufferBytes int
 	SyncTimeout            time.Duration             // 0 = no timeout; bounds SYNC response write time
+	MaxSyncBodyBytes       int64                     // 0 selects defaultMaxSyncBodyBytes; bounds the prior manifest a SYNC may upload
 	RootDir                string                    // "/" or "" means unrestricted
 	ProgressTargets        []filexfer.ProgressTarget // progress output targets
 	ProgressInterval       time.Duration             // tick interval for progress writes (default 1s)
@@ -203,6 +220,7 @@ type connSession struct {
 	gentleBWPct            int
 	socketWriteBufferBytes int
 	syncTimeout            time.Duration
+	maxSyncBodyBytes       int64
 	disableZeroCopy        bool
 	targetIODepth          int
 	respOut                io.Writer
@@ -216,11 +234,23 @@ type connSession struct {
 	encryptedRequests      bool
 }
 
+// handleConn confines a panic to this connection and logs its stack. Panics in
+// other goroutines are outside this recover's scope.
 func handleConn(conn net.Conn, opts ServerOptions, deps Deps, onTransferCreated func(string), onClientActivity func()) {
 	defer conn.Close()
+	defer func() {
+		if r := recover(); r != nil {
+			// The stream may be incomplete; close it without writing an ERR frame.
+			log.Printf("PANIC serving %v: %v\n%s", conn.RemoteAddr(), r, debug.Stack())
+		}
+	}()
 	keepAliveTimeout := opts.KeepAliveTimeout
 	if keepAliveTimeout < 0 {
 		keepAliveTimeout = 0
+	}
+	maxSyncBodyBytes := opts.MaxSyncBodyBytes
+	if maxSyncBodyBytes <= 0 {
+		maxSyncBodyBytes = defaultMaxSyncBodyBytes
 	}
 	s := &connSession{
 		conn:                   conn,
@@ -233,6 +263,7 @@ func handleConn(conn net.Conn, opts ServerOptions, deps Deps, onTransferCreated 
 		gentleBWPct:            opts.GentleBWPct,
 		socketWriteBufferBytes: opts.SocketWriteBufferBytes,
 		syncTimeout:            opts.SyncTimeout,
+		maxSyncBodyBytes:       maxSyncBodyBytes,
 		disableZeroCopy:        opts.DisableZeroCopy,
 		targetIODepth:          opts.TargetIODepth,
 		respOut:                conn,
@@ -487,8 +518,16 @@ func (s *connSession) serveCommand(ctx context.Context, req Request, in *bufio.R
 }
 
 func (s *connSession) handleCommand(ctx context.Context, req Request, in io.Reader, out io.Writer) error {
+	// SEND, ACK, and CXSUM carry their per-file item lists in a framed request
+	// body, so each needs the per-command reader alongside the response writer.
 	if req.Verb == VerbSEND {
-		return handleSENDWithOptions(ctx, req, out, s.deps, s.limiter, s.disableZeroCopy, s.gentleBWPct)
+		return handleSENDWithOptions(ctx, req, in, out, s.deps, s.limiter, s.disableZeroCopy, s.gentleBWPct)
+	}
+	if req.Verb == VerbACK {
+		return handleACKWithInput(ctx, req, in, out, s.deps)
+	}
+	if req.Verb == VerbCXSUM {
+		return handleCXSUMWithInput(ctx, req, in, out, s.deps)
 	}
 	if req.Verb == VerbPROBE {
 		keepAliveMS := int64(0)
@@ -505,7 +544,7 @@ func (s *connSession) handleCommand(ctx context.Context, req Request, in io.Read
 			// written after it expires.
 			defer func() { _ = s.conn.SetWriteDeadline(time.Time{}) }()
 		}
-		return handleSYNCWithInput(ctx, req, in, out, s.deps, s.onTransferCreated)
+		return handleSYNCWithInput(ctx, req, in, out, s.deps, s.onTransferCreated, s.maxSyncBodyBytes)
 	}
 	if req.Verb == VerbTXFER {
 		if len(s.matchedAuthToken) >= 2 {
@@ -521,23 +560,17 @@ func (s *connSession) handleCommand(ctx context.Context, req Request, in io.Read
 }
 
 func readCommandLine(r *bufio.Reader, maxBytes int) ([]byte, error) {
-	line, err := r.ReadBytes('\n')
+	line, err := utils.ReadLineLimit(r, maxBytes)
 	if err != nil {
+		if errors.Is(err, utils.ErrLineTooLarge) {
+			return nil, protocolErr{code: "BAD_REQUEST", message: "command line too large"}
+		}
 		return nil, err
 	}
-	if maxBytes > 0 && len(line) > maxBytes {
-		return nil, errors.New("command line too large")
-	}
-	if len(line) == 0 {
-		return nil, errors.New("empty command")
-	}
-	if line[len(line)-1] != '\n' {
+	if len(line) == 0 || line[len(line)-1] != '\n' {
 		return nil, errors.New("invalid line terminator")
 	}
-	line = line[:len(line)-1]
-	if len(line) > 0 && line[len(line)-1] == '\r' {
-		line = line[:len(line)-1]
-	}
+	line = utils.TrimLineTerminator(line)
 	if len(line) == 0 {
 		return nil, errors.New("empty command")
 	}

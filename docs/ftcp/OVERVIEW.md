@@ -26,7 +26,93 @@ For `TXFER`, `SEND`, and `CXSUM`, the payload interval is a streaming body
 the terminal response status line. `PROBE` also has a request payload and
 response payload body.
 
-Maximum command line size is 4 MiB.
+## Request and Response Bodies
+
+**Any body that grows with the size of the transfer is framed.** A command line
+carries headers only — a verb, at most one path, and a few short options — so
+its length never depends on how many files a request covers.
+
+Framed bodies are FX/1 + FXT/1 streams carrying `file_id=0`, the same wire
+grammar as the TXFER response (see [FRAMING.md](./FRAMING.md)). They are
+self-delimiting via the terminal `next=0` frame, carry per-chunk and cumulative
+integrity hashes, and compress per frame.
+
+| Verb            | Request body            | Response body              |
+|-----------------|-------------------------|----------------------------|
+| `TXFER`         | —                       | framed `FM/1`              |
+| `SYNC`          | framed prior `FM/1`     | framed `FM/1` + `RM` lines |
+| `SEND`          | framed item list        | `FX/1` file frames         |
+| `ACK`           | framed item list        | —                          |
+| `CXSUM`         | framed item list        | `FX/1` checksum frames     |
+| `STATUS` (list) | —                       | framed JSON lines          |
+| `STATUS <tid>`  | —                       | one `OK <json>` line       |
+| `PROBE`         | `probe-bytes` raw bytes | `probe-bytes` raw bytes    |
+| `AUTH`          | —                       | —                          |
+
+A request body is always read in full before the server writes any response
+byte. This keeps the exchange strictly request-then-response: a server that
+answered items as it read them would be writing while the client was still
+writing, and once both socket buffers filled neither side could progress.
+
+### Size limits
+
+Every limit below is set where no legitimate request can reach it. They exist to
+bound a hostile peer, not to shape real traffic.
+
+| Limit                  | Value                   | Why it is out of reach          |
+|------------------------|-------------------------|---------------------------------|
+| Command line           | 64 KiB                  | Headers only; `PATH_MAX` 4096.  |
+| Item line in a body    | 8 KiB                   | One path plus a few tokens.     |
+| Frame wire payload     | `max(rmem_max, 64 MiB)` | Senders emit 4 MiB frames.      |
+| Frame logical size     | `max(rmem_max, 64 MiB)` | Senders emit 4 MiB frames.      |
+| Items per request body | 1,048,576               | A million-file batch.           |
+| SEND/ACK/CXSUM body    | 8 GiB logical           | Items × the item-line cap.      |
+| Response body, client  | 1 GiB logical           | A ten-million-entry manifest.   |
+| SYNC prior manifest    | 1 GiB logical           | A ten-million-entry manifest.   |
+| PROBE payload          | 32 MiB                  | Client-chosen, length-declared. |
+
+Notes on the rows that carry more than their size:
+
+- **Items per request body** counts every line, blank ones included, so a run of
+  newlines cannot spin the reader without reaching the cap.
+- **SEND/ACK/CXSUM body** is the item count times the item-line cap, so no legal
+  item list can exceed it.
+- **Response body, client** exists because a client does not extend unbounded
+  trust to the server it dialed: declared sizes in a response are the server's
+  to choose.
+- **SYNC prior manifest** (`ServerOptions.MaxSyncBodyBytes`) is the one inherent
+  limit. The server must index the whole prior manifest before it can walk the
+  tree, so this bounds that index rather than the wire format.
+
+Exceeding any of them is reported as `ERR BAD_REQUEST <reason>` and the
+connection closes.
+
+**A frame header's declared sizes are bounded before they are used.** `wsize`
+and `size` are attacker-controlled and each sizes an allocation, so both are
+checked against the per-frame caps above before the payload is read and before
+it is decompressed — never by decoding first and comparing afterwards. The
+per-frame bounds are unconditional: a reader that asks for no cumulative cap
+still gets them, because the reader that forgets is the one that needs them.
+
+Cumulative checks subtract rather than add (`size > cap - offset`) so that a
+declared size near `int64` maximum cannot overflow the comparison and wrap into
+appearing under the cap.
+
+Per-frame caps are the kernel's socket receive limit
+(`/proc/sys/net/core/rmem_max`) clamped into [8 MiB, 64 MiB]. **Host tuning may
+only make the bound tighter.** A socket buffer is a throughput setting; this
+ceiling bounds how much memory one peer can make the process commit, so a box
+configured for a high bandwidth-delay product does not thereby grant a peer a
+larger allocation. The 8 MiB floor is required in the other direction: a 4 MiB
+chunk of incompressible data encodes to more than 4 MiB, while a common tuned
+`rmem_max` is exactly 4 MiB, so clamping purely downward would leave a server
+rejecting its own frames.
+
+**A permitted declaration is not a licence to allocate it.** Readers size their
+buffers from the bytes that actually arrive, growing through a pooled size
+ladder, so a four-byte payload naming the largest permitted size costs four
+bytes. Bounding the declaration alone would leave a peer free to drive the
+allocator without ever exceeding a limit.
 
 ## Connection Flow
 
@@ -274,6 +360,11 @@ prior FM/1 manifest (`file_id=0`, same framing rules as TXFER's response
 described below). The terminal frame (`next=0` with the cumulative
 `file-hash`) signals end-of-body — there is no separate terminator.
 
+The body's cumulative logical size is capped (1 GiB by default). Unlike the
+item bodies, this one cannot be consumed incrementally: the server must hold
+the whole prior manifest indexed before it can walk the tree, so the cap bounds
+that index. A body past the cap is rejected before its frames are decompressed.
+
 The server hashes each path in the supplied manifest with xxh3-128 and
 indexes the entries by that hash. The actual path strings are discarded;
 only `(size, mtime, mode, fileID)` are retained per hash.
@@ -324,20 +415,30 @@ same command for metadata-only responses.
 
 ### Request
 
-`SEND <txferid> fd=<fid> <path> [offset=<n>] [size=<n>] [comp=<name>] [mode=<fast|gentle>] [<unknown key=value>...] [fd=<fid> <path> ...]`
+Command line:
 
-- each `fd=` starts a new file block.
-- required per block: `fd`, `path`.
+`SEND <txferid> [mode=<fast|gentle>]`
+
+Followed by a framed request body of one item per line:
+
+```
+fd=<fid> <path> [offset=<n>] [size=<n>] [comp=<name>] [<unknown key=value>...]\n
+fd=<fid> <path> ...\n
+```
+
+- `mode` is transfer-level and appears once on the command line; it defaults to
+  `fast` and applies to every item.
+- each body line is one file block.
+- required per line: `fd`, `path`.
 - `offset` defaults to `0`.
 - `size` defaults to `0` (means "from offset to EOF").
 - `comp` defaults to `adapt`.
-- `mode` defaults to `fast`.
 - accepted compression values: `adapt`, `none`, `identity`, `lz4`, `zstd`.
 - accepted load strategy values: `fast`, `gentle`.
 - `identity` is normalized to `none`.
 - in `adapt`, server may emit different per-frame `comp` values as it adjusts compression.
 - unknown compression values are rejected with `ERR UNSUPPORTED_COMP ...`.
-- each `<path>` is quoted or length-prefixed.
+- each `<path>` is quoted or length-prefixed, and may not contain `\n` or `\r`.
 - directory entries must request `offset=0` and omit `size`; they return one
   empty frame plus terminal metadata trailer.
 - the transfer root is manifest entry `D0` and may be requested for metadata
@@ -355,12 +456,29 @@ Acknowledges file progress/window completion.
 
 ### Request
 
-`ACK <txferid> fd=<fid> <path> ack-token=<token> [delta-bytes=<n>] [recv-ms=<n>] [sync-ms=<n>] [<unknown key=value>...] [fd=<fid> <path> ...]`
+Command line:
 
-- each `fd=` starts a new ack block.
-- required per block: `fd`, `path`, `ack-token`.
+`ACK <txferid>`
+
+Followed by a framed request body of one item per line:
+
+```
+fd=<fid> <path> ack-token=<token> [delta-bytes=<n>] [recv-ms=<n>] [sync-ms=<n>] [<unknown key=value>...]\n
+fd=<fid> <path> ...\n
+```
+
+- each body line is one ack block.
+- required per line: `fd`, `path`, `ack-token`.
 - telemetry fields default to `0` when omitted.
 - unknown `key=value` fields are ignored.
+- an ACK batch is applied atomically: every item is validated before any is
+  applied, so a bad token cannot leave a transfer half-acked.
+- `delta-bytes`, `recv-ms`, and `sync-ms` report the receiver's newly written
+  bytes, download time, and fsync time. The server validates them but does not
+  currently act on them. They are retained because they are the natural input
+  for a receiver-aware compression policy: `CompressionPolicy` today sees only
+  the server's own read and write latencies, so it can tell that compressing is
+  expensive to send but not that the receiver is the bottleneck.
 
 `ack-token` forms:
 
@@ -382,13 +500,24 @@ Streams checksum frames for one or more requested file ranges.
 
 ### Request
 
-`CXSUM <txferid> fd=<fid> <path> [offset=<n>] [size=<n>] [algo=xxh128|xxh64] ...`
+Command line:
+
+`CXSUM <txferid>`
+
+Followed by a framed request body of one range per line:
+
+```
+fd=<fid> <path> [offset=<n>] [size=<n>] [algo=<name>[,<name>]]\n
+fd=<fid> <path> ...\n
+```
 
 - `<path>` is quoted or length-prefixed.
-- `fd=<fid>` may be repeated to request multiple ranges, including multiple ranges for the same file id.
+- a file id may appear on multiple lines to request multiple ranges of it.
 - `offset` defaults to `0`.
 - omitted `size` means checksum through EOF.
-- `algo` defaults to `xxh128`.
+- `algo` defaults to `xxh128`. Accepted values are `xxh128`, `xxh64`, and
+  `none`; a comma-separated list (`algo=xxh128,xxh64`) emits one `file-hash`
+  token per algorithm on the range's trailer, and `algo=none` emits none.
 
 ### Response
 
@@ -418,6 +547,7 @@ Returns transfer status JSON. Two forms:
 {
   "transfer_id": "string",
   "directory": "string",
+  "num_entries": 0,
   "num_files": 0,
   "total_size": 0,
   "done": 0,
@@ -435,7 +565,9 @@ Returns transfer status JSON. Two forms:
 
 **List all** (`STATUS`):
 
-- success: `OK <count>` followed by `<count>` lines, each containing one transfer status JSON object (same schema above). Count may be `0` with no following lines.
+- success: a framed response body carrying one transfer status JSON object per
+  line (same schema above), terminated by the verb-level `OK\r\n` line. An
+  empty list is a single terminal frame with `size=0` and no lines.
 
 ## PROBE
 
@@ -462,7 +594,10 @@ server's observed link estimate for gentle limiting.
 ### Response
 
 - first line:
-  - `PROBE cpu=<server-cpu> cts0=<echo-client-cts0> sts0=<unix-ms> sts1=<unix-ms> probe-bytes=<n> [io-depth=<int>] [wmem=<bytes>] gentle-cpu-pct=<int> gentle-bw-pct=<int> [limiter-bps=<bytes/sec>] [keep-alive-ms=<int>]`
+  - `PROBE cpu=<server-cpu> io-depth=<int> cts0=<echo-client-cts0> sts0=<unix-ms> sts1=<unix-ms> probe-bytes=<n> wmem=<bytes> gentle-cpu-pct=<int> gentle-bw-pct=<int> limiter-bps=<bytes/sec> [keep-alive-ms=<int>]`
+- `io-depth`, `wmem`, and `limiter-bps` are always present; `limiter-bps` is `0`
+  when no per-transfer limiter applies. `keep-alive-ms` is the only conditional
+  field.
 - then exactly `probe-bytes` raw bytes.
 - terminal status line: `OK` or `ERR ...`.
 - `gentle-cpu-pct` is the server-advertised CPU budget clients use when computing

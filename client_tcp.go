@@ -23,10 +23,15 @@ import (
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	ftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	intlimit "github.com/jolynch/tx/internal/filexfer/limit"
+	"github.com/jolynch/tx/internal/utils"
 	"golang.org/x/sys/unix"
 )
 
 const maxTCPLineBytes = 4 * 1024 * 1024
+
+// maxResponseBodyBytes caps server-supplied framed responses at the same size
+// as the server's SYNC manifest limit.
+const maxResponseBodyBytes int64 = 1 << 30
 
 const (
 	// minKeepAliveHeartbeatInterval floors the heartbeat cadence so tiny
@@ -668,16 +673,11 @@ func isStatusLine(line string) bool {
 }
 
 func readTCPLine(br *bufio.Reader, maxBytes int) (string, error) {
-	line, err := br.ReadString('\n')
+	line, err := utils.ReadLineLimit(br, maxBytes)
 	if err != nil {
 		return "", err
 	}
-	if maxBytes > 0 && len(line) > maxBytes {
-		return "", errors.New("line too large")
-	}
-	line = strings.TrimSuffix(line, "\n")
-	line = strings.TrimSuffix(line, "\r")
-	return line, nil
+	return string(utils.TrimLineTerminator(line)), nil
 }
 
 func writeTCPLine(w io.Writer, line string) error {
@@ -897,6 +897,100 @@ func (c *Client) sendAndReadTCP(conn net.Conn, state tcpAuthState, cmd string) (
 	return bufio.NewReader(responseReader), nil
 }
 
+// itemWriter accumulates `fd=<id> <path> [key=value...]` lines for a framed
+// request body. Building the lines separately from framing them keeps the item
+// grammar readable at each call site.
+type itemWriter struct {
+	buf strings.Builder
+	err error
+}
+
+// begin starts an item. Paths are rejected if they contain a line break: the
+// body is newline-delimited, and the receiver splits on '\n' before consulting
+// the path's length prefix, so such a path would be re-read as a second item.
+func (w *itemWriter) begin(fileID uint64, path string) {
+	if w.err != nil {
+		return
+	}
+	if strings.TrimSpace(path) == "" {
+		w.err = errors.New("missing full path")
+		return
+	}
+	if utils.ContainsLineBreak(path) {
+		w.err = fmt.Errorf("path contains a line break: %q", path)
+		return
+	}
+	if w.buf.Len() > 0 {
+		w.buf.WriteByte('\n')
+	}
+	w.buf.WriteString("fd=")
+	w.buf.WriteString(strconv.FormatUint(fileID, 10))
+	w.buf.WriteByte(' ')
+	w.buf.WriteString(makeLenToken(path))
+}
+
+func (w *itemWriter) field(key string, value string) {
+	if w.err != nil {
+		return
+	}
+	w.buf.WriteByte(' ')
+	w.buf.WriteString(key)
+	w.buf.WriteByte('=')
+	w.buf.WriteString(value)
+}
+
+func (w *itemWriter) fieldInt(key string, value int64) {
+	w.field(key, strconv.FormatInt(value, 10))
+}
+
+func (w *itemWriter) bytes() ([]byte, error) {
+	if w.err != nil {
+		return nil, w.err
+	}
+	if w.buf.Len() == 0 {
+		return nil, errors.New("no items")
+	}
+	w.buf.WriteByte('\n')
+	return []byte(w.buf.String()), nil
+}
+
+// sendTCPCommandWithBody writes a command line followed by its framed request
+// body. Both travel through one request writer because on encrypted sessions
+// the server reads them through a single per-command AEAD stream.
+func (c *Client) sendTCPCommandWithBody(conn net.Conn, state tcpAuthState, cmd string, body []byte) error {
+	dst, closeRequest, err := c.newTCPRequestWriter(conn, state)
+	if err != nil {
+		return err
+	}
+	if err := writeTCPLine(dst, cmd); err != nil {
+		_ = closeRequest()
+		return err
+	}
+	bw := intencoding.NewFramedBodyWriter(dst, intencoding.EncodingZstd, intencoding.DefaultBodyChunkSize, 0)
+	if _, err := bw.Write(body); err != nil {
+		_ = closeRequest()
+		return err
+	}
+	if err := bw.Close(); err != nil {
+		_ = closeRequest()
+		return err
+	}
+	return closeRequest()
+}
+
+// sendAndReadTCPWithBody is sendAndReadTCP for verbs whose arguments ride in a
+// framed body rather than on the command line.
+func (c *Client) sendAndReadTCPWithBody(conn net.Conn, state tcpAuthState, cmd string, body []byte) (*bufio.Reader, error) {
+	if err := c.sendTCPCommandWithBody(conn, state, cmd, body); err != nil {
+		return nil, err
+	}
+	responseReader, err := c.responseReaderForTCP(conn, state)
+	if err != nil {
+		return nil, err
+	}
+	return bufio.NewReader(responseReader), nil
+}
+
 func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {
 	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
 	if err != nil {
@@ -929,9 +1023,10 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 		return GetManifestResponse{}, fmt.Errorf("TXFER: %w", err)
 	}
 
-	mr := intencoding.NewChunkedManifestReader(br, intencoding.ChunkedManifestReaderOpts{
-		RawSink: request.RawSink,
-		OnFrame: func(s intencoding.ManifestFrameStats) {
+	mr := intencoding.NewFramedBodyReader(br, intencoding.FramedBodyReaderOpts{
+		MaxLogicalBytes: maxResponseBodyBytes,
+		RawSink:         request.RawSink,
+		OnFrame: func(s intencoding.FrameStats) {
 			if request.ManifestProgress == nil {
 				return
 			}
@@ -1016,7 +1111,7 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 		_ = closeRequest()
 		return SyncManifestResponse{}, fmt.Errorf("marshal old manifest: %w", err)
 	}
-	requestWriter := intencoding.NewChunkedManifestWriter(requestDst, comp, intencoding.DefaultManifestChunkSize, intencoding.DefaultManifestFlushInterval)
+	requestWriter := intencoding.NewFramedBodyWriter(requestDst, comp, intencoding.DefaultBodyChunkSize, intencoding.DefaultBodyFlushInterval)
 	if _, err := requestWriter.Write(oldManifestBytes); err != nil {
 		_ = closeRequest()
 		return SyncManifestResponse{}, fmt.Errorf("write old manifest: %w", err)
@@ -1041,7 +1136,9 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 		return SyncManifestResponse{}, fmt.Errorf("initialize SYNC response stream: %w", err)
 	}
 	br := bufio.NewReader(responseReader)
-	mr := intencoding.NewChunkedManifestReader(br, intencoding.ChunkedManifestReaderOpts{})
+	mr := intencoding.NewFramedBodyReader(br, intencoding.FramedBodyReaderOpts{
+		MaxLogicalBytes: maxResponseBodyBytes,
+	})
 
 	manifestBuf := c.acquireScratchBuffer(maxTCPLineBytes)
 	defer c.releaseScratchBuffer(manifestBuf)
@@ -1117,35 +1214,28 @@ func (c *Client) fetchFileBatchTCP(
 	// so it must outlive this call.
 	closer := &managedTCPConnCloser{client: c, conn: conn, pool: pool}
 
-	var b strings.Builder
-	loadStrategy := normalizeLoadStrategy(c.LoadStrategy)
-	b.WriteString("SEND ")
-	b.WriteString(txferID)
+	// mode is transfer-level, so it rides the command line once; the per-file
+	// items go in the framed body, which is why a batch can be any size.
+	cmd := "SEND " + txferID + " mode=" + normalizeLoadStrategy(c.LoadStrategy)
+	var items itemWriter
 	for _, t := range targets {
-		if strings.TrimSpace(t.FullPath) == "" {
-			_ = closer.Close()
-			return nil, errors.New("missing full path")
-		}
-		b.WriteString(" fd=")
-		b.WriteString(strconv.FormatUint(t.FileID, 10))
-		b.WriteString(" ")
-		b.WriteString(makeLenToken(t.FullPath))
-		b.WriteString(" mode=")
-		b.WriteString(loadStrategy)
+		items.begin(t.FileID, t.FullPath)
 		if t.Comp != "" {
-			b.WriteString(" comp=")
-			b.WriteString(t.Comp)
+			items.field("comp", t.Comp)
 		}
 		if t.Offset != 0 {
-			b.WriteString(" offset=")
-			b.WriteString(strconv.FormatInt(t.Offset, 10))
+			items.fieldInt("offset", t.Offset)
 		}
 		if t.Size > 0 {
-			b.WriteString(" size=")
-			b.WriteString(strconv.FormatInt(t.Size, 10))
+			items.fieldInt("size", t.Size)
 		}
 	}
-	br, err := c.sendAndReadTCP(conn, state, b.String())
+	body, err := items.bytes()
+	if err != nil {
+		_ = closer.Close()
+		return nil, err
+	}
+	br, err := c.sendAndReadTCPWithBody(conn, state, cmd, body)
 	if err != nil {
 		_ = closer.Close()
 		return nil, fmt.Errorf("SEND batch: %w", err)
@@ -1389,30 +1479,26 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 	closer := managedTCPConnCloser{client: c, conn: conn, pool: pool}
 	defer closer.Close()
 
-	var cmd strings.Builder
-	cmd.WriteString("ACK ")
-	cmd.WriteString(txferID)
+	var items itemWriter
 	for _, ack := range commands {
 		request := ack.request
 		if request.TransferID != txferID {
 			return AcknowledgeFileProgressResponse{}, errors.New("ack requests must share transfer id")
 		}
-		cmd.WriteString(" fd=")
-		cmd.WriteString(strconv.FormatUint(request.FileID, 10))
-		cmd.WriteString(" ")
-		cmd.WriteString(makeLenToken(request.FullPath))
-		cmd.WriteString(" ack-token=")
-		cmd.WriteString(ack.ackToken)
+		items.begin(request.FileID, request.FullPath)
+		items.field("ack-token", ack.ackToken)
 		if request.AckBytes >= 0 {
-			cmd.WriteString(" delta-bytes=")
-			cmd.WriteString(strconv.FormatInt(request.DeltaBytes, 10))
-			cmd.WriteString(" recv-ms=")
-			cmd.WriteString(strconv.FormatInt(request.RecvMS, 10))
-			cmd.WriteString(" sync-ms=")
-			cmd.WriteString(strconv.FormatInt(request.SyncMS, 10))
+			// Receiver telemetry; see the ackItem comment on the server side.
+			items.fieldInt("delta-bytes", request.DeltaBytes)
+			items.fieldInt("recv-ms", request.RecvMS)
+			items.fieldInt("sync-ms", request.SyncMS)
 		}
 	}
-	br, err := c.sendAndReadTCP(conn, state, cmd.String())
+	body, err := items.bytes()
+	if err != nil {
+		return AcknowledgeFileProgressResponse{}, err
+	}
+	br, err := c.sendAndReadTCPWithBody(conn, state, "ACK "+txferID, body)
 	if err != nil {
 		return AcknowledgeFileProgressResponse{}, fmt.Errorf("ACK: %w", err)
 	}
@@ -1462,25 +1548,38 @@ func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesReques
 	if err != nil {
 		return ListStatusesResponse{}, fmt.Errorf("STATUS list: %w", err)
 	}
-	countLine, err := readTCPStatus(br)
-	if err != nil {
-		return ListStatusesResponse{}, fmt.Errorf("read STATUS response: %w", err)
-	}
-	count, err := strconv.Atoi(strings.TrimSpace(countLine))
-	if err != nil {
-		return ListStatusesResponse{}, fmt.Errorf("parse STATUS count %q: %w", countLine, err)
-	}
-	statuses := make([]TransferStatus, 0, count)
-	for i := 0; i < count; i++ {
-		line, lineErr := readTCPLine(br, maxTCPLineBytes)
+	// One framed body carrying a JSON object per line, then the verb-level OK.
+	body := intencoding.NewFramedBodyReader(br, intencoding.FramedBodyReaderOpts{
+		MaxLogicalBytes: maxResponseBodyBytes,
+	})
+	var statuses []TransferStatus
+	bodyReader := bufio.NewReader(body)
+	for i := 0; ; i++ {
+		line, lineErr := utils.ReadLineLimit(bodyReader, maxTCPLineBytes)
+		trimmed := strings.TrimSpace(string(utils.TrimLineTerminator(line)))
+		if trimmed != "" {
+			var s TransferStatus
+			if jsonErr := json.Unmarshal([]byte(trimmed), &s); jsonErr != nil {
+				return ListStatusesResponse{}, fmt.Errorf("decode STATUS entry %d: %w", i, jsonErr)
+			}
+			statuses = append(statuses, s)
+		}
 		if lineErr != nil {
+			if errors.Is(lineErr, io.EOF) {
+				break
+			}
 			return ListStatusesResponse{}, fmt.Errorf("read STATUS entry %d: %w", i, lineErr)
 		}
-		var s TransferStatus
-		if jsonErr := json.Unmarshal([]byte(strings.TrimSpace(line)), &s); jsonErr != nil {
-			return ListStatusesResponse{}, fmt.Errorf("decode STATUS entry %d: %w", i, jsonErr)
+	}
+	statusLine, err := readTCPLine(br, maxTCPLineBytes)
+	if err != nil {
+		return ListStatusesResponse{}, fmt.Errorf("read STATUS terminator: %w", err)
+	}
+	if _, ok := parseOKStatusLine(statusLine); !ok {
+		if ctrlErr := parseErrControlFrame(statusLine); ctrlErr != nil {
+			return ListStatusesResponse{}, ctrlErr
 		}
-		statuses = append(statuses, s)
+		return ListStatusesResponse{}, fmt.Errorf("unexpected STATUS terminator: %q", statusLine)
 	}
 	closer.markReusable()
 	return ListStatusesResponse{Statuses: statuses}, nil
@@ -1495,28 +1594,26 @@ func (c *Client) getChecksumTCP(ctx context.Context, request GetChecksumRequest)
 	// Pointer guard: ownership passes to the returned ReadCloser on success.
 	closer := &managedTCPConnCloser{client: c, conn: conn, pool: pool}
 
-	var cmd strings.Builder
-	cmd.WriteString("CXSUM ")
-	cmd.WriteString(request.TransferID)
+	var items itemWriter
 	for _, target := range request.Targets {
-		cmd.WriteString(" fd=")
-		cmd.WriteString(strconv.FormatUint(target.FileID, 10))
-		cmd.WriteByte(' ')
-		cmd.WriteString(makeLenToken(target.FullPath))
+		items.begin(target.FileID, target.FullPath)
 		if target.Offset > 0 {
-			cmd.WriteString(" offset=")
-			cmd.WriteString(strconv.FormatInt(target.Offset, 10))
+			items.fieldInt("offset", target.Offset)
 		}
 		if target.Size > 0 {
-			cmd.WriteString(" size=")
-			cmd.WriteString(strconv.FormatInt(target.Size, 10))
+			items.fieldInt("size", target.Size)
 		}
 		if algo := strings.TrimSpace(target.Algo); algo != "" {
-			cmd.WriteString(" algo=")
-			cmd.WriteString(algo)
+			items.field("algo", algo)
 		}
 	}
-	br, err := c.sendAndReadTCP(conn, state, cmd.String())
+	body, err := items.bytes()
+	if err != nil {
+		stopWatch()
+		_ = closer.Close()
+		return nil, err
+	}
+	br, err := c.sendAndReadTCPWithBody(conn, state, "CXSUM "+request.TransferID, body)
 	if err != nil {
 		stopWatch()
 		_ = closer.Close()

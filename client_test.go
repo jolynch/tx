@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 
 	"filippo.io/age"
 	"github.com/jolynch/tx/internal/aead"
+	"github.com/jolynch/tx/internal/bufpool"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	"github.com/jolynch/tx/internal/utils"
@@ -125,10 +127,49 @@ func serveFTCPTestConn(conn net.Conn, handler func(intftcp.Request, io.Writer) e
 			}
 		}
 	}
+	// SEND, ACK, and CXSUM carry their per-file items in a framed request body.
+	// It must be drained before the response is written: these tests run over
+	// net.Pipe, which is unbuffered, so responding first would deadlock against
+	// a client still writing its body. The real server has the same ordering
+	// requirement for the same reason.
+	if intftcp.VerbHasRequestItems(cmdReq.Verb) {
+		items, itemErr := intftcp.ReadRequestItems(br, cmdReq.Verb)
+		if itemErr != nil {
+			_, _ = io.WriteString(responseOut, "ERR BAD_REQUEST "+itemErr.Error()+"\r\n")
+			_ = closeResponse()
+			return
+		}
+		cmdReq.Params = mergeRequestItems(cmdReq.Verb, cmdReq.Params, items)
+	}
 	if err := handler(cmdReq, responseOut); err != nil {
 		_, _ = io.WriteString(responseOut, "ERR INTERNAL "+err.Error()+"\r\n")
 	}
 	_ = closeResponse()
+}
+
+// mergeRequestItems folds a framed body's items back into Request.Params so
+// test handlers can read a whole request from one place. Transfer-level fields
+// from the command line are copied onto each item, since an item's effective
+// mode or transfer id is what a handler actually wants to assert on.
+func mergeRequestItems(verb intftcp.Verb, header []map[string]string, items []map[string]string) []map[string]string {
+	if len(header) == 0 {
+		return items
+	}
+	txferID := header[0]["txferid"]
+	mode := header[0]["mode"]
+	for _, item := range items {
+		if txferID != "" {
+			item["txferid"] = txferID
+		}
+		if verb == intftcp.VerbSEND && mode != "" {
+			item["mode"] = mode
+		}
+	}
+	if verb == intftcp.VerbACK {
+		// ACK items have always been addressed directly as Params[0:].
+		return items
+	}
+	return append(header, items...)
 }
 
 func readCompatLine(br *bufio.Reader) (string, error) {
@@ -2803,12 +2844,12 @@ func TestLoadManifestHandlesMultiFrameZstd(t *testing.T) {
 // Used by client tests to simulate the streaming TXFER response.
 func writeStreamingManifest(t *testing.T, out io.Writer, manifestRaw []byte, comp string, chunkSize int) {
 	t.Helper()
-	cw := intencoding.NewChunkedManifestWriter(out, comp, int64(chunkSize), 0)
+	cw := intencoding.NewFramedBodyWriter(out, comp, int64(chunkSize), 0)
 	if _, err := cw.Write(manifestRaw); err != nil {
-		t.Fatalf("ChunkedManifestWriter.Write: %v", err)
+		t.Fatalf("FramedBodyWriter.Write: %v", err)
 	}
 	if err := cw.Close(); err != nil {
-		t.Fatalf("ChunkedManifestWriter.Close: %v", err)
+		t.Fatalf("FramedBodyWriter.Close: %v", err)
 	}
 }
 
@@ -3690,8 +3731,18 @@ func scriptedSessionConn(t *testing.T, c *Client, script string) (*tcpConnPool, 
 
 	go func() {
 		defer serverSide.Close()
-		if _, err := bufio.NewReader(serverSide).ReadString('\n'); err != nil {
+		br := bufio.NewReader(serverSide)
+		line, err := br.ReadString('\n')
+		if err != nil {
 			return
+		}
+		// Drain any framed request body before replying. net.Pipe is
+		// unbuffered, so writing the script while the client is still writing
+		// its body would deadlock both sides.
+		if req, parseErr := intftcp.ParseRequest([]byte(strings.TrimRight(line, "\r\n"))); parseErr == nil && intftcp.VerbHasRequestItems(req.Verb) {
+			if _, itemErr := intftcp.ReadRequestItems(br, req.Verb); itemErr != nil {
+				return
+			}
 		}
 		_, _ = io.WriteString(serverSide, script)
 	}()
@@ -3883,5 +3934,87 @@ func TestChecksumStreamNeverMarksConnReusable(t *testing.T) {
 	markStreamReusable(stream)
 	if guard.reusable.Load() {
 		t.Fatalf("markStreamReusable reached the connection guard through a CXSUM stream")
+	}
+}
+
+// A path carrying '\n' cannot be encoded into a framed body: the receiver splits
+// on '\n' before consulting the path's length prefix, so the tail would be
+// re-read as a second item. The builders must refuse it rather than emit a
+// request that decodes into something else.
+func TestRequestBuildersRejectLineBreakPaths(t *testing.T) {
+	c := &Client{FileAddr: "127.0.0.1:1"}
+	defer c.Close()
+
+	for _, path := range []string{"/tmp/bad\nname", "/tmp/bad\rname"} {
+		t.Run(strconv.Quote(path), func(t *testing.T) {
+			if _, err := c.fetchFileBatchTCP(context.Background(), "tx1",
+				[]FetchFileTarget{{FileID: 1, FullPath: path}}); err == nil {
+				t.Error("SEND builder accepted a path containing a line break")
+			}
+			if _, err := c.acknowledgeFileProgressBatch(context.Background(),
+				[]AcknowledgeFileProgressRequest{{
+					TransferID: "tx1", FileID: 1, FullPath: path,
+					AckBytes: 1, ServerTS: 1, HashToken: "xxh128:" + strings.Repeat("0", 32),
+				}}); err == nil {
+				t.Error("ACK builder accepted a path containing a line break")
+			}
+			if _, err := c.getChecksumTCP(context.Background(), GetChecksumRequest{
+				TransferID: "tx1",
+				Targets:    []ChecksumTarget{{FileID: 1, FullPath: path}},
+			}); err == nil {
+				t.Error("CXSUM builder accepted a path containing a line break")
+			}
+		})
+	}
+}
+
+// A hostile server must not make the client allocate from a declared frame size.
+func TestClientRejectsHostileResponseFrameHeader(t *testing.T) {
+	hostile := func() string {
+		var b strings.Builder
+		fmt.Fprintf(&b, "FX/1 0 offset=0 size=%d wsize=4 comp=zstd hash=xxh128:%032d ts=1\n",
+			int64(math.MaxInt64), 0)
+		b.WriteString("AAAA")
+		fmt.Fprintf(&b, "FXT/1 0 status=ok ts=1 next=0 hash=xxh64:%016d\n", 0)
+		b.WriteString("OK\r\n")
+		return b.String()
+	}()
+
+	t.Run("TXFER manifest", func(t *testing.T) {
+		c := &Client{FileAddr: "127.0.0.1:1"}
+		defer c.Close()
+		scriptedSessionConn(t, c, hostile)
+		if _, err := c.getManifestTCP(context.Background(), GetManifestRequest{
+			Directory: "/remote", Mode: LoadStrategyFast, Concurrency: 1,
+		}); err == nil {
+			t.Fatal("client accepted a manifest frame declaring MaxInt64 bytes")
+		}
+	})
+
+	t.Run("STATUS list", func(t *testing.T) {
+		c := &Client{FileAddr: "127.0.0.1:1"}
+		defer c.Close()
+		scriptedSessionConn(t, c, hostile)
+		if _, err := c.listStatusesTCP(context.Background(), ListStatusesRequest{}); err == nil {
+			t.Fatal("client accepted a STATUS frame declaring MaxInt64 bytes")
+		}
+	})
+}
+
+// WithMaxFrameReadBufferBytes is caller-settable, so a value above the largest
+// pooled bucket must be clamped rather than passed through to the pool, which
+// cannot serve it.
+func TestEffectiveFrameReadBufferSizeClampsToLargestBucket(t *testing.T) {
+	for _, capSize := range []int{bufpool.MaxBucket + 1, 128 * 1024 * 1024, 1 << 30} {
+		got := effectiveFrameReadBufferSize(0, int64(capSize), capSize)
+		if got > bufpool.MaxBucket {
+			t.Errorf("capSize=%d produced %d, above the %d bucket ceiling", capSize, got, bufpool.MaxBucket)
+		}
+		// And the result must still be something the pool will serve.
+		if _, release, err := bufpool.Acquire(got); err != nil {
+			t.Errorf("capSize=%d produced %d which the pool rejects: %v", capSize, got, err)
+		} else {
+			release()
+		}
 	}
 }

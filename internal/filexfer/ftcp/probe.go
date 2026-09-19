@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jolynch/tx/internal/bufpool"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/utils"
@@ -156,7 +157,11 @@ func drainProbePayload(in io.Reader, total int64, sts0 *int64) error {
 	if remaining <= 0 {
 		return nil
 	}
-	buf := make([]byte, probeCopyBufferBytes)
+	buf, release, err := bufpool.Acquire(probeCopyBufferBytes)
+	if err != nil {
+		return err
+	}
+	defer release()
 	for remaining > 0 {
 		step := int64(len(buf))
 		if step > remaining {
