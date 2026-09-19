@@ -4,18 +4,23 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/zeebo/xxh3"
+	"golang.org/x/sys/unix"
 )
 
 func TestParseSENDRequestCompDefaultsAndModes(t *testing.T) {
@@ -374,4 +379,322 @@ func TestHandleSENDBasic(t *testing.T) {
 	if !bytes.Equal(frames[0].Logical, data) {
 		t.Fatalf("unexpected logical bytes")
 	}
+}
+
+func TestStreamFramePayloadZeroCopyHandlesShortInterruptedAndBackpressuredSyscalls(t *testing.T) {
+	data := zeroCopyPayload(160 * 1024)
+	path := writeTempSendFile(t, data)
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer file.Close()
+
+	server, client := newTCPPair(t)
+	defer server.Close()
+	defer client.Close()
+	if err := server.SetWriteBuffer(4096); err != nil {
+		t.Fatalf("SetWriteBuffer: %v", err)
+	}
+	if err := client.SetReadBuffer(4096); err != nil {
+		t.Fatalf("SetReadBuffer: %v", err)
+	}
+	releaseReader := make(chan struct{})
+	var releaseReaderOnce sync.Once
+	release := func() { releaseReaderOnce.Do(func() { close(releaseReader) }) }
+	defer release()
+
+	syscalls := kernelZeroCopySyscalls()
+	interruptedSource, interruptedTee := true, true
+	sawBackpressure := false
+	pollCalls := 0
+	closedFDs := make(map[int]unix.Stat_t)
+	observeFD := func(fd int) {
+		if _, seen := closedFDs[fd]; !seen {
+			var stat unix.Stat_t
+			if err := unix.Fstat(fd, &stat); err != nil {
+				panic(err) // A live syscall descriptor must be valid.
+			}
+			closedFDs[fd] = stat
+		}
+	}
+	syscalls.splice = func(src int, srcOffset *int64, dst int, dstOffset *int64, length int, flags int) (int64, error) {
+		if srcOffset != nil {
+			observeFD(dst)
+			if interruptedSource {
+				interruptedSource = false
+				return 0, unix.EINTR
+			}
+		} else {
+			observeFD(src)
+			observeFD(dst)
+		}
+		n, err := unix.Splice(src, srcOffset, dst, dstOffset, min(length, 701), flags)
+		if errors.Is(err, unix.EAGAIN) {
+			sawBackpressure = true
+			release()
+		}
+		return n, err
+	}
+	syscalls.tee = func(src int, dst int, length int, flags int) (int64, error) {
+		observeFD(src)
+		observeFD(dst)
+		if interruptedTee {
+			interruptedTee = false
+			return 0, unix.EINTR
+		}
+		return unix.Tee(src, dst, min(length, 353), flags)
+	}
+	syscalls.poll = func(fds []unix.PollFd, timeout int) (int, error) {
+		if timeout != zeroCopyPollTimeoutMs {
+			return 0, fmt.Errorf("poll timeout = %d, want %d", timeout, zeroCopyPollTimeoutMs)
+		}
+		pollCalls++
+		return unix.Poll(fds, timeout)
+	}
+
+	type result struct {
+		stats frameStreamStats
+		err   error
+	}
+	resultCh := make(chan result, 1)
+	rawCh := make(chan []byte, 1)
+	readErrCh := make(chan error, 1)
+	go func() {
+		<-releaseReader
+		raw, readErr := io.ReadAll(client)
+		rawCh <- raw
+		readErrCh <- readErr
+	}()
+	go func() {
+		offset := int64(0)
+		stats, streamErr := streamFramePayloadZeroCopyWithSyscalls(file, &offset, frameStreamArgs{
+			Ctx:           context.Background(),
+			FileID:        1,
+			FrameSize:     int64(len(data)),
+			Comp:          "none",
+			HeaderTS:      1,
+			IsTerminal:    true,
+			WindowHasher:  xxh3.New128(),
+			Output:        server,
+			OutputTCPConn: server,
+			PipeSizeBytes: 4096,
+		}, syscalls)
+		_ = server.Close()
+		resultCh <- result{stats: stats, err: streamErr}
+	}()
+	var got result
+	select {
+	case got = <-resultCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("zero-copy stream did not finish")
+	}
+	if got.err != nil {
+		t.Fatalf("zero-copy stream: %v", got.err)
+	}
+	if got.stats.NextOffset != int64(len(data)) {
+		t.Fatalf("next offset = %d, want %d", got.stats.NextOffset, len(data))
+	}
+	if got.stats.WindowHashToken != encoding.FormatXXH128HashToken(xxh3.Hash128(data)) {
+		t.Fatalf("window hash = %q", got.stats.WindowHashToken)
+	}
+	if interruptedSource || interruptedTee {
+		t.Fatal("zero-copy stream did not retry an interrupted syscall")
+	}
+	if !sawBackpressure || pollCalls == 0 {
+		t.Fatalf("zero-copy stream did not resume from real socket backpressure (EAGAIN=%t polls=%d)", sawBackpressure, pollCalls)
+	}
+	// srcR, srcW, hashPipeW, and the duplicated socket FD all cross the
+	// syscall seam. hashPipeR is only used by io.ReadFull and is covered by
+	// the function's deferred Close rather than an observable raw operation.
+	if len(closedFDs) != 4 {
+		t.Fatalf("observed %d temporary descriptors, want 4", len(closedFDs))
+	}
+	for fd, original := range closedFDs {
+		var current unix.Stat_t
+		err := unix.Fstat(fd, &current)
+		if err == nil && current.Dev == original.Dev && current.Ino == original.Ino {
+			t.Errorf("temporary zero-copy fd %d was not closed", fd)
+		} else if err != nil && !errors.Is(err, unix.EBADF) {
+			t.Errorf("stat temporary fd %d: %v", fd, err)
+		}
+	}
+
+	var raw []byte
+	select {
+	case raw = <-rawCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client did not receive zero-copy stream")
+	}
+	if err := <-readErrCh; err != nil {
+		t.Fatalf("read zero-copy stream: %v", err)
+	}
+	frames, err := decodeFrameStream(raw)
+	if err != nil {
+		t.Fatalf("decode zero-copy stream: %v", err)
+	}
+	if len(frames) != 1 || !bytes.Equal(frames[0].Logical, data) {
+		t.Fatalf("zero-copy payload did not survive short syscall results")
+	}
+}
+
+func TestStreamFramePayloadZeroCopyShortSourceDoesNotFinalizeHash(t *testing.T) {
+	data := zeroCopyPayload(1024)
+	file, err := os.Open(writeTempSendFile(t, data))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer file.Close()
+	server, client := newTCPPair(t)
+	defer client.Close()
+	defer server.Close()
+
+	offset := int64(0)
+	stats, err := streamFramePayloadZeroCopy(file, &offset, frameStreamArgs{
+		Ctx:           context.Background(),
+		FileID:        1,
+		FrameSize:     int64(len(data) + 1),
+		Comp:          "none",
+		HeaderTS:      1,
+		IsTerminal:    true,
+		WindowHasher:  xxh3.New128(),
+		Output:        server,
+		OutputTCPConn: server,
+		PipeSizeBytes: 4096,
+	})
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("short source error = %v, want ErrUnexpectedEOF", err)
+	}
+	if stats.WindowHashToken != "" {
+		t.Fatalf("short source finalized hash %q", stats.WindowHashToken)
+	}
+}
+
+func TestStreamSendItemZeroCopyDisconnectDoesNotRecordHash(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("tee/splice zero-copy is Linux-only")
+	}
+	data := zeroCopyPayload(int(defaultFileFrameLogicalSize + 64*1024))
+	path := writeTempSendFile(t, data)
+	deps := &mockDeps{filePath: path}
+	server, client := newTCPPair(t)
+	defer server.Close()
+	defer client.Close()
+	closed := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReader(client)
+		if _, err := reader.ReadString('\n'); err != nil {
+			closed <- err
+			return
+		}
+		if _, err := io.CopyN(io.Discard, reader, 1024); err != nil {
+			closed <- err
+			return
+		}
+		_ = client.SetLinger(0)
+		closed <- client.Close()
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- streamSendItem(context.Background(), server, deps, "tx1", sendItem{
+			FileID: 1,
+			Comp:   "none",
+			Path:   path,
+			Mode:   loadStrategyFast,
+		}, false)
+	}()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("receiver did not disconnect during payload: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("receiver did not read and disconnect")
+	}
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("zero-copy SEND unexpectedly succeeded after receiver disconnect")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("zero-copy SEND did not terminate after receiver disconnect")
+	}
+	if deps.setWindowCalls != 0 || deps.windowHash != "" {
+		t.Fatalf("failed SEND recorded terminal hash: calls=%d hash=%q", deps.setWindowCalls, deps.windowHash)
+	}
+}
+
+func TestWaitSocketWritableRejectsNonWritableEvents(t *testing.T) {
+	type pollResult struct {
+		n       int
+		err     error
+		revents int16
+	}
+	tests := []struct {
+		name    string
+		results []pollResult
+		wantErr bool
+	}{
+		{name: "writable", results: []pollResult{{n: 1, revents: unix.POLLOUT}}},
+		{name: "interrupted then writable", results: []pollResult{{err: unix.EINTR}, {n: 1, revents: unix.POLLOUT}}},
+		{name: "timeout", results: []pollResult{{}}, wantErr: true},
+		{name: "error", results: []pollResult{{n: 1, revents: unix.POLLERR | unix.POLLOUT}}, wantErr: true},
+		{name: "hangup", results: []pollResult{{n: 1, revents: unix.POLLHUP | unix.POLLOUT}}, wantErr: true},
+		{name: "invalid descriptor", results: []pollResult{{n: 1, revents: unix.POLLNVAL | unix.POLLOUT}}, wantErr: true},
+		{name: "readable only", results: []pollResult{{n: 1, revents: unix.POLLIN}}, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			syscalls := kernelZeroCopySyscalls()
+			syscalls.poll = func(fds []unix.PollFd, timeout int) (int, error) {
+				if timeout != zeroCopyPollTimeoutMs {
+					t.Fatalf("timeout = %d, want %d", timeout, zeroCopyPollTimeoutMs)
+				}
+				if calls >= len(tc.results) {
+					t.Fatal("unexpected extra poll")
+				}
+				result := tc.results[calls]
+				calls++
+				fds[0].Revents = result.revents
+				return result.n, result.err
+			}
+			err := waitSocketWritable(1, syscalls)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("waitSocketWritable error = %v, want error=%t", err, tc.wantErr)
+			}
+			if calls != len(tc.results) {
+				t.Fatalf("poll calls = %d, want %d", calls, len(tc.results))
+			}
+		})
+	}
+}
+
+func newTCPPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("ListenTCP: %v", err)
+	}
+	defer listener.Close()
+	client, err := net.DialTCP("tcp", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatalf("DialTCP: %v", err)
+	}
+	server, err := listener.AcceptTCP()
+	if err != nil {
+		_ = client.Close()
+		t.Fatalf("AcceptTCP: %v", err)
+	}
+	return server, client
+}
+
+func zeroCopyPayload(size int) []byte {
+	payload := make([]byte, size)
+	for offset := 0; offset < len(payload); {
+		block := sha256.Sum256([]byte(strconv.Itoa(offset)))
+		offset += copy(payload[offset:], block[:])
+	}
+	return payload
 }

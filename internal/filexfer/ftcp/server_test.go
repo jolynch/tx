@@ -3,14 +3,20 @@ package ftcp
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/zeebo/xxh3"
 )
 
 func TestServeLogsExitAfterConfiguration(t *testing.T) {
@@ -360,4 +366,164 @@ func TestServeKeepAliveIdleTimeout(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("idle reap took too long: %v", elapsed)
 	}
+}
+
+// FuzzServeZeroCopySEND checks the wire contract and ACK state through the real
+// server in both zero-copy and buffered modes. Sizes include pipe/frame edges;
+// generating the payload keeps multi-megabyte cases out of the corpus files.
+func FuzzServeZeroCopySEND(f *testing.F) {
+	for _, size := range []uint32{0, 1, 4095, 4096, 4097, 65535, 65536, 65537, 4194303, 4194304, 4194305} {
+		f.Add(size, uint32(0), uint32(0), uint32(8191), byte(0))
+	}
+	f.Add(uint32(4194417), uint32(19), uint32(4194335), uint32(4096), byte(173))
+	f.Fuzz(func(t *testing.T, sizeRaw, offsetRaw, lengthRaw, chunkRaw uint32, content byte) {
+		data := zeroCopyPayload(int(sizeRaw % (2*uint32(defaultFileFrameLogicalSize) + 1)))
+		for i := range data {
+			data[i] ^= content
+		}
+		var offset int64
+		if len(data) > 0 {
+			offset = int64(offsetRaw) % int64(len(data))
+		}
+		length := int64(len(data)) - offset
+		if length > 0 && lengthRaw != 0 {
+			length = 1 + int64(lengthRaw)%length
+		}
+		want := data[offset : offset+length]
+		// Bound syscall count for large files; small cases still allow one-byte reads.
+		readLimit := max(1+int(chunkRaw%65536), len(data)/4096)
+		path := writeTempSendFile(t, data)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, buffered := range []bool{false, true} {
+			t.Run(fmt.Sprintf("buffered=%t", buffered), func(t *testing.T) {
+				deps := realDeps(t, "/")
+				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				done := make(chan error, 1)
+				go func() { done <- Serve(ln, ServerOptions{Deps: deps, DisableZeroCopy: buffered}) }()
+				t.Cleanup(func() {
+					_ = ln.Close()
+					if err := <-done; err != nil {
+						t.Error(err)
+					}
+				})
+				// Every command reads through EOF, including closure of its server
+				// session. Cap actual reads, not just bufio's internal buffer size.
+				exchange := func(command string) []byte {
+					t.Helper()
+					conn, err := net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer conn.Close()
+					_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+					if _, err := io.WriteString(conn, command+"\r\n"); err != nil {
+						t.Fatal(err)
+					}
+					raw, err := io.ReadAll(cappedTCPReader{conn, readLimit})
+					if err != nil {
+						t.Fatalf("%s: %v", strings.Fields(command)[0], err)
+					}
+					return raw
+				}
+				raw := exchange(fmt.Sprintf("TXFER %q mode=fast link-mbps=1000 concurrency=1 comp=none", filepath.Dir(path)))
+				if !bytes.HasSuffix(raw, []byte("OK\r\n")) {
+					t.Fatalf("TXFER failed: %q", raw)
+				}
+				manifest, err := io.ReadAll(encoding.NewChunkedManifestReader(bytes.NewReader(raw), encoding.ChunkedManifestReaderOpts{}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				header, err := encoding.ParseManifestHeader(strings.SplitN(string(manifest), "\n", 2)[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				entries, _ := parseSYNCResponseEntries(string(manifest), nil)
+				if len(entries) != 1 || entries[0].Size != int64(len(data)) {
+					t.Fatalf("unexpected manifest: %s", manifest)
+				}
+				fid, tid := entries[0].ID, header.TransferID
+				raw = exchange(fmt.Sprintf("SEND %s fd=%d %q mode=fast comp=none offset=%d size=%d", tid, fid, path, offset, length))
+				if !bytes.HasSuffix(raw, []byte("OK\r\n")) {
+					t.Fatal("SEND missing terminal OK")
+				}
+				frames, err := decodeFrameStream(bytes.TrimSuffix(raw, []byte("OK\r\n")))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(frames) != max(1, int((length+defaultFileFrameLogicalSize-1)/defaultFileFrameLogicalSize)) {
+					t.Fatalf("unexpected frame count: %d", len(frames))
+				}
+				hash := encoding.FormatXXH128HashToken(xxh3.Hash128(want))
+				cursor := offset
+				for i, frame := range frames {
+					h, tr := frame.Header, frame.Trailer
+					n := min(defaultFileFrameLogicalSize, offset+length-cursor)
+					if h.FileID != fid || tr.FileID != fid || h.Offset != cursor || h.Size != n || h.WireSize != n || h.Comp != "none" {
+						t.Fatalf("unexpected frame %d: %+v / %+v", i, h, tr)
+					}
+					if !bytes.Equal(frame.Logical, data[cursor:cursor+n]) {
+						t.Fatalf("frame %d changed source bytes", i)
+					}
+					cursor += n
+					next, token := cursor, ""
+					if i == len(frames)-1 {
+						next, token = 0, hash
+						for _, field := range []string{
+							fmt.Sprintf("meta:size=%d", info.Size()),
+							fmt.Sprintf("meta:mtime_ns=%d", info.ModTime().UnixNano()),
+							"meta:mode=" + encoding.FormatManifestMode(info.Mode()),
+						} {
+							if !strings.Contains(tr.ChecksumPrefix, field) {
+								t.Fatalf("terminal metadata missing %s", field)
+							}
+						}
+					}
+					if tr.Next == nil || *tr.Next != next || tr.FileHashToken != token {
+						t.Fatalf("unexpected trailer %d: %+v", i, tr)
+					}
+				}
+				if !deps.VerifyTransferFileWindowHash(tid, fid, offset+length, hash) {
+					t.Fatal("server did not store the window hash at its end offset")
+				}
+				ack := fmt.Sprintf("ACK %s fd=%d %q ack-token=%d@1@", tid, fid, path, offset+length)
+				bad := exchange(ack + "xxh128:00000000000000000000000000000000")
+				if !bytes.HasPrefix(bad, []byte("ERR CONFLICT ")) {
+					t.Fatalf("bad ACK accepted: %q", bad)
+				}
+				before, _ := deps.GetTransfer(tid)
+				if before.DoneSize != 0 {
+					t.Fatal("bad ACK advanced progress")
+				}
+				if got := string(exchange(ack + hash)); got != "OK\r\n" {
+					t.Fatalf("valid ACK rejected: %q", got)
+				}
+				var status encoding.TransferStatus
+				raw = exchange("STATUS " + tid)
+				if !bytes.HasPrefix(raw, []byte("OK ")) {
+					t.Fatalf("STATUS failed: %q", raw)
+				}
+				if err := json.Unmarshal(raw[3:], &status); err != nil {
+					t.Fatal(err)
+				}
+				if status.DoneSize != offset+length || status.TotalSize != int64(len(data)) {
+					t.Fatalf("unexpected progress: %+v", status)
+				}
+			})
+		}
+	})
+}
+
+type cappedTCPReader struct {
+	io.Reader
+	limit int
+}
+
+func (r cappedTCPReader) Read(p []byte) (int, error) {
+	return r.Reader.Read(p[:min(len(p), r.limit)])
 }

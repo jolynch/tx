@@ -774,10 +774,27 @@ func dupConnFD(conn *net.TCPConn) (int, error) {
 
 const zeroCopyPollTimeoutMs = 30_000 // 30s per poll wait
 
-func waitSocketWritable(fd int) error {
+// zeroCopySyscalls contains the raw operations used by the zero-copy loop.
+// Keeping this per invocation lets tests reproduce short and interrupted
+// operations without mutable package-level syscall hooks.
+type zeroCopySyscalls struct {
+	splice func(int, *int64, int, *int64, int, int) (int64, error)
+	tee    func(int, int, int, int) (int64, error)
+	poll   func([]unix.PollFd, int) (int, error)
+}
+
+func kernelZeroCopySyscalls() zeroCopySyscalls {
+	return zeroCopySyscalls{
+		splice: unix.Splice,
+		tee:    unix.Tee,
+		poll:   unix.Poll,
+	}
+}
+
+func waitSocketWritable(fd int, syscalls zeroCopySyscalls) error {
 	pollFDs := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
 	for {
-		n, err := unix.Poll(pollFDs, zeroCopyPollTimeoutMs)
+		n, err := syscalls.poll(pollFDs, zeroCopyPollTimeoutMs)
 		if err != nil {
 			if errors.Is(err, unix.EINTR) {
 				continue
@@ -787,14 +804,21 @@ func waitSocketWritable(fd int) error {
 		if n == 0 {
 			return errors.New("zero-copy splice timed out waiting for socket writable")
 		}
-		if pollFDs[0].Revents&(unix.POLLERR|unix.POLLHUP) != 0 {
+		if pollFDs[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
 			return errors.New("socket error during zero-copy splice")
 		}
-		return nil
+		if pollFDs[0].Revents&unix.POLLOUT != 0 {
+			return nil
+		}
+		return errors.New("socket did not become writable during zero-copy splice")
 	}
 }
 
 func streamFramePayloadZeroCopy(fd *os.File, fileOffset *int64, args frameStreamArgs) (frameStreamStats, error) {
+	return streamFramePayloadZeroCopyWithSyscalls(fd, fileOffset, args, kernelZeroCopySyscalls())
+}
+
+func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args frameStreamArgs, syscalls zeroCopySyscalls) (frameStreamStats, error) {
 	srcR, srcW, err := os.Pipe()
 	if err != nil {
 		return frameStreamStats{}, err
@@ -848,9 +872,12 @@ func streamFramePayloadZeroCopy(fd *os.File, fileOffset *int64, args frameStream
 		}
 
 		spliceStart := time.Now()
-		splicedIn, spliceErr := unix.Splice(int(fd.Fd()), fileOffset, int(srcW.Fd()), nil, int(step), unix.SPLICE_F_MOVE)
+		splicedIn, spliceErr := syscalls.splice(int(fd.Fd()), fileOffset, int(srcW.Fd()), nil, int(step), unix.SPLICE_F_MOVE)
 		prepareLatency += time.Since(spliceStart)
 		if spliceErr != nil {
+			if errors.Is(spliceErr, unix.EINTR) {
+				continue
+			}
 			readRegion.End()
 			return frameStreamStats{}, spliceErr
 		}
@@ -866,9 +893,12 @@ func streamFramePayloadZeroCopy(fd *os.File, fileOffset *int64, args frameStream
 		sourceRemaining := splicedIn
 		for sourceRemaining > 0 {
 			teeStart := time.Now()
-			teed, teeErr := unix.Tee(srcRFD, hashPipeWFD, int(sourceRemaining), 0)
+			teed, teeErr := syscalls.tee(srcRFD, hashPipeWFD, int(sourceRemaining), 0)
 			prepareLatency += time.Since(teeStart)
 			if teeErr != nil {
+				if errors.Is(teeErr, unix.EINTR) {
+					continue
+				}
 				readRegion.End()
 				return frameStreamStats{}, teeErr
 			}
@@ -881,13 +911,13 @@ func streamFramePayloadZeroCopy(fd *os.File, fileOffset *int64, args frameStream
 			writeStart := time.Now()
 			moveRemaining := teed
 			for moveRemaining > 0 {
-				moved, moveErr := unix.Splice(srcRFD, nil, outFD, nil, int(moveRemaining), unix.SPLICE_F_MOVE)
+				moved, moveErr := syscalls.splice(srcRFD, nil, outFD, nil, int(moveRemaining), unix.SPLICE_F_MOVE)
 				if moveErr != nil {
 					if errors.Is(moveErr, unix.EINTR) {
 						continue
 					}
 					if errors.Is(moveErr, unix.EAGAIN) {
-						if waitErr := waitSocketWritable(outFD); waitErr != nil {
+						if waitErr := waitSocketWritable(outFD, syscalls); waitErr != nil {
 							readRegion.End()
 							return frameStreamStats{}, waitErr
 						}
