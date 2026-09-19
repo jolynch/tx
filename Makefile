@@ -48,6 +48,7 @@ fuzz-short:
 # coverage past 10s, so CI gives them a larger budget to keep exploring.
 fuzz-long:
 	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzSync -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
+	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzServeZeroCopySEND -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG) -parallel=1
 
 bench: build
 	@mkdir -p bench/results
