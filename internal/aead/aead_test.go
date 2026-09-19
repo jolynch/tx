@@ -5,7 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"io"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"filippo.io/age"
@@ -368,6 +371,90 @@ func TestEncryptDefaultAlgorithmUsesRecommendation(t *testing.T) {
 	}
 	if _, err := io.ReadAll(r); err != nil {
 		t.Fatalf("read: %v", err)
+	}
+}
+
+func TestNewAndValidateAuthToken(t *testing.T) {
+	token, err := NewAuthToken()
+	if err != nil {
+		t.Fatalf("NewAuthToken: %v", err)
+	}
+	if len(token) != 16 {
+		t.Fatalf("token length = %d, want 16", len(token))
+	}
+	if err := ValidateAuthToken(token); err != nil {
+		t.Fatalf("generated token rejected: %v", err)
+	}
+
+	for _, token := range []string{
+		strings.Repeat("a", minAuthTokenLen-1),
+		"valid token",
+		"valid\ttoken",
+		"valid\ntoken",
+	} {
+		if err := ValidateAuthToken(token); err == nil {
+			t.Fatalf("ValidateAuthToken(%q) accepted invalid token", token)
+		}
+	}
+	if err := ValidateAuthToken(strings.Repeat("a", minAuthTokenLen)); err != nil {
+		t.Fatalf("minimum valid token rejected: %v", err)
+	}
+}
+
+func TestLoadOrGenerateAgeIdentity(t *testing.T) {
+	t.Run("default missing directory is ephemeral", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "missing")
+		identity, ephemeral, err := LoadOrGenerateAgeIdentity(dir, true)
+		if err != nil || identity == nil || !ephemeral {
+			t.Fatalf("LoadOrGenerateAgeIdentity = (%v, %t, %v), want ephemeral identity", identity, ephemeral, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "key")); !os.IsNotExist(err) {
+			t.Fatalf("ephemeral identity wrote a key file: %v", err)
+		}
+	})
+
+	t.Run("explicit missing directory fails", func(t *testing.T) {
+		_, ephemeral, err := LoadOrGenerateAgeIdentity(filepath.Join(t.TempDir(), "missing"), false)
+		if err == nil || ephemeral {
+			t.Fatalf("LoadOrGenerateAgeIdentity = (_, %t, %v), want non-ephemeral error", ephemeral, err)
+		}
+	})
+
+	t.Run("new key persists and reloads", func(t *testing.T) {
+		dir := t.TempDir()
+		created, ephemeral, err := LoadOrGenerateAgeIdentity(dir, false)
+		if err != nil || created == nil || ephemeral {
+			t.Fatalf("generate identity = (%v, %t, %v)", created, ephemeral, err)
+		}
+		keyPath := filepath.Join(dir, "key")
+		info, err := os.Stat(keyPath)
+		if err != nil {
+			t.Fatalf("stat persisted key: %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("key permissions = %o, want 600", got)
+		}
+		reloaded, ephemeral, err := LoadOrGenerateAgeIdentity(dir, false)
+		if err != nil || reloaded == nil || ephemeral {
+			t.Fatalf("reload identity = (%v, %t, %v)", reloaded, ephemeral, err)
+		}
+		if reloaded.String() != created.String() {
+			t.Fatal("reloaded identity differs from persisted identity")
+		}
+	})
+}
+
+func TestLoadAgeIdentityRejectsMalformedKey(t *testing.T) {
+	if identity, err := LoadAgeIdentity(filepath.Join(t.TempDir(), "missing")); err != nil || identity != nil {
+		t.Fatalf("missing key = (%v, %v), want (nil, nil)", identity, err)
+	}
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "key"), []byte("# comment\nnot-an-age-key\n"), 0o600); err != nil {
+		t.Fatalf("write malformed key: %v", err)
+	}
+	if _, err := LoadAgeIdentity(dir); err == nil {
+		t.Fatal("LoadAgeIdentity accepted malformed key")
 	}
 }
 
