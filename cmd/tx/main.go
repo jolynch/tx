@@ -122,6 +122,10 @@ func runSendCLI(args []string, stdout, stderr io.Writer) int {
 }
 
 func runSendTreeCLI(args []string, _ io.Writer, stderr io.Writer) int {
+	return runSendTree(args, stderr, ftcp.Serve)
+}
+
+func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.ServerOptions) error) int {
 	cf := cliflags.New("tree")
 	cf.SetOutput(stderr)
 
@@ -298,7 +302,7 @@ func runSendTreeCLI(args []string, _ io.Writer, stderr io.Writer) int {
 	defer fileLn.Close()
 
 	log.Printf("File transfer listener at %s (root=%s)", listenAddr, chroot)
-	if serveErr := ftcp.Serve(fileLn, ftcp.ServerOptions{
+	if serveErr := serve(fileLn, ftcp.ServerOptions{
 		RequireAuth:            requireAuth,
 		AllowedAuthTokens:      authTokenVals,
 		ServerIdentity:         serverKey,
