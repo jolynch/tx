@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jolynch/tx"
+	"github.com/jolynch/tx/internal/bufpool"
 	"github.com/jolynch/tx/internal/cliflags"
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
@@ -1206,6 +1207,7 @@ func verifySampleTaskData(ctx context.Context, client *tx.Client, transferID str
 	}
 	defer fd.Close()
 
+	// Samples are smaller than the pool's 4 KiB minimum.
 	buf := make([]byte, verifySampleBytes)
 	for task.sampleGen.Remaining() > 0 {
 		batchCap := minInt64(task.sampleGen.Remaining(), 1024)
@@ -1289,7 +1291,12 @@ func computeLocalSampleHash(fd *os.File, offset int64, size int64, scratch []byt
 	}
 	buf := scratch
 	if int64(len(buf)) < size {
-		buf = make([]byte, size)
+		pooled, release, err := bufpool.Acquire(int(size))
+		if err != nil {
+			return "", err
+		}
+		defer release()
+		buf = pooled
 	}
 	n, err := fd.ReadAt(buf[:size], offset)
 	if err != nil && !errors.Is(err, io.EOF) {

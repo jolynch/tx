@@ -110,7 +110,7 @@ func handleSYNCCommand(_ context.Context, _ Request, _ io.Writer, _ Deps) error 
 	return protocolErr{code: "INTERNAL", message: "SYNC requires input reader, use handleSYNCWithInput"}
 }
 
-func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.Writer, deps Deps, onTransferCreated func(string)) error {
+func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.Writer, deps Deps, onTransferCreated func(string), maxBodyBytes int64) error {
 	parsed, err := parseSYNCRequest(req)
 	if err != nil {
 		return err
@@ -127,7 +127,11 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	root := filepath.Clean(parsed.Directory)
 
 	// Read the framed old-manifest body from the input stream and parse it.
-	oldManifestReader := encoding.NewChunkedManifestReader(in, encoding.ChunkedManifestReaderOpts{})
+	// The body is capped because the index built from it has to be held whole:
+	// the walk below consults it for every path on disk.
+	oldManifestReader := encoding.NewFramedBodyReader(in, encoding.FramedBodyReaderOpts{
+		MaxLogicalBytes: maxBodyBytes,
+	})
 	pathIndex, parseErr := readOldManifest(oldManifestReader)
 	if parseErr != nil {
 		return protocolErr{code: "BAD_REQUEST", message: fmt.Sprintf("invalid old manifest: %s", parseErr)}
@@ -171,7 +175,7 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	// Wrap the output writer with a chunked manifest writer so FM/1 and RM
 	// lines flow through FX/1 + FXT/1 frames with per-frame compression,
 	// matching TXFER's response framing.
-	cw := encoding.NewChunkedManifestWriter(out, parsed.Comp, encoding.DefaultManifestChunkSize, encoding.DefaultManifestFlushInterval)
+	cw := encoding.NewFramedBodyWriter(out, parsed.Comp, encoding.DefaultBodyChunkSize, encoding.DefaultBodyFlushInterval)
 
 	// Write FM/1 header.
 	hdr := encoding.FormatManifestHeader(encoding.ManifestHeader{
@@ -414,7 +418,14 @@ func readOldManifest(in io.Reader) (map[xxh3.Uint128]*oldEntry, error) {
 			return nil, err
 		}
 		line = strings.TrimRight(line, "\r\n")
+		// Only the line terminator is stripped from what the parsers see:
+		// path tokens are length-prefixed, so trimming spaces would eat bytes
+		// the prefix already counted and break names with trailing whitespace.
+		// The space-trimmed copy is used solely to classify the line.
+		// Leading whitespace is still tolerated; only the trailing side was
+		// destructive.
 		trimmed := strings.TrimSpace(line)
+		parseLine := strings.TrimLeft(line, " \t")
 
 		// Blank line terminates the old manifest body.
 		if trimmed == "" {
@@ -423,7 +434,7 @@ func readOldManifest(in io.Reader) (map[xxh3.Uint128]*oldEntry, error) {
 
 		if strings.HasPrefix(trimmed, "FM/1 ") {
 			// Parse header but we only need to validate it; we don't use its fields.
-			if _, headerErr := encoding.ParseManifestHeader(trimmed); headerErr != nil {
+			if _, headerErr := encoding.ParseManifestHeader(parseLine); headerErr != nil {
 				return nil, headerErr
 			}
 			seenHeader = true
@@ -436,7 +447,7 @@ func readOldManifest(in io.Reader) (map[xxh3.Uint128]*oldEntry, error) {
 			return nil, fmt.Errorf("manifest entry before header")
 		}
 
-		entry, nextPath, nextMtime, parseErr := encoding.ParseManifestEntry(trimmed, prevPath, prevMtime)
+		entry, nextPath, nextMtime, parseErr := encoding.ParseManifestEntry(parseLine, prevPath, prevMtime)
 		if parseErr != nil {
 			return nil, parseErr
 		}

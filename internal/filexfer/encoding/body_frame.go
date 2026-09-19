@@ -7,24 +7,56 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/jolynch/tx/internal/bufpool"
+	"github.com/jolynch/tx/internal/utils"
 	"github.com/zeebo/xxh3"
 )
 
-const DefaultManifestChunkSize int64 = 4 * 1024 * 1024
-const DefaultManifestFlushInterval = 2 * time.Second
+const DefaultBodyChunkSize int64 = 4 * 1024 * 1024
+const DefaultBodyFlushInterval = 2 * time.Second
 
-const ManifestFrameFileID uint64 = 0
+const FramedBodyFileID uint64 = 0
 
-// DefaultMaxManifestFrameWireBytes is the default upper bound on a single
-// manifest frame's wire payload size. Frames larger than this are rejected
-// as malformed.
-const DefaultMaxManifestFrameWireBytes int64 = 64 * 1024 * 1024
+// Frame limits follow the socket receive limit within 8–64 MiB. The 8 MiB
+// floor admits a full 4 MiB chunk even when compression adds overhead; the
+// 64 MiB cap keeps socket tuning from raising the allocation limit.
+const (
+	minFrameCeilingBytes int64 = 8 * 1024 * 1024
+	maxFrameCeilingBytes int64 = 64 * 1024 * 1024
+)
 
-const maxManifestFrameLineBytes = 4 * 1024 * 1024
+var (
+	frameCeilingOnce  sync.Once
+	frameCeilingValue int64
+)
 
-type ChunkedManifestWriter struct {
+// Cache the /proc lookup across requests.
+func frameCeilingBytes() int64 {
+	frameCeilingOnce.Do(func() {
+		v := int64(utils.MaxSocketReadBufferBytes())
+		if v > maxFrameCeilingBytes {
+			v = maxFrameCeilingBytes
+		}
+		if v < minFrameCeilingBytes {
+			v = minFrameCeilingBytes
+		}
+		frameCeilingValue = v
+	})
+	return frameCeilingValue
+}
+
+// DefaultMaxFrameWireBytes bounds one frame's wire payload.
+func DefaultMaxFrameWireBytes() int64 { return frameCeilingBytes() }
+
+// DefaultMaxFrameLogicalBytes bounds one frame's decoded size.
+func DefaultMaxFrameLogicalBytes() int64 { return frameCeilingBytes() }
+
+const maxFrameLineBytes = 4 * 1024 * 1024
+
+type FramedBodyWriter struct {
 	dst           io.Writer
 	comp          string
 	chunkSize     int64
@@ -36,14 +68,14 @@ type ChunkedManifestWriter struct {
 	closed        bool
 }
 
-func NewChunkedManifestWriter(dst io.Writer, comp string, chunkSize int64, flushInterval time.Duration) *ChunkedManifestWriter {
+func NewFramedBodyWriter(dst io.Writer, comp string, chunkSize int64, flushInterval time.Duration) *FramedBodyWriter {
 	if chunkSize <= 0 {
-		chunkSize = DefaultManifestChunkSize
+		chunkSize = DefaultBodyChunkSize
 	}
 	if comp == "" {
 		comp = "none"
 	}
-	return &ChunkedManifestWriter{
+	return &FramedBodyWriter{
 		dst:           dst,
 		comp:          comp,
 		chunkSize:     chunkSize,
@@ -53,9 +85,9 @@ func NewChunkedManifestWriter(dst io.Writer, comp string, chunkSize int64, flush
 	}
 }
 
-func (w *ChunkedManifestWriter) Write(p []byte) (int, error) {
+func (w *FramedBodyWriter) Write(p []byte) (int, error) {
 	if w.closed {
-		return 0, errors.New("write on closed ChunkedManifestWriter")
+		return 0, errors.New("write on closed FramedBodyWriter")
 	}
 	n, _ := w.buf.Write(p)
 	for int64(w.buf.Len()) >= w.chunkSize {
@@ -71,7 +103,7 @@ func (w *ChunkedManifestWriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-func (w *ChunkedManifestWriter) Close() error {
+func (w *FramedBodyWriter) Close() error {
 	if w.closed {
 		return nil
 	}
@@ -79,7 +111,7 @@ func (w *ChunkedManifestWriter) Close() error {
 	return w.flushChunk(w.buf.Len(), true)
 }
 
-func (w *ChunkedManifestWriter) flushChunk(n int, terminal bool) error {
+func (w *FramedBodyWriter) flushChunk(n int, terminal bool) error {
 	var chunk []byte
 	if n > 0 {
 		chunk = w.buf.Next(n)
@@ -87,10 +119,12 @@ func (w *ChunkedManifestWriter) flushChunk(n int, terminal bool) error {
 	var wire []byte
 	switch w.comp {
 	case EncodingZstd:
-		c, err := CompressZstd(chunk)
+		c, release, err := CompressZstdPooled(chunk)
 		if err != nil {
 			return fmt.Errorf("compress manifest chunk: %w", err)
 		}
+		// Release after WriteFrame consumes wire.
+		defer release()
 		wire = c
 	case "none":
 		wire = chunk
@@ -110,7 +144,7 @@ func (w *ChunkedManifestWriter) flushChunk(n int, terminal bool) error {
 
 	now := time.Now().UnixMilli()
 	if _, err := WriteFrame(w.dst, WriteArgs{
-		FileID:     ManifestFrameFileID,
+		FileID:     FramedBodyFileID,
 		Offset:     w.offset,
 		Size:       int64(len(chunk)),
 		WSize:      int64(len(wire)),
@@ -129,9 +163,9 @@ func (w *ChunkedManifestWriter) flushChunk(n int, terminal bool) error {
 	return nil
 }
 
-// ManifestFrameStats is emitted to a ChunkedManifestReader's OnFrame callback
+// FrameStats is emitted to a FramedBodyReader's OnFrame callback
 // after each successfully-validated FX/1+FXT/1 frame in the stream.
-type ManifestFrameStats struct {
+type FrameStats struct {
 	FrameIndex   int
 	WireBytes    int64
 	LogicalBytes int64
@@ -140,29 +174,37 @@ type ManifestFrameStats struct {
 	Terminal     bool
 }
 
-// ChunkedManifestReaderOpts tunes a ChunkedManifestReader.
-type ChunkedManifestReaderOpts struct {
+// FramedBodyReaderOpts tunes a FramedBodyReader.
+type FramedBodyReaderOpts struct {
 	// MaxWireSize caps a single frame's wire payload. Zero selects
-	// DefaultMaxManifestFrameWireBytes.
+	// DefaultMaxFrameWireBytes.
 	MaxWireSize int64
+	// MaxFrameLogicalBytes caps a single frame's declared logical (decoded)
+	// size. Zero selects DefaultMaxFrameLogicalBytes.
+	//
+	// This cap is always active, including when MaxLogicalBytes is unset.
+	MaxFrameLogicalBytes int64
+	// MaxLogicalBytes caps the cumulative decompressed size of the whole
+	// body across all frames. Zero disables this cap; per-frame caps remain.
+	MaxLogicalBytes int64
 	// OnFrame, if set, is invoked after each validated frame.
-	OnFrame func(ManifestFrameStats)
+	OnFrame func(FrameStats)
 	// RawSink, if set, receives the raw wire bytes of frames whose codec is
 	// "zstd". Concatenated, the bytes form a standalone multi-frame zstd
 	// archive that decodes to the full logical manifest.
 	RawSink io.Writer
 }
 
-// ChunkedManifestReader is the streaming counterpart to ChunkedManifestWriter.
-// It consumes FX/1 + FXT/1 framed manifest payloads (file_id=0), validates
+// FramedBodyReader is the streaming counterpart to FramedBodyWriter.
+// It consumes FX/1 + FXT/1 framed body payloads (file_id=0), validates
 // per-chunk and cumulative integrity, and exposes the decompressed logical
 // bytes via io.Reader. It returns io.EOF after consuming the terminal frame;
 // any bytes that follow (e.g. a verb-level "OK\r\n" line) remain in the
 // caller's buffered reader.
-type ChunkedManifestReader struct {
+type FramedBodyReader struct {
 	br            *bufio.Reader
 	fileHasher    *xxh3.Hasher128
-	opts          ChunkedManifestReaderOpts
+	opts          FramedBodyReaderOpts
 	buf           bytes.Buffer
 	offset        int64
 	totalWire     int64
@@ -172,10 +214,10 @@ type ChunkedManifestReader struct {
 	fileHashToken string
 }
 
-// NewChunkedManifestReader wraps src and reads framed manifest bytes from it.
+// NewFramedBodyReader wraps src and reads framed manifest bytes from it.
 // If src is already a *bufio.Reader it is used as-is so the caller can keep
 // reading subsequent bytes from the same buffer after this reader hits EOF.
-func NewChunkedManifestReader(src io.Reader, opts ChunkedManifestReaderOpts) *ChunkedManifestReader {
+func NewFramedBodyReader(src io.Reader, opts FramedBodyReaderOpts) *FramedBodyReader {
 	var br *bufio.Reader
 	if b, ok := src.(*bufio.Reader); ok {
 		br = b
@@ -183,9 +225,12 @@ func NewChunkedManifestReader(src io.Reader, opts ChunkedManifestReaderOpts) *Ch
 		br = bufio.NewReader(src)
 	}
 	if opts.MaxWireSize <= 0 {
-		opts.MaxWireSize = DefaultMaxManifestFrameWireBytes
+		opts.MaxWireSize = DefaultMaxFrameWireBytes()
 	}
-	return &ChunkedManifestReader{
+	if opts.MaxFrameLogicalBytes <= 0 {
+		opts.MaxFrameLogicalBytes = DefaultMaxFrameLogicalBytes()
+	}
+	return &FramedBodyReader{
 		br:         br,
 		fileHasher: xxh3.New128(),
 		opts:       opts,
@@ -194,13 +239,13 @@ func NewChunkedManifestReader(src io.Reader, opts ChunkedManifestReaderOpts) *Ch
 
 // FileHash returns the cumulative xxh128 file-hash carried on the terminal
 // trailer. It is only populated after Read returns io.EOF.
-func (r *ChunkedManifestReader) FileHash() string { return r.fileHashToken }
+func (r *FramedBodyReader) FileHash() string { return r.fileHashToken }
 
 // Buffered exposes the underlying buffered reader so callers that wrapped a
 // non-bufio source can continue reading subsequent connection bytes.
-func (r *ChunkedManifestReader) Buffered() *bufio.Reader { return r.br }
+func (r *FramedBodyReader) Buffered() *bufio.Reader { return r.br }
 
-func (r *ChunkedManifestReader) Read(p []byte) (int, error) {
+func (r *FramedBodyReader) Read(p []byte) (int, error) {
 	for r.buf.Len() == 0 {
 		if r.err != nil {
 			return 0, r.err
@@ -220,8 +265,8 @@ func (r *ChunkedManifestReader) Read(p []byte) (int, error) {
 	return r.buf.Read(p)
 }
 
-func (r *ChunkedManifestReader) readNextFrame() error {
-	headerLine, err := readManifestFrameLine(r.br)
+func (r *FramedBodyReader) readNextFrame() error {
+	headerLine, err := readFrameLine(r.br)
 	if err != nil {
 		return fmt.Errorf("read frame header: %w", err)
 	}
@@ -237,7 +282,7 @@ func (r *ChunkedManifestReader) readNextFrame() error {
 	if err != nil {
 		return fmt.Errorf("invalid frame header: %w", err)
 	}
-	if meta.FileID != ManifestFrameFileID {
+	if meta.FileID != FramedBodyFileID {
 		return fmt.Errorf("unexpected frame file_id=%d", meta.FileID)
 	}
 	if meta.HashToken == "" {
@@ -249,13 +294,31 @@ func (r *ChunkedManifestReader) readNextFrame() error {
 	if meta.WireSize > r.opts.MaxWireSize {
 		return fmt.Errorf("frame %d wire size too large: %d", r.frameIdx, meta.WireSize)
 	}
+	// Reject the peer's size before reading or decoding the payload.
+	if meta.Size > r.opts.MaxFrameLogicalBytes {
+		return fmt.Errorf("frame %d logical size too large: %d", r.frameIdx, meta.Size)
+	}
+	// Subtraction avoids overflow from offset + size.
+	if r.opts.MaxLogicalBytes > 0 && meta.Size > r.opts.MaxLogicalBytes-r.offset {
+		return fmt.Errorf("body exceeds maximum logical size %d", r.opts.MaxLogicalBytes)
+	}
 
-	wire := make([]byte, meta.WireSize)
+	// Grow with received bytes, not the peer's declared wire size.
+	wireBuf, err := bufpool.NewGrowing(meta.WireSize)
+	if err != nil {
+		return err
+	}
+	defer wireBuf.Release()
 	if meta.WireSize > 0 {
-		if _, err := io.ReadFull(r.br, wire); err != nil {
-			return fmt.Errorf("read frame payload: %w", err)
+		n, readErr := wireBuf.ReadFrom(io.LimitReader(r.br, meta.WireSize))
+		if readErr != nil {
+			return fmt.Errorf("read frame payload: %w", readErr)
+		}
+		if n != meta.WireSize {
+			return fmt.Errorf("read frame payload: %w", io.ErrUnexpectedEOF)
 		}
 	}
+	wire := wireBuf.Bytes()
 
 	var chunk []byte
 	switch meta.Comp {
@@ -265,10 +328,15 @@ func (r *ChunkedManifestReader) readNextFrame() error {
 				return fmt.Errorf("write raw sink: %w", werr)
 			}
 		}
-		chunk, err = DecompressZstd(wire)
+		// meta.Size is the declared logical size, so decoding is bounded by
+		// it rather than checked against it afterwards.
+		var releaseChunk func()
+		chunk, releaseChunk, err = DecompressZstdN(wire, meta.Size)
 		if err != nil {
 			return fmt.Errorf("decompress frame %d: %w", r.frameIdx, err)
 		}
+		// r.buf takes a copy before release.
+		defer releaseChunk()
 	case "none":
 		if meta.WireSize != meta.Size {
 			return fmt.Errorf("frame %d none-comp wsize=%d != size=%d", r.frameIdx, meta.WireSize, meta.Size)
@@ -277,15 +345,12 @@ func (r *ChunkedManifestReader) readNextFrame() error {
 	default:
 		return fmt.Errorf("unsupported manifest frame comp=%q", meta.Comp)
 	}
-	if int64(len(chunk)) != meta.Size {
-		return fmt.Errorf("frame %d size mismatch: header=%d actual=%d", r.frameIdx, meta.Size, len(chunk))
-	}
 	wantChunkHash := FormatXXH128HashToken(xxh3.Hash128(chunk))
 	if !strings.EqualFold(meta.HashToken, wantChunkHash) {
 		return fmt.Errorf("frame %d header hash mismatch: want=%s got=%s", r.frameIdx, wantChunkHash, meta.HashToken)
 	}
 
-	trailerLine, err := readManifestFrameLine(r.br)
+	trailerLine, err := readFrameLine(r.br)
 	if err != nil {
 		return fmt.Errorf("read frame trailer: %w", err)
 	}
@@ -293,13 +358,13 @@ func (r *ChunkedManifestReader) readNextFrame() error {
 	if err != nil {
 		return fmt.Errorf("invalid frame trailer: %w", err)
 	}
-	if trailer.FileID != ManifestFrameFileID {
+	if trailer.FileID != FramedBodyFileID {
 		return fmt.Errorf("unexpected trailer file_id=%d", trailer.FileID)
 	}
 	if trailer.HashToken == "" {
 		return fmt.Errorf("frame %d missing trailer hash", r.frameIdx)
 	}
-	wantFrameHash := ManifestFrameHashToken(headerLine, wire, trailer.ChecksumPrefix)
+	wantFrameHash := FrameHashToken(headerLine, wire, trailer.ChecksumPrefix)
 	if !strings.EqualFold(trailer.HashToken, wantFrameHash) {
 		return fmt.Errorf("frame %d trailer hash mismatch: want=%s got=%s", r.frameIdx, wantFrameHash, trailer.HashToken)
 	}
@@ -334,7 +399,7 @@ func (r *ChunkedManifestReader) readNextFrame() error {
 	}
 
 	if r.opts.OnFrame != nil {
-		r.opts.OnFrame(ManifestFrameStats{
+		r.opts.OnFrame(FrameStats{
 			FrameIndex:   r.frameIdx,
 			WireBytes:    meta.WireSize,
 			LogicalBytes: meta.Size,
@@ -347,11 +412,11 @@ func (r *ChunkedManifestReader) readNextFrame() error {
 	return nil
 }
 
-// ManifestFrameHashToken computes the xxh64 frame hash carried in the
+// FrameHashToken computes the xxh64 frame hash carried in the
 // FXT/1 trailer. The input is the header line (without trailing newline),
 // the raw wire payload, and the trailer prefix (everything up to but not
 // including the " hash=..." token).
-func ManifestFrameHashToken(headerLine string, payload []byte, trailerPrefix string) string {
+func FrameHashToken(headerLine string, payload []byte, trailerPrefix string) string {
 	h := xxh3.New()
 	_, _ = h.Write([]byte(headerLine))
 	_, _ = h.Write([]byte("\n"))
@@ -362,15 +427,13 @@ func ManifestFrameHashToken(headerLine string, payload []byte, trailerPrefix str
 	return FormatXXH64HashToken(h.Sum64())
 }
 
-func readManifestFrameLine(br *bufio.Reader) (string, error) {
-	line, err := br.ReadString('\n')
+func readFrameLine(br *bufio.Reader) (string, error) {
+	line, err := utils.ReadLineLimit(br, maxFrameLineBytes)
 	if err != nil {
+		if errors.Is(err, utils.ErrLineTooLarge) {
+			return "", errors.New("manifest frame line too large")
+		}
 		return "", err
 	}
-	if len(line) > maxManifestFrameLineBytes {
-		return "", errors.New("manifest frame line too large")
-	}
-	line = strings.TrimSuffix(line, "\n")
-	line = strings.TrimSuffix(line, "\r")
-	return line, nil
+	return string(utils.TrimLineTerminator(line)), nil
 }

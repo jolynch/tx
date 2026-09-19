@@ -6,8 +6,15 @@ file transfers over plain TCP sockets.
 ## Scope
 
 - Transport: plain TCP stream.
-- This framing is for per-file transfer messages after a manifest has been exchanged out of band.
+- This framing carries per-file transfer messages after a manifest has been
+  exchanged out of band, and it also carries **request and response bodies** for
+  the command protocol — any body whose size grows with the transfer. See
+  [OVERVIEW.md](./OVERVIEW.md#request-and-response-bodies) for which verbs use
+  which bodies.
 - `file_id` is an integer index into that exchanged manifest (0-based).
+  `file_id=0` is reserved as a sentinel meaning "this frame carries a byte
+  stream, not a manifest file" — used by manifest streams, request item lists,
+  and the `STATUS` list response.
 
 ## Frame Structure
 
@@ -101,12 +108,17 @@ Receiver behavior:
 
 ## Parsing Rules
 
-- Maximum header/trailer line bytes: 4 MiB (defensive limit, matching the
-  command-line cap).
+- Maximum header/trailer line bytes: 4 MiB (defensive limit; a real header or
+  trailer is a few hundred bytes). Enforced as bytes arrive, not after
+  buffering the line.
 - Unknown properties are ignored.
 - Missing required fields (`comp`, `offset`, `size`, `wsize`, `ts`) reject frame.
 - Invalid `file_id` reject frame.
 - Invalid numeric value formats reject frame.
+- `size` and `wsize` beyond the receiver's per-frame caps reject the frame
+  **before** the payload is read or decompressed. Both values are supplied by
+  the peer and each sizes an allocation, so neither may be decoded first and
+  checked afterwards. See [OVERVIEW.md](./OVERVIEW.md#size-limits).
 - Header must be exactly one line; no multi-line property blocks.
 
 ## Semantics
@@ -154,7 +166,9 @@ The full command grammar (`AUTH`, `TXFER`, `SYNC`, `SEND`, `ACK`, `CXSUM`,
 [OVERVIEW.md](./OVERVIEW.md). This section covers only how `SEND` and
 `TXFER` responses use FX/1 framing.
 
-`SEND` returns one or more `FX/1` frame triplets, then a terminal status line:
+`SEND` takes a framed request body listing the files to send (one item per
+line; see [OVERVIEW.md](./OVERVIEW.md#send)) and returns one or more `FX/1`
+frame triplets, then a terminal status line:
 
 1. `FX/1` header line
 2. `wsize` payload bytes (raw or compressed per `comp`)

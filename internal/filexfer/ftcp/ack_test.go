@@ -50,14 +50,14 @@ func TestHandleACKLogsCompleteAfterFinalProgress(t *testing.T) {
 		t.Fatalf("SetTransferFileWindowHash returned false")
 	}
 
-	ackRaw := fmt.Sprintf(`ACK %s fd=%d %q ack-token=%d@123@%s`, txferID, entries[0].ID, fullPath, entries[0].Size, ackHash)
-	ackReq, err := ParseRequest([]byte(ackRaw))
+	ackReq, err := ParseRequest([]byte("ACK " + txferID))
 	if err != nil {
 		t.Fatalf("ParseRequest ACK failed: %v", err)
 	}
+	ackBody := framedItemBody(t, fmt.Sprintf(`fd=%d %q ack-token=%d@123@%s`, entries[0].ID, fullPath, entries[0].Size, ackHash))
 	var ackOut bytes.Buffer
-	if err := handleACK(context.Background(), ackReq, &ackOut, deps); err != nil {
-		t.Fatalf("handleACK failed: %v", err)
+	if err := handleACKWithInput(context.Background(), ackReq, ackBody, &ackOut, deps); err != nil {
+		t.Fatalf("handleACKWithInput failed: %v", err)
 	}
 
 	logged := logs.String()

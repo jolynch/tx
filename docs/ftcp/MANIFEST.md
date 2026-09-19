@@ -125,6 +125,12 @@ Path constraints:
 - `mode` must be octal and `<= 07777`.
 - Each entry must have at least 5 space-separated fields; trailing tokens are optional except for `S` entries which require a link target.
 - Path token must parse and remain traversal-safe after decode.
+- Paths and symlink targets may not contain `\n` or `\r`, and are rejected at
+  encode time if they do. FM/1 is newline-delimited and readers split on `\n`
+  before consulting the path token's length prefix, so such a path would be
+  re-parsed as an extra entry rather than decoded as one path. Every other byte
+  — including trailing whitespace — round-trips intact, because the length
+  prefix is authoritative and parsers trim only the line terminator.
 - `pc:` tokens are valid only on regular-file entries; they may appear at most once per entry.
 
 ## Example

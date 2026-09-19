@@ -15,14 +15,19 @@ type ackItem struct {
 	TransferID string
 	FileID     uint64
 	AckToken   string
+	Path       string
+
+	// Receiver telemetry: how long the client spent receiving this window and
+	// fsyncing it, plus the bytes it newly wrote. The server validates these
+	// but does not yet act on them. They are the natural input for a
+	// receiver-aware compression policy — CompressionPolicy.Decide currently
+	// sees only the server's own PrepareLatency/WriteLatency from
+	// frameStreamStats, so it can tell that compressing is expensive to send
+	// but not that the receiver is the bottleneck. Kept on the wire so that
+	// wiring stays available.
 	DeltaBytes int64
 	RecvMS     int64
 	SyncMS     int64
-	Path       string
-}
-
-type ackRequest struct {
-	Items []ackItem
 }
 
 type validatedAckItem struct {
@@ -32,55 +37,80 @@ type validatedAckItem struct {
 	ackHashToken string
 }
 
-func parseACKRequest(req Request) (ackRequest, error) {
+// parseACKItem turns one framed body item into an ackItem.
+func parseACKItem(p map[string]string, txferID string) (ackItem, error) {
+	fid, err := strconv.ParseUint(p["fid"], 10, 64)
+	if err != nil {
+		return ackItem{}, protocolErr{code: "BAD_REQUEST", message: "invalid file id"}
+	}
+	ackToken := p["ack-token"]
+	if strings.TrimSpace(ackToken) == "" {
+		return ackItem{}, protocolErr{code: "BAD_REQUEST", message: "missing ack token"}
+	}
+	deltaBytes, recvMS, syncMS, err := parseAckTelemetryFields(p["delta-bytes"], p["recv-ms"], p["sync-ms"])
+	if err != nil {
+		return ackItem{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK telemetry"}
+	}
+	path := p["path"]
+	if path == "" {
+		return ackItem{}, protocolErr{code: "BAD_REQUEST", message: "missing path"}
+	}
+	return ackItem{
+		TransferID: txferID,
+		FileID:     fid,
+		AckToken:   ackToken,
+		Path:       path,
+		DeltaBytes: deltaBytes,
+		RecvMS:     recvMS,
+		SyncMS:     syncMS,
+	}, nil
+}
+
+func ackTransferID(req Request) (string, error) {
 	if req.Verb != VerbACK {
-		return ackRequest{}, protocolErr{code: "BAD_COMMAND", message: "not ACK"}
+		return "", protocolErr{code: "BAD_COMMAND", message: "not ACK"}
 	}
-	if len(req.Params) == 0 {
-		return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK arguments"}
+	if len(req.Params) != 1 {
+		return "", protocolErr{code: "BAD_REQUEST", message: "invalid ACK arguments"}
 	}
-	items := make([]ackItem, 0, len(req.Params))
-	for _, p := range req.Params {
-		txferID := p["txferid"]
-		if txferID == "" {
-			return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing transfer id"}
-		}
-		fid, err := strconv.ParseUint(p["fid"], 10, 64)
-		if err != nil {
-			return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid file id"}
-		}
-		ackToken := p["ack-token"]
-		if strings.TrimSpace(ackToken) == "" {
-			return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing ack token"}
-		}
-		deltaBytes, recvMS, syncMS, err := parseAckTelemetryFields(p["delta-bytes"], p["recv-ms"], p["sync-ms"])
-		if err != nil {
-			return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid ACK telemetry"}
-		}
-		path := p["path"]
-		if path == "" {
-			return ackRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing path"}
-		}
-		items = append(items, ackItem{
-			TransferID: txferID,
-			FileID:     fid,
-			AckToken:   ackToken,
-			DeltaBytes: deltaBytes,
-			RecvMS:     recvMS,
-			SyncMS:     syncMS,
-			Path:       path,
-		})
+	txferID := strings.TrimSpace(req.Params[0]["txferid"])
+	if txferID == "" {
+		return "", protocolErr{code: "BAD_REQUEST", message: "missing transfer id"}
 	}
-	return ackRequest{Items: items}, nil
+	return txferID, nil
 }
 
 func handleACK(ctx context.Context, req Request, out io.Writer, deps Deps) error {
-	parsed, err := parseACKRequest(req)
+	return protocolErr{code: "INTERNAL", message: "ACK requires a request body, use handleACKWithInput"}
+}
+
+// handleACKWithInput applies a batch of acks atomically: every item is validated
+// before any is applied, so a bad token in the middle of a batch cannot leave
+// the transfer half-acked.
+func handleACKWithInput(ctx context.Context, req Request, in io.Reader, out io.Writer, deps Deps) error {
+	txferID, err := ackTransferID(req)
 	if err != nil {
 		return err
 	}
-	validated := make([]validatedAckItem, 0, len(parsed.Items))
-	for _, item := range parsed.Items {
+
+	rawItems, err := readItemBody(in, ackItemKeys, "ACK")
+	if err != nil {
+		return err
+	}
+	if len(rawItems) == 0 {
+		return protocolErr{code: "BAD_REQUEST", message: "ACK requires at least one item"}
+	}
+	items := make([]ackItem, 0, len(rawItems))
+	for _, raw := range rawItems {
+		item, itemErr := parseACKItem(raw, txferID)
+		if itemErr != nil {
+			return itemErr
+		}
+		items = append(items, item)
+	}
+
+	validated := make([]validatedAckItem, 0, len(items))
+	for _, item := range items {
 		ackBytes, ackTS, ackHashToken, ackProvided, err := parseAckToken(item.AckToken)
 		if err != nil || !ackProvided {
 			return protocolErr{code: "BAD_REQUEST", message: "invalid ack token"}

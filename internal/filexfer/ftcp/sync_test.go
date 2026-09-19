@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -405,7 +407,7 @@ func runSYNCTestFull(t *testing.T, root string, oldManifest string, comp string,
 
 	// Frame the old manifest body.
 	var input bytes.Buffer
-	cw := encoding.NewChunkedManifestWriter(&input, comp, encoding.DefaultManifestChunkSize, 0)
+	cw := encoding.NewFramedBodyWriter(&input, comp, encoding.DefaultBodyChunkSize, 0)
 	if oldManifest != "" {
 		if _, err := cw.Write([]byte(oldManifest)); err != nil {
 			t.Fatalf("frame old manifest: %v", err)
@@ -422,7 +424,7 @@ func runSYNCTestFull(t *testing.T, root string, oldManifest string, comp string,
 
 	deps := &mockDeps{}
 	var out bytes.Buffer
-	if err := handleSYNCWithInput(context.Background(), req, &input, &out, deps, nil); err != nil {
+	if err := handleSYNCWithInput(context.Background(), req, &input, &out, deps, nil, defaultMaxSyncBodyBytes); err != nil {
 		t.Fatalf("handleSYNCWithInput: %v", err)
 	}
 
@@ -743,4 +745,73 @@ func fuzzBuildManifestFromEntries(t *testing.T, root string, entries []encoding.
 		prevMtime = nextMtime
 	}
 	return b.String()
+}
+
+// SYNC is the one verb whose body cannot be streamed away: readOldManifest must
+// hold the whole prior manifest indexed before it can walk the tree. The cap is
+// therefore a memory bound on that index, and it has to be enforced.
+func TestHandleSYNCRejectsOversizedBody(t *testing.T) {
+	root := t.TempDir()
+	req, err := ParseRequest([]byte(fmt.Sprintf("SYNC %q mode=fast link-mbps=100 concurrency=1 comp=zstd", root)))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+
+	// A well-formed manifest that simply exceeds the cap the server was given.
+	var body bytes.Buffer
+	cw := encoding.NewFramedBodyWriter(&body, encoding.EncodingZstd, 64*1024, 0)
+	if _, err := io.WriteString(cw, "FM/1 tx1 mode=fast link-mbps=100 concurrency=1\n"); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+	for i := 0; i < 20_000; i++ {
+		if _, err := fmt.Fprintf(cw, "F%d 1 0:%d 0644 0:13:file-%06d.x\n", i+1, 1000+i, i); err != nil {
+			t.Fatalf("write entry: %v", err)
+		}
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatalf("close body: %v", err)
+	}
+
+	var out bytes.Buffer
+	err = handleSYNCWithInput(context.Background(), req, bytes.NewReader(body.Bytes()), &out, realDeps(t, "/"), nil, 64*1024)
+	if err == nil {
+		t.Fatal("oversized SYNC body was accepted")
+	}
+	var pe protocolErr
+	if !errors.As(err, &pe) || pe.code != "BAD_REQUEST" {
+		t.Fatalf("expected BAD_REQUEST, got %v", err)
+	}
+
+	// The same body is fine when the server allows room for it.
+	out.Reset()
+	if err := handleSYNCWithInput(context.Background(), req, bytes.NewReader(body.Bytes()), &out, realDeps(t, "/"), nil, defaultMaxSyncBodyBytes); err != nil {
+		t.Fatalf("body within the cap was rejected: %v", err)
+	}
+}
+
+// A frame may declare a small wire size and expand to an enormous payload. The
+// declared logical size is checked before the payload is read, so the body is
+// refused without ever materializing the expansion.
+func TestHandleSYNCRejectsDeclaredOversizeBeforeDecompressing(t *testing.T) {
+	root := t.TempDir()
+	req, err := ParseRequest([]byte(fmt.Sprintf("SYNC %q mode=fast link-mbps=100 concurrency=1 comp=zstd", root)))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+
+	const logical = 256 << 20
+	wire, err := encoding.CompressZstd(make([]byte, logical))
+	if err != nil {
+		t.Fatalf("compress: %v", err)
+	}
+	var body bytes.Buffer
+	fmt.Fprintf(&body, "FX/1 0 offset=0 size=%d wsize=%d comp=zstd hash=xxh128:%032x ts=1\n", logical, len(wire), 0)
+	body.Write(wire)
+	fmt.Fprintf(&body, "FXT/1 0 status=ok ts=1 next=0 hash=xxh64:%016x\n", 0)
+	t.Logf("%d wire bytes declaring %d logical bytes", len(wire), logical)
+
+	var out bytes.Buffer
+	if err := handleSYNCWithInput(context.Background(), req, bytes.NewReader(body.Bytes()), &out, realDeps(t, "/"), nil, 1<<20); err == nil {
+		t.Fatal("frame declaring a payload past the cap was accepted")
+	}
 }

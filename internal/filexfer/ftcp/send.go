@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jolynch/tx/internal/bufpool"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/filexfer/policy"
@@ -30,7 +31,6 @@ const maxCompressedFrameBufferPoolBytes = 32 * 1024 * 1024
 const loadStrategyFast = "fast"
 const loadStrategyGentle = "gentle"
 
-var logicalBufferPools sync.Map
 var compressedFrameBufferPool sync.Pool
 var pipeMaxSizeOnce sync.Once
 var pipeMaxSizeBytes int64 = defaultMaxLinuxPipeSizeBytes
@@ -44,9 +44,9 @@ type sendItem struct {
 	Mode   string
 }
 
-type sendRequest struct {
+type sendHeader struct {
 	TransferID string
-	Items      []sendItem
+	Mode       string
 }
 
 type frameStreamArgs struct {
@@ -77,90 +77,116 @@ type frameStreamStats struct {
 	WindowHashToken string
 }
 
-func parseSENDRequest(req Request) (sendRequest, error) {
+// parseSENDHeader reads the command line, which now carries only
+// transfer-level fields. The per-file items arrive in the framed request body.
+func parseSENDHeader(req Request) (sendHeader, error) {
 	if req.Verb != VerbSEND {
-		return sendRequest{}, protocolErr{code: "BAD_COMMAND", message: "not SEND"}
+		return sendHeader{}, protocolErr{code: "BAD_COMMAND", message: "not SEND"}
 	}
-	if len(req.Params) < 2 {
-		return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "SEND requires at least one item"}
+	if len(req.Params) != 1 {
+		return sendHeader{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND arguments"}
 	}
-	header := req.Params[0]
-	txferID := strings.TrimSpace(header["txferid"])
+	p := req.Params[0]
+	txferID := strings.TrimSpace(p["txferid"])
 	if txferID == "" {
-		return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing transfer id"}
+		return sendHeader{}, protocolErr{code: "BAD_REQUEST", message: "missing transfer id"}
 	}
+	mode := strings.ToLower(strings.TrimSpace(p["mode"]))
+	if mode == "" {
+		mode = loadStrategyFast
+	}
+	switch mode {
+	case loadStrategyFast, loadStrategyGentle:
+	default:
+		return sendHeader{}, protocolErr{code: "BAD_REQUEST", message: "unsupported SEND mode"}
+	}
+	return sendHeader{TransferID: txferID, Mode: mode}, nil
+}
 
-	items := make([]sendItem, 0, len(req.Params)-1)
-	for _, p := range req.Params[1:] {
-		fid, err := strconv.ParseUint(p["fid"], 10, 64)
-		if err != nil {
-			return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND file id"}
-		}
-		offset := int64(0)
-		if raw := strings.TrimSpace(p["offset"]); raw != "" {
-			offset, err = strconv.ParseInt(raw, 10, 64)
-			if err != nil || offset < 0 {
-				return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND offset"}
-			}
-		}
-		size := int64(0)
-		if raw := strings.TrimSpace(p["size"]); raw != "" {
-			size, err = strconv.ParseInt(raw, 10, 64)
-			if err != nil || size < 0 {
-				return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND size"}
-			}
-		}
-		comp := strings.ToLower(strings.TrimSpace(p["comp"]))
-		if comp == "" {
-			comp = "adapt"
-		}
-		if comp == encoding.EncodingIdentity {
-			comp = "none"
-		}
-		switch comp {
-		case "adapt", "none", encoding.EncodingLz4, encoding.EncodingZstd:
-		default:
-			return sendRequest{}, protocolErr{code: "UNSUPPORTED_COMP", message: "supported comp values: adapt, none, lz4, zstd"}
-		}
-		path := p["path"]
-		if path == "" {
-			return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND path"}
-		}
-		mode := strings.ToLower(strings.TrimSpace(p["mode"]))
-		if mode == "" {
-			mode = loadStrategyFast
-		}
-		switch mode {
-		case loadStrategyFast, loadStrategyGentle:
-		default:
-			return sendRequest{}, protocolErr{code: "BAD_REQUEST", message: "unsupported SEND mode"}
-		}
-		items = append(items, sendItem{FileID: fid, Offset: offset, Size: size, Comp: comp, Path: path, Mode: mode})
+// parseSENDItem turns one framed body item into a sendItem. mode comes from the
+// command line: it is a transfer-level property, so it is sent once rather than
+// repeated on every file.
+func parseSENDItem(p map[string]string, mode string) (sendItem, error) {
+	fid, err := strconv.ParseUint(p["fid"], 10, 64)
+	if err != nil {
+		return sendItem{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND file id"}
 	}
-	return sendRequest{TransferID: txferID, Items: items}, nil
+	offset := int64(0)
+	if raw := strings.TrimSpace(p["offset"]); raw != "" {
+		offset, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || offset < 0 {
+			return sendItem{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND offset"}
+		}
+	}
+	size := int64(0)
+	if raw := strings.TrimSpace(p["size"]); raw != "" {
+		size, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || size < 0 {
+			return sendItem{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND size"}
+		}
+	}
+	comp := strings.ToLower(strings.TrimSpace(p["comp"]))
+	if comp == "" {
+		comp = "adapt"
+	}
+	if comp == encoding.EncodingIdentity {
+		comp = "none"
+	}
+	switch comp {
+	case "adapt", "none", encoding.EncodingLz4, encoding.EncodingZstd:
+	default:
+		return sendItem{}, protocolErr{code: "UNSUPPORTED_COMP", message: "supported comp values: adapt, none, lz4, zstd"}
+	}
+	path := p["path"]
+	if path == "" {
+		return sendItem{}, protocolErr{code: "BAD_REQUEST", message: "invalid SEND path"}
+	}
+	return sendItem{FileID: fid, Offset: offset, Size: size, Comp: comp, Path: path, Mode: mode}, nil
 }
 
 func handleSEND(ctx context.Context, req Request, out io.Writer, deps Deps) error {
-	return handleSENDWithOptions(ctx, req, out, deps, nil, false, 25)
+	return protocolErr{code: "INTERNAL", message: "SEND requires a request body, use handleSENDWithOptions"}
 }
 
-func handleSENDWithOptions(ctx context.Context, req Request, out io.Writer, deps Deps, limiter *limit.Limiter, disableZeroCopy bool, gentleBWPct int) error {
-	parsed, err := parseSENDRequest(req)
+// handleSENDWithOptions reads the whole item list, then streams one window per
+// item. Reading first is required: responses are file data, and emitting any of
+// it before the request body is drained would deadlock against a client that is
+// still writing that body.
+func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out io.Writer, deps Deps, limiter *limit.Limiter, disableZeroCopy bool, gentleBWPct int) error {
+	header, err := parseSENDHeader(req)
 	if err != nil {
+		// Drain before replying so a client writing its body receives this error.
+		drainItemBody(in)
 		return err
 	}
 	gentleBWPct = limit.NormalizeGentleBWPct(gentleBWPct)
 
-	transfer, hasTransfer := deps.GetTransfer(parsed.TransferID)
-	for _, item := range parsed.Items {
+	rawItems, err := readItemBody(in, sendItemKeys, "SEND")
+	if err != nil {
+		return err
+	}
+	if len(rawItems) == 0 {
+		return protocolErr{code: "BAD_REQUEST", message: "SEND requires at least one item"}
+	}
+	items := make([]sendItem, 0, len(rawItems))
+	for _, raw := range rawItems {
+		item, itemErr := parseSENDItem(raw, header.Mode)
+		if itemErr != nil {
+			return itemErr
+		}
+		items = append(items, item)
+	}
+
+	transfer, hasTransfer := deps.GetTransfer(header.TransferID)
+	for _, item := range items {
 		itemOut := out
 		if item.Mode == loadStrategyGentle {
 			if hasTransfer && transfer.DeadlineMS > 0 {
-				if err := checkTransferDeadline(deps, parsed.TransferID, transfer); err != nil {
+				if err := checkTransferDeadline(deps, header.TransferID, transfer); err != nil {
 					return err
 				}
 			}
-			gentleLimiter := deps.GetTransferGentleLimiter(parsed.TransferID, transfer.LinkMbps, gentleBWPct, gentleLimiterBurstBytes(limiter))
+			gentleLimiter := deps.GetTransferGentleLimiter(header.TransferID, transfer.LinkMbps, gentleBWPct, gentleLimiterBurstBytes(limiter))
 			if gentleLimiter != nil {
 				itemOut = gentleLimiter.WrapRateLimitedWriter(itemOut, ctx)
 			}
@@ -168,7 +194,7 @@ func handleSENDWithOptions(ctx context.Context, req Request, out io.Writer, deps
 				itemOut = limiter.WrapRateLimitedWriter(itemOut, ctx)
 			}
 		}
-		if err := streamSendItem(ctx, itemOut, deps, parsed.TransferID, item, disableZeroCopy); err != nil {
+		if err := streamSendItem(ctx, itemOut, deps, header.TransferID, item, disableZeroCopy); err != nil {
 			return err
 		}
 	}
@@ -643,7 +669,7 @@ func metadataTrailerTokens(metadata *encoding.FileFrameMetadata) []string {
 }
 
 func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStreamArgs) (frameStreamStats, error) {
-	readBuf, releaseRead, err := acquireLogicalBuffer(logicalBufferBucketSize(args.FrameSize))
+	readBuf, releaseRead, err := bufpool.Acquire(bufpool.BucketSize(args.FrameSize))
 	if err != nil {
 		return frameStreamStats{}, err
 	}
@@ -676,7 +702,12 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 		payloadWriter = compWriter
 	} else {
 		if stagedDirectWrite {
-			stagingBuf = bytes.NewBuffer(make([]byte, 0, int(args.FrameSize)))
+			staging, releaseStaging, stageErr := bufpool.Acquire(bufpool.BucketSize(args.FrameSize))
+			if stageErr != nil {
+				return frameStreamStats{}, stageErr
+			}
+			defer releaseStaging()
+			stagingBuf = bytes.NewBuffer(staging[:0])
 			payloadWriter = stagingBuf
 		} else {
 			if err := writeFrameHeader(args.Output, args, args.FrameSize, &writeLatency); err != nil {
@@ -828,8 +859,8 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 	growPipeBestEffort(srcR, args.PipeSizeBytes)
 	growPipeBestEffort(srcW, args.PipeSizeBytes)
 
-	copyBufSize := logicalBufferBucketSize(int64(args.PipeSizeBytes))
-	copyBuf, releaseCopyBuf, err := acquireLogicalBuffer(copyBufSize)
+	copyBufSize := bufpool.BucketSize(int64(args.PipeSizeBytes))
+	copyBuf, releaseCopyBuf, err := bufpool.Acquire(copyBufSize)
 	if err != nil {
 		return frameStreamStats{}, err
 	}
@@ -1067,57 +1098,6 @@ func releaseCompressedFrameBuffer(buf *bytes.Buffer) {
 	}
 	buf.Reset()
 	compressedFrameBufferPool.Put(buf)
-}
-
-func acquireLogicalBuffer(size int) ([]byte, func(), error) {
-	if size <= 0 {
-		return nil, nil, errors.New("invalid logical buffer size")
-	}
-	pool := logicalBufferPool(size)
-	raw := pool.Get()
-	buf, ok := raw.([]byte)
-	if !ok {
-		return nil, nil, errors.New("logical buffer pool returned invalid type")
-	}
-	if cap(buf) < size {
-		buf = make([]byte, size)
-	}
-	buf = buf[:size]
-	return buf, func() { pool.Put(buf[:size]) }, nil
-}
-
-func logicalBufferPool(size int) *sync.Pool {
-	if existing, ok := logicalBufferPools.Load(size); ok {
-		return existing.(*sync.Pool)
-	}
-	sz := size
-	created := &sync.Pool{New: func() any { return make([]byte, sz) }}
-	actual, _ := logicalBufferPools.LoadOrStore(size, created)
-	return actual.(*sync.Pool)
-}
-
-func logicalBufferBucketSize(maxChunk int64) int {
-	const (
-		KiB          = 1024
-		MiB          = 1024 * KiB
-		bucket4KiB   = 4 * KiB
-		bucket16KiB  = 16 * KiB
-		bucket64KiB  = 64 * KiB
-		bucket256KiB = 256 * KiB
-		bucket1MiB   = 1 * MiB
-		bucket2MiB   = 2 * MiB
-		bucket4MiB   = 4 * MiB
-		bucket8MiB   = 8 * MiB
-	)
-	if maxChunk <= int64(bucket4KiB) {
-		return bucket4KiB
-	}
-	for _, bucket := range []int{bucket16KiB, bucket64KiB, bucket256KiB, bucket1MiB, bucket2MiB, bucket4MiB, bucket8MiB} {
-		if maxChunk <= int64(bucket) {
-			return bucket
-		}
-	}
-	return bucket8MiB
 }
 
 func tryAdviseSequential(fd *os.File, offset int64, length int64) {

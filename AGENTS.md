@@ -92,11 +92,15 @@ go run ./internal/bench
 - `internal/cliflags`: shared flags, short/long aliases, repeatable strings,
   and progress target resolution.
 - `internal/filexfer/ftcp`: server, parser, FTCP handlers, and `Deps` boundary.
-- `internal/filexfer/encoding`: FM/1 manifests, FX/1 frames, codecs, formats,
-  page-cache hints, and shared transfer types.
+- `internal/filexfer/encoding`: FM/1 manifests, FX/1 frames (`body_frame.go`
+  provides `FramedBodyWriter`/`FramedBodyReader`, the generic framed-body
+  codec), codecs, formats, page-cache hints, and shared transfer types.
 - `internal/filexfer/store`: transfer state and TTL reaping; `interface.go`
   holds the `Interface` contract consumers depend on.
 - `internal/filexfer/{policy,limit}`: adaptive compression and rate limiting.
+- `internal/bufpool`: size-bucketed reusable byte buffers for per-request I/O,
+  plus `Growing`, whose buffer tracks bytes actually received rather than a
+  size a peer declared.
 - `internal/{aead,pagecache,fsync,sampler,utils,metrics}`: encryption/auth,
   cache restore, fsync batching, sampling, network/string helpers, and metrics.
 - `internal/bench`: benchmark runner and regression benchmarks.
@@ -109,11 +113,27 @@ FTCP is a line protocol documented in the
 [protocol reference](docs/ftcp/OVERVIEW.md):
 
 ```text
-VERB args...\r\n -> optional stream -> OK [msg]\r\n | ERR <code> <msg>\r\n
+VERB args...\r\n -> optional framed body -> OK [msg]\r\n | ERR <code> <msg>\r\n
 PROBE -> TXFER (FM/1 manifest) -> SEND (FX/1 frames) -> ACK -> STATUS
 ```
 
-- Paths/blobs are quoted or length-prefixed (`<len>:<bytes>`).
+- **Any body that grows with the transfer is framed.** Command lines carry
+  headers only, so their length never depends on how many files a request
+  covers. `SEND`/`ACK`/`CXSUM` send their per-file item lists as FX/1 request
+  bodies; `TXFER`/`SYNC` and the `STATUS` list use framed response bodies. A
+  request body is always read in full before any response byte is written,
+  which is what keeps the exchange from deadlocking against itself.
+- Size limits are set where no legitimate request reaches them (64 KiB command
+  line, 8 KiB item line, 1M items per body) and are checked before the bytes
+  they describe are allocated. A frame header's `size`/`wsize` are peer-supplied
+  and each sizes an allocation, so per-frame caps are **unconditional** — a
+  reader that sets no cumulative cap still gets them — and cumulative checks
+  subtract rather than add so a near-`int64` declaration cannot overflow into
+  appearing under the cap. The [protocol reference](docs/ftcp/OVERVIEW.md) lists
+  each limit with its justification.
+- Paths/blobs are quoted or length-prefixed (`<len>:<bytes>`), and may not
+  contain `\n` or `\r` — readers split on `\n` before consulting the length
+  prefix, so encoders reject line breaks rather than emit an ambiguous stream.
 - Optional first-command `AUTH` age-encrypts request/response data and carries
   bearer tokens inside the encrypted blob.
 - Connections are normally single-command. `PROBE keep-alive=auto` can grant
@@ -135,10 +155,12 @@ one when `ServerOptions.Deps` is nil, exactly as it does the restore pool.
 
 - `TXFER` emits a directory or single-file manifest, then `ClipTransfer` seals
   the file count.
-- `SEND` validates files through `Deps`, streams adaptively compressed FX/1
-  windows (sendfile when possible), and records window hashes for ACK checks.
-- `STATUS <tid>` returns one JSON status; bare `STATUS` returns a count followed
-  by that many JSON lines. Completed transfers remain listed until TTL expiry.
+- `SEND` reads its item list from the framed request body, validates files
+  through `Deps`, streams adaptively compressed FX/1 windows (sendfile when
+  possible), and records window hashes for ACK checks. `ACK` and `CXSUM` read
+  the same body shape via `ReadRequestItems`.
+- `STATUS <tid>` returns one JSON status; bare `STATUS` returns a framed body of
+  one JSON object per line. Completed transfers remain listed until TTL expiry.
 - FM/1 front-codes paths/mtimes. FX/1 frames carry file ID, codec, offsets,
   sizes, and checksum; zstd/lz4 decoders are pooled.
 - `CompressionPolicy` selects zstd, lz4, or identity from read/write latency.
@@ -155,14 +177,14 @@ have no production caller and exist for the store's own tests or benchmarks.
 
 `Client` is a config struct, not an interface. Principal mappings:
 
-| Method | FTCP operation |
-|---|---|
-| `GetManifest` | `TXFER` |
-| `GetFiles` / `AcknowledgeFileProgress` | `SEND` / `ACK` |
-| `GetStatus` / `ListStatuses` | `STATUS <tid>` / `STATUS` |
-| `GetChecksum`, `ProbeLink`, `SyncManifest` | `CXSUM`, `PROBE`, `SYNC` |
-| `StartFromManifest` | batched `SEND` + `ACK` orchestration |
-| `Close`, `MetricSnapshot` | pool release, metrics snapshot |
+| Method                                     | FTCP operation                       |
+|--------------------------------------------|--------------------------------------|
+| `GetManifest`                              | `TXFER`                              |
+| `GetFiles` / `AcknowledgeFileProgress`     | `SEND` / `ACK`                       |
+| `GetStatus` / `ListStatuses`               | `STATUS <tid>` / `STATUS`            |
+| `GetChecksum`, `ProbeLink`, `SyncManifest` | `CXSUM`, `PROBE`, `SYNC`             |
+| `StartFromManifest`                        | batched `SEND` + `ACK` orchestration |
+| `Close`, `MetricSnapshot`                  | pool release, metrics snapshot       |
 
 Client age keys apply automatically. `WithClientAuthTokens` sends bearer
 tokens inside AUTH; `WithContextDialer` supplies custom connections. The TCP

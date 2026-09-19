@@ -3,7 +3,6 @@ package ftcp
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
@@ -73,21 +72,24 @@ func handleSTATUS(_ context.Context, req Request, out io.Writer, deps Deps) erro
 	}
 
 	if parsed.TransferID == "" {
-		// List all active transfers: write count header then one JSON line per transfer.
+		// List all active transfers. The body grows with the number of
+		// transfers, so it is framed rather than written as bare lines whose
+		// count the reader has to trust.
 		transfers := deps.ListTransfers()
-		if _, err := fmt.Fprintf(out, "OK %d\r\n", len(transfers)); err != nil {
-			return err
-		}
+		bw := encoding.NewFramedBodyWriter(out, encoding.EncodingZstd, encoding.DefaultBodyChunkSize, 0)
 		for _, t := range transfers {
 			payload, err := json.Marshal(transferToStatus(t.ID, t))
 			if err != nil {
 				return protocolErr{code: "INTERNAL", message: "failed to encode status"}
 			}
-			if _, err := fmt.Fprintf(out, "%s\r\n", payload); err != nil {
+			if _, err := bw.Write(append(payload, '\n')); err != nil {
 				return err
 			}
 		}
-		return nil
+		if err := bw.Close(); err != nil {
+			return err
+		}
+		return writeOKLine(out, "")
 	}
 
 	transfer, ok := deps.GetTransfer(parsed.TransferID)

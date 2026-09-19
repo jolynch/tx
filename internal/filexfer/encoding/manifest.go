@@ -432,6 +432,13 @@ func MarshalManifestEntry(entry ManifestEntry, prevPath string, prevMtime string
 	if strings.Contains(entry.Path, `\`) {
 		return "", "", "", fmt.Errorf("manifest path contains backslash: %q", entry.Path)
 	}
+	// FM/1 entries are newline-delimited, and readers split on '\n' before
+	// consulting the path token's length prefix. A path carrying '\n' or '\r'
+	// would therefore be re-parsed as an additional entry rather than decoded
+	// as one path, so it is rejected at the encoder.
+	if utils.ContainsLineBreak(entry.Path) {
+		return "", "", "", fmt.Errorf("manifest path contains a line break: %q", entry.Path)
+	}
 	entryType := entry.Type
 	if entryType == 0 {
 		entryType = EntryTypeFile
@@ -465,8 +472,12 @@ func MarshalManifestEntry(entry ManifestEntry, prevPath string, prevMtime string
 	pathToken := EncodePathToken(prevPath, entry.Path)
 	line := fmt.Sprintf("%c%d %d %s %s %s", entryType, entry.ID, entry.Size, mtimeToken, modeToken, pathToken)
 
-	// For S entries, append the symlink target as a len-prefixed token.
+	// For S entries, append the symlink target as a len-prefixed token. The
+	// target shares the path token's line-break hazard.
 	if entryType == EntryTypeSymlink {
+		if utils.ContainsLineBreak(entry.LinkPath) {
+			return "", "", "", fmt.Errorf("symlink target contains a line break: %q", entry.LinkPath)
+		}
 		line += fmt.Sprintf(" %d:%s", len(entry.LinkPath), entry.LinkPath)
 	}
 

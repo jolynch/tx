@@ -436,3 +436,109 @@ func TestWalkManifestEntriesMixedTypes(t *testing.T) {
 		t.Errorf("sub mode: got %o, want 0750", results[3].Entry.Mode)
 	}
 }
+
+// FM/1 entries are newline-delimited, but the path token is length-prefixed and
+// therefore self-delimiting. Readers split on '\n' before consulting that
+// prefix, so the two only agree if no encoded path can contain '\n'. The
+// invariant: either the encoder refuses the path, or the emitted line survives
+// a line split and decodes byte-exact — trailing whitespace included.
+func FuzzManifestEntryRoundTrip(f *testing.F) {
+	f.Add("data/chunk-000", "", uint64(1), int64(4096), int64(1735771234000000000), uint32(0o644))
+	f.Add("trailing ", "", uint64(2), int64(0), int64(1), uint32(0o600))
+	f.Add("with\nnewline", "", uint64(3), int64(1), int64(1), uint32(0o644))
+	f.Add("with\rcarriage", "", uint64(4), int64(1), int64(1), uint32(0o644))
+	f.Add("link", "target\ninjected", uint64(5), int64(0), int64(1), uint32(0o777))
+	f.Add("link", "../escape", uint64(6), int64(0), int64(1), uint32(0o777))
+	f.Add(" leading", "", uint64(7), int64(1), int64(1), uint32(0o644))
+	f.Add("emoji😀/path", "", uint64(8), int64(9), int64(7), uint32(0o755))
+
+	f.Fuzz(func(t *testing.T, path string, linkPath string, id uint64, size int64, mtime int64, mode uint32) {
+		if size < 0 || mtime < 0 || id == RootFileID {
+			t.Skip()
+		}
+		entryType := byte(EntryTypeFile)
+		if linkPath != "" {
+			entryType = EntryTypeSymlink
+			size = 0
+		}
+		entry := ManifestEntry{
+			Type:       entryType,
+			ID:         id,
+			Size:       size,
+			Mtime:      mtime,
+			Mode:       NormalizeManifestMode(os.FileMode(mode & 0o7777)),
+			Path:       path,
+			LinkPath:   linkPath,
+			LinkTarget: -1,
+		}
+
+		line, _, _, err := MarshalManifestEntry(entry, "", "")
+		if err != nil {
+			// Refusing to encode is always a valid outcome.
+			return
+		}
+
+		// Having accepted the entry, the encoder owes us a single line.
+		if strings.ContainsAny(line, "\n\r") {
+			t.Fatalf("encoded entry contains a line break: %q", line)
+		}
+
+		got, _, _, err := ParseManifestEntry(line, "", "")
+		if err != nil {
+			t.Fatalf("encoder emitted %q which its own parser rejects: %v", line, err)
+		}
+		if got.Path != entry.Path {
+			t.Fatalf("path round trip: got %q want %q (line %q)", got.Path, entry.Path, line)
+		}
+		if got.Size != entry.Size {
+			t.Fatalf("size round trip: got %d want %d", got.Size, entry.Size)
+		}
+		if got.Mode != entry.Mode {
+			t.Fatalf("mode round trip: got %v want %v", got.Mode, entry.Mode)
+		}
+		if entryType == EntryTypeSymlink && got.LinkPath != entry.LinkPath {
+			t.Fatalf("link target round trip: got %q want %q", got.LinkPath, entry.LinkPath)
+		}
+		if entryType != EntryTypeSymlink && got.Mtime != entry.Mtime {
+			t.Fatalf("mtime round trip: got %d want %d", got.Mtime, entry.Mtime)
+		}
+	})
+}
+
+func TestMarshalManifestEntryRejectsLineBreaks(t *testing.T) {
+	for _, path := range []string{"a\nb", "a\rb", "dir/x\ny", "\n"} {
+		if _, _, _, err := MarshalManifestEntry(ManifestEntry{
+			Type: EntryTypeFile, ID: 1, Size: 1, Mtime: 1, Mode: 0o644,
+			Path: path, LinkTarget: -1,
+		}, "", ""); err == nil {
+			t.Errorf("path %q was accepted", path)
+		}
+	}
+	if _, _, _, err := MarshalManifestEntry(ManifestEntry{
+		Type: EntryTypeSymlink, ID: 1, Mtime: 1, Mode: 0o777,
+		Path: "link", LinkPath: "target\nF999 0 0:0 0777 0:3:hax", LinkTarget: -1,
+	}, "", ""); err == nil {
+		t.Error("symlink target containing a newline was accepted")
+	}
+}
+
+// Paths ending in whitespace used to be destroyed by a TrimSpace in the
+// parsers, which ate bytes the path token's length prefix had already counted.
+func TestManifestEntryPreservesTrailingWhitespace(t *testing.T) {
+	for _, path := range []string{"weird name ", "two  ", "tab\t", "dir /file "} {
+		line, _, _, err := MarshalManifestEntry(ManifestEntry{
+			Type: EntryTypeFile, ID: 1, Size: 3, Mtime: 12345, Mode: 0o644,
+			Path: path, LinkTarget: -1,
+		}, "", "")
+		if err != nil {
+			t.Fatalf("marshal %q: %v", path, err)
+		}
+		got, _, _, err := ParseManifestEntry(line, "", "")
+		if err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		if got.Path != path {
+			t.Errorf("got %q, want %q", got.Path, path)
+		}
+	}
+}

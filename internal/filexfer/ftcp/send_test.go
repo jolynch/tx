@@ -23,51 +23,39 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestParseSENDRequestCompDefaultsAndModes(t *testing.T) {
-	req, err := ParseRequest([]byte(`SEND tx1 fd=1 "/tmp/a.txt"`))
+func TestParseSENDItemCompDefaultsAndModes(t *testing.T) {
+	item, err := parseOneSENDItem(t, "SEND tx1", `fd=1 "/tmp/a.txt"`)
 	if err != nil {
-		t.Fatalf("ParseRequest failed: %v", err)
+		t.Fatalf("parse failed: %v", err)
 	}
-	parsed, err := parseSENDRequest(req)
-	if err != nil {
-		t.Fatalf("parseSENDRequest failed: %v", err)
-	}
-	if parsed.Items[0].Comp != "adapt" {
-		t.Fatalf("expected default comp adapt, got %q", parsed.Items[0].Comp)
+	if item.Comp != "adapt" {
+		t.Fatalf("expected default comp adapt, got %q", item.Comp)
 	}
 
 	tests := []struct {
 		name string
-		raw  string
+		item string
 		want string
 	}{
-		{name: "none", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=none`, want: "none"},
-		{name: "identity", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=identity`, want: "none"},
-		{name: "lz4", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=lz4`, want: encoding.EncodingLz4},
-		{name: "zstd", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=zstd`, want: encoding.EncodingZstd},
-		{name: "adapt", raw: `SEND tx1 fd=1 "/tmp/a.txt" comp=adapt`, want: "adapt"},
+		{name: "none", item: `fd=1 "/tmp/a.txt" comp=none`, want: "none"},
+		{name: "identity", item: `fd=1 "/tmp/a.txt" comp=identity`, want: "none"},
+		{name: "lz4", item: `fd=1 "/tmp/a.txt" comp=lz4`, want: encoding.EncodingLz4},
+		{name: "zstd", item: `fd=1 "/tmp/a.txt" comp=zstd`, want: encoding.EncodingZstd},
+		{name: "adapt", item: `fd=1 "/tmp/a.txt" comp=adapt`, want: "adapt"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			req, err := ParseRequest([]byte(tc.raw))
+			got, err := parseOneSENDItem(t, "SEND tx1", tc.item)
 			if err != nil {
-				t.Fatalf("ParseRequest failed: %v", err)
+				t.Fatalf("parse failed: %v", err)
 			}
-			parsed, err := parseSENDRequest(req)
-			if err != nil {
-				t.Fatalf("parseSENDRequest failed: %v", err)
-			}
-			if got := parsed.Items[0].Comp; got != tc.want {
-				t.Fatalf("expected comp %q, got %q", tc.want, got)
+			if got.Comp != tc.want {
+				t.Fatalf("expected comp %q, got %q", tc.want, got.Comp)
 			}
 		})
 	}
 
-	req, err = ParseRequest([]byte(`SEND tx1 fd=1 "/tmp/a.txt" comp=snappy`))
-	if err != nil {
-		t.Fatalf("ParseRequest failed: %v", err)
-	}
-	_, err = parseSENDRequest(req)
+	_, err = parseOneSENDItem(t, "SEND tx1", `fd=1 "/tmp/a.txt" comp=snappy`)
 	if err == nil {
 		t.Fatalf("expected unsupported comp error")
 	}
@@ -87,37 +75,29 @@ func TestBuildFrameHeaderLineOmitsPlaceholderHash(t *testing.T) {
 	}
 }
 
-func TestParseSENDRequestModeDefaultsAndValidation(t *testing.T) {
-	req, err := ParseRequest([]byte(`SEND tx1 fd=1 "/tmp/a.txt"`))
+// mode is a transfer-level field on the command line, not a per-item one.
+func TestParseSENDHeaderModeDefaultsAndValidation(t *testing.T) {
+	item, err := parseOneSENDItem(t, "SEND tx1", `fd=1 "/tmp/a.txt"`)
 	if err != nil {
-		t.Fatalf("ParseRequest failed: %v", err)
+		t.Fatalf("parse failed: %v", err)
 	}
-	parsed, err := parseSENDRequest(req)
-	if err != nil {
-		t.Fatalf("parseSENDRequest failed: %v", err)
-	}
-	if got := parsed.Items[0].Mode; got != loadStrategyFast {
-		t.Fatalf("expected default mode %q, got %q", loadStrategyFast, got)
+	if item.Mode != loadStrategyFast {
+		t.Fatalf("expected default mode %q, got %q", loadStrategyFast, item.Mode)
 	}
 
-	req, err = ParseRequest([]byte(`SEND tx1 fd=1 "/tmp/a.txt" mode=gentle`))
+	item, err = parseOneSENDItem(t, "SEND tx1 mode=gentle", `fd=1 "/tmp/a.txt"`)
 	if err != nil {
-		t.Fatalf("ParseRequest failed: %v", err)
+		t.Fatalf("parse failed: %v", err)
 	}
-	parsed, err = parseSENDRequest(req)
-	if err != nil {
-		t.Fatalf("parseSENDRequest failed: %v", err)
-	}
-	if got := parsed.Items[0].Mode; got != loadStrategyGentle {
-		t.Fatalf("expected mode %q, got %q", loadStrategyGentle, got)
+	if item.Mode != loadStrategyGentle {
+		t.Fatalf("expected mode %q, got %q", loadStrategyGentle, item.Mode)
 	}
 
-	req, err = ParseRequest([]byte(`SEND tx1 fd=1 "/tmp/a.txt" mode=slow`))
+	req, err := ParseRequest([]byte("SEND tx1 mode=slow"))
 	if err != nil {
 		t.Fatalf("ParseRequest failed: %v", err)
 	}
-	_, err = parseSENDRequest(req)
-	if err == nil {
+	if _, err := parseSENDHeader(req); err == nil {
 		t.Fatalf("expected mode validation error")
 	}
 }
@@ -360,14 +340,14 @@ func TestHandleSENDBasic(t *testing.T) {
 	data := []byte("hello send")
 	tmp := writeTempSendFile(t, data)
 	deps := &mockDeps{filePath: tmp}
-	payload := []byte(`SEND tx1 fd=1 ` + strconv.Quote(tmp))
-	req, err := ParseRequest(payload)
+	req, err := ParseRequest([]byte("SEND tx1"))
 	if err != nil {
 		t.Fatalf("ParseRequest failed: %v", err)
 	}
+	body := framedItemBody(t, `fd=1 `+strconv.Quote(tmp))
 	var out bytes.Buffer
-	if err := handleSEND(context.Background(), req, &out, deps); err != nil {
-		t.Fatalf("handleSEND failed: %v", err)
+	if err := handleSENDWithOptions(context.Background(), req, body, &out, deps, nil, false, 25); err != nil {
+		t.Fatalf("handleSENDWithOptions failed: %v", err)
 	}
 	frames, err := decodeFrameStream(out.Bytes())
 	if err != nil {
