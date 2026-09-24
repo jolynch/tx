@@ -899,6 +899,12 @@ func verifyCopyRemoteMetadata(serverURL string, cfg copyCLIConfig, manifest *tx.
 	}
 	client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...))
 	defer client.Close()
+	probeCtx, cancel := context.WithTimeout(context.Background(), verifyChecksumRequestTimeout)
+	_, err = client.ProbeLink(probeCtx, tx.ProbeRequest{ProbeBytes: 1})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("probe metadata request limits: %w", err)
+	}
 
 	var dirs []tx.ManifestEntry
 	for _, entry := range manifest.Entries {
@@ -1026,6 +1032,14 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 	budgetExpired := func() bool {
 		return cfg.verifyBudget > 0 && budgetCtx.Err() == context.DeadlineExceeded
 	}
+	client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...))
+	defer client.Close()
+	probeCtx, probeCancel := context.WithTimeout(workerCtx, verifyChecksumRequestTimeout)
+	_, err = client.ProbeLink(probeCtx, tx.ProbeRequest{ProbeBytes: 1})
+	probeCancel()
+	if err != nil {
+		return 0, 0, time.Since(start), false, fmt.Errorf("probe checksum request limits: %w", err)
+	}
 	var wg sync.WaitGroup
 	var completed atomic.Int64
 	var completedRanges atomic.Int64
@@ -1051,8 +1065,6 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...))
-			defer client.Close()
 			for task := range taskCh {
 				if err := verifySampleTaskData(workerCtx, client, manifest.TransferID, task, func(done int64) {
 					completedRanges.Add(done)
@@ -1161,45 +1173,6 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 	}
 }
 
-func estimateChecksumRequestCommandBytes(transferID string, targets []tx.ChecksumTarget) int {
-	total := len("CXSUM ") + len(transferID)
-	for _, target := range targets {
-		total += estimateChecksumTargetCommandBytes(target)
-	}
-	return total
-}
-
-func estimateChecksumTargetCommandBytes(target tx.ChecksumTarget) int {
-	total := len(" fd=") + digitsBase10Uint64(target.FileID) + 1 + len(strconv.Itoa(len(target.FullPath))) + 1 + len(target.FullPath)
-	if target.Offset > 0 {
-		total += len(" offset=") + digitsBase10Int64(target.Offset)
-	}
-	if target.Size > 0 {
-		total += len(" size=") + digitsBase10Int64(target.Size)
-	}
-	if algo := strings.TrimSpace(target.Algo); algo != "" {
-		total += len(" algo=") + len(algo)
-	}
-	return total
-}
-
-func digitsBase10Uint64(v uint64) int {
-	if v == 0 {
-		return 1
-	}
-	return len(strconv.FormatUint(v, 10))
-}
-
-func digitsBase10Int64(v int64) int {
-	if v == 0 {
-		return 1
-	}
-	if v < 0 {
-		return digitsBase10Uint64(uint64(-v)) + 1
-	}
-	return digitsBase10Uint64(uint64(v))
-}
-
 func verifySampleTaskData(ctx context.Context, client *tx.Client, transferID string, task verifySampleTask, onBatchVerified func(int64)) error {
 	fd, err := os.Open(task.localPath)
 	if err != nil {
@@ -1214,8 +1187,7 @@ func verifySampleTaskData(ctx context.Context, client *tx.Client, transferID str
 		targets := make([]tx.ChecksumTarget, 0, int(batchCap))
 		samples := make([]sampler.Sample, 0, int(batchCap))
 		wantHashes := make([]string, 0, int(batchCap))
-		cmdBytes := len("CXSUM ") + len(transferID)
-		for task.sampleGen.Remaining() > 0 {
+		for task.sampleGen.Remaining() > 0 && int64(len(targets)) < batchCap {
 			sample, ok := task.sampleGen.Peek()
 			if !ok {
 				break
@@ -1227,10 +1199,6 @@ func verifySampleTaskData(ctx context.Context, client *tx.Client, transferID str
 				Size:     sample.Size,
 				Algo:     "xxh128",
 			}
-			targetBytes := estimateChecksumTargetCommandBytes(target)
-			if len(targets) > 0 && cmdBytes+targetBytes > verifyChecksumCommandBudgetBytes {
-				break
-			}
 			want, err := computeLocalSampleHash(fd, sample.Offset, sample.Size, buf)
 			if err != nil {
 				return fmt.Errorf("hash local sample %s@%d: %w", task.localPath, sample.Offset, err)
@@ -1238,45 +1206,43 @@ func verifySampleTaskData(ctx context.Context, client *tx.Client, transferID str
 			targets = append(targets, target)
 			samples = append(samples, sample)
 			wantHashes = append(wantHashes, want)
-			cmdBytes += targetBytes
 			task.sampleGen.Advance()
 		}
 		if len(targets) == 0 {
 			return fmt.Errorf("checksum batching failed for %s", task.serverPath)
 		}
 
-		verifyCtx, cancel := context.WithTimeout(ctx, verifyChecksumRequestTimeout)
-		resp, err := client.GetChecksum(verifyCtx, tx.GetChecksumRequest{
-			TransferID: transferID,
-			Targets:    targets,
+		verified := 0
+		err := client.VisitChecksumBatches(ctx, tx.GetChecksumRequest{TransferID: transferID, Targets: targets}, tx.ChecksumBatchOptions{
+			TargetRequestBytes: verifyChecksumRequestTargetBytes, RequestTimeout: verifyChecksumRequestTimeout,
+		}, func(batch []tx.ChecksumTarget, resp tx.GetChecksumResponse) error {
+			results, err := readChecksumResults(resp.Reader)
+			if err != nil {
+				return fmt.Errorf("read checksum response for %s: %w", task.serverPath, err)
+			}
+			if len(results) != len(batch) {
+				return fmt.Errorf("checksum response count mismatch for %s: got %d want %d", task.serverPath, len(results), len(batch))
+			}
+			for i, result := range results {
+				sample := samples[verified+i]
+				if result.FileID != task.entry.ID {
+					return fmt.Errorf("checksum file id mismatch for %s: got %d want %d", task.serverPath, result.FileID, task.entry.ID)
+				}
+				if result.Offset != sample.Offset || result.Size != sample.Size {
+					return fmt.Errorf("checksum range mismatch for %s: got offset=%d size=%d want offset=%d size=%d", task.serverPath, result.Offset, result.Size, sample.Offset, sample.Size)
+				}
+				if !strings.EqualFold(result.FileHashToken, wantHashes[verified+i]) {
+					return fmt.Errorf("checksum mismatch for %s at offset=%d size=%d", task.localPath, sample.Offset, sample.Size)
+				}
+			}
+			if onBatchVerified != nil {
+				onBatchVerified(int64(len(batch)))
+			}
+			verified += len(batch)
+			return nil
 		})
 		if err != nil {
-			cancel()
-			return fmt.Errorf("checksum request failed for %s: %w", task.serverPath, err)
-		}
-		results, err := readChecksumResults(resp.Reader)
-		_ = resp.Reader.Close()
-		cancel()
-		if err != nil {
-			return fmt.Errorf("read checksum response for %s: %w", task.serverPath, err)
-		}
-		if len(results) != len(samples) {
-			return fmt.Errorf("checksum response count mismatch for %s: got %d want %d", task.serverPath, len(results), len(samples))
-		}
-		for i, result := range results {
-			sample := samples[i]
-			if result.FileID != task.entry.ID {
-				return fmt.Errorf("checksum file id mismatch for %s: got %d want %d", task.serverPath, result.FileID, task.entry.ID)
-			}
-			if result.Offset != sample.Offset || result.Size != sample.Size {
-				return fmt.Errorf("checksum range mismatch for %s: got offset=%d size=%d want offset=%d size=%d", task.serverPath, result.Offset, result.Size, sample.Offset, sample.Size)
-			}
-			if !strings.EqualFold(result.FileHashToken, wantHashes[i]) {
-				return fmt.Errorf("checksum mismatch for %s at offset=%d size=%d", task.localPath, sample.Offset, sample.Size)
-			}
-		}
-		if onBatchVerified != nil {
-			onBatchVerified(int64(len(samples)))
+			return fmt.Errorf("checksum verification failed for %s: %w", task.serverPath, err)
 		}
 	}
 	return nil

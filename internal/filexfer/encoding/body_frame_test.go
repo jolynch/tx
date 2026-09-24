@@ -3,6 +3,7 @@ package encoding
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -256,15 +257,13 @@ func TestChunkedManifestReaderRejectsTruncatedStream(t *testing.T) {
 	if err := cw.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	// Truncate the last frame entirely so no terminal trailer is seen.
-	trimmed := wire.Bytes()[:wire.Len()/2]
-	r := NewFramedBodyReader(bytes.NewReader(trimmed), FramedBodyReaderOpts{})
-	_, err := io.ReadAll(r)
-	if err == nil {
-		t.Fatalf("expected error from truncated stream")
-	}
-	if err == io.EOF { //nolint:errorlint
-		t.Fatalf("truncation must not surface as clean EOF: %v", err)
+	// Every strict prefix is incomplete, including complete nonterminal frames.
+	for cut := 0; cut < wire.Len(); cut++ {
+		r := NewFramedBodyReader(bytes.NewReader(wire.Bytes()[:cut]), FramedBodyReaderOpts{})
+		_, err := io.ReadAll(r)
+		if !errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+			t.Fatalf("cut %d: expected unexpected EOF, got %v", cut, err)
+		}
 	}
 }
 

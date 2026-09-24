@@ -238,7 +238,11 @@ func acquirePooledZstdDecoder(src io.Reader) (*zstd.Decoder, error) {
 			decoder.Close()
 		}
 	}
-	return zstd.NewReader(src, zstd.WithDecoderConcurrency(1))
+	// Limit decoder history as well as the caller's output buffer. Every
+	// decoder in this pool has the same limits, including after Reset.
+	ceiling := uint64(DefaultMaxFrameLogicalBytes())
+	return zstd.NewReader(src, zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderMaxMemory(ceiling), zstd.WithDecoderMaxWindow(ceiling))
 }
 
 func releasePooledZstdDecoder(decoder *zstd.Decoder) {

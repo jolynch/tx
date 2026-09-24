@@ -24,6 +24,50 @@ type cxsumItem struct {
 	Algorithms []string
 }
 
+// The low two flag bits select hashes; the third records an explicit size.
+const (
+	checksumXXH128 uint8 = 1 << iota
+	checksumXXH64
+	checksumHasSize
+)
+
+type checksumRequestRecord struct {
+	FileID uint64
+	Offset int64
+	Size   int64
+	Path   string
+	Flags  uint8
+}
+
+func parseCXSUMRecord(raw map[string]string) (checksumRequestRecord, error) {
+	item, err := parseCXSUMItem(raw)
+	if err != nil {
+		return checksumRequestRecord{}, err
+	}
+	r := checksumRequestRecord{FileID: item.FileID, Offset: item.Offset, Size: item.Size, Path: item.Path}
+	if item.HasSize {
+		r.Flags |= checksumHasSize
+	}
+	for _, algo := range item.Algorithms {
+		switch algo {
+		case "xxh128":
+			r.Flags |= checksumXXH128
+		case "xxh64":
+			r.Flags |= checksumXXH64
+		}
+	}
+	return r, nil
+}
+
+var checksumRequestAlgorithms = [...][]string{
+	nil, {"xxh128"}, {"xxh64"}, {"xxh128", "xxh64"},
+}
+
+func (r checksumRequestRecord) item() cxsumItem {
+	return cxsumItem{FileID: r.FileID, Offset: r.Offset, Size: r.Size, Path: r.Path,
+		HasSize: r.Flags&checksumHasSize != 0, Algorithms: checksumRequestAlgorithms[r.Flags&(checksumXXH128|checksumXXH64)]}
+}
+
 type cxsumRequest struct {
 	TransferID string
 	Items      []cxsumItem
@@ -87,28 +131,18 @@ func handleCXSUM(_ context.Context, req Request, out io.Writer, deps Deps) error
 	return protocolErr{code: "INTERNAL", message: "CXSUM requires a request body, use handleCXSUMWithInput"}
 }
 
-// handleCXSUMWithInput reads the whole item list, then emits one checksum frame
-// per requested range. Reading first keeps the exchange request-then-response;
-// see maxBodyItems.
+// handleCXSUMWithInput validates the complete body before emitting checksums.
 func handleCXSUMWithInput(_ context.Context, req Request, in io.Reader, out io.Writer, deps Deps) error {
 	txferID, err := cxsumTransferID(req)
 	if err != nil {
 		return err
 	}
-	rawItems, err := readItemBody(in, cxsumItemKeys, "CXSUM")
+	records, err := parseRequestItemRecords(in, cxsumItemKeys, "CXSUM", parseCXSUMRecord)
 	if err != nil {
 		return err
 	}
-	if len(rawItems) == 0 {
+	if len(records) == 0 {
 		return protocolErr{code: "BAD_REQUEST", message: "CXSUM requires at least one item"}
-	}
-	items := make([]cxsumItem, 0, len(rawItems))
-	for _, raw := range rawItems {
-		item, itemErr := parseCXSUMItem(raw)
-		if itemErr != nil {
-			return itemErr
-		}
-		items = append(items, item)
 	}
 
 	buf, release, err := bufpool.Acquire(int(checksumReadBufferSize))
@@ -116,8 +150,9 @@ func handleCXSUMWithInput(_ context.Context, req Request, in io.Reader, out io.W
 		return err
 	}
 	defer release()
-	for _, item := range items {
-		if err := streamChecksumItem(out, deps, txferID, item, buf); err != nil {
+
+	for _, record := range records {
+		if err := streamChecksumItem(out, deps, txferID, record.item(), buf); err != nil {
 			return err
 		}
 	}

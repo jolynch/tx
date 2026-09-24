@@ -90,9 +90,29 @@ the ceiling is the window size.
 **Small files → packed batches.** The manifest is walked in order and files are
 packed into batches until the next file would exceed `batchMaxBytes`. A batch
 of 1000 tiny files and a batch containing one 32 MiB file are the same unit of
-work — each becomes a single multi-file `SEND` request over one TCP connection.
+work. Each normally becomes one multi-file `SEND` request; metadata-heavy
+batches can require several requests on the same worker.
 This avoids the per-connection overhead that makes small-file transfers slow in
 tools that open one connection per file.
+
+**Request memory.** PROBE separately advertises `target-request-bytes` (8 MiB)
+and `max-request-bytes` (64 MiB). These count encoded metadata before
+compression, including line terminators, rather than the file content scheduled
+by a work batch. SEND groups, directory metadata, ACK lists, and CLI checksum
+batches split at the target without exceeding the maximum. Work-size overrides
+do not override these limits. Direct `GetChecksum` calls remain single requests.
+
+The server verifies one bounded request body and parses its entries once into
+compact ordered records. All entries are validated before processing, and the
+decoded body is released before applying the records. Invalid or truncated ACK
+requests apply no acknowledgments; earlier successful requests remain applied
+when a later request fails. Records, frame buffers, and bounded decoder history
+are additional memory, so the request limit is not a total heap limit. Many
+short entries can require more record storage than their encoded payload.
+
+Logical transport frames remain 4 MiB, independently of request and work sizes.
+SYNC has its own `max-sync-request-bytes` advertisement (1 GiB by default) and
+is checked before transmission, without splitting the manifest.
 
 **Large files → split windows.** When a single file exceeds `batchMaxBytes`,
 it is split into windows of that size. Each window is downloaded on its own TCP

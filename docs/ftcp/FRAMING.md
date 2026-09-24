@@ -106,6 +106,11 @@ Receiver behavior:
 - `none`: write bytes directly.
 - `zstd` or `lz4`: decompress before writing to destination offset.
 
+Pooled zstd decoders bound both history window and decoder memory to the
+effective frame ceiling, including after reuse. Output grows incrementally and
+must match the declared logical size; the output bound alone does not bound
+decoder history.
+
 ## Parsing Rules
 
 - Maximum header/trailer line bytes: 4 MiB (defensive limit; a real header or
@@ -142,6 +147,12 @@ Receiver must close the TCP connection on framing errors:
 - payload shorter/longer than declared `wsize`
 - decompressed segment length not equal to declared `size`
 - trailer `status` other than `ok`
+- EOF before the terminal trailer and its cumulative hash have been verified
+
+Framed body readers report premature EOF as `io.ErrUnexpectedEOF`. Normal EOF
+means verified completion. A request that exactly fills its byte budget must
+still read and verify the terminal frame; a limiting reader must not fabricate
+successful completion at that boundary.
 
 Receiver should emit protocol error code in logs with offending `file_id` when available.
 

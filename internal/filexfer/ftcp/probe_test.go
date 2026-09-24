@@ -18,7 +18,7 @@ func TestHandlePROBERoundTrip(t *testing.T) {
 	payload := bytes.Repeat([]byte{0x5a}, 1024)
 	in := bytes.NewReader(payload)
 	var out bytes.Buffer
-	if err := handlePROBEWithInput(context.Background(), req, in, &out, &mockDeps{}, 8, 25, 25, 1*1024*1024, 0); err != nil {
+	if err := handlePROBEWithInput(context.Background(), req, in, &out, &mockDeps{}, 8, 25, 25, 1*1024*1024, 0, defaultMaxSyncBodyBytes); err != nil {
 		t.Fatalf("handlePROBEWithInput failed: %v", err)
 	}
 
@@ -64,7 +64,7 @@ func TestHandlePROBEDefaultIODepth(t *testing.T) {
 		t.Fatalf("ParseRequest failed: %v", err)
 	}
 	var out bytes.Buffer
-	if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, &mockDeps{}, 0, 30, 25, 1*1024*1024, 0); err != nil {
+	if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, &mockDeps{}, 0, 30, 25, 1*1024*1024, 0, defaultMaxSyncBodyBytes); err != nil {
 		t.Fatalf("handlePROBEWithInput failed: %v", err)
 	}
 	line, err := bufio.NewReader(bytes.NewReader(out.Bytes())).ReadString('\n')
@@ -93,7 +93,7 @@ func TestHandlePROBERejectsShortPayload(t *testing.T) {
 	}
 	in := bytes.NewReader([]byte{1, 2, 3})
 	var out bytes.Buffer
-	err = handlePROBEWithInput(context.Background(), req, in, &out, &mockDeps{}, 8, 25, 25, 1*1024*1024, 0)
+	err = handlePROBEWithInput(context.Background(), req, in, &out, &mockDeps{}, 8, 25, 25, 1*1024*1024, 0, defaultMaxSyncBodyBytes)
 	if err == nil {
 		t.Fatalf("expected payload validation error")
 	}
@@ -109,7 +109,7 @@ func TestHandlePROBEReportsObservedLink(t *testing.T) {
 		reportReturnOK: true,
 	}
 	var out bytes.Buffer
-	if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, deps, 8, 25, 25, 2*1024*1024, 0); err != nil {
+	if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, deps, 8, 25, 25, 2*1024*1024, 0, defaultMaxSyncBodyBytes); err != nil {
 		t.Fatalf("handlePROBEWithInput failed: %v", err)
 	}
 	if !deps.reportCalled {
@@ -167,7 +167,7 @@ func TestHandlePROBEKeepAliveGrant(t *testing.T) {
 				t.Fatalf("ParseRequest failed: %v", err)
 			}
 			var out bytes.Buffer
-			if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, &mockDeps{}, 8, 25, 25, 1*1024*1024, tc.keepAliveMS); err != nil {
+			if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, &mockDeps{}, 8, 25, 25, 1*1024*1024, tc.keepAliveMS, defaultMaxSyncBodyBytes); err != nil {
 				t.Fatalf("handlePROBEWithInput failed: %v", err)
 			}
 			line, err := bufio.NewReader(bytes.NewReader(out.Bytes())).ReadString('\n')

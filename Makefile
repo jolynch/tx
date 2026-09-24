@@ -53,8 +53,11 @@ fuzz-long:
 	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzSync -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
 	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzServeZeroCopySEND -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG) -parallel=1
 
+# internal/bench holds benchmarks of exported code. Benchmarks that need
+# unexported access live with their package; both sets are registered here so
+# the Makefile stays the single place that lists them.
 bench: build
 	@mkdir -p bench/results
-	go test -bench=. -run=^$$ -benchmem ./internal/bench | tee bench/results/latest.txt
+	go test -bench=. -run=^$$ -benchmem ./internal/bench . ./internal/filexfer/ftcp | tee bench/results/latest.txt
 	@echo
 	@go run ./internal/bench report bench/results/latest.txt

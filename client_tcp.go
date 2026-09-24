@@ -2,6 +2,7 @@ package tx
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -65,18 +66,21 @@ type tcpAuthState struct {
 }
 
 type probeResponse struct {
-	ServerCPU       int
-	ServerIODepth   int
-	GentleCPUPct    int
-	GentleBWPct     int
-	CTS0            int64
-	CTS1            int64
-	STS0            int64
-	STS1            int64
-	ProbeBytes      int64
-	ServerWmemBytes int64
-	LimiterBps      int64
-	KeepAliveMS     int64
+	ServerCPU           int
+	ServerIODepth       int
+	GentleCPUPct        int
+	GentleBWPct         int
+	CTS0                int64
+	CTS1                int64
+	STS0                int64
+	STS1                int64
+	ProbeBytes          int64
+	ServerWmemBytes     int64
+	LimiterBps          int64
+	KeepAliveMS         int64
+	TargetRequestBytes  int64
+	MaxRequestBytes     int64
+	MaxSyncRequestBytes int64
 }
 
 type tcpConnPool struct {
@@ -741,6 +745,7 @@ func (c *Client) discoverServerKey(ctx context.Context) (recommendedCipher strin
 		return "", "", fmt.Errorf("dial for key exchange: %w", dialErr)
 	}
 	defer conn.Close()
+	defer watchManagedTCPConnContext(ctx, conn)()
 	if err := writeTCPLine(conn, "AUTH key"); err != nil {
 		return "", "", err
 	}
@@ -863,6 +868,9 @@ func (c *Client) dialAndAuthWithState(ctx context.Context, state tcpAuthState) (
 	if err != nil {
 		return nil, fmt.Errorf("dial file listener: %w", err)
 	}
+	if state.hasAuth {
+		defer watchManagedTCPConnContext(ctx, conn)()
+	}
 	if err := c.sendTCPAuth(conn, state); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("send AUTH: %w", err)
@@ -901,7 +909,7 @@ func (c *Client) sendAndReadTCP(conn net.Conn, state tcpAuthState, cmd string) (
 // request body. Building the lines separately from framing them keeps the item
 // grammar readable at each call site.
 type itemWriter struct {
-	buf strings.Builder
+	buf bytes.Buffer
 	err error
 }
 
@@ -951,7 +959,7 @@ func (w *itemWriter) bytes() ([]byte, error) {
 		return nil, errors.New("no items")
 	}
 	w.buf.WriteByte('\n')
-	return []byte(w.buf.String()), nil
+	return w.buf.Bytes(), nil
 }
 
 // sendTCPCommandWithBody writes a command line followed by its framed request
@@ -1066,6 +1074,20 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 }
 
 func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestRequest) (SyncManifestResponse, error) {
+	limit := c.currentRequestLimits().maxSync
+	// Marshal and preflight before dialing. SYNC is never split — the server
+	// indexes the prior manifest as a whole — so a manifest above the limit can
+	// only be refused. Checking here rather than mid-request also avoids
+	// leaving the server holding a SYNC command whose body never arrives.
+	oldManifestBytes, err := marshalManifest(request.OldManifest)
+	if err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("marshal old manifest: %w", err)
+	}
+	if int64(len(oldManifestBytes)) > limit {
+		return SyncManifestResponse{}, fmt.Errorf(
+			"prior manifest is %d bytes, above the server's %d byte SYNC limit", len(oldManifestBytes), limit)
+	}
+
 	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
 	if err != nil {
 		return SyncManifestResponse{}, err
@@ -1106,11 +1128,6 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 
 	// Send the old manifest as an FX/1 + FXT/1 framed stream — mirrors TXFER's
 	// response framing so the server can validate the body chunk-by-chunk.
-	oldManifestBytes, err := marshalManifest(request.OldManifest)
-	if err != nil {
-		_ = closeRequest()
-		return SyncManifestResponse{}, fmt.Errorf("marshal old manifest: %w", err)
-	}
 	requestWriter := intencoding.NewFramedBodyWriter(requestDst, comp, intencoding.DefaultBodyChunkSize, intencoding.DefaultBodyFlushInterval)
 	if _, err := requestWriter.Write(oldManifestBytes); err != nil {
 		_ = closeRequest()
@@ -1194,48 +1211,46 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 	}, nil
 }
 
+// fetchFileBatchTCP builds the request body for targets and issues one SEND.
+// Callers that have already encoded a body — the download worker, which splits
+// on encoded length — use fetchFileBatchBodyTCP instead so nothing is encoded
+// twice.
 func (c *Client) fetchFileBatchTCP(
 	ctx context.Context,
 	txferID string,
 	targets []FetchFileTarget,
 ) (io.ReadCloser, error) {
+	body, err := encodeRequest(targets, c.currentRequestLimits().max, fetchTargetItemBytes)
+	if err != nil {
+		return nil, err
+	}
+	return c.fetchFileBatchBodyTCP(ctx, txferID, body)
+}
+
+// fetchFileBatchBodyTCP issues one SEND for an already-encoded item body.
+func (c *Client) fetchFileBatchBodyTCP(
+	ctx context.Context,
+	txferID string,
+	body encodedRequest,
+) (io.ReadCloser, error) {
 	if txferID == "" {
 		return nil, errors.New("missing transfer id")
 	}
-	if len(targets) == 0 {
+	if len(body.body) == 0 {
 		return nil, errors.New("missing file targets")
+	}
+	if err := body.validate(); err != nil {
+		return nil, err
 	}
 	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
 	if err != nil {
 		return nil, err
 	}
-
 	// Pointer guard: ownership passes to the returned ReadCloser on success,
 	// so it must outlive this call.
 	closer := &managedTCPConnCloser{client: c, conn: conn, pool: pool}
-
-	// mode is transfer-level, so it rides the command line once; the per-file
-	// items go in the framed body, which is why a batch can be any size.
 	cmd := "SEND " + txferID + " mode=" + normalizeLoadStrategy(c.LoadStrategy)
-	var items itemWriter
-	for _, t := range targets {
-		items.begin(t.FileID, t.FullPath)
-		if t.Comp != "" {
-			items.field("comp", t.Comp)
-		}
-		if t.Offset != 0 {
-			items.fieldInt("offset", t.Offset)
-		}
-		if t.Size > 0 {
-			items.fieldInt("size", t.Size)
-		}
-	}
-	body, err := items.bytes()
-	if err != nil {
-		_ = closer.Close()
-		return nil, err
-	}
-	br, err := c.sendAndReadTCPWithBody(conn, state, cmd, body)
+	br, err := c.sendAndReadTCPWithBody(conn, state, cmd, body.body)
 	if err != nil {
 		_ = closer.Close()
 		return nil, fmt.Errorf("SEND batch: %w", err)
@@ -1305,6 +1320,7 @@ func (c *Client) probeTCP(ctx context.Context, req ProbeRequest, probeBytes int6
 		return probeResponse{}, err
 	}
 	defer conn.Close()
+	defer watchManagedTCPConnContext(ctx, conn)()
 
 	cts0 := time.Now().UnixMilli()
 	localCPU := runtime.NumCPU()
@@ -1443,18 +1459,46 @@ func parseProbeResponseLine(line string) (probeResponse, error) {
 	if keepAliveMS < 0 {
 		keepAliveMS = 0
 	}
+	parseRequestLimit := func(key string, fallback int64) (int64, error) {
+		raw, ok := p[key]
+		if !ok {
+			return fallback, nil
+		}
+		value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+		if err != nil || value <= 0 {
+			return 0, fmt.Errorf("invalid PROBE response %s", key)
+		}
+		return value, nil
+	}
+	targetRequestBytes, err := parseRequestLimit("target-request-bytes", intencoding.DefaultTargetRequestBytes)
+	if err != nil {
+		return probeResponse{}, err
+	}
+	maxRequestBytes, err := parseRequestLimit("max-request-bytes", intencoding.MaxRequestBytes)
+	if err != nil {
+		return probeResponse{}, err
+	}
+	maxSyncRequestBytes, err := parseRequestLimit("max-sync-request-bytes", intencoding.DefaultMaxSyncRequestBytes)
+	if err != nil {
+		return probeResponse{}, err
+	}
+	maxRequestBytes = min(maxRequestBytes, intencoding.MaxRequestBytes)
+	targetRequestBytes = min(targetRequestBytes, maxRequestBytes)
 	return probeResponse{
-		ServerCPU:       serverCPU,
-		ServerIODepth:   ioDepth,
-		GentleCPUPct:    gentleCPUPct,
-		GentleBWPct:     gentleBWPct,
-		CTS0:            cts0,
-		STS0:            sts0,
-		STS1:            sts1,
-		ProbeBytes:      probeBytes,
-		ServerWmemBytes: wmemBytes,
-		LimiterBps:      limiterBps,
-		KeepAliveMS:     keepAliveMS,
+		ServerCPU:           serverCPU,
+		ServerIODepth:       ioDepth,
+		GentleCPUPct:        gentleCPUPct,
+		GentleBWPct:         gentleBWPct,
+		CTS0:                cts0,
+		STS0:                sts0,
+		STS1:                sts1,
+		ProbeBytes:          probeBytes,
+		ServerWmemBytes:     wmemBytes,
+		LimiterBps:          limiterBps,
+		KeepAliveMS:         keepAliveMS,
+		TargetRequestBytes:  targetRequestBytes,
+		MaxRequestBytes:     maxRequestBytes,
+		MaxSyncRequestBytes: maxSyncRequestBytes,
 	}, nil
 }
 
@@ -1465,12 +1509,28 @@ func (c *Client) acknowledgeFileProgressTCP(ctx context.Context, request Acknowl
 }
 
 func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands []acknowledgeFileProgressCommand) (AcknowledgeFileProgressResponse, error) {
+	err := visitEncodedRequests(commands, c.currentRequestLimits(), acknowledgeItemBytes, func(chunk requestChunk) error {
+		_, err := c.acknowledgeFileProgressGroupTCP(ctx, commands[chunk.lo:chunk.hi], chunk.encodedRequest)
+		return err
+	})
+	return AcknowledgeFileProgressResponse{}, err
+}
+
+func (c *Client) acknowledgeFileProgressGroupTCP(ctx context.Context, commands []acknowledgeFileProgressCommand, body encodedRequest) (AcknowledgeFileProgressResponse, error) {
 	if len(commands) == 0 {
 		return AcknowledgeFileProgressResponse{}, errors.New("missing ack requests")
 	}
 	txferID := strings.TrimSpace(commands[0].request.TransferID)
 	if txferID == "" {
 		return AcknowledgeFileProgressResponse{}, errors.New("missing transfer id")
+	}
+	for _, ack := range commands {
+		if ack.request.TransferID != txferID {
+			return AcknowledgeFileProgressResponse{}, errors.New("ack requests must share transfer id")
+		}
+	}
+	if err := body.validate(); err != nil {
+		return AcknowledgeFileProgressResponse{}, err
 	}
 	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
 	if err != nil {
@@ -1479,26 +1539,7 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 	closer := managedTCPConnCloser{client: c, conn: conn, pool: pool}
 	defer closer.Close()
 
-	var items itemWriter
-	for _, ack := range commands {
-		request := ack.request
-		if request.TransferID != txferID {
-			return AcknowledgeFileProgressResponse{}, errors.New("ack requests must share transfer id")
-		}
-		items.begin(request.FileID, request.FullPath)
-		items.field("ack-token", ack.ackToken)
-		if request.AckBytes >= 0 {
-			// Receiver telemetry; see the ackItem comment on the server side.
-			items.fieldInt("delta-bytes", request.DeltaBytes)
-			items.fieldInt("recv-ms", request.RecvMS)
-			items.fieldInt("sync-ms", request.SyncMS)
-		}
-	}
-	body, err := items.bytes()
-	if err != nil {
-		return AcknowledgeFileProgressResponse{}, err
-	}
-	br, err := c.sendAndReadTCPWithBody(conn, state, "ACK "+txferID, body)
+	br, err := c.sendAndReadTCPWithBody(conn, state, "ACK "+txferID, body.body)
 	if err != nil {
 		return AcknowledgeFileProgressResponse{}, fmt.Errorf("ACK: %w", err)
 	}
@@ -1586,34 +1627,24 @@ func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesReques
 }
 
 func (c *Client) getChecksumTCP(ctx context.Context, request GetChecksumRequest) (io.ReadCloser, error) {
+	body, err := encodeRequest(request.Targets, c.currentRequestLimits().max, checksumTargetItemBytes)
+	if err != nil {
+		return nil, err
+	}
+	return c.getChecksumBodyTCP(ctx, request.TransferID, body)
+}
+
+func (c *Client) getChecksumBodyTCP(ctx context.Context, transferID string, body encodedRequest) (io.ReadCloser, error) {
+	if err := body.validate(); err != nil {
+		return nil, err
+	}
 	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
 	if err != nil {
 		return nil, err
 	}
 	stopWatch := watchManagedTCPConnContext(ctx, conn)
-	// Pointer guard: ownership passes to the returned ReadCloser on success.
 	closer := &managedTCPConnCloser{client: c, conn: conn, pool: pool}
-
-	var items itemWriter
-	for _, target := range request.Targets {
-		items.begin(target.FileID, target.FullPath)
-		if target.Offset > 0 {
-			items.fieldInt("offset", target.Offset)
-		}
-		if target.Size > 0 {
-			items.fieldInt("size", target.Size)
-		}
-		if algo := strings.TrimSpace(target.Algo); algo != "" {
-			items.field("algo", algo)
-		}
-	}
-	body, err := items.bytes()
-	if err != nil {
-		stopWatch()
-		_ = closer.Close()
-		return nil, err
-	}
-	br, err := c.sendAndReadTCPWithBody(conn, state, "CXSUM "+request.TransferID, body)
+	br, err := c.sendAndReadTCPWithBody(conn, state, "CXSUM "+transferID, body.body)
 	if err != nil {
 		stopWatch()
 		_ = closer.Close()

@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 )
@@ -359,6 +360,15 @@ func FuzzFramedItemRoundTrip(f *testing.F) {
 		if comp != "" && got["comp"] != comp {
 			t.Fatalf("comp round trip: got %q want %q", got["comp"], comp)
 		}
+		want, parseErr := parseSENDItem(got, loadStrategyFast)
+		records, recordErr := parseRequestItemRecords(bytes.NewReader(body.Bytes()), sendItemKeys, "SEND", parseSENDRecord)
+		if parseErr != nil {
+			if recordErr == nil {
+				t.Fatal("compact parser accepted an invalid SEND item")
+			}
+		} else if recordErr != nil || len(records) != 1 || records[0].item(loadStrategyFast) != want {
+			t.Fatalf("compact round trip: records=%+v err=%v want=%+v", records, recordErr, want)
+		}
 	})
 }
 
@@ -437,32 +447,6 @@ func TestReadItemBodyRejectsHostileFrameHeader(t *testing.T) {
 	}
 }
 
-// Blank lines must count toward the item limit.
-func TestReadItemBodyBoundsBlankLineFlood(t *testing.T) {
-	var body bytes.Buffer
-	w := encoding.NewFramedBodyWriter(&body, encoding.EncodingZstd, encoding.DefaultBodyChunkSize, 0)
-	if _, err := io.WriteString(w, strings.Repeat("\n", maxBodyItems+10)); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := readItemBody(bytes.NewReader(body.Bytes()), sendItemKeys, "SEND")
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("a blank-line flood past the item cap was accepted")
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("readItemBody did not terminate on a blank-line flood")
-	}
-}
-
 // FuzzFramedBodyHeader varies frame declarations; parsing must return or
 // reject them without panicking or allocating from an unbounded size.
 func FuzzFramedBodyHeader(f *testing.F) {
@@ -487,4 +471,286 @@ func FuzzFramedBodyHeader(f *testing.F) {
 
 		_, _ = readItemBody(bytes.NewReader(body.Bytes()), sendItemKeys, "SEND")
 	})
+}
+
+// A body that ends before its terminal frame must be rejected *by the framing
+// layer*, not merely produce some error.
+//
+// The distinction is the whole test. Without the read-side EOF conversion the
+// framing layer accepts a truncated body, and the only thing that fails is
+// parsing whatever partial item line happens to be last — "invalid ACK path",
+// "invalid ACK item option". That is detection by coincidence: a cut landing on
+// an item-line boundary parses cleanly and the ACK applies a prefix. So this
+// asserts the error names frame-level truncation, which an assertion of
+// "err != nil" cannot distinguish.
+func TestReadItemBodyRejectsTruncation(t *testing.T) {
+	var full bytes.Buffer
+	w := encoding.NewFramedBodyWriter(&full, encoding.EncodingZstd, 4096, 0)
+	for i := 0; i < 400; i++ {
+		if _, err := fmt.Fprintf(w, "fd=%d %d:/remote/path/to/file-%06d.bin ack-token=-1\n",
+			i+1, 31, i); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	complete := full.Bytes()
+
+	items, err := readItemBody(bytes.NewReader(complete), ackItemKeys, "ACK")
+	if err != nil {
+		t.Fatalf("complete body rejected: %v", err)
+	}
+	if len(items) != 400 {
+		t.Fatalf("got %d items, want 400", len(items))
+	}
+
+	// Frame starts, so a cut can land exactly at a boundary with every
+	// preceding frame complete — the case the payload-length check cannot see.
+	var starts []int
+	for i := 1; i+5 < len(complete); i++ {
+		if complete[i] == 'F' && string(complete[i:i+5]) == "FX/1 " && complete[i-1] == '\n' {
+			starts = append(starts, i)
+		}
+	}
+	if len(starts) < 2 {
+		t.Fatalf("expected a multi-frame body, found %d frame starts", len(starts))
+	}
+
+	cuts := []struct {
+		name string
+		at   int
+	}{
+		{"exact frame boundary", starts[1]},
+		{"inside a header", starts[1] + 10},
+		{"inside a payload", len(complete) / 4},
+		{"inside the final trailer", len(complete) - 20},
+		{"one byte short", len(complete) - 1},
+	}
+	for _, cut := range cuts {
+		t.Run(cut.name, func(t *testing.T) {
+			_, err := readItemBody(bytes.NewReader(complete[:cut.at]), ackItemKeys, "ACK")
+			if err == nil {
+				t.Fatalf("a body truncated at %d/%d bytes was accepted", cut.at, len(complete))
+			}
+			// Frame header, payload, and trailer each report their own stage;
+			// all three are framing errors. An item-grammar error here means
+			// the framing layer let the truncation through.
+			if !strings.Contains(err.Error(), "read frame") {
+				t.Fatalf("truncation surfaced as %q, not a framing error; the framing "+
+					"layer accepted a short body and only item parsing happened to fail", err)
+			}
+		})
+	}
+}
+
+// A truncated ACK must leave the store untouched, not apply the prefix that
+// arrived. Uses realDeps because the point is real store state.
+func TestHandleACKTruncatedAppliesNothing(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "f.bin")
+	if err := os.WriteFile(path, []byte("hello world"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	deps := realDeps(t, "/")
+
+	txferReq, err := ParseRequest([]byte(fmt.Sprintf("TXFER %q mode=fast link-mbps=100 concurrency=1 comp=none", root)))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	var manifest bytes.Buffer
+	var txferID string
+	if err := handleTXFERWithCallback(context.Background(), txferReq, &manifest, deps, func(id string) { txferID = id }); err != nil {
+		t.Fatalf("TXFER: %v", err)
+	}
+	entries, _ := parseSYNCResponseEntries(unframeManifestWire(t, manifest.Bytes()), nil)
+	if len(entries) != 1 {
+		t.Fatalf("expected one entry, got %d", len(entries))
+	}
+	hash := "xxh128:0000000000000000000000000000000a"
+	if !deps.SetTransferFileWindowHash(txferID, entries[0].ID, entries[0].Size, hash) {
+		t.Fatal("SetTransferFileWindowHash returned false")
+	}
+
+	var body bytes.Buffer
+	line := fmt.Sprintf("fd=%d %q ack-token=%d@1@%s\n", entries[0].ID, path, entries[0].Size, hash)
+	bw := encoding.NewFramedBodyWriter(&body, encoding.EncodingZstd, int64(len(line)), 0)
+	if _, err := io.WriteString(bw, line); err != nil {
+		t.Fatal(err)
+	}
+	terminalStart := body.Len()
+	if err := bw.Close(); err != nil {
+		t.Fatalf("close body: %v", err)
+	}
+
+	req, err := ParseRequest([]byte("ACK " + txferID))
+	if err != nil {
+		t.Fatalf("ParseRequest ACK: %v", err)
+	}
+	for _, cut := range []int{terminalStart, body.Len() - 8} {
+		var out bytes.Buffer
+		if err := handleACKWithInput(context.Background(), req, bytes.NewReader(body.Bytes()[:cut]), &out, deps); err == nil {
+			t.Fatalf("ACK truncated at %d was accepted", cut)
+		}
+		if got, ok := deps.GetTransfer(txferID); !ok || got.DoneSize != 0 || got.Done != 0 {
+			t.Fatalf("truncated ACK advanced progress: Done=%d DoneSize=%d", got.Done, got.DoneSize)
+		}
+		if out.Len() != 0 {
+			t.Fatalf("truncated ACK produced a response: %q", out.String())
+		}
+	}
+}
+
+// Exercise the real maximum through the production reader without retaining
+// millions of parsed items in the test harness.
+func TestReadItemBodyMaxRequestBytesBoundary(t *testing.T) {
+	maxBytes := int(encoding.MaxRequestBytes)
+	blankLines := bytes.Repeat([]byte("\n"), 64*1024)
+	for _, size := range []int{maxBytes, maxBytes + 1} {
+		var wire bytes.Buffer
+		w := encoding.NewFramedBodyWriter(&wire, encoding.EncodingZstd, encoding.DefaultBodyChunkSize, 0)
+		for written := 0; written < size; {
+			n := min(len(blankLines), size-written)
+			if _, err := w.Write(blankLines[:n]); err != nil {
+				t.Fatal(err)
+			}
+			written += n
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		body, err := readRequestItemBody(&wire, "SEND")
+		if size > maxBytes {
+			if err == nil {
+				body.Release()
+				t.Fatal("maximum plus one blank byte accepted")
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("exact maximum rejected: %v", err)
+		}
+		if body.Len() != maxBytes {
+			t.Fatalf("decoded %d bytes, want %d", body.Len(), maxBytes)
+		}
+		body.Release()
+	}
+}
+
+func TestRequestValidationPrecedesResponse(t *testing.T) {
+	for _, verb := range []string{"SEND", "CXSUM"} {
+		t.Run(verb, func(t *testing.T) {
+			req, err := ParseRequest([]byte(verb + " tx123"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire, out bytes.Buffer
+			w := encoding.NewFramedBodyWriter(&wire, "none", 4096, 0)
+			if _, err := io.WriteString(w, "fd=1 6:/first\nfd=2 7:/second offset=-1\n"); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			deps := &mockDeps{}
+			if verb == "SEND" {
+				err = handleSENDWithOptions(context.Background(), req, &wire, &out, deps, nil, true, 100)
+			} else {
+				err = handleCXSUMWithInput(context.Background(), req, &wire, &out, deps)
+			}
+			pe, ok := err.(protocolErr)
+			if !ok || pe.code != "BAD_REQUEST" || !strings.Contains(pe.message, "offset") || out.Len() != 0 || deps.setStateCalls != 0 {
+				t.Fatalf("invalid later item: err=%v, response bytes=%d, state changes=%d", err, out.Len(), deps.setStateCalls)
+			}
+		})
+	}
+}
+
+// benchItemBody frames n item lines, returning the wire bytes. Built once per
+// benchmark so the measurement covers decoding, not construction.
+func benchItemBody(b *testing.B, n, pathDepth int) []byte {
+	b.Helper()
+	var buf bytes.Buffer
+	w := encoding.NewFramedBodyWriter(&buf, encoding.EncodingZstd, encoding.DefaultBodyChunkSize, 0)
+	prefix := "/remote/" + strings.Repeat("nested-directory/", pathDepth)
+	for i := 0; i < n; i++ {
+		path := fmt.Sprintf("%sfile-%07d.bin", prefix, i)
+		if _, err := fmt.Fprintf(w, "fd=%d %d:%s comp=none\n", i+1, len(path), path); err != nil {
+			b.Fatalf("write: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		b.Fatalf("close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// Measure the production compact-record parser, including framed decoding.
+func BenchmarkRequestRecords(b *testing.B) {
+	for _, tc := range []struct {
+		name  string
+		depth int
+	}{{"short-paths", 1}, {"long-paths", 12}} {
+		body := benchItemBody(b, 50000, tc.depth)
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				records, err := parseRequestItemRecords(bytes.NewReader(body), sendItemKeys, "SEND", parseSENDRecord)
+				if err != nil || len(records) != 50000 {
+					b.Fatalf("records=%d err=%v", len(records), err)
+				}
+			}
+		})
+	}
+}
+
+func TestCompactRequestRecords(t *testing.T) {
+	for _, codec := range []string{"adapt", "none", "identity", "lz4", "zstd"} {
+		line := fmt.Sprintf("fd=7 4:/foo offset=9 size=11 comp=%s", codec)
+		records, err := parseRequestItemRecords(framedItemBody(t, "\n"+line+"\r\n\n"+line), sendItemKeys, "SEND", parseSENDRecord)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(records) != 2 || cap(records) != 2 || records[0] != records[1] {
+			t.Fatalf("records: %+v", records)
+		}
+		item := records[0].item(loadStrategyGentle)
+		wantCodec := codec
+		if codec == "identity" {
+			wantCodec = "none"
+		}
+		if item.FileID != 7 || item.Path != "/foo" || item.Offset != 9 || item.Size != 11 || item.Comp != wantCodec || item.Mode != loadStrategyGentle {
+			t.Fatalf("codec=%s item=%+v", codec, item)
+		}
+	}
+	for _, algo := range []string{"", "none", "xxh128", "xxh64", "xxh64,none,xxh128,xxh64"} {
+		for _, size := range []string{"", " size=0", " size=3"} {
+			line := "fd=7 4:/foo offset=9" + size
+			if algo != "" {
+				line += " algo=" + algo
+			}
+			raw, err := parseItemLine([]byte(line), cxsumItemKeys, "CXSUM")
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := parseCXSUMItem(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			records, err := parseRequestItemRecords(framedItemBody(t, line), cxsumItemKeys, "CXSUM", parseCXSUMRecord)
+			if err != nil || len(records) != 1 {
+				t.Fatalf("records=%v err=%v", records, err)
+			}
+			got := records[0].item()
+			if got.FileID != want.FileID || got.Path != want.Path || got.Offset != want.Offset || got.Size != want.Size || got.HasSize != want.HasSize || strings.Join(got.Algorithms, ",") != strings.Join(want.Algorithms, ",") {
+				t.Fatalf("got=%+v want=%+v", got, want)
+			}
+		}
+	}
+	// Reject impossible lines in the counting pass, before reserving records.
+	called := false
+	_, err := parseRequestItemRecords(framedItemBody(t, strings.Repeat("x\n", 1000)), sendItemKeys, "SEND", func(raw map[string]string) (sendRequestRecord, error) { called = true; return parseSENDRecord(raw) })
+	if err == nil || called {
+		t.Fatalf("invalid preflight: called=%v err=%v", called, err)
+	}
 }

@@ -56,39 +56,69 @@ writing, and once both socket buffers filled neither side could progress.
 
 ### Size limits
 
-Every limit below is set where no legitimate request can reach it. They exist to
-bound a hostile peer, not to shape real traffic.
+Request size and transfer work size are separate budgets:
 
-| Limit                  | Value                   | Why it is out of reach          |
-|------------------------|-------------------------|---------------------------------|
-| Command line           | 64 KiB                  | Headers only; `PATH_MAX` 4096.  |
-| Item line in a body    | 8 KiB                   | One path plus a few tokens.     |
-| Frame wire payload     | `max(rmem_max, 64 MiB)` | Senders emit 4 MiB frames.      |
-| Frame logical size     | `max(rmem_max, 64 MiB)` | Senders emit 4 MiB frames.      |
-| Items per request body | 1,048,576               | A million-file batch.           |
-| SEND/ACK/CXSUM body    | 8 GiB logical           | Items × the item-line cap.      |
-| Response body, client  | 1 GiB logical           | A ten-million-entry manifest.   |
-| SYNC prior manifest    | 1 GiB logical           | A ten-million-entry manifest.   |
-| PROBE payload          | 32 MiB                  | Client-chosen, length-declared. |
+- **Request bytes** count decoded SEND/ACK/CXSUM body metadata (paths, IDs,
+  ranges, and options), including line terminators. `TargetRequestBytes` is a
+  soft 8 MiB client batching target; `MaxRequestBytes` is a hard 64 MiB server
+  limit. These bound the payload retained while validating one request.
+- **Window/batch work bytes** count file contents scheduled for transfer.
+  Existing probe-derived tuning and client overrides still apply. A SEND batch
+  ends at its work budget or request target, whichever comes first. Empty files
+  consume request bytes even though they contribute no file-data work.
+- **Frame bytes** describe transport chunks, normally 4 MiB before compression.
+  One request or work batch can span multiple frames.
 
-Notes on the rows that carry more than their size:
+| Limit | Value | Scope |
+|-------|-------|-------|
+| Command line | 64 KiB | Headers only. |
+| Item line in a body | 8 KiB | One path plus options. |
+| Frame wire payload | socket receive limit clamped to 8–64 MiB | One compressed frame. |
+| Frame logical size | socket receive limit clamped to 8–64 MiB | One decoded frame. |
+| SEND/ACK/CXSUM body | 64 MiB decoded | Whole request, including blank lines. |
+| Response body, client | 1 GiB decoded | Whole manifest or STATUS response. |
+| SYNC prior manifest | 1 GiB decoded by default | `ServerOptions.MaxSyncBodyBytes`. |
+| PROBE payload | 32 MiB | Client-chosen, length-declared. |
 
-- **Items per request body** counts every line, blank ones included, so a run of
-  newlines cannot spin the reader without reaching the cap.
-- **SEND/ACK/CXSUM body** is the item count times the item-line cap, so no legal
-  item list can exceed it.
-- **Response body, client** exists because a client does not extend unbounded
-  trust to the server it dialed: declared sizes in a response are the server's
-  to choose.
-- **SYNC prior manifest** (`ServerOptions.MaxSyncBodyBytes`) is the one inherent
-  limit. The server must index the whole prior manifest before it can walk the
-  tree, so this bounds that index rather than the wire format.
+There is no separate item-count limit. The server verifies the complete framed
+body, counts nonblank lines to size record storage, then parses and validates
+each entry once. It retains compact ordered records, discards temporary maps,
+and releases the decoded body before processing those records. ACK records
+retain only file IDs and validated acknowledgment progress.
 
-Exceeding any of them is reported as `ERR BAD_REQUEST <reason>` and the
-connection closes.
+Record storage can exceed the encoded payload size, especially for many short
+entries. Body and records coexist during validation; frame and decoder working
+buffers are additional memory. The payload limit is not a total heap limit.
+Buffers up to 64 MiB are supported, but only capacities up to 32 MiB are retained
+in the reusable buffer pool.
+
+The client splits file SEND, directory metadata SEND, and ACK requests at the
+advertised request target, allowing the final complete item to cross the soft
+target but never the hard maximum. CLI checksum batches use the same budget;
+a direct `GetChecksum` call remains one request and fails locally if oversized. `VisitChecksumBatches`
+encodes and sends each bounded request once. Its callback consumes the supplied
+response synchronously; the client closes the reader afterward and stops on the
+first request or callback error. Successful earlier batches remain complete.
+`ChecksumBatchOptions` can tighten the target and set a per-request timeout;
+zero values use the advertised target and parent-context deadline. Each call
+captures one limit snapshot, which stays attached to its encoded request bodies.
+A single SEND may request hundreds of MiB of file contents while its request body
+occupies only a few hundred bytes.
+
+SYNC remains one operation: the server indexes its prior manifest before walking
+the tree. Its separately advertised limit lets clients reject oversized input
+before transmitting it.
+
+CLI checksum verification also retains its local 3 MiB soft latency target and
+1024-sample batch cap; advertised request limits may tighten these. Fresh
+verification clients use a discovery-only PROBE to learn the limits.
+
+Oversized request bodies produce `ERR BAD_REQUEST <reason>` and close the
+connection. Clients check advertised limits before sending to avoid encountering
+this while still writing a request.
 
 **A frame header's declared sizes are bounded before they are used.** `wsize`
-and `size` are attacker-controlled and each sizes an allocation, so both are
+and `size` are attacker-controlled and bound buffer growth, so both are
 checked against the per-frame caps above before the payload is read and before
 it is decompressed — never by decoding first and comparing afterwards. The
 per-frame bounds are unconditional: a reader that asks for no cumulative cap
@@ -110,8 +140,9 @@ rejecting its own frames.
 
 **A permitted declaration is not a licence to allocate it.** Readers size their
 buffers from the bytes that actually arrive, growing through a pooled size
-ladder, so a four-byte payload naming the largest permitted size costs four
-bytes. Bounding the declaration alone would leave a peer free to drive the
+ladder, so a short payload naming the largest permitted size does not allocate
+that entire size. Decoder history has its own frame-aligned cap. Bounding the
+declaration alone would leave a peer free to drive the
 allocator without ever exceeding a limit.
 
 ## Connection Flow
@@ -471,8 +502,10 @@ fd=<fid> <path> ...\n
 - required per line: `fd`, `path`, `ack-token`.
 - telemetry fields default to `0` when omitted.
 - unknown `key=value` fields are ignored.
-- an ACK batch is applied atomically: every item is validated before any is
-  applied, so a bad token cannot leave a transfer half-acked.
+- every item and the complete body framing are validated before any ACK is
+  applied. A truncated body or invalid later token applies no ACKs. Separate
+  successful ACK requests remain applied if a subsequent request fails; this
+  is not a transaction across requests or concurrent store changes.
 - `delta-bytes`, `recv-ms`, and `sync-ms` report the receiver's newly written
   bytes, download time, and fsync time. The server validates them but does not
   currently act on them. They are retained because they are the natural input
@@ -594,10 +627,18 @@ server's observed link estimate for gentle limiting.
 ### Response
 
 - first line:
-  - `PROBE cpu=<server-cpu> io-depth=<int> cts0=<echo-client-cts0> sts0=<unix-ms> sts1=<unix-ms> probe-bytes=<n> wmem=<bytes> gentle-cpu-pct=<int> gentle-bw-pct=<int> limiter-bps=<bytes/sec> [keep-alive-ms=<int>]`
+  - `PROBE cpu=<server-cpu> io-depth=<int> cts0=<echo-client-cts0> sts0=<unix-ms> sts1=<unix-ms> probe-bytes=<n> wmem=<bytes> gentle-cpu-pct=<int> gentle-bw-pct=<int> limiter-bps=<bytes/sec> target-request-bytes=<bytes> max-request-bytes=<bytes> max-sync-request-bytes=<bytes> [keep-alive-ms=<int>]`
 - `io-depth`, `wmem`, and `limiter-bps` are always present; `limiter-bps` is `0`
   when no per-transfer limiter applies. `keep-alive-ms` is the only conditional
   field.
+- `target-request-bytes` and `max-request-bytes` advertise the soft target and
+  hard maximum for decoded SEND/ACK/CXSUM metadata bodies: 8 MiB and 64 MiB.
+  `max-sync-request-bytes` advertises the configured prior-manifest limit.
+- Clients without these fields, or without a prior probe, use 8 MiB, 64 MiB,
+  and 1 GiB respectively. Present values must be positive integers. Clients
+  cap the effective request maximum at their own 64 MiB ceiling and clamp
+  the target to that maximum. Each request uses a snapshot of these limits.
+- File-content work-size overrides do not override request acceptance limits.
 - then exactly `probe-bytes` raw bytes.
 - terminal status line: `OK` or `ERR ...`.
 - `gentle-cpu-pct` is the server-advertised CPU budget clients use when computing
