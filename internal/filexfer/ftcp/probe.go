@@ -80,7 +80,7 @@ func parsePROBERequest(req Request) (probeRequest, error) {
 	}, nil
 }
 
-func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.Writer, deps Deps, ioDepth int, gentleCPUPct int, gentleBWPct int, gentleBurstBytes int64, keepAliveMS int64) error {
+func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.Writer, deps Deps, ioDepth int, gentleCPUPct int, gentleBWPct int, gentleBurstBytes int64, keepAliveMS int64, maxSyncBodyBytes int64) error {
 	parsed, err := parsePROBERequest(req)
 	if err != nil {
 		return err
@@ -90,6 +90,9 @@ func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.W
 	}
 	if ioDepth <= 0 {
 		ioDepth = 8
+	}
+	if maxSyncBodyBytes <= 0 {
+		maxSyncBodyBytes = defaultMaxSyncBodyBytes
 	}
 	gentleCPUPct = limit.NormalizeGentleCPUPct(gentleCPUPct)
 	gentleBWPct = limit.NormalizeGentleBWPct(gentleBWPct)
@@ -116,8 +119,12 @@ func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.W
 	if deps != nil && parsed.TransferID != "" {
 		limiterBps = deps.GetTransferLimiterBps(parsed.TransferID)
 	}
+	// Advertise the request-body budgets so a client can size its batches to
+	// what this server will accept. These bound decoded metadata bytes and are
+	// unrelated to the window/batch settings that size file-content work.
 	respLine := fmt.Sprintf(
-		"PROBE cpu=%d io-depth=%d cts0=%d sts0=%d sts1=%d probe-bytes=%d wmem=%d gentle-cpu-pct=%d gentle-bw-pct=%d limiter-bps=%d",
+		"PROBE cpu=%d io-depth=%d cts0=%d sts0=%d sts1=%d probe-bytes=%d wmem=%d gentle-cpu-pct=%d gentle-bw-pct=%d limiter-bps=%d"+
+			" target-request-bytes=%d max-request-bytes=%d max-sync-request-bytes=%d",
 		runtime.NumCPU(),
 		ioDepth,
 		parsed.ClientTS0,
@@ -128,6 +135,9 @@ func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.W
 		gentleCPUPct,
 		gentleBWPct,
 		limiterBps,
+		encoding.DefaultTargetRequestBytes,
+		encoding.MaxRequestBytes,
+		maxSyncBodyBytes,
 	)
 	if parsed.KeepAlive && keepAliveMS > 0 {
 		respLine += " keep-alive-ms=" + strconv.FormatInt(keepAliveMS, 10)

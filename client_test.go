@@ -329,6 +329,53 @@ func TestNewClientLoadStrategyOption(t *testing.T) {
 	}
 }
 
+func TestProbeCancellation(t *testing.T) {
+	for _, encrypt := range []string{"none", "auto"} {
+		t.Run(encrypt, func(t *testing.T) {
+			clientConn, peer := net.Pipe()
+			defer clientConn.Close()
+			defer peer.Close()
+			client := NewClient("unused", WithEncryptMode(encrypt), WithContextDialer(func(context.Context, string) (net.Conn, error) {
+				return clientConn, nil
+			}))
+			defer client.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ready := make(chan error, 1)
+			go func() {
+				br := bufio.NewReader(peer)
+				_, err := br.ReadString('\n')
+				if err == nil && encrypt == "none" {
+					_, err = io.CopyN(io.Discard, br, 1)
+				}
+				ready <- err // Withhold the PROBE or AUTH key response.
+			}()
+			done := make(chan error, 1)
+			go func() {
+				_, err := client.ProbeLink(ctx, ProbeRequest{ProbeBytes: 1})
+				done <- err
+			}()
+			select {
+			case err := <-ready:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("probe did not reach peer")
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("canceled probe succeeded")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("probe ignored cancellation")
+			}
+		})
+	}
+}
+
 func TestProbeDiscoveryResponseAndConcurrency(t *testing.T) {
 	discovery := probeResponse{
 		ServerCPU: 24, ServerIODepth: 8, GentleCPUPct: 25, GentleBWPct: 40,
@@ -1447,151 +1494,176 @@ func TestGetFilesSplitWindowWorkersCapsConcurrency(t *testing.T) {
 }
 
 func TestGetFilesUsesMultiACK(t *testing.T) {
-	outRoot := t.TempDir()
-	manifest := &Manifest{
-		TransferID: "txbatchack",
-		Root:       "/remote",
-		Entries: []ManifestEntry{
-			{ID: 0, Size: 5, Path: "a.txt"},
-			{ID: 1, Size: 6, Path: "b.txt"},
-		},
-	}
-	dataA := []byte("hello")
-	dataB := []byte("world!")
+	for _, split := range []bool{false, true} {
+		t.Run(fmt.Sprint(split), func(t *testing.T) {
+			outRoot := t.TempDir()
+			manifest := &Manifest{
+				TransferID: "txbatchack",
+				Root:       "/remote",
+				Entries: []ManifestEntry{
+					{ID: 0, Size: 5, Path: "a.txt"},
+					{ID: 1, Size: 6, Path: "b.txt"},
+				},
+			}
+			dataA := []byte("hello")
+			dataB := []byte("world!")
 
-	var ackRequests int
-	var ackBlocks []map[string]string
-	progressUpdates := make(chan DownloadProgressUpdate, 64)
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		switch req.Verb {
-		case intftcp.VerbSEND:
-			if len(req.Params) < 2 {
-				return fmt.Errorf("expected txfer header + at least 1 SEND item, got %d params", len(req.Params))
-			}
-			if got := req.Params[0]["txferid"]; got != manifest.TransferID {
-				return fmt.Errorf("unexpected transfer id: %q", got)
-			}
-			for _, item := range req.Params[1:] {
-				switch item["path"] {
-				case "/remote/a.txt":
-					if _, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, dataA, nil)); err != nil {
-						return err
+			var ackRequests, sendRequests int
+			var ackBlocks []map[string]string
+			progressUpdates := make(chan DownloadProgressUpdate, 64)
+			srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+				switch req.Verb {
+				case intftcp.VerbPROBE:
+					_, err := io.WriteString(out, "PROBE cpu=1 io-depth=1 cts0=0 sts0=0 sts1=0 probe-bytes=1 target-request-bytes=1 max-request-bytes=256 max-sync-request-bytes=2048\r\nxOK\r\n")
+					return err
+				case intftcp.VerbSEND:
+					sendRequests++
+					if len(req.Params) < 2 {
+						return fmt.Errorf("expected txfer header + at least 1 SEND item, got %d params", len(req.Params))
 					}
-				case "/remote/b.txt":
-					if _, err := io.WriteString(out, buildFXFrame(t, 1, "none", 0, dataB, nil)); err != nil {
-						return err
+					if got := req.Params[0]["txferid"]; got != manifest.TransferID {
+						return fmt.Errorf("unexpected transfer id: %q", got)
+					}
+					for _, item := range req.Params[1:] {
+						switch item["path"] {
+						case "/remote/a.txt":
+							if _, err := io.WriteString(out, buildFXFrame(t, 0, "none", 0, dataA, nil)); err != nil {
+								return err
+							}
+						case "/remote/b.txt":
+							if _, err := io.WriteString(out, buildFXFrame(t, 1, "none", 0, dataB, nil)); err != nil {
+								return err
+							}
+						default:
+							return fmt.Errorf("unexpected path in SEND: %q", item["path"])
+						}
+					}
+					_, err := io.WriteString(out, "OK\r\n")
+					return err
+				case intftcp.VerbACK:
+					ackRequests++
+					for _, p := range req.Params {
+						item := map[string]string{}
+						for k, v := range p {
+							item[k] = v
+						}
+						ackBlocks = append(ackBlocks, item)
+					}
+					_, err := io.WriteString(out, "OK\r\n")
+					return err
+				default:
+					return fmt.Errorf("unexpected verb: %v", req.Verb)
+				}
+			})
+			defer srv.Close()
+
+			client := NewClient(srv.URL)
+			defer client.Close()
+			if split {
+				probe, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if probe.TargetRequestBytes != 1 || probe.MaxRequestBytes != 256 || probe.MaxSyncRequestBytes != 2048 {
+					t.Fatalf("probe limits: %+v", probe)
+				}
+			}
+
+			resp, err := client.GetFiles(context.Background(), GetFilesRequest{
+				Manifest:           manifest,
+				FileIDs:            []uint64{0, 1},
+				SplitWindowWorkers: 1,
+				BatchMaxBytes:      512 << 20,
+				OutputWriter: func(entry ManifestEntry, _ int64) (io.WriteCloser, func() error, error) {
+					destPath := filepath.Join(outRoot, filepath.FromSlash(entry.Path))
+					if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+						return nil, nil, err
+					}
+					fd, err := os.Create(destPath)
+					if err != nil {
+						return nil, nil, err
+					}
+					return fd, func() error { return nil }, nil
+				},
+				ProgressUpdates: progressUpdates,
+			})
+			if err != nil {
+				t.Fatalf("GetFiles failed: %v", err)
+			}
+			if len(resp.Files) != 2 {
+				t.Fatalf("expected two downloaded files, got %d", len(resp.Files))
+			}
+			wantRequests := 1
+			if split {
+				wantRequests = 2
+			}
+			if ackRequests != wantRequests || sendRequests != wantRequests {
+				t.Fatalf("SEND=%d ACK=%d want each=%d", sendRequests, ackRequests, wantRequests)
+			}
+			if len(ackBlocks) != 2 {
+				t.Fatalf("expected two ACK blocks, got %d", len(ackBlocks))
+			}
+
+			acksByFID := map[string]map[string]string{}
+			for _, block := range ackBlocks {
+				acksByFID[block["fid"]] = block
+			}
+			ack0, ok := acksByFID["0"]
+			if !ok {
+				t.Fatalf("missing ACK block for fid=0")
+			}
+			ack1, ok := acksByFID["1"]
+			if !ok {
+				t.Fatalf("missing ACK block for fid=1")
+			}
+			expectedAck0 := "5@1001@xxh128:" + xxh128HexTest(dataA)
+			expectedAck1 := "6@1001@xxh128:" + xxh128HexTest(dataB)
+			if got := ack0["ack-token"]; got != expectedAck0 {
+				t.Fatalf("unexpected fid=0 ack-token: %q", got)
+			}
+			if got := ack1["ack-token"]; got != expectedAck1 {
+				t.Fatalf("unexpected fid=1 ack-token: %q", got)
+			}
+			if got := ack0["delta-bytes"]; got != "5" {
+				t.Fatalf("unexpected fid=0 delta-bytes: %q", got)
+			}
+			if got := ack1["delta-bytes"]; got != "6" {
+				t.Fatalf("unexpected fid=1 delta-bytes: %q", got)
+			}
+
+			gotA, err := os.ReadFile(filepath.Join(outRoot, "a.txt"))
+			if err != nil {
+				t.Fatalf("read output a.txt: %v", err)
+			}
+			gotB, err := os.ReadFile(filepath.Join(outRoot, "b.txt"))
+			if err != nil {
+				t.Fatalf("read output b.txt: %v", err)
+			}
+			if !bytes.Equal(gotA, dataA) {
+				t.Fatalf("unexpected output for a.txt: %q", gotA)
+			}
+			if !bytes.Equal(gotB, dataB) {
+				t.Fatalf("unexpected output for b.txt: %q", gotB)
+			}
+			finalProgress := make(map[uint64]int64)
+			for {
+				select {
+				case update := <-progressUpdates:
+					if update.CopiedBytes > 0 {
+						finalProgress[update.FileID] = update.CopiedBytes
 					}
 				default:
-					return fmt.Errorf("unexpected path in SEND: %q", item["path"])
+					goto doneBatchProgress
 				}
 			}
-			_, err := io.WriteString(out, "OK\r\n")
-			return err
-		case intftcp.VerbACK:
-			ackRequests++
-			for _, p := range req.Params {
-				item := map[string]string{}
-				for k, v := range p {
-					item[k] = v
-				}
-				ackBlocks = append(ackBlocks, item)
+		doneBatchProgress:
+			if got := finalProgress[0]; got != int64(len(dataA)) {
+				t.Fatalf("unexpected final progress for fid=0: %d", got)
 			}
-			_, err := io.WriteString(out, "OK\r\n")
-			return err
-		default:
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-	})
-	defer srv.Close()
-
-	client := NewClient(srv.URL)
-	resp, err := client.GetFiles(context.Background(), GetFilesRequest{
-		Manifest: manifest,
-		FileIDs:  []uint64{0, 1},
-		OutputWriter: func(entry ManifestEntry, _ int64) (io.WriteCloser, func() error, error) {
-			destPath := filepath.Join(outRoot, filepath.FromSlash(entry.Path))
-			if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
-				return nil, nil, err
+			if got := finalProgress[1]; got != int64(len(dataB)) {
+				t.Fatalf("unexpected final progress for fid=1: %d", got)
 			}
-			fd, err := os.Create(destPath)
-			if err != nil {
-				return nil, nil, err
-			}
-			return fd, func() error { return nil }, nil
-		},
-		ProgressUpdates: progressUpdates,
-	})
-	if err != nil {
-		t.Fatalf("GetFiles failed: %v", err)
-	}
-	if len(resp.Files) != 2 {
-		t.Fatalf("expected two downloaded files, got %d", len(resp.Files))
-	}
-	if ackRequests != 1 {
-		t.Fatalf("expected one ACK request, got %d", ackRequests)
-	}
-	if len(ackBlocks) != 2 {
-		t.Fatalf("expected two ACK blocks, got %d", len(ackBlocks))
-	}
-
-	acksByFID := map[string]map[string]string{}
-	for _, block := range ackBlocks {
-		acksByFID[block["fid"]] = block
-	}
-	ack0, ok := acksByFID["0"]
-	if !ok {
-		t.Fatalf("missing ACK block for fid=0")
-	}
-	ack1, ok := acksByFID["1"]
-	if !ok {
-		t.Fatalf("missing ACK block for fid=1")
-	}
-	expectedAck0 := "5@1001@xxh128:" + xxh128HexTest(dataA)
-	expectedAck1 := "6@1001@xxh128:" + xxh128HexTest(dataB)
-	if got := ack0["ack-token"]; got != expectedAck0 {
-		t.Fatalf("unexpected fid=0 ack-token: %q", got)
-	}
-	if got := ack1["ack-token"]; got != expectedAck1 {
-		t.Fatalf("unexpected fid=1 ack-token: %q", got)
-	}
-	if got := ack0["delta-bytes"]; got != "5" {
-		t.Fatalf("unexpected fid=0 delta-bytes: %q", got)
-	}
-	if got := ack1["delta-bytes"]; got != "6" {
-		t.Fatalf("unexpected fid=1 delta-bytes: %q", got)
-	}
-
-	gotA, err := os.ReadFile(filepath.Join(outRoot, "a.txt"))
-	if err != nil {
-		t.Fatalf("read output a.txt: %v", err)
-	}
-	gotB, err := os.ReadFile(filepath.Join(outRoot, "b.txt"))
-	if err != nil {
-		t.Fatalf("read output b.txt: %v", err)
-	}
-	if !bytes.Equal(gotA, dataA) {
-		t.Fatalf("unexpected output for a.txt: %q", gotA)
-	}
-	if !bytes.Equal(gotB, dataB) {
-		t.Fatalf("unexpected output for b.txt: %q", gotB)
-	}
-	finalProgress := make(map[uint64]int64)
-	for {
-		select {
-		case update := <-progressUpdates:
-			if update.CopiedBytes > 0 {
-				finalProgress[update.FileID] = update.CopiedBytes
-			}
-		default:
-			goto doneBatchProgress
-		}
-	}
-doneBatchProgress:
-	if got := finalProgress[0]; got != int64(len(dataA)) {
-		t.Fatalf("unexpected final progress for fid=0: %d", got)
-	}
-	if got := finalProgress[1]; got != int64(len(dataB)) {
-		t.Fatalf("unexpected final progress for fid=1: %d", got)
+		})
 	}
 }
 

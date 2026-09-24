@@ -534,7 +534,7 @@ func (s *connSession) handleCommand(ctx context.Context, req Request, in io.Read
 		if s.keepAlive {
 			keepAliveMS = s.keepAliveTimeout.Milliseconds()
 		}
-		return handlePROBEWithInput(ctx, req, in, out, s.deps, s.targetIODepth, s.gentleCPUPct, s.gentleBWPct, gentleLimiterBurstBytes(s.limiter), keepAliveMS)
+		return handlePROBEWithInput(ctx, req, in, out, s.deps, s.targetIODepth, s.gentleCPUPct, s.gentleBWPct, gentleLimiterBurstBytes(s.limiter), keepAliveMS, s.maxSyncBodyBytes)
 	}
 	if req.Verb == VerbSYNC {
 		if s.syncTimeout > 0 {

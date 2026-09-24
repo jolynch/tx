@@ -123,14 +123,20 @@ PROBE -> TXFER (FM/1 manifest) -> SEND (FX/1 frames) -> ACK -> STATUS
   bodies; `TXFER`/`SYNC` and the `STATUS` list use framed response bodies. A
   request body is always read in full before any response byte is written,
   which is what keeps the exchange from deadlocking against itself.
-- Size limits are set where no legitimate request reaches them (64 KiB command
-  line, 8 KiB item line, 1M items per body) and are checked before the bytes
-  they describe are allocated. A frame header's `size`/`wsize` are peer-supplied
-  and each sizes an allocation, so per-frame caps are **unconditional** — a
-  reader that sets no cumulative cap still gets them — and cumulative checks
-  subtract rather than add so a near-`int64` declaration cannot overflow into
-  appearing under the cap. The [protocol reference](docs/ftcp/OVERVIEW.md) lists
-  each limit with its justification.
+- PROBE advertises `target-request-bytes` (8 MiB), `max-request-bytes`
+  (64 MiB), and `max-sync-request-bytes` (configured; 1 GiB default). These
+  limit decoded request metadata, independently of file-content window/batch
+  work budgets and ordinary 4 MiB transport frames. Clients use those defaults
+  without a probe and split SEND/ACK and CLI checksum batches accordingly.
+- SEND/ACK/CXSUM verify a bounded decoded body, then parse and validate once
+  into compact ordered records. The body is released before records are applied;
+  temporary per-item maps are not retained. Record storage is additional to the
+  payload budget, with no independent item-count cap. ACK validation precedes
+  application within each request; separate requests are not atomic.
+- Per-frame wire and logical caps are unconditional, cumulative checks avoid
+  integer overflow, and zstd decoder window/memory limits bound internal
+  allocations. Premature frame EOF is an error, never successful completion.
+  Payload limits exclude additional frame and decoder working buffers.
 - Paths/blobs are quoted or length-prefixed (`<len>:<bytes>`), and may not
   contain `\n` or `\r` — readers split on `\n` before consulting the length
   prefix, so encoders reject line breaks rather than emit an ambiguous stream.
@@ -158,7 +164,7 @@ one when `ServerOptions.Deps` is nil, exactly as it does the restore pool.
 - `SEND` reads its item list from the framed request body, validates files
   through `Deps`, streams adaptively compressed FX/1 windows (sendfile when
   possible), and records window hashes for ACK checks. `ACK` and `CXSUM` read
-  the same body shape via `ReadRequestItems`.
+  the same bounded body shape through the shared iterator.
 - `STATUS <tid>` returns one JSON status; bare `STATUS` returns a framed body of
   one JSON object per line. Completed transfers remain listed until TTL expiry.
 - FM/1 front-codes paths/mtimes. FX/1 frames carry file ID, codec, offsets,
@@ -185,6 +191,11 @@ have no production caller and exist for the store's own tests or benchmarks.
 | `GetChecksum`, `ProbeLink`, `SyncManifest` | `CXSUM`, `PROBE`, `SYNC`             |
 | `StartFromManifest`                        | batched `SEND` + `ACK` orchestration |
 | `Close`, `MetricSnapshot`                  | pool release, metrics snapshot       |
+
+`VisitChecksumBatches` builds one bounded request at a time and owns each
+response reader until its synchronous consumer returns. Direct `GetChecksum`
+remains a single request. Encoded request bodies carry their captured maximum;
+SEND checks that budget before acquiring a connection.
 
 Client age keys apply automatically. `WithClientAuthTokens` sends bearer
 tokens inside AUTH; `WithContextDialer` supplies custom connections. The TCP
@@ -218,4 +229,7 @@ JSON.
 - CLI end-to-end tests run `RunCLI` against a minimal in-process
   `net.Listener` FTCP server; extend that pattern for complete flows.
 - Benchmarks cover AEAD, codec pools, manifest prefix encoding, and store
-  operations under `internal/bench`.
+  operations under `internal/bench`. Benchmarks that must reach unexported
+  functions — request splitting and body parsing — live in their own package
+  instead, and every package carrying benchmarks is listed in the Makefile's
+  `bench` target, which is the single registry.

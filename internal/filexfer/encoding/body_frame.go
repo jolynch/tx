@@ -18,6 +18,14 @@ import (
 const DefaultBodyChunkSize int64 = 4 * 1024 * 1024
 const DefaultBodyFlushInterval = 2 * time.Second
 
+// Request budgets count decoded metadata, independently of file-data work windows
+// and transport framing. Frame and decoder buffers are additional allocations.
+const (
+	DefaultTargetRequestBytes  int64 = 8 * 1024 * 1024
+	MaxRequestBytes            int64 = 64 * 1024 * 1024
+	DefaultMaxSyncRequestBytes int64 = 1 << 30
+)
+
 const FramedBodyFileID uint64 = 0
 
 // Frame limits follow the socket receive limit within 8–64 MiB. The 8 MiB
@@ -432,6 +440,9 @@ func readFrameLine(br *bufio.Reader) (string, error) {
 	if err != nil {
 		if errors.Is(err, utils.ErrLineTooLarge) {
 			return "", errors.New("manifest frame line too large")
+		}
+		if errors.Is(err, io.EOF) {
+			return "", io.ErrUnexpectedEOF
 		}
 		return "", err
 	}

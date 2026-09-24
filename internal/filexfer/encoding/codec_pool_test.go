@@ -2,9 +2,39 @@ package encoding
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
+
+func TestPooledZstdDecoderBoundsWindowAfterReset(t *testing.T) {
+	good, err := CompressZstd([]byte("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One raw byte with a 128 MiB history window, above every frame ceiling.
+	bad := []byte{0x28, 0xb5, 0x2f, 0xfd, 0, 0x88, 9, 0, 0, 'x'}
+	dec, err := acquirePooledZstdDecoder(bytes.NewReader(good))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releasePooledZstdDecoder(dec)
+	for _, wire := range [][]byte{good, bad, good} {
+		if err := dec.Reset(bytes.NewReader(wire)); err != nil {
+			t.Fatal(err)
+		}
+		out, err := io.ReadAll(dec)
+		if bytes.Equal(wire, bad) {
+			if !errors.Is(err, zstd.ErrWindowSizeExceeded) && !errors.Is(err, zstd.ErrDecoderSizeExceeded) {
+				t.Fatalf("oversized window: got %v", err)
+			}
+		} else if err != nil || string(out) != "x" {
+			t.Fatalf("normal frame: out=%q err=%v", out, err)
+		}
+	}
+}
 
 func TestWrapDecompressedReaderSequentialDecode(t *testing.T) {
 	payload := bytes.Repeat([]byte("tx-filexfer-pool-test-"), 4096)

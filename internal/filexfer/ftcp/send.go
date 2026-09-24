@@ -44,6 +44,36 @@ type sendItem struct {
 	Mode   string
 }
 
+// sendRequestRecord omits transfer-wide mode and stores the codec as one byte.
+type sendRequestRecord struct {
+	FileID uint64
+	Offset int64
+	Size   int64
+	Path   string
+	Codec  uint8
+}
+
+var sendRequestCodecs = [...]string{"adapt", "none", encoding.EncodingLz4, encoding.EncodingZstd}
+
+func parseSENDRecord(raw map[string]string) (sendRequestRecord, error) {
+	item, err := parseSENDItem(raw, "")
+	if err != nil {
+		return sendRequestRecord{}, err
+	}
+	var codec uint8
+	for i, name := range sendRequestCodecs {
+		if name == item.Comp {
+			codec = uint8(i)
+			break
+		}
+	}
+	return sendRequestRecord{FileID: item.FileID, Offset: item.Offset, Size: item.Size, Path: item.Path, Codec: codec}, nil
+}
+
+func (r sendRequestRecord) item(mode string) sendItem {
+	return sendItem{FileID: r.FileID, Offset: r.Offset, Size: r.Size, Path: r.Path, Comp: sendRequestCodecs[r.Codec], Mode: mode}
+}
+
 type sendHeader struct {
 	TransferID string
 	Mode       string
@@ -161,24 +191,17 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 	}
 	gentleBWPct = limit.NormalizeGentleBWPct(gentleBWPct)
 
-	rawItems, err := readItemBody(in, sendItemKeys, "SEND")
+	records, err := parseRequestItemRecords(in, sendItemKeys, "SEND", parseSENDRecord)
 	if err != nil {
 		return err
 	}
-	if len(rawItems) == 0 {
+	if len(records) == 0 {
 		return protocolErr{code: "BAD_REQUEST", message: "SEND requires at least one item"}
-	}
-	items := make([]sendItem, 0, len(rawItems))
-	for _, raw := range rawItems {
-		item, itemErr := parseSENDItem(raw, header.Mode)
-		if itemErr != nil {
-			return itemErr
-		}
-		items = append(items, item)
 	}
 
 	transfer, hasTransfer := deps.GetTransfer(header.TransferID)
-	for _, item := range items {
+	for _, record := range records {
+		item := record.item(header.Mode)
 		itemOut := out
 		if item.Mode == loadStrategyGentle {
 			if hasTransfer && transfer.DeadlineMS > 0 {

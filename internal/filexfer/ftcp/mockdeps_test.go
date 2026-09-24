@@ -225,3 +225,21 @@ func parseOneSENDItem(t *testing.T, cmd string, item string) (sendItem, error) {
 	}
 	return parseSENDItem(raw[0], header.Mode)
 }
+
+// readItemBody is a test shim over the production pair readRequestItemBody +
+// visitItemBody, kept so the item-grammar tests read as a single call.
+// Production handlers use the pair directly, which is the point: they retain
+// one bounded buffer rather than a map per item.
+func readItemBody(in io.Reader, allowed map[string]bool, verb string) ([]map[string]string, error) {
+	body, err := readRequestItemBody(in, verb)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Release()
+	var items []map[string]string
+	err = visitItemBody(body.Bytes(), allowed, verb, func(item map[string]string) error {
+		items = append(items, item)
+		return nil
+	})
+	return items, err
+}

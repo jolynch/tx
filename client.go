@@ -205,6 +205,44 @@ type Client struct {
 	// PROBE response). Zero until a probe observes support; pools created
 	// after that point warm keep-alive session connections.
 	keepAliveMS atomic.Int64
+
+	// requestLimits is replaced as one immutable value after a successful
+	// PROBE. Request formation takes one snapshot so a concurrent refresh can
+	// never split a batch using a mixture of old and new limits.
+	requestLimits atomic.Pointer[clientRequestLimits]
+}
+
+type clientRequestLimits struct {
+	target  int64
+	max     int64
+	maxSync int64
+}
+
+func defaultClientRequestLimits() clientRequestLimits {
+	return clientRequestLimits{
+		target:  intencoding.DefaultTargetRequestBytes,
+		max:     intencoding.MaxRequestBytes,
+		maxSync: intencoding.DefaultMaxSyncRequestBytes,
+	}
+}
+
+func (c *Client) currentRequestLimits() clientRequestLimits {
+	if c != nil {
+		if limits := c.requestLimits.Load(); limits != nil {
+			return *limits
+		}
+	}
+	return defaultClientRequestLimits()
+}
+
+func (c *Client) cacheRequestLimits(target, maxBytes, maxSync int64) clientRequestLimits {
+	maxBytes = min(maxBytes, intencoding.MaxRequestBytes)
+	target = min(target, maxBytes)
+	limits := clientRequestLimits{target: target, max: maxBytes, maxSync: maxSync}
+	if c != nil {
+		c.requestLimits.Store(&limits)
+	}
+	return limits
 }
 
 type Manifest struct {
@@ -445,6 +483,9 @@ type ProbeResponse struct {
 	ServerSendBufBytes     int64
 	SuggestedCipher        string // resolved cipher suggested for this connection (e.g. "aes", "chacha20", or "" if none)
 	ServerLimiterBps       int64  // server's current rate limiter in bytes/sec (0 = unlimited)
+	TargetRequestBytes     int64  // decoded metadata target for SEND, ACK, and CXSUM bodies
+	MaxRequestBytes        int64  // decoded metadata hard limit for SEND, ACK, and CXSUM bodies
+	MaxSyncRequestBytes    int64  // decoded old-manifest hard limit for SYNC bodies
 }
 
 type GetManifestResponse struct {
@@ -911,34 +952,53 @@ func (c *Client) GetEntryMetadata(ctx context.Context, transferID string, pathsB
 			Comp:     "none",
 		})
 	}
-	stream, err := c.fetchFileBatchTCP(ctx, transferID, requestTargets)
+	results := make(map[uint64]*FileTrailerMetadata, len(ids))
+	err := visitEncodedRequests(requestTargets, c.currentRequestLimits(), fetchTargetItemBytes, func(chunk requestChunk) error {
+		return c.collectEntryMetadataGroup(ctx, transferID, requestTargets[chunk.lo:chunk.hi], chunk.encodedRequest, results)
+	})
 	if err != nil {
 		return nil, err
+	}
+	return results, nil
+}
+
+// collectEntryMetadataGroup issues one metadata SEND and reads its whole
+// response, so the connection is never left mid-stream between groups.
+func (c *Client) collectEntryMetadataGroup(
+	ctx context.Context,
+	transferID string,
+	targets []FetchFileTarget,
+	body encodedRequest,
+	results map[uint64]*FileTrailerMetadata,
+) error {
+	stream, err := c.fetchFileBatchBodyTCP(ctx, transferID, body)
+	if err != nil {
+		return err
 	}
 	defer stream.Close()
 	br := c.acquireLineReader(stream)
 	defer c.releaseLineReader(br)
 
-	results := make(map[uint64]*FileTrailerMetadata, len(ids))
-	for i, fileID := range ids {
-		meta, err := readEntryMetadataFrame(br, fileID)
+	for i, target := range targets {
+		meta, err := readEntryMetadataFrame(br, target.FileID)
 		if err != nil {
-			return nil, fmt.Errorf("entry metadata target %d id=%d: %w", i, fileID, err)
+			return fmt.Errorf("entry metadata target %d id=%d: %w", i, target.FileID, err)
 		}
-		results[fileID] = meta
+		results[target.FileID] = meta
 	}
 	statusLine, err := readTCPLine(br, maxTCPLineBytes)
 	if err != nil {
-		return nil, fmt.Errorf("read metadata terminal status: %w", err)
+		return fmt.Errorf("read metadata terminal status: %w", err)
 	}
 	if err := parseErrControlFrame(statusLine); err != nil {
-		return nil, err
+		return err
 	}
 	if _, ok := parseOKStatusLine(statusLine); !ok {
-		return nil, fmt.Errorf("unexpected metadata terminal status: %s", strings.TrimSpace(statusLine))
+		return fmt.Errorf("unexpected metadata terminal status: %s", strings.TrimSpace(statusLine))
 	}
 	markStreamReusable(stream)
-	return results, nil
+	return nil
+
 }
 
 func readEntryMetadataFrame(br *bufio.Reader, fileID uint64) (*FileTrailerMetadata, error) {
@@ -994,22 +1054,8 @@ func (c *Client) GetChecksum(ctx context.Context, request GetChecksumRequest) (G
 	if c == nil {
 		return GetChecksumResponse{}, errors.New("nil client")
 	}
-	if request.TransferID == "" {
-		return GetChecksumResponse{}, errors.New("missing transfer id")
-	}
-	if len(request.Targets) == 0 {
-		return GetChecksumResponse{}, errors.New("missing checksum targets")
-	}
-	for _, target := range request.Targets {
-		if target.FullPath == "" {
-			return GetChecksumResponse{}, errors.New("missing full path")
-		}
-		if target.Offset < 0 {
-			return GetChecksumResponse{}, errors.New("invalid checksum offset")
-		}
-		if target.Size < 0 {
-			return GetChecksumResponse{}, errors.New("invalid checksum size")
-		}
+	if err := validateChecksumRequest(request); err != nil {
+		return GetChecksumResponse{}, err
 	}
 
 	reader, err := c.getChecksumTCP(ctx, request)
@@ -1157,7 +1203,39 @@ func (c *Client) downloadManifestGroupSequential(
 	targets []FetchFileTarget,
 	emitProgressUpdate func(DownloadProgressUpdate),
 ) ([]DownloadFileResponse, []AcknowledgeFileProgressRequest, []seqAckProgress, error) {
-	stream, err := c.fetchFileBatchTCP(ctx, req.Manifest.TransferID, targets)
+	var (
+		allFiles    []DownloadFileResponse
+		allAcks     []AcknowledgeFileProgressRequest
+		allProgress []seqAckProgress
+	)
+	err := visitEncodedRequests(targets, c.currentRequestLimits(), fetchTargetItemBytes, func(chunk requestChunk) error {
+		files, acks, progresses, err := c.downloadManifestSubBatchSequential(
+			ctx, req, plans[chunk.lo:chunk.hi], chunk.encodedRequest, emitProgressUpdate)
+		if err != nil {
+			return err
+		}
+		allFiles = append(allFiles, files...)
+		allAcks = append(allAcks, acks...)
+		allProgress = append(allProgress, progresses...)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return allFiles, allAcks, allProgress, nil
+}
+
+// downloadManifestSubBatchSequential runs one SEND request and consumes its
+// whole response before returning, so the connection is never left mid-stream
+// between sub-batches.
+func (c *Client) downloadManifestSubBatchSequential(
+	ctx context.Context,
+	req GetFilesRequest,
+	plans []downloadBatchPlan,
+	body encodedRequest,
+	emitProgressUpdate func(DownloadProgressUpdate),
+) ([]DownloadFileResponse, []AcknowledgeFileProgressRequest, []seqAckProgress, error) {
+	stream, err := c.fetchFileBatchBodyTCP(ctx, req.Manifest.TransferID, body)
 	if err != nil {
 		var missingErr *fileMissingError
 		if len(plans) == 1 && errors.Is(err, ErrFileMissing) && errors.As(err, &missingErr) && shouldAcknowledgeMissing404(missingErr.Body) {
@@ -2243,6 +2321,7 @@ func (c *Client) ProbeLink(ctx context.Context, req ProbeRequest) (ProbeResponse
 	// Mini-probe caller: discovery only.
 	if probeBytes <= 1 {
 		response.ParallelConns = 1
+		c.cacheRequestLimits(response.TargetRequestBytes, response.MaxRequestBytes, response.MaxSyncRequestBytes)
 		return response, nil
 	}
 
@@ -2278,6 +2357,7 @@ func (c *Client) ProbeLink(ctx context.Context, req ProbeRequest) (ProbeResponse
 	if phaseB.limiterBps > 0 {
 		response.ServerLimiterBps = phaseB.limiterBps
 	}
+	c.cacheRequestLimits(response.TargetRequestBytes, response.MaxRequestBytes, response.MaxSyncRequestBytes)
 	return response, nil
 }
 
@@ -2291,13 +2371,16 @@ type probeThroughput struct {
 func probeDiscoveryResponse(result probeResponse) ProbeResponse {
 	intervalMS := max(int64(1), (result.CTS1-result.CTS0)-(result.STS1-result.STS0))
 	return ProbeResponse{
-		ServerCPU:          result.ServerCPU,
-		ServerIODepth:      result.ServerIODepth,
-		GentleCPUPct:       result.GentleCPUPct,
-		GentleBWPct:        result.GentleBWPct,
-		AvgLatencyMS:       intervalMS,
-		ServerSendBufBytes: result.ServerWmemBytes,
-		ServerLimiterBps:   result.LimiterBps,
+		ServerCPU:           result.ServerCPU,
+		ServerIODepth:       result.ServerIODepth,
+		GentleCPUPct:        result.GentleCPUPct,
+		GentleBWPct:         result.GentleBWPct,
+		AvgLatencyMS:        intervalMS,
+		ServerSendBufBytes:  result.ServerWmemBytes,
+		ServerLimiterBps:    result.LimiterBps,
+		TargetRequestBytes:  result.TargetRequestBytes,
+		MaxRequestBytes:     result.MaxRequestBytes,
+		MaxSyncRequestBytes: result.MaxSyncRequestBytes,
 	}
 }
 

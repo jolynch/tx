@@ -30,13 +30,6 @@ type ackItem struct {
 	SyncMS     int64
 }
 
-type validatedAckItem struct {
-	item         ackItem
-	ackBytes     int64
-	ackTS        int64
-	ackHashToken string
-}
-
 // parseACKItem turns one framed body item into an ackItem.
 func parseACKItem(p map[string]string, txferID string) (ackItem, error) {
 	fid, err := strconv.ParseUint(p["fid"], 10, 64)
@@ -84,83 +77,75 @@ func handleACK(ctx context.Context, req Request, out io.Writer, deps Deps) error
 	return protocolErr{code: "INTERNAL", message: "ACK requires a request body, use handleACKWithInput"}
 }
 
-// handleACKWithInput applies a batch of acks atomically: every item is validated
-// before any is applied, so a bad token in the middle of a batch cannot leave
-// the transfer half-acked.
+type ackRequestRecord struct {
+	FileID   uint64
+	AckBytes int64
+}
+
+// Validate every acknowledgment before applying any. This does not lock the
+// store against concurrent requests or make multiple requests transactional.
 func handleACKWithInput(ctx context.Context, req Request, in io.Reader, out io.Writer, deps Deps) error {
 	txferID, err := ackTransferID(req)
 	if err != nil {
 		return err
 	}
-
-	rawItems, err := readItemBody(in, ackItemKeys, "ACK")
+	records, err := parseRequestItemRecords(in, ackItemKeys, "ACK", func(raw map[string]string) (ackRequestRecord, error) {
+		item, err := parseACKItem(raw, txferID)
+		if err != nil {
+			return ackRequestRecord{}, err
+		}
+		ackBytes, err := validateACKItem(item, deps)
+		return ackRequestRecord{FileID: item.FileID, AckBytes: ackBytes}, err
+	})
 	if err != nil {
 		return err
 	}
-	if len(rawItems) == 0 {
+	if len(records) == 0 {
 		return protocolErr{code: "BAD_REQUEST", message: "ACK requires at least one item"}
 	}
-	items := make([]ackItem, 0, len(rawItems))
-	for _, raw := range rawItems {
-		item, itemErr := parseACKItem(raw, txferID)
-		if itemErr != nil {
-			return itemErr
-		}
-		items = append(items, item)
-	}
-
-	validated := make([]validatedAckItem, 0, len(items))
-	for _, item := range items {
-		ackBytes, ackTS, ackHashToken, ackProvided, err := parseAckToken(item.AckToken)
-		if err != nil || !ackProvided {
-			return protocolErr{code: "BAD_REQUEST", message: "invalid ack token"}
-		}
-		if ackBytes == -1 {
-			item.DeltaBytes, item.RecvMS, item.SyncMS = 0, 0, 0
-		}
-
-		fileRef, err := deps.GetFileRef(item.TransferID, item.FileID, item.Path)
-		if err != nil {
-			return mapLookupError(err)
-		}
-
-		maxAck := fileRef.FileSize
-		ackTarget := ackBytes
-		if ackTarget > maxAck {
-			ackTarget = maxAck
-		}
-		if ackTarget < 0 {
-			ackTarget = 0
-		}
-		if ackBytes >= 0 {
-			if ackHashToken == "" {
-				return protocolErr{code: "BAD_REQUEST", message: "missing window ack hash token"}
+	for _, record := range records {
+		_, task := trace.NewTask(ctx, "ack")
+		ok := deps.AcknowledgeTransferFile(txferID, record.FileID, record.AckBytes)
+		if ok {
+			if record.AckBytes >= 0 {
+				deps.MaybeLogTransferProgress(txferID)
 			}
-			if !deps.VerifyTransferFileWindowHash(item.TransferID, item.FileID, ackTarget, ackHashToken) {
-				return protocolErr{code: "CONFLICT", message: "window ack hash token mismatch"}
-			}
+			deps.MaybeLogTransferComplete(txferID)
 		}
-		validated = append(validated, validatedAckItem{
-			item:         item,
-			ackBytes:     ackBytes,
-			ackTS:        ackTS,
-			ackHashToken: ackHashToken,
-		})
-	}
-
-	for _, v := range validated {
-		_, ackTask := trace.NewTask(ctx, "ack")
-		if ok := deps.AcknowledgeTransferFile(v.item.TransferID, v.item.FileID, v.ackBytes); !ok {
-			ackTask.End()
+		task.End()
+		if !ok {
 			return protocolErr{code: "INTERNAL", message: "failed to acknowledge file progress"}
 		}
-		if v.ackBytes >= 0 {
-			deps.MaybeLogTransferProgress(v.item.TransferID)
-		}
-		deps.MaybeLogTransferComplete(v.item.TransferID)
-		ackTask.End()
 	}
 	return writeOKLine(out, "")
+}
+
+// validateACKItem checks one item against the store without mutating it,
+// returning the ack byte count the apply pass will use.
+func validateACKItem(item ackItem, deps Deps) (int64, error) {
+	ackBytes, _, ackHashToken, ackProvided, err := parseAckToken(item.AckToken)
+	if err != nil || !ackProvided {
+		return 0, protocolErr{code: "BAD_REQUEST", message: "invalid ack token"}
+	}
+
+	fileRef, err := deps.GetFileRef(item.TransferID, item.FileID, item.Path)
+	if err != nil {
+		return 0, mapLookupError(err)
+	}
+
+	ackTarget := min(ackBytes, fileRef.FileSize)
+	if ackTarget < 0 {
+		ackTarget = 0
+	}
+	if ackBytes >= 0 {
+		if ackHashToken == "" {
+			return 0, protocolErr{code: "BAD_REQUEST", message: "missing window ack hash token"}
+		}
+		if !deps.VerifyTransferFileWindowHash(item.TransferID, item.FileID, ackTarget, ackHashToken) {
+			return 0, protocolErr{code: "CONFLICT", message: "window ack hash token mismatch"}
+		}
+	}
+	return ackBytes, nil
 }
 
 func parseAckToken(raw string) (ackBytes int64, ackTS int64, ackHashToken string, provided bool, err error) {

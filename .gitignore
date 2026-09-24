@@ -5,3 +5,11 @@
 .codex
 **/testdata/fuzz/
 **/testdata/fuzz/**
+
+# Scratch test files. Investigating a bug here usually means writing a throwaway
+# test to isolate it; two such files were staged by accident before this rule
+# existed. Anything named with these prefixes is exploratory by convention and
+# never belongs in a commit — real tests extend an existing *_test.go file.
+zz_*_test.go
+tmp_*_test.go
+*_scratch_test.go
