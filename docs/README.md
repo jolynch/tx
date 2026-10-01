@@ -5,6 +5,7 @@ The docs are organized into three top-level sections:
 - [Architecture](./arch/OVERVIEW.md): system design, data flow, performance model, and integrity verification
 - [Public Interface](./pub/CLI.md): CLI usage, flags, and operator-facing workflows
 - [FTCP Protocol](./ftcp/OVERVIEW.md): wire protocol, manifest format, and frame format
+- [Benchmarking](./bench/OVERVIEW.md): `tx-bench` two-host benchmark harness (spec)
 
 ## Architecture
 
@@ -20,3 +21,10 @@ The docs are organized into three top-level sections:
 - [Overview](./ftcp/OVERVIEW.md)
 - [Manifest Format (FM/1)](./ftcp/MANIFEST.md)
 - [Frame Format (FX/1)](./ftcp/FRAMING.md)
+
+## Benchmarking
+
+- [Overview](./bench/OVERVIEW.md)
+- [CLI](./bench/CLI.md)
+- [Dataset](./bench/DATASET.md)
+- [Trace](./bench/TRACE.md)

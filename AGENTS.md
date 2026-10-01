@@ -15,6 +15,8 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
 - [FM/1 manifests](docs/ftcp/MANIFEST.md) and
   [FX/1 frames](docs/ftcp/FRAMING.md): exact wire formats and parsing rules.
 - [CLI reference](docs/pub/CLI.md): commands, flags, workflows, and `.tx/` state.
+- [tx-bench](docs/bench/OVERVIEW.md): two-host benchmark harness, dataset
+  oracle, cache warming, and traces.
 
 ## Code standards
 
