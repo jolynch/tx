@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/pagecache"
 )
 
@@ -813,5 +814,72 @@ func TestHandleSYNCRejectsDeclaredOversizeBeforeDecompressing(t *testing.T) {
 	var out bytes.Buffer
 	if err := handleSYNCWithInput(context.Background(), req, bytes.NewReader(body.Bytes()), &out, realDeps(t, "/"), nil, 1<<20); err == nil {
 		t.Fatal("frame declaring a payload past the cap was accepted")
+	}
+}
+
+func TestHandleSYNCRejectsPathEscapingRoot(t *testing.T) {
+	root := escapeTestLayout(t)
+	for _, tc := range rootEscapeCases {
+		t.Run(tc.path, func(t *testing.T) {
+			st := store.NewStore()
+			t.Cleanup(st.Close)
+			deps := NewRuntimeDeps(st, WithRoot(root))
+			req, err := ParseRequest([]byte(fmt.Sprintf(`SYNC %q mode=fast link-mbps=1000 concurrency=8 comp=none`, tc.path)))
+			if err != nil {
+				t.Fatalf("ParseRequest: %v", err)
+			}
+			var body bytes.Buffer
+			if err := encoding.NewFramedBodyWriter(&body, "none", encoding.DefaultBodyChunkSize, 0).Close(); err != nil {
+				t.Fatalf("frame empty manifest: %v", err)
+			}
+			var out bytes.Buffer
+			err = handleSYNCWithInput(context.Background(), req, &body, &out, deps, nil, defaultMaxSyncBodyBytes)
+			if !tc.escape {
+				if err != nil || len(st.ListTransfers()) != 1 {
+					t.Fatalf("in-root path rejected: err=%v transfers=%d", err, len(st.ListTransfers()))
+				}
+				return
+			}
+			var pe protocolErr
+			if !errors.As(err, &pe) || pe.code != "UNPROCESSABLE" {
+				t.Fatalf("expected UNPROCESSABLE, got err=%v manifest=%q", err, unframeManifestWire(t, out.Bytes()))
+			}
+			if out.Len() != 0 || len(st.ListTransfers()) != 0 {
+				t.Fatalf("escape left state: manifest=%d bytes transfers=%d", out.Len(), len(st.ListTransfers()))
+			}
+		})
+	}
+}
+
+// A zero-delta SYNC auto-ACKs every matched file, including empty ones whose
+// ACK never advances AckedSize; the transfer must still complete.
+func TestHandleSYNCZeroDeltaWithEmptyFileCompletes(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "a.txt", "hello")
+	writeTestFile(t, root, "empty.txt", "")
+	oldManifest := runTXFERTest(t, root)
+
+	req, err := ParseRequest([]byte(fmt.Sprintf(`SYNC %q mode=fast link-mbps=1000 concurrency=8 comp=none`, root)))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	var body bytes.Buffer
+	cw := encoding.NewFramedBodyWriter(&body, "none", encoding.DefaultBodyChunkSize, 0)
+	if _, err := io.WriteString(cw, oldManifest); err != nil {
+		t.Fatalf("frame old manifest: %v", err)
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatalf("close old manifest: %v", err)
+	}
+
+	deps := realDeps(t, "/")
+	var txferID string
+	var out bytes.Buffer
+	if err := handleSYNCWithInput(context.Background(), req, &body, &out, deps, func(id string) { txferID = id }, defaultMaxSyncBodyBytes); err != nil {
+		t.Fatalf("SYNC: %v", err)
+	}
+	got, ok := deps.GetTransfer(txferID)
+	if !ok || got.NumFiles != 2 || got.Done != 2 || !got.CompleteLogged {
+		t.Fatalf("zero-delta SYNC incomplete: Done=%d NumFiles=%d complete=%v", got.Done, got.NumFiles, got.CompleteLogged)
 	}
 }

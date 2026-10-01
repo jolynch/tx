@@ -27,6 +27,7 @@ import (
 	intfilexfer "github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
+	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/fsync"
 	"github.com/jolynch/tx/internal/pagecache"
 	"github.com/jolynch/tx/internal/sampler"
@@ -3780,6 +3781,104 @@ func TestRunCLICopySendFailureReturnsNonzero(t *testing.T) {
 	}
 }
 
+// startRealCLIServer runs the real FTCP server over root with a short
+// --exit-after, so the returned channel closes only once a transfer has
+// completed on the server and the exit timer has fired.
+func startRealCLIServer(t *testing.T, root string) (string, *store.Store, <-chan struct{}) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	st := store.NewStore()
+	t.Cleanup(st.Close)
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		_ = intftcp.Serve(ln, intftcp.ServerOptions{
+			Deps:      intftcp.NewRuntimeDeps(st, intftcp.WithRoot(root)),
+			ExitAfter: 100 * time.Millisecond,
+		})
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		<-exited
+	})
+	return ln.Addr().String(), st, exited
+}
+
+func TestRunCLICopyEmptyFilesCompleteEndToEnd(t *testing.T) {
+	src := t.TempDir()
+	mtime := time.Unix(1_700_000_000, 0)
+	files := map[string]string{"empty.txt": "", "nested/empty.txt": "", "data.txt": "hello"}
+	for rel, body := range files {
+		full := filepath.Join(src, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o640); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+		if err := os.Chtimes(full, mtime, mtime); err != nil {
+			t.Fatalf("chtimes %s: %v", rel, err)
+		}
+	}
+
+	for _, skipWrite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("skip-write=%v", skipWrite), func(t *testing.T) {
+			addr, st, exited := startRealCLIServer(t, src)
+			dst := filepath.Join(t.TempDir(), "dst")
+			args := []string{"copy", "--progress=false", "--verify", "none"}
+			if skipWrite {
+				args = append(args, "--skip-write")
+			}
+			args = append(args, "tx://"+addr+"/", dst)
+
+			var stdout, stderr bytes.Buffer
+			codeCh := make(chan int, 1)
+			go func() { codeCh <- RunCLI(args, &stdout, &stderr) }()
+			select {
+			case code := <-codeCh:
+				if code != 0 {
+					t.Fatalf("copy exit code %d\nstderr=%s", code, stderr.String())
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("copy did not finish within 10s")
+			}
+
+			select {
+			case <-exited:
+			case <-time.After(5 * time.Second):
+				for _, tr := range st.ListTransfers() {
+					t.Logf("transfer %s: done=%d/%d complete=%v states=%v", tr.ID, tr.Done, tr.NumFiles, tr.CompleteLogged, tr.State)
+				}
+				t.Fatal("server never completed the transfer, so --exit-after never fired")
+			}
+			for _, tr := range st.ListTransfers() {
+				if !tr.CompleteLogged || tr.Done != uint64(tr.NumFiles) {
+					t.Fatalf("transfer %s: done=%d/%d complete=%v", tr.ID, tr.Done, tr.NumFiles, tr.CompleteLogged)
+				}
+			}
+
+			if skipWrite {
+				if _, err := os.Stat(dst); !os.IsNotExist(err) {
+					t.Fatalf("--skip-write created the destination: %v", err)
+				}
+				return
+			}
+			for rel, body := range files {
+				info, err := os.Stat(filepath.Join(dst, rel))
+				if err != nil {
+					t.Fatalf("stat %s: %v", rel, err)
+				}
+				if info.Size() != int64(len(body)) || info.Mode().Perm() != 0o640 || !info.ModTime().Equal(mtime) {
+					t.Fatalf("%s: size=%d mode=%v mtime=%v", rel, info.Size(), info.Mode().Perm(), info.ModTime())
+				}
+			}
+		})
+	}
+}
+
 // writeCLIStatusList frames STATUS list entries the way the server does.
 func writeCLIStatusList(out io.Writer, entries ...string) error {
 	bw := encoding.NewFramedBodyWriter(out, encoding.EncodingZstd, encoding.DefaultBodyChunkSize, 0)
@@ -4190,6 +4289,38 @@ func TestProgressTotalsClampsOutOfRangeAckBytes(t *testing.T) {
 	}
 	if priorFiles != 1 {
 		t.Errorf("priorFiles: got %d want 1", priorFiles)
+	}
+}
+
+// TestCollectPendingManifestWorkAgreesWithProgressTotals pins that every
+// regular file is either prior work or pending, never both or neither, which
+// is what validateResumeProgressTotals checks. A fresh empty file must be
+// pending (it still needs SEND to create it and ACK to count it), even with
+// noWrite; one whose metadata is done is prior work.
+func TestCollectPendingManifestWorkAgreesWithProgressTotals(t *testing.T) {
+	file := func(id uint64, size int64, ack int64, metaDone bool) tx.ManifestEntry {
+		return tx.ManifestEntry{ID: id, Size: size, Type: encoding.EntryTypeFile, Progress: tx.ManifestProgress{AckBytes: ack, MetadataDone: metaDone}}
+	}
+	entries := []tx.ManifestEntry{
+		file(1, 0, 0, false), // fresh empty file
+		file(2, 0, 0, true),  // resumed empty file, already done
+		file(3, 5, 0, false),
+		file(4, 5, 5, true),
+		file(5, 5, 5, false), // bytes done, metadata refresh pending
+	}
+	for _, noWrite := range []bool{false, true} {
+		refresh := func(tx.ManifestEntry) error { return nil }
+		pending, completed := collectPendingManifestWork(entries, noWrite, nil, refresh, nil)
+		totalBytes, totalFiles, priorBytes, priorFiles := progressTotals(entries)
+		if err := validateResumeProgressTotals(entries, pending, totalBytes, totalFiles, priorBytes, priorFiles); err != nil {
+			t.Fatalf("noWrite=%v: %v", noWrite, err)
+		}
+		if uint64(completed) != priorFiles {
+			t.Fatalf("noWrite=%v: completed=%d priorFiles=%d", noWrite, completed, priorFiles)
+		}
+		if !slices.ContainsFunc(pending.files, func(e tx.ManifestEntry) bool { return e.ID == 1 }) {
+			t.Fatalf("noWrite=%v: fresh empty file is not pending: %+v", noWrite, pending.files)
+		}
 	}
 }
 

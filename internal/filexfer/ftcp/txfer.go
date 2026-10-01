@@ -13,6 +13,7 @@ import (
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/pagecache"
+	"github.com/jolynch/tx/internal/utils"
 	"github.com/zeebo/xxh3"
 )
 
@@ -116,7 +117,10 @@ func handleTXFERWithCallback(ctx context.Context, req Request, out io.Writer, de
 	if err != nil {
 		return err
 	}
-	parsed.Directory = filepath.Join(deps.Root(), parsed.Directory)
+	parsed.Directory, err = resolveUnderRoot(deps.Root(), parsed.Directory)
+	if err != nil {
+		return err
+	}
 	isDir, err := validatePath(parsed.Directory)
 	if err != nil {
 		return protocolErr{code: "UNPROCESSABLE", message: err.Error()}
@@ -187,6 +191,18 @@ func handleTXFERWithCallback(ctx context.Context, req Request, out io.Writer, de
 
 func handleTXFER(ctx context.Context, req Request, out io.Writer, deps Deps) error {
 	return handleTXFERWithCallback(ctx, req, out, deps, nil)
+}
+
+// resolveUnderRoot joins a requested path onto the server root and rejects
+// any result that lexically leaves it, before anything is stat-ed. Symlinks
+// are deliberately not resolved: links inside the root, which the operator
+// created, are still followed.
+func resolveUnderRoot(root string, requested string) (string, error) {
+	joined := filepath.Join(root, requested)
+	if !utils.PathWithinRoot(filepath.Clean(root), joined) {
+		return "", protocolErr{code: "UNPROCESSABLE", message: "path must be within server root"}
+	}
+	return joined, nil
 }
 
 func validatePath(path string) (isDir bool, err error) {

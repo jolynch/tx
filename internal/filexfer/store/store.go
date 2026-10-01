@@ -17,6 +17,7 @@ import (
 
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
+	"github.com/jolynch/tx/internal/utils"
 	"github.com/zeebo/xxh3"
 )
 
@@ -139,9 +140,11 @@ type AckEntry struct {
 // StoreOption configures a Store built by NewStore.
 type StoreOption func(*Store)
 
-// WithTTL overrides how long transfers and their hash state survive past
-// their last update. Chiefly useful to tests, which otherwise cannot reach
-// the expiry paths inside the default ten minute window.
+// WithTTL overrides how long transfers survive past their last forward
+// progress (see touchLocked), and how long window hashes survive past being
+// stored. Chiefly useful to
+// tests, which otherwise cannot reach the expiry paths inside the default
+// ten minute window.
 func WithTTL(d time.Duration) StoreOption {
 	return func(s *Store) {
 		if d > 0 {
@@ -472,10 +475,12 @@ func (s *Store) RegisterTransferFileStates(txferID string, updates []TransferFil
 		}
 	}
 
+	added := false
 	for _, update := range updates {
 		idx := int(update.FileID)
 		oldLen := len(managed.transfer.State)
 		ensureLen(idx + 1)
+		added = added || idx >= oldLen
 
 		wasRegularFile := idx < oldLen && isRegularFileEntryType(managed.transfer.EntryType[idx])
 		if update.FileID != intencoding.RootFileID && idx >= oldLen {
@@ -496,6 +501,11 @@ func (s *Store) RegisterTransferFileStates(txferID string, updates []TransferFil
 		if shouldAdvanceState(managed.transfer.State[idx], state) {
 			managed.transfer.State[idx] = state
 		}
+	}
+	// A batch that grows the transfer is manifest-walk progress. Re-registering
+	// known entries is not, and entries are finite, so this stays bounded.
+	if added {
+		s.touchLocked(managed, time.Now())
 	}
 }
 
@@ -571,7 +581,7 @@ func (s *Store) GetFileRef(txferID string, fileID uint64, fullPathRaw string) (F
 	}
 	managed.mu.RUnlock()
 
-	if !pathWithinRoot(directory, fullPath) {
+	if !utils.PathWithinRoot(directory, fullPath) {
 		return FileRef{}, &FileLookupError{Code: http.StatusForbidden, Msg: "path must be within transfer root"}
 	}
 
@@ -650,6 +660,7 @@ func (s *Store) SetTransferFileState(txferID string, fileID uint64, state uint8)
 		return true
 	}
 	managed.transfer.State[idx] = state
+	s.touchLocked(managed, time.Now())
 	return true
 }
 
@@ -705,8 +716,12 @@ func (s *Store) acknowledgeFileLocked(managed *managedTransfer, fileID uint64, a
 		if shouldAdvanceState(currentState, TransferStateMissing) {
 			wasTerminal := currentState == TransferStateDone || currentState == TransferStateMissing
 			managed.transfer.State[idx] = TransferStateMissing
-			if !wasTerminal {
+			// NumFiles counts only regular files and completion needs
+			// Done == NumFiles exactly, so a missing directory or
+			// symlink must not be counted.
+			if !wasTerminal && isRegularFileEntryType(managed.transfer.EntryType[idx]) {
 				managed.transfer.Done++
+				s.touchLocked(managed, time.Now())
 			}
 		}
 		return true
@@ -724,24 +739,37 @@ func (s *Store) acknowledgeFileLocked(managed *managedTransfer, fileID uint64, a
 		target = maxAck
 	}
 
-	prev := managed.transfer.AckedSize[idx]
-	if target <= prev {
-		return true
+	now := time.Now()
+	if prev := managed.transfer.AckedSize[idx]; target > prev {
+		managed.transfer.AckedSize[idx] = target
+		managed.transfer.DoneSize += target - prev
+		s.touchLocked(managed, now)
 	}
 
-	delta := target - prev
-	managed.transfer.AckedSize[idx] = target
-	managed.transfer.DoneSize += delta
-
-	if prev < maxAck && target == maxAck {
+	// One completion rule for every size. State doubles as the "counted"
+	// marker: SEND never marks a regular file Done, so a file below Done has
+	// not been counted yet. This runs even when target did not advance,
+	// which is the only way an empty file is ever counted.
+	if target == maxAck && managed.transfer.State[idx] < TransferStateDone && isRegularFileEntryType(managed.transfer.EntryType[idx]) {
+		managed.transfer.State[idx] = TransferStateDone
 		managed.transfer.Done++
-		if shouldAdvanceState(managed.transfer.State[idx], TransferStateDone) {
-			managed.transfer.State[idx] = TransferStateDone
-		}
+		s.touchLocked(managed, now)
 	}
 
 	delete(managed.windowHashes, windowHashKey{fileID: fileID, endBytes: target})
 	return true
+}
+
+// touchLocked restarts the transfer's TTL. It is called only where the
+// transfer irreversibly advances (the manifest walk registers new entries or
+// finishes, acknowledged bytes grow, a file is counted, a file state moves
+// forward), never on reads or repeated requests, so a client cannot hold
+// state alive without making progress. A single SEND window and
+// post-completion CXSUM verification do not refresh it.
+// Window hashes keep their own store-time expiry: a window is ACKed soon
+// after SEND writes it, so they need no refresh. The caller holds m.mu.
+func (s *Store) touchLocked(m *managedTransfer, now time.Time) {
+	m.transfer.ExpiresAt = now.Add(s.ttl)
 }
 
 func (s *Store) ClipTransfer(txferID string) bool {
@@ -763,6 +791,9 @@ func (s *Store) ClipTransfer(txferID string) bool {
 		managed.transfer.PageCache = slices.Clip(managed.transfer.PageCache)
 	}
 
+	// The manifest walk is over; a long walk must not eat the TTL the
+	// transfer of those files needs.
+	s.touchLocked(managed, time.Now())
 	t := &managed.transfer
 	log.Printf(
 		"txfer-start: tid=%s dir=%s mode=%s entries=%d files=%d size=%s link=%dMbps concurrency=%d",
@@ -803,13 +834,16 @@ func (s *Store) reapExpiredLoop() {
 		s.mu.Lock()
 		survivors := make([]*managedTransfer, 0, len(s.transfers))
 		for txferID, managed := range s.transfers {
-			managed.mu.RLock()
+			// Progress can renew the deadline after an ACK has looked up
+			// this transfer, even while we hold the store lock. Check and
+			// mark deletion under one lock so that renewal cannot be lost.
+			managed.mu.Lock()
 			expired := !managed.deleted && !managed.transfer.ExpiresAt.After(now)
-			managed.mu.RUnlock()
 			if expired {
-				managed.mu.Lock()
 				managed.deleted = true
-				managed.mu.Unlock()
+			}
+			managed.mu.Unlock()
+			if expired {
 				delete(s.transfers, txferID)
 				continue
 			}
@@ -1041,20 +1075,4 @@ func transferID() (string, error) {
 		return "", fmt.Errorf("generate transfer id: %w", err)
 	}
 	return hex.EncodeToString(buf), nil
-}
-
-func pathWithinRoot(root string, p string) bool {
-	root = filepath.Clean(root)
-	p = filepath.Clean(p)
-	rel, err := filepath.Rel(root, p)
-	if err != nil {
-		return false
-	}
-	if rel == "." {
-		return true
-	}
-	if strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
-		return false
-	}
-	return !filepath.IsAbs(rel)
 }

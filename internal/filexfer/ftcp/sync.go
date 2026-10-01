@@ -115,7 +115,10 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	if err != nil {
 		return err
 	}
-	parsed.Directory = filepath.Join(deps.Root(), parsed.Directory)
+	parsed.Directory, err = resolveUnderRoot(deps.Root(), parsed.Directory)
+	if err != nil {
+		return err
+	}
 	isDir, err := validatePath(parsed.Directory)
 	if err != nil {
 		return protocolErr{code: "UNPROCESSABLE", message: err.Error()}

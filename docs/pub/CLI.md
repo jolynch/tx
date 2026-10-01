@@ -33,7 +33,8 @@ usage: tx send tree [--listen <addr>] [options] [CHROOT]
 
 Offer a tree (directory) via a FTCP server.
 
-  CHROOT    server root directory (default: current working directory)
+  CHROOT    server root directory (default: current working directory); requests cannot
+            leave it, symlinks inside it are followed
 
 Options:
       --listen string              Listen address (host:port) (default "127.0.0.1:3453")

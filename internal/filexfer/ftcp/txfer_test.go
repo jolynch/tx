@@ -3,12 +3,14 @@ package ftcp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -654,4 +656,103 @@ func TestParseTXFERRequestRejectsMaxChunkSize(t *testing.T) {
 	if pe, ok := err.(protocolErr); !ok || pe.code != "BAD_REQUEST" {
 		t.Fatalf("expected protocolErr BAD_REQUEST, got %v", err)
 	}
+}
+
+// escapeTestLayout builds base/root (the chroot) beside base/secret and
+// base/rootx, which share a parent and a name prefix with the root and hold
+// files that no request under root may reach.
+func escapeTestLayout(t *testing.T) (root string) {
+	t.Helper()
+	base := t.TempDir()
+	root = filepath.Join(base, "root")
+	writeTestFile(t, root, "sub/f.txt", "inside")
+	writeTestFile(t, base, "secret/s.txt", "outside")
+	writeTestFile(t, base, "rootx/s.txt", "sibling sharing the root's prefix")
+	return root
+}
+
+var rootEscapeCases = []struct {
+	path   string
+	escape bool
+}{
+	{"/../secret", true},
+	{"/a/../../secret", true},
+	{"/..", true},
+	{"/../rootx", true},
+	{"/sub/../sub", false},
+}
+
+func TestHandleTXFERRejectsPathEscapingRoot(t *testing.T) {
+	root := escapeTestLayout(t)
+	for _, tc := range rootEscapeCases {
+		t.Run(tc.path, func(t *testing.T) {
+			st := store.NewStore()
+			t.Cleanup(st.Close)
+			deps := NewRuntimeDeps(st, WithRoot(root))
+			req, err := ParseRequest([]byte(fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8 comp=none`, tc.path)))
+			if err != nil {
+				t.Fatalf("ParseRequest: %v", err)
+			}
+			var out bytes.Buffer
+			err = handleTXFER(context.Background(), req, &out, deps)
+			if !tc.escape {
+				if err != nil || len(st.ListTransfers()) != 1 {
+					t.Fatalf("in-root path rejected: err=%v transfers=%d", err, len(st.ListTransfers()))
+				}
+				return
+			}
+			var pe protocolErr
+			if !errors.As(err, &pe) || pe.code != "UNPROCESSABLE" {
+				t.Fatalf("expected UNPROCESSABLE, got err=%v manifest=%q", err, unframeManifestWire(t, out.Bytes()))
+			}
+			if out.Len() != 0 || len(st.ListTransfers()) != 0 {
+				t.Fatalf("escape left state: manifest=%d bytes transfers=%d", out.Len(), len(st.ListTransfers()))
+			}
+		})
+	}
+}
+
+// lexicallyUnder is an oracle independent of utils.PathWithinRoot: a clean
+// path is under a clean root when it is the root, the root is "/", or it
+// extends the root by a whole path component.
+func lexicallyUnder(cleanRoot string, p string) bool {
+	return p == cleanRoot || cleanRoot == "/" || strings.HasPrefix(p, cleanRoot+"/")
+}
+
+// FuzzResolveUnderRoot checks that a resolved path is exactly the join and
+// stays under the root, and that only a request with a ".." segment can be
+// refused. The server root is always absolute.
+func FuzzResolveUnderRoot(f *testing.F) {
+	f.Add("/srv/data", "/../secret")
+	f.Add("/srv/data", "/a/../../secret")
+	f.Add("/srv/data", "/..")
+	f.Add("/srv/data", "/sub/../sub")
+	f.Add("/srv/data", "/../dataX")
+	f.Add("/srv/data", "")
+	f.Add("/", "/../../etc")
+	f.Add("/srv/data", "..foo/../x")
+	f.Add("/srv/./data/", "a//b/./../..")
+
+	f.Fuzz(func(t *testing.T, root string, requested string) {
+		root = "/" + root
+		cleanRoot := filepath.Clean(root)
+		got, err := resolveUnderRoot(root, requested)
+		joined := filepath.Join(root, requested)
+		if err != nil {
+			var pe protocolErr
+			if !errors.As(err, &pe) || pe.code != "UNPROCESSABLE" {
+				t.Fatalf("resolveUnderRoot(%q, %q): unexpected error %v", root, requested, err)
+			}
+			if lexicallyUnder(cleanRoot, joined) {
+				t.Fatalf("resolveUnderRoot(%q, %q) refused in-root path %q", root, requested, joined)
+			}
+			if !slices.Contains(strings.Split(requested, "/"), "..") {
+				t.Fatalf("resolveUnderRoot(%q, %q) refused a request without a .. segment", root, requested)
+			}
+			return
+		}
+		if got != joined || !lexicallyUnder(cleanRoot, got) {
+			t.Fatalf("resolveUnderRoot(%q, %q) = %q, want in-root %q", root, requested, got, joined)
+		}
+	})
 }

@@ -91,55 +91,6 @@ func TestNewTransferInitializesStateByFileID(t *testing.T) {
 	}
 }
 
-func TestRegisterTransferFileStateMixedEntriesTrackAckableFiles(t *testing.T) {
-	s := newTestStore(t)
-	transfer, err := s.NewTransfer("/tmp/x", 0, 0)
-	if err != nil {
-		t.Fatalf("NewTransfer returned error: %v", err)
-	}
-	s.RegisterTransferFileStates(transfer.ID, []TransferFileStateUpdate{
-		{FileID: 1, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/file")), FileSize: 10},
-		{FileID: 2, EntryType: encoding.EntryTypeDir, PathHash: xxh3.Hash128([]byte("/tmp/x/sub")), FileSize: 0},
-		{FileID: 3, EntryType: encoding.EntryTypeSymlink, PathHash: xxh3.Hash128([]byte("/tmp/x/link")), FileSize: 0},
-	}, TransferStateStarted)
-
-	stored := waitForTransferState(t, s, transfer.ID, func(stored Transfer) bool {
-		return stored.NumEntries == 3 && stored.NumFiles == 1
-	})
-	if stored.NumEntries != 3 || stored.NumFiles != 1 {
-		t.Fatalf("unexpected counts: entries=%d files=%d", stored.NumEntries, stored.NumFiles)
-	}
-	if stored.EntryType[1] != encoding.EntryTypeFile || stored.EntryType[2] != encoding.EntryTypeDir || stored.EntryType[3] != encoding.EntryTypeSymlink {
-		t.Fatalf("unexpected entry types: %q", string(stored.EntryType))
-	}
-}
-
-func TestRegisterTransferFileState(t *testing.T) {
-	s := newTestStore(t)
-	transfer, err := s.NewTransfer("/tmp/x", 1, 42)
-	if err != nil {
-		t.Fatalf("NewTransfer returned error: %v", err)
-	}
-	hash := xxh3.Hash128([]byte("/tmp/x/1"))
-	updatesCh := make(chan TransferFileStateUpdate, 1)
-	updatesCh <- TransferFileStateUpdate{FileID: 0, PathHash: hash, FileSize: 42}
-	close(updatesCh)
-	s.RegisterTransferFileState(transfer.ID, updatesCh, TransferStateDone)
-
-	stored := waitForTransferState(t, s, transfer.ID, func(stored Transfer) bool {
-		return len(stored.State) == 1 && stored.State[0] == TransferStateDone
-	})
-	if stored.State[0] != TransferStateDone {
-		t.Fatalf("expected state[0] to be done, got %d", stored.State[0])
-	}
-	if stored.PathHash[0] != hash {
-		t.Fatalf("expected hash[0] to be updated")
-	}
-	if stored.FileSize[0] != 42 {
-		t.Fatalf("expected file-size[0] to be updated, got %d", stored.FileSize[0])
-	}
-}
-
 func TestRegisterTransferFileStatePreservesPrestoredPageCacheLength(t *testing.T) {
 	s := newTestStore(t)
 	transfer, err := s.NewTransfer("/tmp/x", 0, 0)
@@ -170,37 +121,32 @@ func TestRegisterTransferFileStatePreservesPrestoredPageCacheLength(t *testing.T
 	}
 }
 
-func TestRegisterTransferFileStateMultipleIDs(t *testing.T) {
-	s := newTestStore(t)
-	transfer, err := s.NewTransfer("/tmp/x", 1, 42)
-	if err != nil {
-		t.Fatalf("NewTransfer returned error: %v", err)
-	}
-	hash0 := xxh3.Hash128([]byte("/tmp/x/0"))
-	hash2 := xxh3.Hash128([]byte("/tmp/x/2"))
-	updatesCh := make(chan TransferFileStateUpdate, 2)
-	updatesCh <- TransferFileStateUpdate{FileID: 0, PathHash: hash0, FileSize: 100}
-	updatesCh <- TransferFileStateUpdate{FileID: 1, PathHash: hash2, FileSize: 300}
-	close(updatesCh)
-	s.RegisterTransferFileState(transfer.ID, updatesCh, TransferStateRunning)
+// TestRegisterTransferFileState registers through the channel API and checks
+// every per-file slot is filled in, for each state a registration may carry.
+func TestRegisterTransferFileState(t *testing.T) {
+	for _, state := range []uint8{TransferStateRunning, TransferStateDone} {
+		s := newTestStore(t)
+		transfer, err := s.NewTransfer("/tmp/x", 1, 42)
+		if err != nil {
+			t.Fatalf("NewTransfer returned error: %v", err)
+		}
+		hashes := []xxh3.Uint128{xxh3.Hash128([]byte("/tmp/x/0")), xxh3.Hash128([]byte("/tmp/x/2"))}
+		sizes := []int64{100, 300}
+		updatesCh := make(chan TransferFileStateUpdate, 2)
+		for i := range hashes {
+			updatesCh <- TransferFileStateUpdate{FileID: uint64(i), PathHash: hashes[i], FileSize: sizes[i]}
+		}
+		close(updatesCh)
+		s.RegisterTransferFileState(transfer.ID, updatesCh, state)
 
-	stored := waitForTransferState(t, s, transfer.ID, func(stored Transfer) bool {
-		return len(stored.State) == 2 && stored.State[0] == TransferStateRunning && stored.State[1] == TransferStateRunning
-	})
-	if stored.State[0] != TransferStateRunning {
-		t.Fatalf("expected state[0] to be running, got %d", stored.State[0])
-	}
-	if stored.State[1] != TransferStateRunning {
-		t.Fatalf("expected state[1] to be running, got %d", stored.State[1])
-	}
-	if stored.PathHash[0] != hash0 {
-		t.Fatalf("expected hash[0] to be updated")
-	}
-	if stored.PathHash[1] != hash2 {
-		t.Fatalf("expected hash[1] to be updated")
-	}
-	if stored.FileSize[0] != 100 || stored.FileSize[1] != 300 {
-		t.Fatalf("expected file sizes at indices 0 and 1 to be updated")
+		stored := waitForTransferState(t, s, transfer.ID, func(stored Transfer) bool {
+			return len(stored.State) == 2 && stored.State[0] == state && stored.State[1] == state
+		})
+		for i := range hashes {
+			if stored.State[i] != state || stored.PathHash[i] != hashes[i] || stored.FileSize[i] != sizes[i] {
+				t.Fatalf("state %d: slot %d = (state=%d size=%d hash ok=%v)", state, i, stored.State[i], stored.FileSize[i], stored.PathHash[i] == hashes[i])
+			}
+		}
 	}
 }
 
@@ -349,6 +295,9 @@ func TestMaybeLogTransferCompleteLogsForMixedEntries(t *testing.T) {
 	if stored.Done != 1 || stored.NumFiles != 1 || stored.NumEntries != 3 {
 		t.Fatalf("unexpected counts after completion: done=%d files=%d entries=%d", stored.Done, stored.NumFiles, stored.NumEntries)
 	}
+	if stored.EntryType[1] != encoding.EntryTypeFile || stored.EntryType[2] != encoding.EntryTypeDir || stored.EntryType[3] != encoding.EntryTypeSymlink {
+		t.Fatalf("unexpected entry types: %q", string(stored.EntryType))
+	}
 	logged := buf.String()
 	if !strings.Contains(logged, "txfer-start: tid="+transfer.ID) {
 		t.Fatalf("expected txfer-start log, got %q", logged)
@@ -420,32 +369,6 @@ func TestMaybeLogTransferProgressUsesClientStyleFixedWidthLayout(t *testing.T) {
 	rateField := logged[rateIdx+len("rate="):]
 	if len(rateField) != progressLogRateWidth {
 		t.Fatalf("expected fixed-width rate field length %d, got %d in %q", progressLogRateWidth, len(rateField), logged)
-	}
-}
-
-func TestAcknowledgeTransferFileMissing(t *testing.T) {
-	s := newTestStore(t)
-	transfer, err := s.NewTransfer("/tmp/x", 1, 10)
-	if err != nil {
-		t.Fatalf("NewTransfer failed: %v", err)
-	}
-	updates := []TransferFileStateUpdate{
-		{FileID: 0, PathHash: xxh3.Hash128([]byte("/tmp/x/0")), FileSize: 10},
-	}
-	s.RegisterTransferFileStates(transfer.ID, updates, TransferStateStarted)
-
-	if ok := s.AcknowledgeTransferFile(transfer.ID, 0, -1); !ok {
-		t.Fatalf("AcknowledgeTransferFile returned false")
-	}
-	stored, ok := s.GetTransfer(transfer.ID)
-	if !ok {
-		t.Fatalf("transfer not found")
-	}
-	if stored.State[0] != TransferStateMissing {
-		t.Fatalf("expected missing state, got %d", stored.State[0])
-	}
-	if stored.Done != 1 {
-		t.Fatalf("expected done=1 for missing file, got %d", stored.Done)
 	}
 }
 
@@ -920,34 +843,6 @@ func TestWithTTLRejectsNonPositive(t *testing.T) {
 	}
 }
 
-// TestStoreExpiresTransfers covers the reaper, which before WithTTL could
-// only be reached by waiting out the ten minute default. Expiry is enforced
-// solely by the reap goroutine — there is no lazy check on read — so this is
-// the only way to exercise that code.
-func TestStoreExpiresTransfers(t *testing.T) {
-	s := NewStore(WithTTL(40 * time.Millisecond))
-	defer s.Close()
-
-	transfer, err := s.NewTransfer("/tmp/expiring", 1, 10)
-	if err != nil {
-		t.Fatalf("NewTransfer: %v", err)
-	}
-	if _, ok := s.GetTransfer(transfer.ID); !ok {
-		t.Fatalf("transfer should be present immediately after creation")
-	}
-
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, ok := s.GetTransfer(transfer.ID); !ok {
-			return // reaped as expected
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("transfer %q was never reaped", transfer.ID)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
 func TestStoreCloseWaitsForActiveReap(t *testing.T) {
 	s := NewStore(WithTTL(20 * time.Millisecond))
 	transfer, err := s.NewTransfer("/tmp/x", 1, 10)
@@ -997,4 +892,247 @@ func TestStoreCloseWaitsForActiveReap(t *testing.T) {
 		t.Fatalf("Close did not return after the reaper finished")
 	}
 	s.Close() // idempotent
+}
+
+// An ACK can already hold a managed-transfer pointer when the reaper takes
+// the store lock. Either reaping wins and the ACK fails, or the ACK renews
+// the deadline and the transfer survives; a successful renewal cannot be lost.
+func TestStoreReapConcurrentACK(t *testing.T) {
+	s := newTestStoreWithOptions(t, WithTTL(time.Second))
+	tr, err := s.NewTransfer("/tmp/x", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed, _ := s.getManagedTransfer(tr.ID)
+	managed.mu.Lock()
+	managed.transfer.FileSize[0] = 10
+	managed.transfer.ExpiresAt = time.Now().Add(-time.Second)
+
+	// Block the reaper on this transfer, after it has taken the store lock.
+	deadline := time.Now().Add(5 * time.Second)
+	for s.mu.TryLock() {
+		s.mu.Unlock()
+		if time.Now().After(deadline) {
+			managed.mu.Unlock()
+			t.Fatal("reaper did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	ackStarted := make(chan struct{})
+	ackDone := make(chan bool, 1)
+	go func() {
+		close(ackStarted)
+		// This is the apply step of an ACK that looked up the transfer
+		// before the reaper took the store lock.
+		managed.mu.Lock()
+		ackDone <- s.acknowledgeFileLocked(managed, 0, 1)
+		managed.mu.Unlock()
+	}()
+	<-ackStarted
+	// Let the ACK queue behind the reaper's initial lock acquisition.
+	time.Sleep(10 * time.Millisecond)
+
+	closed := make(chan struct{})
+	go func() {
+		s.Close()
+		close(closed)
+	}()
+	<-s.done
+	managed.mu.Unlock()
+	<-closed
+	acked := <-ackDone
+
+	got, exists := s.GetTransfer(tr.ID)
+	if acked != exists {
+		t.Fatalf("ACK succeeded=%v, transfer survived=%v: reaper lost a renewed deadline", acked, exists)
+	}
+	if acked && (got.AckedSize[0] != 1 || !got.ExpiresAt.After(tr.ExpiresAt)) {
+		t.Fatalf("successful ACK did not preserve progress and renew TTL: %+v", got)
+	}
+}
+
+// ttlTestFiles is enough files for one progress step per file throughout a
+// ttlTestRun, so every step is a fresh, irreversible advance.
+const ttlTestFiles = 64
+
+// newTTLTestTransfer registers ttlTestFiles regular files of the given size
+// in a store whose transfers expire after ttl without progress.
+func newTTLTestTransfer(t *testing.T, ttl time.Duration, size int64) (*Store, string) {
+	t.Helper()
+	s := newTestStoreWithOptions(t, WithTTL(ttl))
+	transfer, err := s.NewTransfer("/tmp/x", 0, 0)
+	if err != nil {
+		t.Fatalf("NewTransfer: %v", err)
+	}
+	updates := make([]TransferFileStateUpdate, ttlTestFiles)
+	for i := range updates {
+		path := fmt.Sprintf("/tmp/x/f%d", i+1)
+		updates[i] = TransferFileStateUpdate{FileID: uint64(i + 1), EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte(path)), FileSize: size}
+	}
+	s.RegisterTransferFileStates(transfer.ID, updates, TransferStateStarted)
+	return s, transfer.ID
+}
+
+// ttlTestRun calls step every 5ms for d, or until the transfer is reaped,
+// and reports whether it survived the whole time.
+func ttlTestRun(s *Store, txferID string, d time.Duration, step func(i int)) bool {
+	start := time.Now()
+	for i := 1; time.Since(start) < d; i++ {
+		if _, ok := s.GetTransfer(txferID); !ok {
+			return false
+		}
+		step(i)
+		time.Sleep(5 * time.Millisecond)
+	}
+	_, ok := s.GetTransfer(txferID)
+	return ok
+}
+
+// waitReaped fails the test unless the reaper removes the transfer.
+func waitReaped(t *testing.T, s *Store, txferID string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := s.GetTransfer(txferID); !ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("transfer %q was never reaped", txferID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestStoreProgressExtendsTTL pins that the TTL counts from the last forward
+// progress, for each kind of progress, and that the reaper still removes the
+// transfer once progress stops. Expiry is enforced solely by the reap
+// goroutine, so these runs drive it for real.
+func TestStoreProgressExtendsTTL(t *testing.T) {
+	const ttl = 60 * time.Millisecond
+	tests := []struct {
+		name string
+		size int64
+		step func(s *Store, txferID string, i int)
+	}{
+		{"acked bytes", 1 << 20, func(s *Store, id string, i int) { s.AcknowledgeTransferFile(id, 1, int64(i)) }},
+		{"file state advances", 1, func(s *Store, id string, i int) {
+			s.SetTransferFileState(id, uint64(i%ttlTestFiles+1), TransferStateRunning)
+		}},
+		{"empty file acks", 0, func(s *Store, id string, i int) { s.AcknowledgeTransferFile(id, uint64(i%ttlTestFiles+1), 0) }},
+		{"new registrations", 1, func(s *Store, id string, i int) {
+			fileID := uint64(ttlTestFiles + i)
+			s.RegisterTransferFileStates(id, []TransferFileStateUpdate{
+				{FileID: fileID, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte(fmt.Sprint(fileID))), FileSize: 1},
+			}, TransferStateStarted)
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s, id := newTTLTestTransfer(t, ttl, tc.size)
+			// ttlTestFiles steps of 5ms outlast the TTL several times over
+			// without any file seeing a second advance.
+			if !ttlTestRun(s, id, 4*ttl, func(i int) { tc.step(s, id, i) }) {
+				t.Fatalf("transfer reaped despite continuous %s", tc.name)
+			}
+			waitReaped(t, s, id)
+		})
+	}
+
+	// ClipTransfer ends the manifest walk once per transfer, so it cannot be
+	// repeated in a loop; check the deadline it sets instead.
+	t.Run("clip transfer", func(t *testing.T) {
+		t.Parallel()
+		s, id := newTTLTestTransfer(t, time.Hour, 1)
+		before, _ := s.GetTransfer(id)
+		time.Sleep(5 * time.Millisecond)
+		s.ClipTransfer(id)
+		after, _ := s.GetTransfer(id)
+		if !after.ExpiresAt.After(before.ExpiresAt) {
+			t.Fatalf("ClipTransfer did not refresh the TTL: before=%v after=%v", before.ExpiresAt, after.ExpiresAt)
+		}
+	})
+}
+
+// TestStoreNonProgressDoesNotExtendTTL guards the other half of the rule: an
+// idle transfer is reaped, and repeating requests that do no work does not
+// keep one alive.
+func TestStoreNonProgressDoesNotExtendTTL(t *testing.T) {
+	const ttl = 50 * time.Millisecond
+	token := "xxh128:00000000000000000000000000000001"
+	tests := []struct {
+		name string
+		step func(s *Store, txferID string)
+	}{
+		{"idle", func(*Store, string) {}},
+		{"repeated requests", func(s *Store, id string) {
+			s.AcknowledgeTransferFile(id, 1, 10)
+			s.AcknowledgeTransferFile(id, 1, 5)
+			s.SetTransferFileState(id, 1, TransferStateRunning)
+			s.SetTransferFileWindowHash(id, 1, 20, token)
+			s.RegisterTransferFileStates(id, []TransferFileStateUpdate{
+				{FileID: 1, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/f1")), FileSize: 1 << 20},
+			}, TransferStateStarted)
+			s.ListTransfers()
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s, id := newTTLTestTransfer(t, ttl, 1<<20)
+			s.SetTransferFileState(id, 1, TransferStateRunning)
+			s.AcknowledgeTransferFile(id, 1, 10)
+			if ttlTestRun(s, id, 8*ttl, func(int) { tc.step(s, id) }) {
+				t.Fatalf("transfer outlived 8 TTLs (ttl=%v) without progress", ttl)
+			}
+		})
+	}
+}
+
+// TestAcknowledgeZeroByteFileCompletesTransfer covers empty files, whose ACK
+// never advances AckedSize, and Missing (-1) ACKs, and pins that each regular
+// file is counted exactly once and non-files never are.
+func TestAcknowledgeZeroByteFileCompletesTransfer(t *testing.T) {
+	s := newTestStore(t)
+	transfer, err := s.NewTransfer("/tmp/x", 0, 0)
+	if err != nil {
+		t.Fatalf("NewTransfer: %v", err)
+	}
+	s.RegisterTransferFileStates(transfer.ID, []TransferFileStateUpdate{
+		{FileID: 1, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/empty")), FileSize: 0},
+		{FileID: 2, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/five")), FileSize: 5},
+		{FileID: 3, EntryType: encoding.EntryTypeDir, PathHash: xxh3.Hash128([]byte("/tmp/x/sub")), FileSize: 0},
+		{FileID: 4, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/tmp/x/gone")), FileSize: 7},
+	}, TransferStateStarted)
+	s.ClipTransfer(transfer.ID)
+
+	assertDone := func(step string, want uint64) Transfer {
+		t.Helper()
+		stored, ok := s.GetTransfer(transfer.ID)
+		if !ok {
+			t.Fatalf("%s: transfer not found", step)
+		}
+		if stored.Done != want {
+			t.Fatalf("%s: done=%d want %d (states=%v)", step, stored.Done, want, stored.State)
+		}
+		return stored
+	}
+
+	s.AcknowledgeTransferFile(transfer.ID, 1, 0)
+	s.AcknowledgeTransferFile(transfer.ID, 2, 5)
+	s.AcknowledgeTransferFile(transfer.ID, 4, -1) // a file that vanished counts as Missing
+	s.MaybeLogTransferComplete(transfer.ID)
+	stored := assertDone("ack all", 3)
+	if !stored.CompleteLogged || stored.State[1] != TransferStateDone || stored.State[4] != TransferStateMissing {
+		t.Fatalf("expected completion: complete=%v states=%v", stored.CompleteLogged, stored.State)
+	}
+	s.AcknowledgeTransferFile(transfer.ID, 1, 0)
+	assertDone("re-ack empty file", 3)
+	s.AcknowledgeTransferFile(transfer.ID, 1, -1)
+	assertDone("missing ack after done", 3)
+	s.AcknowledgeTransferFile(transfer.ID, 4, -1)
+	assertDone("repeated missing ack", 3)
+	s.AcknowledgeTransferFile(transfer.ID, 3, -1)
+	assertDone("missing ack for directory", 3)
 }

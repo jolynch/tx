@@ -173,7 +173,8 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Offer a tree (directory) via a FTCP server.")
 		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "  CHROOT    server root directory (default: current working directory)")
+		fmt.Fprintln(stderr, "  CHROOT    server root directory (default: current working directory); requests cannot")
+		fmt.Fprintln(stderr, "            leave it, symlinks inside it are followed")
 		fmt.Fprintln(stderr)
 		cf.PrintDefaults(stderr)
 	}

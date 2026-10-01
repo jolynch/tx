@@ -168,7 +168,8 @@ one when `ServerOptions.Deps` is nil, exactly as it does the restore pool.
   possible), and records window hashes for ACK checks. `ACK` and `CXSUM` read
   the same bounded body shape through the shared iterator.
 - `STATUS <tid>` returns one JSON status; bare `STATUS` returns a framed body of
-  one JSON object per line. Completed transfers remain listed until TTL expiry.
+  one JSON object per line. Completed transfers remain listed until TTL expiry,
+  which counts from the transfer's last forward progress.
 - FM/1 front-codes paths/mtimes. FX/1 frames carry file ID, codec, offsets,
   sizes, and checksum; zstd/lz4 decoders are pooled.
 - `CompressionPolicy` selects zstd, lz4, or identity from read/write latency.
@@ -176,8 +177,12 @@ one when `ServerOptions.Deps` is nil, exactly as it does the restore pool.
 `Store` is an RWMutex-protected transfer map with **no process-wide instance**:
 whoever runs a server owns one and closes it. Per-file state is
 `Started -> Running -> Done` (or `Missing` for 404). `NewStore` owns a reap
-goroutine and **must be closed**. TTL expiry happens only in that goroutine,
-not lazily during reads; `WithTTL` shortens the window so tests can reach it.
+goroutine and **must be closed**. The TTL restarts only on forward progress
+(the manifest walk registers new entries or finishes, acknowledged bytes grow,
+a file is counted, a file state advances), never on reads or repeated
+requests. It does not refresh during a single SEND window or post-completion
+CXSUM verification. Expiry happens only in that goroutine, not lazily during
+reads; `WithTTL` shortens the window so tests can reach it.
 `store.Interface` is the consumer contract — methods on `*Store` outside it
 have no production caller and exist for the store's own tests or benchmarks.
 
