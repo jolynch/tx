@@ -274,7 +274,11 @@ Creates a transfer and streams a manifest.
 `TXFER <path> mode=<fast|gentle> link-mbps=<int> concurrency=<int> [verbose=<0|1|true|false>] [deadline-ms=<int>] [cache-map=none|send] [comp=none|zstd]`
 
 - `<path>` must be quoted or length-prefixed.
-- directory must be absolute, existing, and readable.
+- `<path>` is resolved under the server root (`CHROOT`). A path that
+  lexically leaves the root via `..` is rejected with
+  `ERR UNPROCESSABLE path must be within server root` before anything is
+  stat-ed; symlinks inside the root are followed. The resolved directory
+  must exist and be readable.
 - `mode`, `link-mbps`, and `concurrency` are required.
 - `link-mbps` must be `>= 0`.
 - `concurrency` must be `> 0`.
@@ -357,7 +361,11 @@ manifest comes from the client-supplied body.
 `SYNC <path> mode=<fast|gentle> link-mbps=<int> concurrency=<int> [deadline-ms=<int>] [comp=none|zstd] [cache-map=none|send|recv]`
 
 - `<path>` must be quoted or length-prefixed.
-- directory must be absolute, existing, and readable.
+- `<path>` is resolved under the server root (`CHROOT`). A path that
+  lexically leaves the root via `..` is rejected with
+  `ERR UNPROCESSABLE path must be within server root` before anything is
+  stat-ed; symlinks inside the root are followed. The resolved directory
+  must exist and be readable.
 - `mode`, `link-mbps`, and `concurrency` are required.
 - `link-mbps` must be `>= 0`.
 - `concurrency` must be `> 0`.

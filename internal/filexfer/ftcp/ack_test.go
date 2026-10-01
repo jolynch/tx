@@ -149,3 +149,101 @@ func TestHandleACKInvalidLateItemAppliesNothing(t *testing.T) {
 		t.Fatalf("a rejected batch produced a response: %q", out.String())
 	}
 }
+
+// An empty file's ACK never advances AckedSize, yet it must still count
+// toward completion and clear its (fid, 0) window hash.
+func TestHandleACKCompletesTransferWithEmptyFile(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "empty.txt"), nil, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	deps := realDeps(t, "/")
+
+	var logs bytes.Buffer
+	oldFlags := log.Flags()
+	oldWriter := log.Writer()
+	log.SetFlags(0)
+	log.SetOutput(&logs)
+	defer func() {
+		log.SetFlags(oldFlags)
+		log.SetOutput(oldWriter)
+	}()
+
+	req, err := ParseRequest([]byte(fmt.Sprintf("TXFER %q mode=fast link-mbps=1000 concurrency=8 comp=none", root)))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	var manifest bytes.Buffer
+	var txferID string
+	if err := handleTXFERWithCallback(context.Background(), req, &manifest, deps, func(id string) { txferID = id }); err != nil {
+		t.Fatalf("TXFER: %v", err)
+	}
+	entries, _ := parseSYNCResponseEntries(unframeManifestWire(t, manifest.Bytes()), nil)
+	if len(entries) != 2 {
+		t.Fatalf("expected two manifest entries, got %d", len(entries))
+	}
+
+	// The empty file goes through a real SEND, which must leave it Running:
+	// only its ACK may mark it Done and count it.
+	var emptyID uint64
+	for _, e := range entries {
+		if e.Size == 0 {
+			emptyID = e.ID
+		}
+	}
+	emptyPath := filepath.Join(root, "empty.txt")
+	sendReq, err := ParseRequest([]byte("SEND " + txferID))
+	if err != nil {
+		t.Fatalf("ParseRequest SEND: %v", err)
+	}
+	var sendOut bytes.Buffer
+	if err := handleSENDWithOptions(context.Background(), sendReq, framedItemBody(t, fmt.Sprintf("fd=%d %q", emptyID, emptyPath)), &sendOut, deps, nil, false, 25); err != nil {
+		t.Fatalf("SEND: %v", err)
+	}
+	frames, err := decodeFrameStream(sendOut.Bytes())
+	if err != nil || len(frames) != 1 || frames[0].Trailer.FileHashToken == "" {
+		t.Fatalf("SEND of empty file: frames=%d err=%v", len(frames), err)
+	}
+	emptyHash := frames[0].Trailer.FileHashToken
+	if got, _ := deps.GetTransfer(txferID); got.State[emptyID] != TransferStateRunning || got.Done != 0 {
+		t.Fatalf("after SEND: empty file state=%d Done=%d, want Running and uncounted", got.State[emptyID], got.Done)
+	}
+
+	hash := "xxh128:0000000000000000000000000000000a"
+	var body bytes.Buffer
+	bw := encoding.NewFramedBodyWriter(&body, encoding.EncodingZstd, 4096, 0)
+	for _, e := range entries {
+		token := emptyHash
+		if e.ID != emptyID {
+			token = hash
+			if !deps.SetTransferFileWindowHash(txferID, e.ID, e.Size, hash) {
+				t.Fatalf("SetTransferFileWindowHash(%d) returned false", e.ID)
+			}
+		}
+		fmt.Fprintf(bw, "fd=%d %q ack-token=%d@1@%s\n", e.ID, filepath.Join(root, filepath.Base(e.Path)), e.Size, token)
+	}
+	if err := bw.Close(); err != nil {
+		t.Fatalf("close body: %v", err)
+	}
+
+	ackReq, err := ParseRequest([]byte("ACK " + txferID))
+	if err != nil {
+		t.Fatalf("ParseRequest ACK: %v", err)
+	}
+	var out bytes.Buffer
+	if err := handleACKWithInput(context.Background(), ackReq, bytes.NewReader(body.Bytes()), &out, deps); err != nil {
+		t.Fatalf("ACK: %v", err)
+	}
+	if got, ok := deps.GetTransfer(txferID); !ok || got.Done != 2 || !got.CompleteLogged {
+		t.Fatalf("transfer incomplete after ACK: Done=%d NumFiles=%d complete=%v", got.Done, got.NumFiles, got.CompleteLogged)
+	}
+	if !strings.Contains(logs.String(), "txfer-complete: tid="+txferID) {
+		t.Fatalf("expected txfer-complete log, got %q", logs.String())
+	}
+	if deps.VerifyTransferFileWindowHash(txferID, emptyID, 0, emptyHash) {
+		t.Fatalf("empty file's (fid, 0) window hash survived its ACK")
+	}
+}

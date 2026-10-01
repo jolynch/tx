@@ -711,7 +711,9 @@ func progressTotals(entries []tx.ManifestEntry) (totalBytes int64, totalFiles ui
 			ack = size
 		}
 		priorBytes += ack
-		if ack >= size && size > 0 {
+		// Mirrors collectPendingManifestWork: an empty file is prior work
+		// only once its metadata is done.
+		if ack >= size && (size > 0 || entry.Progress.MetadataDone) {
 			priorFiles++
 		}
 	}
@@ -768,6 +770,13 @@ func collectPendingManifestWork(
 			if !noWrite {
 				pendingEntries = append(pendingEntries, entry)
 			}
+			continue
+		}
+		// A fresh empty file trivially has AckBytes >= Size, but it still
+		// needs a SEND to create it and an ACK so the server counts it, so
+		// until its metadata is done it takes the normal pending path.
+		if entry.Size == 0 && !entry.Progress.MetadataDone {
+			pendingEntries = append(pendingEntries, entry)
 			continue
 		}
 		if entry.Progress.AckBytes >= entry.Size {

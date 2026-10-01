@@ -37,3 +37,26 @@ func FuzzCommonPrefixLen(f *testing.F) {
 		}
 	})
 }
+
+func TestPathWithinRoot(t *testing.T) {
+	tests := []struct {
+		root, p string
+		want    bool
+	}{
+		{"/srv/data", "/srv/data", true},
+		{"/srv/data/", "/srv/data/sub/f", true},
+		{"/srv/data", "/srv/data/a/../b", true},
+		{"/srv/data", "/srv/dataX", false}, // sibling sharing the root's prefix
+		{"/srv/data", "/srv/dataX/f", false},
+		{"/srv/data", "/srv", false},
+		{"/srv/data", "/srv/data/../other", false},
+		{"/srv/data", "/srv/data/..foo", true}, // "..foo" is a name, not a parent
+		{"/", "/etc", true},
+		{"/srv/data", "relative", false},
+	}
+	for _, tc := range tests {
+		if got := PathWithinRoot(tc.root, tc.p); got != tc.want {
+			t.Errorf("PathWithinRoot(%q, %q) = %v, want %v", tc.root, tc.p, got, tc.want)
+		}
+	}
+}

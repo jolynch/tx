@@ -298,6 +298,13 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 	if item.Size > 0 && item.Size < windowLen {
 		windowLen = item.Size
 	}
+	// Never stream past the size registered at TXFER/SYNC, which is also
+	// where ACK clamps. A file that grew since then would otherwise send
+	// bytes the client did not plan for (an empty file's SEND carries no
+	// size at all) and fail the client's whole batch.
+	if fileRef.FileSize >= 0 {
+		windowLen = min(windowLen, max(fileRef.FileSize-item.Offset, 0))
+	}
 	// In fast mode, advise sequential access for the whole window then spawn
 	// a background goroutine that issues readahead(2) for the next frame
 	// while we read and process the current one. Only useful when there are
@@ -356,7 +363,8 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 		if !deps.SetTransferFileWindowHash(txferID, item.FileID, 0, windowHashToken) {
 			return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
 		}
-		_ = deps.SetTransferFileState(txferID, item.FileID, TransferStateDone)
+		// The file stays Running until its ACK, which is where every
+		// regular file, empty or not, is marked Done and counted.
 		return nil
 	}
 

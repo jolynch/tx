@@ -27,6 +27,7 @@ import (
 	"github.com/jolynch/tx/internal/bufpool"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
+	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/utils"
 	"github.com/zeebo/xxh3"
 )
@@ -3460,6 +3461,82 @@ func startRealKeepAliveServer(t *testing.T, opts intftcp.ServerOptions) string {
 	go func() { _ = intftcp.Serve(ln, opts) }()
 	t.Cleanup(func() { _ = ln.Close() })
 	return ln.Addr().String()
+}
+
+// A file that grows between TXFER and SEND must still be served at its
+// manifest size. An empty file's SEND carries no size, so without the server
+// clamping the window the whole batch fails on a size mismatch.
+func TestGetFilesServesManifestSizeWhenFilesGrowAfterTXFER(t *testing.T) {
+	root := t.TempDir()
+	for name, body := range map[string]string{"empty.txt": "", "data.txt": "hello"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	st := store.NewStore()
+	t.Cleanup(st.Close)
+	addr := startRealKeepAliveServer(t, intftcp.ServerOptions{Deps: intftcp.NewRuntimeDeps(st, intftcp.WithRoot(root))})
+	client := NewClient(addr)
+	defer client.Close()
+
+	ctx := context.Background()
+	manifestResp, err := client.GetManifest(ctx, GetManifestRequest{Directory: "/", Mode: "fast", LinkMbps: 100, Concurrency: 1})
+	if err != nil {
+		t.Fatalf("GetManifest: %v", err)
+	}
+	var fileIDs []uint64
+	for _, entry := range manifestResp.Manifest.Entries {
+		if entry.Type == intencoding.EntryTypeFile {
+			fileIDs = append(fileIDs, entry.ID)
+		}
+	}
+	if len(fileIDs) != 2 {
+		t.Fatalf("expected two files in manifest, got %d", len(fileIDs))
+	}
+	for _, name := range []string{"empty.txt", "data.txt"} {
+		fd, err := os.OpenFile(filepath.Join(root, name), os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatalf("open %s: %v", name, err)
+		}
+		if _, err := fd.WriteString("grown after TXFER!!!"); err != nil {
+			t.Fatalf("append %s: %v", name, err)
+		}
+		fd.Close()
+	}
+
+	var mu sync.Mutex
+	got := map[string]*bytes.Buffer{}
+	_, err = client.GetFiles(ctx, GetFilesRequest{
+		Manifest: manifestResp.Manifest,
+		FileIDs:  fileIDs,
+		OutputWriter: func(entry ManifestEntry, _ int64) (io.WriteCloser, func() error, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			buf := &bytes.Buffer{}
+			got[entry.Path] = buf
+			return struct {
+				io.Writer
+				io.Closer
+			}{buf, io.NopCloser(nil)}, func() error { return nil }, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("GetFiles: %v", err)
+	}
+	for path, want := range map[string]string{"empty.txt": "", "data.txt": "hello"} {
+		var body string
+		for p, buf := range got {
+			if strings.HasSuffix(p, path) {
+				body = buf.String()
+			}
+		}
+		if body != want {
+			t.Fatalf("%s: got %q want %q", path, body, want)
+		}
+	}
+	if tr, ok := st.GetTransfer(manifestResp.Manifest.TransferID); !ok || !tr.CompleteLogged {
+		t.Fatalf("server transfer did not complete: %+v", tr)
+	}
 }
 
 func TestClientKeepAliveSessionConnReuse(t *testing.T) {

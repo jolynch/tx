@@ -51,6 +51,7 @@ fuzz-long:
 	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzFramedItemRoundTrip -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
 	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzFramedBodyHeader -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
 	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzSync -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
+	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzResolveUnderRoot -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
 	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzServeZeroCopySEND -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG) -parallel=1
 
 # internal/bench holds benchmarks of exported code. Benchmarks that need
