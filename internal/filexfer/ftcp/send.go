@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jolynch/tx/internal/bufpool"
+	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/filexfer/policy"
@@ -99,9 +100,12 @@ type frameStreamArgs struct {
 }
 
 type frameStreamStats struct {
-	LogicalSize     int64
-	WireSize        int64
-	PrepareLatency  time.Duration
+	LogicalSize    int64
+	WireSize       int64
+	PrepareLatency time.Duration
+	// ReadLatency is the part of PrepareLatency spent reading the file; the
+	// rest is compression.
+	ReadLatency     time.Duration
 	WriteLatency    time.Duration
 	NextOffset      int64
 	WindowHashToken string
@@ -109,6 +113,27 @@ type frameStreamStats struct {
 
 // parseSENDHeader reads the command line, which now carries only
 // transfer-level fields. The per-file items arrive in the framed request body.
+// Send paths reported in window events: the zero-copy tee+splice path is
+// reported as sendfile.
+const (
+	sendPathSendfile = "sendfile"
+	sendPathBuffered = "buffered"
+)
+
+func emitWindow(scope events.Scope, txferID string, fileID uint64, off int64, comp, sendPath string, stats frameStreamStats) {
+	scope.Sink.Emit("window", txferID,
+		events.F("conn", scope.Conn),
+		events.F("file", fileID),
+		events.F("off", off),
+		events.F("len", stats.LogicalSize),
+		events.F("wire", stats.WireSize),
+		events.F("codec", comp),
+		events.F("send_path", sendPath),
+		events.Dur("read_dur", stats.ReadLatency),
+		events.Dur("comp_dur", stats.PrepareLatency-stats.ReadLatency),
+		events.Dur("write_dur", stats.WriteLatency))
+}
+
 func parseSENDHeader(req Request) (sendHeader, error) {
 	if req.Verb != VerbSEND {
 		return sendHeader{}, protocolErr{code: "BAD_COMMAND", message: "not SEND"}
@@ -255,9 +280,16 @@ func checkTransferDeadline(deps Deps, txferID string, transfer Transfer) error {
 func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID string, item sendItem, disableZeroCopy bool) error {
 	ctx, windowTask := trace.NewTask(ctx, "send-window")
 	defer windowTask.End()
+	scope := events.FromContext(ctx)
+	itemStart := time.Now()
 	fd, fileRef, usedDirectOpen, err := openSendFile(deps, txferID, item)
 	if err != nil {
 		return mapLookupError(err)
+	}
+	if scope.Sink.Enabled() {
+		scope.Sink.Emit("file_open", txferID,
+			events.F("conn", scope.Conn), events.F("file", item.FileID), events.F("path", item.Path),
+			events.F("len", fileRef.FileSize), events.Dur("dur", time.Since(itemStart)))
 	}
 	defer func() {
 		if fd != nil {
@@ -363,6 +395,9 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 		if !deps.SetTransferFileWindowHash(txferID, item.FileID, 0, windowHashToken) {
 			return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
 		}
+		if scope.Sink.Enabled() {
+			scope.Sink.Emit("file_done", txferID, events.F("conn", scope.Conn), events.F("file", item.FileID), events.Dur("dur", time.Since(itemStart)))
+		}
 		// The file stays Running until its ACK, which is where every
 		// regular file, empty or not, is marked Done and counted.
 		return nil
@@ -419,7 +454,9 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 
 		frameOffset := cursor
 		var stats frameStreamStats
+		sendPath := sendPathBuffered
 		if !disableZeroCopy && canZeroCopy(frameArgs) {
+			sendPath = sendPathSendfile
 			stats, err = streamFramePayloadZeroCopy(fd, &frameOffset, frameArgs)
 		} else {
 			stats, err = streamFramePayloadBuffered(fd, &frameOffset, frameArgs)
@@ -459,9 +496,15 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 			return err
 		}
 
+		if scope.Sink.Enabled() {
+			emitWindow(scope, txferID, item.FileID, cursor, frameComp, sendPath, stats)
+		}
 		cursor = stats.NextOffset
 		remaining -= frameSize
 		firstFrame = false
+		if isTerminal && scope.Sink.Enabled() && cursor >= fileRef.FileSize {
+			scope.Sink.Emit("file_done", txferID, events.F("conn", scope.Conn), events.F("file", item.FileID), events.Dur("dur", time.Since(itemStart)))
+		}
 
 		if isTerminal {
 			if stats.WindowHashToken == "" {
@@ -748,7 +791,7 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 	}
 
 	readRegion := trace.StartRegion(args.Ctx, "frame-read")
-	prepareLatency, err := streamBufferedRead(fd, fileOffset, args.FrameSize, readBuf, isCompressed, func(chunk []byte) error {
+	prepareLatency, readLatency, err := streamBufferedRead(fd, fileOffset, args.FrameSize, readBuf, isCompressed, func(chunk []byte) error {
 		_, _ = args.WindowHasher.Write(chunk)
 		writeStart := time.Now()
 		written, writeErr := payloadWriter.Write(chunk)
@@ -807,6 +850,7 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 		LogicalSize:     args.FrameSize,
 		WireSize:        wireSize,
 		PrepareLatency:  prepareLatency,
+		ReadLatency:     readLatency,
 		WriteLatency:    writeLatency,
 		NextOffset:      *fileOffset,
 		WindowHashToken: windowHashToken,
@@ -1022,6 +1066,7 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 		LogicalSize:     args.FrameSize,
 		WireSize:        args.FrameSize,
 		PrepareLatency:  prepareLatency,
+		ReadLatency:     prepareLatency,
 		WriteLatency:    writeLatency,
 		NextOffset:      *fileOffset,
 		WindowHashToken: windowHashToken,
@@ -1063,8 +1108,7 @@ func streamBufferedRead(
 	buf []byte,
 	includeHandleInPrepare bool,
 	handle func([]byte) error,
-) (time.Duration, error) {
-	prepareLatency := time.Duration(0)
+) (prepareLatency, readLatency time.Duration, err error) {
 	remaining := frameSize
 	for remaining > 0 {
 		readSize := len(buf)
@@ -1073,13 +1117,13 @@ func streamBufferedRead(
 		}
 		readStart := time.Now()
 		n, readErr := fd.ReadAt(buf[:readSize], *fileOffset)
-		prepareLatency += time.Since(readStart)
+		readLatency += time.Since(readStart)
 		if n > 0 {
 			*fileOffset += int64(n)
 			remaining -= int64(n)
 			handleStart := time.Now()
 			if err := handle(buf[:n]); err != nil {
-				return 0, err
+				return 0, 0, err
 			}
 			if includeHandleInPrepare {
 				prepareLatency += time.Since(handleStart)
@@ -1089,13 +1133,13 @@ func streamBufferedRead(
 			if errors.Is(readErr, io.EOF) && remaining == 0 {
 				break
 			}
-			return 0, readErr
+			return 0, 0, readErr
 		}
 	}
 	if remaining != 0 {
-		return 0, io.ErrUnexpectedEOF
+		return 0, 0, io.ErrUnexpectedEOF
 	}
-	return prepareLatency, nil
+	return prepareLatency + readLatency, readLatency, nil
 }
 
 func acquireCompressedFrameBuffer(logicalSize int64, comp string) *bytes.Buffer {

@@ -23,6 +23,7 @@ import (
 
 	"filippo.io/age"
 	"github.com/jolynch/tx/internal/bufpool"
+	"github.com/jolynch/tx/internal/events"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	intlimit "github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/metrics"
@@ -134,6 +135,73 @@ func WithEncryptMode(mode string) ClientOption {
 	})
 }
 
+// metrics returns the counters this client records into.
+// manifestStart emits manifest_start for a TXFER or SYNC.
+func (c *Client) manifestStart(dir string) time.Time {
+	c.sink().Emit("manifest_start", "", events.F("path", dir))
+	return time.Now()
+}
+
+// manifestEnd emits manifest_end with the manifest's file and byte counts.
+func (c *Client) manifestEnd(start time.Time, m *Manifest, err error) {
+	var files, size int64
+	tid := ""
+	if m != nil {
+		tid = m.TransferID
+		for _, e := range m.Entries {
+			if e.Type == 0 || e.Type == intencoding.EntryTypeFile {
+				files++
+				size += e.Size
+			}
+		}
+	}
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	c.sink().Emit("manifest_end", tid, events.F("files", files), events.F("bytes", size),
+		events.Dur("dur", time.Since(start)), events.F("err", msg))
+}
+
+func (c *Client) emitFileStart(tid string, plan downloadBatchPlan) {
+	if s := c.sink(); s.Enabled() {
+		s.Emit("file_start", tid, events.F("file", plan.entry.ID), events.F("path", plan.entry.Path),
+			events.F("len", plan.entry.Size), events.F("off", plan.resumeFrom))
+	}
+}
+
+func (c *Client) emitFileDone(tid string, fileID uint64, d time.Duration) {
+	if s := c.sink(); s.Enabled() {
+		s.Emit("file_done", tid, events.F("file", fileID), events.Dur("dur", d))
+	}
+}
+
+func (c *Client) emitFsync(tid string, fileID uint64, d time.Duration) {
+	if s := c.sink(); s.Enabled() {
+		s.Emit("fsync", tid, events.F("file", fileID), events.Dur("dur", d))
+	}
+}
+
+func (c *Client) metrics() *metrics.ClientMetrics {
+	if c.sharedMetrics != nil {
+		return c.sharedMetrics
+	}
+	return &c.ownMetrics
+}
+
+// ClientMetricCounters is a concurrency-safe set of client counters. Its
+// zero value is ready to share across clients; Snapshot reads the totals.
+type ClientMetricCounters = metrics.ClientMetrics
+
+// WithClientMetrics makes the client count into m instead of its own
+// counters, so several clients in one process share one set. A nil m is
+// ignored.
+func WithClientMetrics(m *ClientMetricCounters) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.sharedMetrics = m
+	})
+}
+
 func WithClientAuthTokens(tokens ...string) ClientOption {
 	return clientOptionFunc(func(c *Client) {
 		var out []string
@@ -197,9 +265,16 @@ type Client struct {
 	// scratchBufferPool caches reusable temporary byte buffers.
 	scratchBufferPool sync.Pool
 
-	// clientMetrics owns all counters for this client. Mutate via its methods
-	// (e.g. IncSyncConnectionFallback) and read via MetricSnapshot.
-	clientMetrics metrics.ClientMetrics
+	// ownMetrics holds this client's counters unless WithClientMetrics
+	// supplied sharedMetrics. Use metrics() to mutate (e.g.
+	// IncSyncConnectionFallback) and MetricSnapshot to read.
+	ownMetrics    metrics.ClientMetrics
+	sharedMetrics *metrics.ClientMetrics
+
+	// eventSink receives the client's event timeline (WithEventSink);
+	// connIDs numbers its connections for conn_* and req_* events.
+	eventSink *events.Sink
+	connIDs   sync.Map // net.Conn -> uint64
 
 	// keepAliveMS caches the server's keep-alive grant (keep-alive-ms from a
 	// PROBE response). Zero until a probe observes support; pools created
@@ -669,10 +744,20 @@ func (c *Client) MetricSnapshot() ClientMetrics {
 	if c == nil {
 		return ClientMetrics{}
 	}
-	return c.clientMetrics.Snapshot()
+	return c.metrics().Snapshot()
 }
 
 func (c *Client) GetManifest(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {
+	if !c.sink().Enabled() {
+		return c.getManifest(ctx, request)
+	}
+	start := c.manifestStart(request.Directory)
+	resp, err := c.getManifest(ctx, request)
+	c.manifestEnd(start, resp.Manifest, err)
+	return resp, err
+}
+
+func (c *Client) getManifest(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {
 	ctx, task := trace.NewTask(ctx, "fetch-manifest")
 	defer task.End()
 	if c == nil {
@@ -699,6 +784,16 @@ func (c *Client) GetManifest(ctx context.Context, request GetManifestRequest) (G
 }
 
 func (c *Client) SyncManifest(ctx context.Context, request SyncManifestRequest) (SyncManifestResponse, error) {
+	if !c.sink().Enabled() {
+		return c.syncManifest(ctx, request)
+	}
+	start := c.manifestStart(request.Directory)
+	resp, err := c.syncManifest(ctx, request)
+	c.manifestEnd(start, resp.Manifest, err)
+	return resp, err
+}
+
+func (c *Client) syncManifest(ctx context.Context, request SyncManifestRequest) (SyncManifestResponse, error) {
 	ctx, task := trace.NewTask(ctx, "sync-manifest")
 	defer task.End()
 	if c == nil {
@@ -909,7 +1004,7 @@ func (c *Client) fetchFileWindow(
 	if err != nil {
 		return nil, nil, err
 	}
-	fileStream, meta, err := c.newFileStream(stream, "", target.Size)
+	fileStream, meta, err := c.newFileStreamTraced(stream, "", target.Size, reqTraceFrom(ctx))
 	if err != nil {
 		_ = stream.Close()
 		return nil, nil, err
@@ -990,7 +1085,7 @@ func (c *Client) collectEntryMetadataGroup(
 	if err != nil {
 		return fmt.Errorf("read metadata terminal status: %w", err)
 	}
-	if err := parseErrControlFrame(statusLine); err != nil {
+	if err := parseErrControlFrame(c.metrics(), statusLine); err != nil {
 		return err
 	}
 	if _, ok := parseOKStatusLine(statusLine); !ok {
@@ -1070,7 +1165,7 @@ func (c *Client) acknowledgeMissingFile(ctx context.Context, transferID string, 
 	if ackTimeout <= 0 {
 		ackTimeout = defaultClientAckRequestTimeout
 	}
-	return retryAck(ctx, func(callCtx context.Context) error {
+	return c.retryAck(ctx, func(callCtx context.Context) error {
 		ackCtx, cancel := context.WithTimeout(callCtx, ackTimeout)
 		defer cancel()
 		_, err := c.AcknowledgeFileProgress(ackCtx, AcknowledgeFileProgressRequest{
@@ -1235,6 +1330,20 @@ func (c *Client) downloadManifestSubBatchSequential(
 	body encodedRequest,
 	emitProgressUpdate func(DownloadProgressUpdate),
 ) ([]DownloadFileResponse, []AcknowledgeFileProgressRequest, []seqAckProgress, error) {
+	rt := c.beginReq("SEND", req.Manifest.TransferID)
+	files, acks, progress, err := c.downloadSubBatch(withReqTrace(ctx, rt), rt, req, plans, body, emitProgressUpdate)
+	rt.end(c, err)
+	return files, acks, progress, err
+}
+
+func (c *Client) downloadSubBatch(
+	ctx context.Context,
+	rt *reqTrace,
+	req GetFilesRequest,
+	plans []downloadBatchPlan,
+	body encodedRequest,
+	emitProgressUpdate func(DownloadProgressUpdate),
+) ([]DownloadFileResponse, []AcknowledgeFileProgressRequest, []seqAckProgress, error) {
 	stream, err := c.fetchFileBatchBodyTCP(ctx, req.Manifest.TransferID, body)
 	if err != nil {
 		var missingErr *fileMissingError
@@ -1294,6 +1403,13 @@ func (c *Client) downloadManifestSubBatchSequential(
 		}
 
 		fileStart := time.Now()
+		c.emitFileStart(req.Manifest.TransferID, plan)
+		var timedOut *timedWriter
+		var out io.Writer = writer
+		if rt != nil {
+			timedOut = &timedWriter{w: writer}
+			out = timedOut
+		}
 		meta := FileFrameMeta{
 			FileID: plan.entry.ID,
 			Comp:   "none",
@@ -1311,6 +1427,7 @@ func (c *Client) downloadManifestSubBatchSequential(
 				_ = closeWriter()
 				return nil, nil, nil, fmt.Errorf("read frame header: %w", readErr)
 			}
+			arrival := time.Now()
 			headerTrimmed := strings.TrimRight(headerLine, "\r\n")
 			if isStatusLine(headerTrimmed) {
 				_ = closeWriter()
@@ -1340,7 +1457,7 @@ func (c *Client) downloadManifestSubBatchSequential(
 				return nil, nil, nil, fmt.Errorf("decode payload reader: %w", decodeErr)
 			}
 			frameStartOffset := offset
-			copyErr := copyStreamWithProgress(io.MultiWriter(writer, windowHasher), logicalReader, frameBuf, func(written int64) error {
+			copyErr := copyStreamWithProgress(io.MultiWriter(out, windowHasher), logicalReader, frameBuf, func(written int64) error {
 				emitProgressUpdate(DownloadProgressUpdate{
 					TransferID:  req.Manifest.TransferID,
 					FileID:      plan.entry.ID,
@@ -1363,6 +1480,10 @@ func (c *Client) downloadManifestSubBatchSequential(
 			meta.WireSize += frameMeta.WireSize
 			meta.Comp = frameMeta.Comp
 			offset += frameMeta.Size
+			c.metrics().ObserveWindow(frameMeta.Comp, frameMeta.Size, frameMeta.WireSize)
+			if rt != nil {
+				rt.window(c, frameMeta, arrival, timedOut.take())
+			}
 
 			trailerLine, trailerReadErr := br.ReadString('\n')
 			if trailerReadErr != nil {
@@ -1420,9 +1541,11 @@ func (c *Client) downloadManifestSubBatchSequential(
 		}
 		syncTask.End()
 		syncMS = time.Since(syncStart).Milliseconds()
+		c.emitFsync(req.Manifest.TransferID, plan.entry.ID, time.Since(syncStart))
 		if err := closeWriter(); err != nil {
 			return nil, nil, nil, fmt.Errorf("close output for file %d: %w", plan.entry.ID, err)
 		}
+		c.emitFileDone(req.Manifest.TransferID, plan.entry.ID, time.Since(fileStart))
 
 		localHash := windowHash
 		recvMS := time.Since(fileStart).Milliseconds()
@@ -1460,7 +1583,7 @@ func (c *Client) downloadManifestSubBatchSequential(
 			return nil, nil, nil, fmt.Errorf("read batch terminal status: %w", err)
 		}
 	} else {
-		if err := parseErrControlFrame(statusLine); err != nil {
+		if err := parseErrControlFrame(c.metrics(), statusLine); err != nil {
 			return nil, nil, nil, err
 		}
 		if _, ok := parseOKStatusLine(statusLine); !ok {
@@ -1559,7 +1682,7 @@ func (c *Client) downloadManifestBatchSequential(
 
 	if len(allAcks) > 0 {
 		_, ackTask := trace.NewTask(ctx, "ack")
-		ackErr := retryAck(ctx, func(callCtx context.Context) error {
+		ackErr := c.retryAck(ctx, func(callCtx context.Context) error {
 			ackCtx, cancel := context.WithTimeout(callCtx, ackTimeout)
 			defer cancel()
 			_, err := c.acknowledgeFileProgressBatch(ackCtx, allAcks)
@@ -1584,6 +1707,23 @@ func (c *Client) downloadManifestBatchSequential(
 }
 
 func (c *Client) downloadManifestBatchWindows(
+	ctx context.Context,
+	req GetFilesRequest,
+	plan downloadBatchPlan,
+) (GetFilesResponse, error) {
+	if !c.sink().Enabled() {
+		return c.downloadWindows(ctx, req, plan)
+	}
+	start := time.Now()
+	c.emitFileStart(req.Manifest.TransferID, plan)
+	resp, err := c.downloadWindows(ctx, req, plan)
+	if err == nil {
+		c.emitFileDone(req.Manifest.TransferID, plan.entry.ID, time.Since(start))
+	}
+	return resp, err
+}
+
+func (c *Client) downloadWindows(
 	ctx context.Context,
 	req GetFilesRequest,
 	plan downloadBatchPlan,
@@ -1699,7 +1839,7 @@ func (c *Client) downloadManifestBatchWindows(
 			continue
 		}
 		_, ackTask := trace.NewTask(requestCtx, "ack")
-		ackErr := retryAck(requestCtx, func(callCtx context.Context) error {
+		ackErr := c.retryAck(requestCtx, func(callCtx context.Context) error {
 			ackCtx, cancelAck := context.WithTimeout(callCtx, ackTimeout)
 			defer cancelAck()
 			_, err := c.acknowledgeFileProgressBatch(ackCtx, ackBatch)
@@ -1800,6 +1940,22 @@ func (c *Client) downloadSplitWindow(
 ) (splitWindowResult, error) {
 	ctx, windowTask := trace.NewTask(ctx, "download-window")
 	defer windowTask.End()
+	rt := c.beginReq("SEND", req.Manifest.TransferID)
+	ctx = withReqTrace(ctx, rt)
+	result, err := c.downloadSplitWindowTraced(ctx, req, plan, window, writer, syncOutput, emitProgressUpdate)
+	rt.end(c, err)
+	return result, err
+}
+
+func (c *Client) downloadSplitWindowTraced(
+	ctx context.Context,
+	req GetFilesRequest,
+	plan downloadBatchPlan,
+	window splitWindow,
+	writer io.WriteCloser,
+	syncOutput func() error,
+	emitProgressUpdate func(DownloadProgressUpdate),
+) (splitWindowResult, error) {
 	start := time.Now()
 	reader, meta, err := c.fetchFileWindow(
 		ctx,
@@ -1881,6 +2037,7 @@ func (c *Client) downloadSplitWindow(
 	}
 	syncTask.End()
 	syncMS := time.Since(syncStart).Milliseconds()
+	c.emitFsync(req.Manifest.TransferID, plan.entry.ID, time.Since(syncStart))
 	if err := closeWriter(); err != nil {
 		return splitWindowResult{}, fmt.Errorf("close output for file %d: %w", plan.entry.ID, err)
 	}
@@ -2030,6 +2187,8 @@ func (c *Client) StartFromManifest(ctx context.Context, req StartFromManifestReq
 				ProgressUpdates:    req.ProgressUpdates,
 			})
 			if err != nil {
+				c.sink().Emit("error", req.Manifest.TransferID, events.F("verb", "SEND"), events.F("file", batch[0].ID),
+					events.F("files", len(batch)), events.F("err", err.Error()))
 				errCh <- fmt.Errorf("batch first-id=%d count=%d: %w", batch[0].ID, len(batch), err)
 				continue
 			}
@@ -2287,6 +2446,25 @@ func LocalSuggestedConcurrency(cpu, ioDepth int) int {
 }
 
 func (c *Client) ProbeLink(ctx context.Context, req ProbeRequest) (ProbeResponse, error) {
+	if !c.sink().Enabled() {
+		return c.probeLink(ctx, req)
+	}
+	start := time.Now()
+	resp, err := c.probeLink(ctx, req)
+	if err == nil {
+		c.sink().Emit("probe", "", events.Dur("dur", time.Since(start)),
+			events.Dur("rtt", time.Duration(resp.AvgLatencyMS)*time.Millisecond),
+			events.F("keepalive_ms", c.keepAliveMS.Load()),
+			events.F("target_request_bytes", resp.TargetRequestBytes),
+			events.F("max_request_bytes", resp.MaxRequestBytes),
+			events.F("max_sync_request_bytes", resp.MaxSyncRequestBytes),
+			events.F("concurrency", resp.SuggestedConcurrency),
+			events.F("link_mbps", resp.LinkMbps))
+	}
+	return resp, err
+}
+
+func (c *Client) probeLink(ctx context.Context, req ProbeRequest) (ProbeResponse, error) {
 	ctx, task := trace.NewTask(ctx, "probe-link")
 	defer task.End()
 	if c == nil {
@@ -2575,15 +2753,23 @@ func buildAckToken(ackBytes int64, serverTS int64, hashToken string) (string, er
 	return token, nil
 }
 
-func retryAck(ctx context.Context, fn func(context.Context) error) error {
+// ackAttemptKey carries the attempt number to the ACK request, for ack
+// events.
+type ackAttemptKey struct{}
+
+func (c *Client) retryAck(ctx context.Context, fn func(context.Context) error) error {
 	const maxAttempts = 5
 	backoff := 100 * time.Millisecond
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if err := fn(ctx); err == nil {
+		if attempt > 1 {
+			c.metrics().IncAckRetry()
+		}
+		if err := fn(context.WithValue(ctx, ackAttemptKey{}, attempt)); err == nil {
 			return nil
 		} else {
 			lastErr = err
+			c.sink().Emit("retry", "", events.F("verb", "ACK"), events.F("attempt", attempt), events.F("err", err.Error()))
 		}
 		if attempt == maxAttempts {
 			break
@@ -2974,6 +3160,10 @@ type fileStream struct {
 	respBody io.Closer
 	br       frameLineReader
 	identity age.Identity
+	metrics  *metrics.ClientMetrics
+	client   *Client
+	rt       *reqTrace // nil unless events are on
+	arrival  time.Time // when the current frame's header arrived
 
 	meta *FileFrameMeta
 
@@ -3117,6 +3307,10 @@ func (c *Client) fileStreamBufferHint(fileSizeHint int64, firstFrameSize int64) 
 }
 
 func (c *Client) newFileStream(respBody io.ReadCloser, ageIdentity string, fileSizeHint int64) (io.ReadCloser, *FileFrameMeta, error) {
+	return c.newFileStreamTraced(respBody, ageIdentity, fileSizeHint, nil)
+}
+
+func (c *Client) newFileStreamTraced(respBody io.ReadCloser, ageIdentity string, fileSizeHint int64, rt *reqTrace) (io.ReadCloser, *FileFrameMeta, error) {
 	identity, err := parseAgeIdentity(ageIdentity)
 	if err != nil {
 		return nil, nil, err
@@ -3143,6 +3337,10 @@ func (c *Client) newFileStream(respBody io.ReadCloser, ageIdentity string, fileS
 		respBody:  respBody,
 		br:        newPooledLineReader(probe, readBuf),
 		identity:  identity,
+		metrics:   c.metrics(),
+		client:    c,
+		rt:        rt,
+		arrival:   time.Now(),
 		meta:      &FileFrameMeta{},
 		pending:   &firstMeta,
 		releaseBr: release,
@@ -3236,6 +3434,9 @@ func (s *fileStream) openNextFrame() error {
 		s.pending = nil
 	} else {
 		headerLine, err := s.br.ReadString('\n')
+		if s.rt != nil {
+			s.arrival = time.Now()
+		}
 		if err != nil {
 			if errors.Is(err, io.EOF) && headerLine == "" {
 				if s.expectNextFrame {
@@ -3247,7 +3448,7 @@ func (s *fileStream) openNextFrame() error {
 		}
 		trimmedHeader := strings.TrimRight(headerLine, "\r\n")
 		if s.expectOffset && !s.expectNextFrame && isStatusLine(trimmedHeader) {
-			if err := parseErrControlFrame(trimmedHeader); err != nil {
+			if err := parseErrControlFrame(s.metrics, trimmedHeader); err != nil {
 				return err
 			}
 			if _, ok := parseOKStatusLine(trimmedHeader); ok {
@@ -3331,6 +3532,10 @@ func (s *fileStream) finishFrame() error {
 
 	s.meta.Size += s.frameMeta.Size
 	s.meta.WireSize += s.frameMeta.WireSize
+	s.metrics.ObserveWindow(s.frameMeta.Comp, s.frameMeta.Size, s.frameMeta.WireSize)
+	if s.rt != nil {
+		s.rt.window(s.client, s.frameMeta, s.arrival, 0)
+	}
 	if s.meta.CompCounts == nil {
 		s.meta.CompCounts = make(map[string]uint64, 3)
 	}

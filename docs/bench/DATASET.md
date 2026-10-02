@@ -9,7 +9,7 @@ fingerprint over that list identifies the whole tree.
 ## Layout
 
 ```text
-tx-bench/
+tx-bench-src/
   bench.json
   files.tsv                            every entry's type, size, hash, path
   data/
@@ -85,7 +85,7 @@ your own tree. It cannot be combined with shape flags.
   both `BENCH_DIR` and `DIR`, and `bench.json` records both remote paths
   ([Served Root](./OVERVIEW.md#served-root)).
 - **Not nested.** `BENCH_DIR` and `DIR` may not be nested inside each other in
-  either direction. `--in .` with the default `./tx-bench` is a usage error
+  either direction. `--in .` with the default `./tx-bench-src` is a usage error
   that suggests a sibling `BENCH_DIR`.
 - **Hashed once.** Import walks `DIR` and hashes every regular file with
   `-j` workers, then writes `files.tsv`, the fingerprint, and `bench.json`.

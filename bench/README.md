@@ -1,153 +1,52 @@
 # Benchmarks
 
-This directory holds the helper CLI, benchmark runner, and scratch space used
-for transfer benchmarking.
+End-to-end benchmarks run with `tx-bench`, which forks real `tx` processes on
+two hosts (or one), verifies every byte against an independent oracle, and
+reports. Its design and reference live in [docs/bench](../docs/bench/OVERVIEW.md).
 
-Commands below assume your current directory is `bench/`.
-
-## Layout
-
-- `run`: benchmark runner for `tx` and an `rsync` baseline.
-- `bench`: helper CLI built from `./internal/bench`.
-- `tx`: local transfer binary used by `./run`.
-- `data/src`: source tree used as the remote dataset.
-- `data/dst`: target tree used as the local destination.
-- `data/silesia`: cached original Silesia corpus files used by `-source silesia:<csv>`.
-
-`./run` clears `data/dst` and `data/.tx` before each run.
-
-## Quickstart
-
-Build the benchmark tools:
+Build both binaries into the repo root:
 
 ```bash
-make -C .. build-bench
+make build                  # ./tx and ./tx-bench
 ```
 
-This creates both `./bench` and `./tx` in the `bench/` directory.
+Commands below run from the repo root.
 
-Generate a dataset into `data/src`:
+`tx-bench` forks the `tx` next to it unless `--tx` or `$TX_BIN` names another,
+for example `TX_BIN=./tx-new ./tx-bench local -s 1GiB` to A/B a build.
+
+## Two hosts
 
 ```bash
-./bench generate -source rand data/src:81920@64KiB
+# sender: generate 10GiB (mixed profile), serve it, print the client command
+./tx-bench remote send-tree --size 10GiB
+
+# receiver: paste the printed command
+./tx-bench remote recv-copy 10.0.4.17:3453 --expect 7f3a9c21e0b4d8aa
 ```
 
-Run the copy benchmark:
+## One host
 
 ```bash
-./run data/src --target-dir data/dst
+./tx-bench local -s 1GiB -n 3                      # tx against itself
+./tx-bench local -s 1GiB --baseline rsync          # rsync on the same dataset
+./tx-bench local -s 1GiB -- --compress zstd        # pass flags to tx recv copy
+./tx-bench local -s 1GiB --send-arg --disable-zero-copy
+./tx-bench local -s 1GiB --go-trace c.out --send-go-trace s.out   # runtime/trace
 ```
 
-`./run` resolves `data/src` to an absolute server path automatically, so these
-relative examples work from inside `bench/`.
+Datasets are described by a size and a mix (`--profile mixed|small|large|random|compressible`
+or `--mix rand=40%@1GiB,silesia:osdb=60%@16MiB`); see
+[Dataset](../docs/bench/DATASET.md). `tx-bench prep` generates or imports one
+ahead of time and sets the sender's page cache.
 
-Useful runner variants:
+## Profiling
+
+CPU flamegraphs are an external `perf record` against the forked processes,
+for example `perf record -g -p "$(pgrep -f 'tx recv copy')"`.
+
+## Microbenchmarks
 
 ```bash
-./run data/src --skip-write
-./run data/src --compress zstd
-./run data/src --encrypt chacha20
-./run data/src --rsync
+make bench                  # go test -bench, results in bench/results/latest.txt
 ```
-
-See `./bench generate -h` and `./run --help` for the full command
-surface.
-
-## Generate Datasets
-
-`bench generate` accepts one or more specs:
-
-```text
-<outdir>:<count>@<size>
-```
-
-Examples:
-
-```bash
-./bench generate data/src:100@10MiB
-./bench generate -source rand data/src-small:81920@64KiB
-./bench generate -source silesia:osdb,nci data/src:10@100MiB
-```
-
-Before regenerating `data/src`, clear prior files but keep the placeholder:
-
-```bash
-find data/src -mindepth 1 ! -name .keep -delete
-```
-
-## Example: 5 GiB Of Small Files
-
-This uses `64KiB` files, which gives exactly `5GiB` total across `81,920`
-files.
-
-```bash
-find data/src -mindepth 1 ! -name .keep -delete
-./bench generate -source rand data/src:81920@64KiB
-./run data/src --target-dir data/dst
-```
-
-## Example: 5 GiB As Two Large Files
-
-This creates two `2560MiB` files, for exactly `5GiB` total.
-
-```bash
-find data/src -mindepth 1 ! -name .keep -delete
-./bench generate -source rand data/src:2@2560MiB
-./run data/src --target-dir data/dst
-```
-
-## Example: Mixed 10 GiB Dataset
-
-This mix uses:
-
-- `2 x 1GiB` files from `silesia:osdb,dickens`
-- `409 x 10MiB` files from `rand`
-- `2 x 2GiB` files from `rand`
-
-```bash
-find data/src -mindepth 1 ! -name .keep -delete
-./bench generate -source silesia:osdb,dickens data/src:2@1GiB
-./bench generate -source rand data/src:409@10MiB
-./bench generate -source rand data/src:2@2GiB
-./run data/src --target-dir data/dst
-```
-
-This lands `6MiB` short of exact `10GiB`, because `10MiB` files do not divide
-evenly into `4GiB`. If you want the total to be exactly `10GiB`, add one more
-small file:
-
-```bash
-./bench generate -source rand data/src:1@6MiB
-```
-
-## Generate From Silesia
-
-Use one cached corpus file:
-
-```bash
-find data/src -mindepth 1 ! -name .keep -delete
-./bench generate -source silesia:osdb data/src:10@100MiB
-./run data/src --target-dir data/dst
-```
-
-Use multiple corpus files in round-robin order:
-
-```bash
-find data/src -mindepth 1 ! -name .keep -delete
-./bench generate -source silesia:osdb,nci data/src:10@100MiB
-./run data/src --target-dir data/dst
-```
-
-When `-source silesia:<csv>` is used:
-
-- requested originals are downloaded once into `bench/data/silesia/`
-- cached originals are reused on later runs
-- output files are built by repeating and truncating the selected original bytes
-- multiple selected corpus files are assigned to outputs in round-robin order
-
-Useful small Silesia subsets include `osdb`, `nci`, `mr`, and `dickens`.
-
-## Notes
-
-- `-source rand` creates deterministic random data, which is useful for stressing I/O, framing, and crypto.
-- `-source silesia:<csv>` produces more compression-realistic content while still letting you scale each generated file to any target size.

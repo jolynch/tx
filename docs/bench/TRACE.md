@@ -36,7 +36,7 @@ Every record carries these fields:
 
 | Field  | Meaning |
 |--------|---------|
-| `t`    | Emitting host's wall clock, unix nanoseconds. Durations are taken from the monotonic clock. |
+| `t`    | Emitting host's wall clock, unix nanoseconds, when the event happened; an event with a `dur` is stamped at its end. Durations are taken from the monotonic clock. |
 | `side` | `c` (client) or `s` (sender) |
 | `run`  | Client run label (`w1`, `1`, …), added by `tx-bench`; `-` on the sender |
 | `tid`  | Transfer ID; `-` before `TXFER` returns |
@@ -60,17 +60,17 @@ t side run tid ev file off len dur k=v...
 
 | Event                        | Fields |
 |------------------------------|--------|
-| `run_start` / `run_end`      | `dst`; end: `status`, `bytes`, `files`, `err` |
-| `probe`                      | `dur`, `rtt`, `keepalive_ms`, advertised limits |
-| `manifest_start` / `manifest_end` | end: `files`, `bytes`, `dur` |
+| `run_start` / `run_end`      | `dst`, `command`; end: `status`, `bytes`, `files`, `err`, `exit_code` |
+| `probe`                      | `dur`, `rtt`, `keepalive_ms`, advertised limits (`target_request_bytes`, `max_request_bytes`, `max_sync_request_bytes`), `concurrency`, `link_mbps` |
+| `manifest_start` / `manifest_end` | start: `path`; end: `files`, `bytes`, `dur`, `err` |
 | `conn_dial`                  | `conn`, `dur`, `sync` (true for synchronous pool fallback) |
-| `conn_reuse` / `conn_close`  | `conn`; close: `reason` |
+| `conn_reuse` / `conn_close`  | `conn`; close: `reason` (`released`, `dead`, `heartbeat_fail`) |
 | `heartbeat` / `heartbeat_fail` | `conn`, `rtt` / `err` |
 | `req_start` / `req_end`      | `verb` (SEND, ACK, CXSUM), `conn`, `items`, `body_bytes`; end: `dur`, `err` |
-| `file_start` / `file_done`   | `file`, `path`, `len`; done: `dur` |
-| `window`                     | `file`, `off`, `len`, `wire`, `codec`, `server_ts_ms`, `first_byte` (ns after `req_start`), `dur`, `write_dur` |
+| `file_start` / `file_done`   | `file`, `path`, `len`, `off` (resume offset); done: `dur` |
+| `window`                     | `file`, `off`, `len`, `wire`, `codec`, `conn`, `server_ts_ms`, `first_byte` (ns the client waited for the window's header after `req_start` or the previous window of the request), `dur` (header arrival to last byte written, so `t - dur` is the arrival), `write_dur` (0 for split windows of large files, whose writes the caller does) |
 | `fsync`                      | `file`, `dur` |
-| `ack`                        | `files`, `bytes`, `dur`, `attempt` |
+| `ack`                        | `files`, `bytes`, `dur`, `attempt`, `ok` |
 | `retry`                      | `verb`, `attempt`, `err` |
 | `error`                      | `verb`, `file`, `err` |
 | `rss`                        | Emitted by `tx-bench` from `/proc/<tx pid>/status`. `bytes`; sampled every `--trace-rss-interval` (default 100ms) |
@@ -89,16 +89,22 @@ Both sides also emit:
 |------------------------------|--------|
 | `prep_start` / `prep_end`    | Emitted by `tx-bench`, not tx. `seq`, `warm`, `skew`; end: `evicted`, `warmed`, `hot_pct`, `dur` |
 | `accept` / `conn_close`      | `conn`, `remote`; close: `reason` |
-| `cmd_start` / `cmd_end`      | `verb`, `conn`, `req_bytes`; end: `resp_bytes`, `dur`, `err` |
+| `cmd_start` / `cmd_end`      | `verb`, `conn`; end: `req_bytes` and `resp_bytes` (from the kernel's TCP counters, so they include zero-copy payloads), `dur`, `err` |
+| `heartbeat`                  | `conn` (a keep-alive PROBE) |
 | `file_open`                  | `file`, `path`, `len`, `dur` |
 | `window`                     | `file`, `off`, `len`, `wire`, `codec`, `send_path` (`sendfile` or `buffered`), `read_dur`, `comp_dur`, `write_dur` |
 | `file_done`                  | `file`, `dur` (first window start to last window end) |
-| `ack`                        | `files`, `bytes` |
-| `transfer_done`              | `files`, `bytes`, `dur` |
+| `ack`                        | `conn`, `files`, `bytes` |
+| `transfer_start` / `transfer_done` | `path`; done: `files`, `bytes`, `dur` |
 | `rss`                        | `bytes`, sampled as on the client |
 
 The `file` field holds manifest file IDs, which match across sides within a
 `tid`.
+
+JSON-lines traces start with a header object,
+`{"trace":"tx-bench v1","header":{...}}`, carrying the same fields as the text
+header. Strings are JSON-escaped, so a path that is not valid UTF-8 appears
+with U+FFFD in JSON traces; text traces keep its bytes.
 
 ## Clock Alignment
 

@@ -16,6 +16,7 @@ import (
 
 	"filippo.io/age"
 	"github.com/jolynch/tx/internal/aead"
+	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/filexfer/store"
@@ -70,6 +71,7 @@ type ServerOptions struct {
 	TargetIODepth          int                       // target IO depth per CPU advertised in PROBE (default 4)
 	ExitAfter              time.Duration             // 0 = disabled; exit this long after last transfer completes
 	KeepAliveTimeout       time.Duration             // idle window for kept-alive connections; 0 = keep-alive disabled (close after every verb)
+	Events                 *events.Sink              // nil disables the event timeline; also handed to the store Serve creates
 }
 
 type HandlerFunc func(context.Context, Request, io.Writer, Deps) error
@@ -93,7 +95,7 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 	if deps == nil {
 		pool := pagecache.NewRestoreWorkerPool(0, 0)
 		defer pool.Close()
-		st := store.NewStore()
+		st := store.NewStore(store.WithEvents(opts.Events))
 		defer st.Close()
 		deps = NewRuntimeDeps(st, WithRoot(opts.RootDir), WithPool(pool))
 	}
@@ -232,6 +234,7 @@ type connSession struct {
 	clientRecipient        age.Recipient
 	responseCipher         aead.Algorithm
 	encryptedRequests      bool
+	events                 events.Scope
 }
 
 // handleConn confines a panic to this connection and logs its stack. Panics in
@@ -252,7 +255,13 @@ func handleConn(conn net.Conn, opts ServerOptions, deps Deps, onTransferCreated 
 	if maxSyncBodyBytes <= 0 {
 		maxSyncBodyBytes = defaultMaxSyncBodyBytes
 	}
+	var scope events.Scope
+	if opts.Events.Enabled() {
+		scope = events.Scope{Sink: opts.Events, Conn: opts.Events.NextConn()}
+		opts.Events.Emit("accept", "", events.F("conn", scope.Conn), events.F("remote", conn.RemoteAddr().String()))
+	}
 	s := &connSession{
+		events:                 scope,
 		conn:                   conn,
 		requireAuth:            opts.RequireAuth,
 		allowedAuthTokens:      opts.AllowedAuthTokens,
@@ -277,8 +286,16 @@ func handleConn(conn net.Conn, opts ServerOptions, deps Deps, onTransferCreated 
 			_ = tc.SetWriteBuffer(s.socketWriteBufferBytes)
 		}
 	}
-	if err := s.run(); err != nil {
+	err := s.run()
+	if err != nil {
 		s.reportError(err)
+	}
+	if scope.Sink.Enabled() {
+		reason := "done"
+		if err != nil {
+			reason = err.Error()
+		}
+		scope.Sink.Emit("conn_close", "", events.F("conn", scope.Conn), events.F("reason", reason))
 	}
 }
 
@@ -444,6 +461,7 @@ func (s *connSession) run() error {
 
 	cmdCtx, connTask := trace.NewTask(context.Background(), "tcp-connection")
 	defer connTask.End()
+	cmdCtx = events.WithScope(cmdCtx, s.events)
 	for {
 		// A PROBE carrying keep-alive=auto upgrades the connection to a
 		// kept-alive session: the server stops closing after each command
@@ -497,24 +515,62 @@ func (s *connSession) run() error {
 // the socket is dead, so the connection is closed silently without
 // attempting to report anything on it.
 func (s *connSession) serveCommand(ctx context.Context, req Request, in *bufio.Reader) bool {
+	if s.events.Sink.Enabled() {
+		return s.serveCommandWithEvents(ctx, req, in)
+	}
+	return s.serveCommandInner(ctx, req, in) == nil
+}
+
+// serveCommandWithEvents brackets one command with cmd_start and cmd_end.
+// Byte counts come from the kernel's TCP counters, so they include buffered
+// read-ahead, encryption overhead, and zero-copy payloads; they are zero on
+// transports without TCP_INFO.
+func (s *connSession) serveCommandWithEvents(ctx context.Context, req Request, in *bufio.Reader) bool {
+	sink, conn := s.events.Sink, s.events.Conn
+	if isKeepAliveHeartbeat(req) {
+		sink.Emit("heartbeat", "", events.F("conn", conn))
+	}
+	start := time.Now()
+	read0, wrote0 := tcpByteCounts(s.conn)
+	verb := req.Verb.String()
+	sink.Emit("cmd_start", "", events.F("verb", verb), events.F("conn", conn))
+	err := s.serveCommandInner(ctx, req, in)
+	errStr := ""
+	if err != nil && err != errConnDone {
+		errStr = err.Error()
+	}
+	read1, wrote1 := tcpByteCounts(s.conn)
+	sink.Emit("cmd_end", "",
+		events.F("verb", verb), events.F("conn", conn),
+		events.F("req_bytes", read1-read0),
+		events.F("resp_bytes", wrote1-wrote0),
+		events.Dur("dur", time.Since(start)), events.F("err", errStr))
+	return err == nil
+}
+
+// errConnDone ends a connection after a response that could not be completed
+// without a handler error to report.
+var errConnDone = errors.New("connection done")
+
+func (s *connSession) serveCommandInner(ctx context.Context, req Request, in *bufio.Reader) error {
 	respOut, closeResp, err := s.newResponseWriter()
 	if err != nil {
-		return false
+		return errConnDone
 	}
 	if err := s.handleCommand(ctx, req, in, respOut); err != nil {
 		_ = writeErrFrame(respOut, err)
 		_ = closeResp()
-		return false
+		return err
 	}
 	if req.Verb == VerbTXFER || req.Verb == VerbSEND || req.Verb == VerbCXSUM || req.Verb == VerbPROBE || req.Verb == VerbSYNC {
 		if err := writeOKLine(respOut, ""); err != nil {
-			return false
+			return errConnDone
 		}
 	}
 	if err := closeResp(); err != nil {
-		return false
+		return errConnDone
 	}
-	return true
+	return nil
 }
 
 func (s *connSession) handleCommand(ctx context.Context, req Request, in io.Reader, out io.Writer) error {

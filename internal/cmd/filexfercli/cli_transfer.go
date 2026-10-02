@@ -13,6 +13,7 @@ import (
 	"github.com/jolynch/tx"
 	"github.com/jolynch/tx/internal/cliflags"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/txstats"
 )
 
 type transferArgs struct {
@@ -27,6 +28,7 @@ type transferArgs struct {
 	verbosity    int
 	deadlineMS   int64
 	cacheLoad    bool
+	stats        *txstats.Recorder
 }
 
 func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -117,17 +119,19 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 
 	fmt.Fprintf(stderr, "transfer(addr=[%s], source=[%s])\n", serverURL, cfg.sourceDir)
 
-	client := tx.NewClient(serverURL, tx.WithLoadStrategy(cfg.loadStrategy), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...))
+	client := tx.NewClient(serverURL, tx.WithLoadStrategy(cfg.loadStrategy), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
 	defer client.Close()
 	start := time.Now()
+	cfg.stats.Phase("probe")
 	probeResult, err := client.ProbeLink(context.Background(), tx.ProbeRequest{
 		ProbeBytes:   cfg.probeBytes,
 		LoadStrategy: cfg.loadStrategy,
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "probe failed: %v\n", err)
+		failf(stderr, cfg.stats, "probe failed: %v", err)
 		return 1
 	}
+	cfg.stats.Phase("manifest")
 	cipherDisplay := "none"
 	if probeResult.SuggestedCipher != "" {
 		cipherDisplay = probeResult.SuggestedCipher
@@ -183,7 +187,7 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 	closeErr := tmpFile.Close()
 	if err != nil {
 		_ = os.Remove(tmpManifestPath)
-		fmt.Fprintf(stderr, "transfer failed: %v\n", err)
+		failf(stderr, cfg.stats, "transfer failed: %v", err)
 		return 1
 	}
 	if closeErr != nil {
@@ -192,11 +196,13 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 		return 1
 	}
 	manifest := manifestResp.Manifest
+	cfg.stats.SetTID(manifest.TransferID)
 
 	var total int64
 	for _, e := range manifest.Entries {
 		total += e.Size
 	}
+	cfg.stats.AddFiles(countRegularFiles(manifest.Entries), total)
 	if manifestWireBytes.Load() > 0 {
 		if err := os.Rename(tmpManifestPath, ps.ServerManifestPath); err != nil {
 			_ = os.Remove(tmpManifestPath)
@@ -278,18 +284,21 @@ func runResumeRefresh(serverURL string, cfg transferArgs, stderr io.Writer) int 
 		tx.WithClientAgeIdentity(cfg.ageIdentity),
 		tx.WithEncryptMode(cfg.encMode),
 		tx.WithClientAuthTokens(cfg.authTokens...),
+		tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()),
 	)
 	defer client.Close()
 
 	start := time.Now()
+	cfg.stats.Phase("probe")
 	probeResult, err := client.ProbeLink(context.Background(), tx.ProbeRequest{
 		ProbeBytes:   cfg.probeBytes,
 		LoadStrategy: cfg.loadStrategy,
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "probe failed: %v\n", err)
+		failf(stderr, cfg.stats, "probe failed: %v", err)
 		return 1
 	}
+	cfg.stats.Phase("manifest")
 	cipherDisplay := "none"
 	if probeResult.SuggestedCipher != "" {
 		cipherDisplay = probeResult.SuggestedCipher
@@ -320,10 +329,11 @@ func runResumeRefresh(serverURL string, cfg transferArgs, stderr io.Writer) int 
 		Concurrency: probeResult.SuggestedConcurrency,
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "resume sync failed: %v\n", err)
+		failf(stderr, cfg.stats, "resume sync failed: %v", err)
 		return 1
 	}
 	newManifest := syncResp.Manifest
+	cfg.stats.SetTID(newManifest.TransferID)
 	if cfg.deadlineMS > 0 {
 		newManifest.DeadlineMS = cfg.deadlineMS
 	}

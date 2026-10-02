@@ -23,9 +23,12 @@ import (
 	"filippo.io/age"
 	"github.com/jolynch/tx"
 	"github.com/jolynch/tx/internal/aead"
+	"github.com/jolynch/tx/internal/cliflags"
+	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/fsync"
+	"github.com/jolynch/tx/internal/txstats"
 	"github.com/jolynch/tx/internal/utils"
 )
 
@@ -477,8 +480,12 @@ func verbosityFromFlags(progress bool, verbose bool) int {
 	return 0
 }
 
-func printTransferErrors(stderr io.Writer, phase string, errs []error, verbosity int) {
-	if stderr == nil || len(errs) == 0 {
+func printTransferErrors(stderr io.Writer, stats *txstats.Recorder, phase string, errs []error, verbosity int) {
+	if len(errs) == 0 {
+		return
+	}
+	stats.Fail(fmt.Sprintf("%s failed with %d errors; first: %v", phase, len(errs), rootError(errs)))
+	if stderr == nil {
 		return
 	}
 	printed := len(errs)
@@ -2080,4 +2087,83 @@ func formatCompSummary(meta tx.FileFrameMeta) string {
 	sort.Strings(other)
 	parts = append(parts, other...)
 	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+// rootError picks the error that most likely caused the others: the first
+// that is not a cancellation, since one failure cancels its siblings.
+func rootError(errs []error) error {
+	for _, err := range errs {
+		if !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "operation was canceled") {
+			return err
+		}
+	}
+	return errs[0]
+}
+
+// failf prints a failure to stderr and records it as the run's --stats
+// error.
+func failf(stderr io.Writer, stats *txstats.Recorder, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintln(stderr, msg)
+	stats.Fail(msg)
+}
+
+// lastLineWriter forwards to w and remembers the last non-empty line, which
+// --stats reports as a failed run's error.
+type lastLineWriter struct {
+	mu   sync.Mutex
+	w    io.Writer
+	cur  []byte
+	last string
+}
+
+func newLastLineWriter(w io.Writer) *lastLineWriter { return &lastLineWriter{w: w} }
+
+func (l *lastLineWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	for _, b := range p {
+		if b == '\n' {
+			if line := strings.TrimSpace(string(l.cur)); line != "" {
+				l.last = line
+			}
+			l.cur = l.cur[:0]
+			continue
+		}
+		if len(l.cur) < 4096 {
+			l.cur = append(l.cur, b)
+		}
+	}
+	l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// Last returns the last complete non-empty line, or a pending partial one.
+func (l *lastLineWriter) Last() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if line := strings.TrimSpace(string(l.cur)); line != "" {
+		return line
+	}
+	return l.last
+}
+
+func countRegularFiles(entries []tx.ManifestEntry) int64 {
+	var n int64
+	for _, e := range entries {
+		if e.Type == 0 || e.Type == encoding.EntryTypeFile {
+			n++
+		}
+	}
+	return n
+}
+
+// resolveEventTargets returns the events targets among the progress flags.
+// Invalid flags yield none here; the command reports them where it resolves
+// its snapshot targets.
+func resolveEventTargets(paths, formats []string) []events.Target {
+	targets, err := cliflags.ResolveProgressTargets(paths, formats)
+	if err != nil {
+		return nil
+	}
+	return cliflags.EventTargets(targets)
 }

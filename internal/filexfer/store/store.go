@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jolynch/tx/internal/events"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/utils"
@@ -35,8 +36,11 @@ const (
 const minReapInterval = 10 * time.Millisecond
 
 type Transfer struct {
-	ID              string
-	Directory       string
+	ID        string
+	Directory string
+	// RequestPath is the path the client asked for, including a single
+	// file's name; Directory holds only that file's parent.
+	RequestPath     string
 	Mode            string
 	LinkMbps        int64
 	Concurrency     int
@@ -110,6 +114,7 @@ type Store struct {
 	done      chan struct{}
 	stopped   chan struct{}
 	closeOnce sync.Once
+	events    *events.Sink
 }
 
 type windowHashKey struct {
@@ -151,6 +156,30 @@ func WithTTL(d time.Duration) StoreOption {
 			s.ttl = d
 		}
 	}
+}
+
+// WithEvents emits transfer_start when a transfer is created and
+// transfer_done when it completes.
+func WithEvents(sink *events.Sink) StoreOption {
+	return func(s *Store) { s.events = sink }
+}
+
+// TransferOption configures one NewTransfer call.
+type TransferOption func(*Transfer)
+
+// WithRequestPath records the path the client requested.
+func WithRequestPath(p string) TransferOption {
+	return func(t *Transfer) { t.RequestPath = p }
+}
+
+// emitDone reports a transfer that just became complete. Callers invoke it
+// after releasing the transfer's lock.
+func (s *Store) emitDone(t Transfer) {
+	s.events.Emit("transfer_done", t.ID,
+		events.F("path", t.RequestPath),
+		events.F("files", t.NumFiles),
+		events.F("bytes", t.TotalSize),
+		events.Dur("dur", time.Since(t.CreatedAt)))
 }
 
 // NewStore returns an isolated store with its own expiry goroutine. Callers
@@ -229,16 +258,20 @@ func (s *Store) MaybeLogTransferComplete(txferID string) {
 	}
 
 	managed.mu.Lock()
-	defer managed.mu.Unlock()
 	if managed.deleted {
+		managed.mu.Unlock()
 		return
 	}
 	t := &managed.transfer
 	if t.CompleteLogged || t.NumFiles <= 0 || t.Done != uint64(t.NumFiles) {
+		managed.mu.Unlock()
 		return
 	}
 	t.CompleteLogged = true
 	logTransferComplete(t)
+	done := *t
+	managed.mu.Unlock()
+	s.emitDone(done)
 }
 
 func (s *Store) getManagedTransfer(txferID string) (*managedTransfer, bool) {
@@ -779,8 +812,8 @@ func (s *Store) ClipTransfer(txferID string) bool {
 	}
 
 	managed.mu.Lock()
-	defer managed.mu.Unlock()
 	if managed.deleted {
+		managed.mu.Unlock()
 		return false
 	}
 	managed.transfer.State = slices.Clip(managed.transfer.State)
@@ -803,9 +836,15 @@ func (s *Store) ClipTransfer(txferID string) bool {
 		intencoding.HumanBytes(t.TotalSize),
 		t.LinkMbps, t.Concurrency,
 	)
-	if t.NumFiles == 0 {
+	emptyDone := t.NumFiles == 0
+	if emptyDone {
 		t.CompleteLogged = true
 		logTransferComplete(t)
+	}
+	done := *t
+	managed.mu.Unlock()
+	if emptyDone {
+		s.emitDone(done)
 	}
 	return true
 }
@@ -922,7 +961,7 @@ func (s *Store) VerifyTransferFileWindowHash(txferID string, fileID uint64, endB
 	return state.hashToken == normalizeHashToken(token)
 }
 
-func (s *Store) NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, error) {
+func (s *Store) NewTransfer(directory string, numFiles int, totalSize int64, opts ...TransferOption) (Transfer, error) {
 	for attempts := 0; attempts < 5; attempts++ {
 		txferID, err := transferID()
 		if err != nil {
@@ -952,7 +991,14 @@ func (s *Store) NewTransfer(directory string, numFiles int, totalSize int64) (Tr
 			transfer.State[i] = TransferStateStarted
 			transfer.EntryType[i] = intencoding.EntryTypeFile
 		}
+		for _, opt := range opts {
+			opt(&transfer)
+		}
+		if transfer.RequestPath == "" {
+			transfer.RequestPath = directory
+		}
 		if s.create(transfer) {
+			s.events.Emit("transfer_start", transfer.ID, events.F("path", transfer.RequestPath))
 			return transfer, nil
 		}
 	}

@@ -14,13 +14,15 @@ import (
 
 	"github.com/jolynch/tx"
 	"github.com/jolynch/tx/internal/cliflags"
+	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/fsync"
 	"github.com/jolynch/tx/internal/pagecache"
+	"github.com/jolynch/tx/internal/txstats"
 )
 
-func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) int {
+func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 	cf := cliflags.New("get")
 	cf.SetOutput(stderr)
 	cf.FlagSet().Usage = func() {
@@ -53,6 +55,7 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	var cacheLoadRaw string
 	var cacheLoadEnabled bool
 	var cacheLoadBudget time.Duration
+	var statsPath string
 	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
 	cf.StringVar(&keysDir, "k", "keys", "", "Persistent age keys directory (default: ephemeral)")
 	cf.StringSliceVar(&authTokens, "t", "auth-token", "Client auth token presented in encrypted AUTH blob; repeatable")
@@ -65,7 +68,7 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	cf.BoolVar(&progress, "", "progress", true, "Show transfer progress every 2s")
 	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
 	cf.StringSliceVar(&progressFilePaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
-	cf.StringSliceVar(&progressFormats, "f", "progress-format", "Progress format: json|int; 1 applies to all targets, or one per target (default json)")
+	cf.StringSliceVar(&progressFormats, "f", "progress-format", "Progress format: json|int|events; 1 applies to all targets, or one per target (default json)")
 	cf.StringVar(&progressIntervalRaw, "", "progress-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
 	cacheLoadRaw = "none"
 	cf.StringVar(&cacheLoadRaw, "", "cache-load", cacheLoadRaw, "Load downloaded file into page cache after success: none|full|<duration> (default none)")
@@ -73,11 +76,29 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
 	cf.StringVar(&deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
 	cf.StringVar(&traceFile, "", "trace", "", "Write runtime/trace output to this file")
+	cf.StringVar(&statsPath, "", "stats", "", "Write a JSON statistics object for this run to this file at exit")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
 		return 2
+	}
+	eventTargets := resolveEventTargets(progressFilePaths, progressFormats)
+	var sink *events.Sink
+	if len(eventTargets) > 0 {
+		sink = events.NewSink()
+		interval, _ := time.ParseDuration(progressIntervalRaw)
+		defer events.StartTargetWriter(sink, events.Header{Side: "c"}, interval, eventTargets).Stop()
+	}
+	stats := txstats.NewRecorder(statsPath, "get", sink)
+	if stats != nil {
+		lastErr := newLastLineWriter(stderr)
+		stderr = lastErr
+		defer func() {
+			if err := stats.Finish(code, lastErr.Last()); err != nil {
+				fmt.Fprintf(lastErr, "write --stats: %v\n", err)
+			}
+		}()
 	}
 	stopTracing := startTracing(traceFile, stderr)
 	defer stopTracing()
@@ -168,6 +189,7 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	if skipWrite {
 		outputPath = os.DevNull
 	}
+	stats.Begin(outputPath)
 
 	if src.IsLocal {
 		return runLocalGetCLI(localGetArgs{
@@ -185,11 +207,12 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		effectiveConcurrency = concurrency
 	}
 
-	client := tx.NewClient(serverURL, tx.WithLoadStrategy(tx.LoadStrategyFast), tx.WithComp(compress), tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(resolvedEncMode), tx.WithClientAuthTokens(authTokens...))
+	client := tx.NewClient(serverURL, tx.WithLoadStrategy(tx.LoadStrategyFast), tx.WithComp(compress), tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(resolvedEncMode), tx.WithClientAuthTokens(authTokens...), tx.WithClientMetrics(stats.ClientMetrics()), tx.WithEventSink(stats.EventSink()))
 	defer client.Close()
 
 	// Fetch manifest for the single file (skip full probe).
 	fmt.Fprintf(stderr, "get(addr=[%s], path=[%s])\n", serverURL, remotePath)
+	stats.Phase("manifest")
 	manifestResp, err := client.GetManifest(context.Background(), tx.GetManifestRequest{
 		Directory:   remotePath,
 		Mode:        tx.LoadStrategyFast,
@@ -199,18 +222,21 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		CacheMap:    cacheMapValue(cacheLoadEnabled),
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "get failed: %v\n", err)
+		failf(stderr, stats, "get failed: %v", err)
 		return 1
 	}
 	manifest := manifestResp.Manifest
 	if len(manifest.Entries) != 1 {
-		fmt.Fprintf(stderr, "get failed: expected single file manifest, got %d entries\n", len(manifest.Entries))
+		failf(stderr, stats, "get failed: expected single file manifest, got %d entries", len(manifest.Entries))
 		return 1
 	}
 	entry := manifest.Entries[0]
+	stats.SetTID(manifest.TransferID)
+	stats.AddFiles(countRegularFiles(manifest.Entries), entry.Size)
 	fmt.Fprintf(stderr, "get-manifest: tid=%s file=%s size=%s\n", manifest.TransferID, entry.Path, encoding.HumanBytes(entry.Size))
 
 	// Mini-probe to detect server send buffer and compute batch size.
+	stats.Phase("probe")
 	var miniProbe tx.ProbeResponse
 	if probe, probeErr := client.ProbeLink(context.Background(), tx.ProbeRequest{ProbeBytes: 1}); probeErr == nil {
 		miniProbe = probe
@@ -294,6 +320,7 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		defer func() { stopProgressFile(err == nil) }()
 	}
 
+	stats.Phase("data")
 	downloadBatchResp, err := client.GetFiles(transferCtx, tx.GetFilesRequest{
 		Manifest:           manifest,
 		FileIDs:            []uint64{entry.ID},
@@ -303,17 +330,18 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		ProgressUpdates:    progressUpdates,
 	})
 	elapsed := time.Since(start)
+	stats.Phase("finalize")
 	if err != nil {
-		fmt.Fprintf(stderr, "get failed: %v\n", err)
+		failf(stderr, stats, "get failed: %v", err)
 		return 1
 	}
 	if len(downloadBatchResp.Files) != 1 {
-		fmt.Fprintf(stderr, "get failed: expected one downloaded file, got %d\n", len(downloadBatchResp.Files))
+		failf(stderr, stats, "get failed: expected one downloaded file, got %d", len(downloadBatchResp.Files))
 		return 1
 	}
 	downloadResp := downloadBatchResp.Files[0]
 	if err := applyDownloadedTrailerMetadata(outputPath, downloadResp.Meta.TrailerMetadata); err != nil {
-		fmt.Fprintf(stderr, "get failed: %v\n", err)
+		failf(stderr, stats, "get failed: %v", err)
 		return 1
 	}
 	if cacheLoadEnabled {

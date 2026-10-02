@@ -12,7 +12,7 @@ import (
 // production caller and exist for the store's own tests or benchmarks.
 type Interface interface {
 	// Transfer lifecycle.
-	NewTransfer(directory string, numFiles int, totalSize int64) (Transfer, error)
+	NewTransfer(directory string, numFiles int, totalSize int64, opts ...TransferOption) (Transfer, error)
 	DeleteTransfer(txferID string) bool
 	RegisterTransferFileState(txferID string, updatesCh <-chan TransferFileStateUpdate, state uint8) <-chan struct{}
 	ClipTransfer(txferID string) bool

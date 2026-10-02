@@ -2,6 +2,7 @@
 # which hides it from any tool that honours .gitignore (ripgrep, ugrep, most
 # editor search). Only the built binary here should be ignored.
 /tx
+/tx-bench
 .codex
 **/testdata/fuzz/
 **/testdata/fuzz/**
@@ -13,3 +14,8 @@
 zz_*_test.go
 tmp_*_test.go
 *_scratch_test.go
+
+# tx-bench defaults when run from the repo root: dataset, work dir, metrics.
+/tx-bench-src/
+/tx-bench-dst/
+/tx-bench-*.json

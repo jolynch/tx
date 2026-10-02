@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -24,6 +26,7 @@ import (
 	"filippo.io/age"
 	"github.com/jolynch/tx"
 	"github.com/jolynch/tx/internal/aead"
+	"github.com/jolynch/tx/internal/events"
 	intfilexfer "github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
@@ -31,6 +34,7 @@ import (
 	"github.com/jolynch/tx/internal/fsync"
 	"github.com/jolynch/tx/internal/pagecache"
 	"github.com/jolynch/tx/internal/sampler"
+	"github.com/jolynch/tx/internal/txstats"
 	"github.com/zeebo/xxh3"
 )
 
@@ -2722,7 +2726,7 @@ func TestPrintTransferErrors(t *testing.T) {
 
 	t.Run("no errors", func(t *testing.T) {
 		var buf bytes.Buffer
-		printTransferErrors(&buf, "start", nil, 1)
+		printTransferErrors(&buf, nil, "start", nil, 1)
 		if got := buf.String(); got != "" {
 			t.Fatalf("expected no output, got %q", got)
 		}
@@ -2730,7 +2734,7 @@ func TestPrintTransferErrors(t *testing.T) {
 
 	t.Run("prints first five and summary when not verbose", func(t *testing.T) {
 		var buf bytes.Buffer
-		printTransferErrors(&buf, "start", buildErrors(7), 1)
+		printTransferErrors(&buf, nil, "start", buildErrors(7), 1)
 		got := buf.String()
 		for i := 1; i <= 5; i++ {
 			want := fmt.Sprintf("start error: boom-%d\n", i)
@@ -2748,7 +2752,7 @@ func TestPrintTransferErrors(t *testing.T) {
 
 	t.Run("prints all when verbose", func(t *testing.T) {
 		var buf bytes.Buffer
-		printTransferErrors(&buf, "sync", buildErrors(6), 2)
+		printTransferErrors(&buf, nil, "sync", buildErrors(6), 2)
 		got := buf.String()
 		for i := 1; i <= 6; i++ {
 			want := fmt.Sprintf("sync error: boom-%d\n", i)
@@ -3772,12 +3776,25 @@ func TestRunCLICopySendFailureReturnsNonzero(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := RunCLI([]string{"copy", "--progress=false", "--verify", "none", "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
+	statsPath := filepath.Join(t.TempDir(), "stats.json")
+	code := RunCLI([]string{"copy", "--progress=false", "--verify", "none", "--stats", statsPath, "tx://" + srv.URL + "/remote", targetDir}, &stdout, &stderr)
 	if code == 0 {
 		t.Fatalf("copy should fail when SEND fails\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "start error:") || !strings.Contains(stderr.String(), "intentional SEND failure") {
 		t.Fatalf("expected SEND failure to be reported, got: %s", stderr.String())
+	}
+	// --stats names the failure, not whatever cleanup printed last.
+	data, err := os.ReadFile(statsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st txstats.Client
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Status != "error" || !strings.HasPrefix(st.Error, "start failed with") || !strings.Contains(st.Error, "intentional SEND failure") {
+		t.Fatalf("stats error = %q", st.Error)
 	}
 }
 
@@ -4474,5 +4491,160 @@ func TestRunCLIStartProgressFileShowsResumedBytes(t *testing.T) {
 		if done < 5 {
 			t.Errorf("line %d: bytes.done=%d should be >= 5 (resume baseline): %s", i, done, line)
 		}
+	}
+}
+
+// TestRunCLIStatsEndToEnd runs copy and get with --stats against a real
+// server writing its own --stats, and checks both sides describe the same
+// transfers.
+func TestRunCLIStatsEndToEnd(t *testing.T) {
+	src := t.TempDir()
+	for rel, body := range map[string]string{"a.txt": "hello", "sub/b.txt": strings.Repeat("x", 300_000), "sub/empty": ""} {
+		full := filepath.Join(src, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tmp := t.TempDir()
+	sink := events.NewSink()
+	serverStatsPath := filepath.Join(tmp, "server.jsonl")
+	writer, err := txstats.NewServerWriter(serverStatsPath, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := store.NewStore(store.WithEvents(sink))
+	t.Cleanup(st.Close)
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = intftcp.Serve(ln, intftcp.ServerOptions{
+			Deps:             intftcp.NewRuntimeDeps(st, intftcp.WithRoot(src)),
+			Events:           sink,
+			KeepAliveTimeout: time.Second,
+		})
+	}()
+	addr := ln.Addr().String()
+
+	run := func(args ...string) (int, string) {
+		var stdout, stderr bytes.Buffer
+		code := RunCLI(args, &stdout, &stderr)
+		return code, stderr.String()
+	}
+	readClient := func(path string) txstats.Client {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var c txstats.Client
+		if err := json.Unmarshal(data, &c); err != nil {
+			t.Fatalf("parse %s: %v", data, err)
+		}
+		return c
+	}
+
+	copyStats := filepath.Join(tmp, "copy.json")
+	copyEvents := filepath.Join(tmp, "copy.events.jsonl")
+	if code, stderr := run("copy", "--progress=false", "--verify", "none", "--stats", copyStats,
+		"-p", copyEvents, "-f", "events", "tx://"+addr+"/", filepath.Join(tmp, "dst")); code != 0 {
+		t.Fatalf("copy exit %d: %s", code, stderr)
+	}
+	evData, err := os.ReadFile(copyEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]int{}
+	var last map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(evData)), "\n") {
+		var e map[string]any
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("events line %q: %v", line, err)
+		}
+		seen[e["ev"].(string)]++
+		last = e
+	}
+	if seen["run_start"] != 1 || seen["window"] == 0 || seen["file_done"] != 3 || seen["manifest_end"] == 0 || last["ev"] != "run_end" || last["status"] != "ok" {
+		t.Fatalf("copy events %v, last %v", seen, last)
+	}
+	getStats := filepath.Join(tmp, "get.json")
+	if code, stderr := run("get", "--progress=false", "--stats", getStats, "tx://"+addr+"/sub/b.txt", filepath.Join(tmp, "b.txt")); code != 0 {
+		t.Fatalf("get exit %d: %s", code, stderr)
+	}
+	missStats := filepath.Join(tmp, "miss.json")
+	if code, _ := run("get", "--progress=false", "--stats", missStats, "tx://"+addr+"/nope", filepath.Join(tmp, "nope")); code == 0 {
+		t.Fatal("get of a missing file succeeded")
+	}
+	_ = ln.Close()
+	<-served
+	if err := writer.Close("test"); err != nil {
+		t.Fatal(err)
+	}
+
+	cp := readClient(copyStats)
+	if cp.Status != "ok" || cp.TID == "" || cp.Files != 3 || cp.Bytes != 300_005 || cp.LogicalBytes != 300_005 {
+		t.Fatalf("copy stats %+v", cp)
+	}
+	if cp.Phases.Probe <= 0 || cp.Phases.Manifest <= 0 || cp.Phases.Data <= 0 || cp.Dials == 0 || len(cp.Windows) == 0 {
+		t.Fatalf("copy stats missing phases or counters: %+v", cp)
+	}
+	gt := readClient(getStats)
+	if gt.Status != "ok" || gt.TID == "" || gt.TID == cp.TID || gt.Bytes != 300_000 {
+		t.Fatalf("get stats %+v", gt)
+	}
+	miss := readClient(missStats)
+	if miss.Status != "error" || miss.TID != "" || miss.RequestErrors == 0 || !strings.Contains(miss.Error, "does not exist") {
+		t.Fatalf("failed get stats %+v", miss)
+	}
+
+	data, err := os.ReadFile(serverStatsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs := map[string]map[string]txstats.ServerRecord{}
+	var process *txstats.ServerRecord
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var r txstats.ServerRecord
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		if r.Rec == txstats.RecProcess {
+			process = &r
+			continue
+		}
+		if recs[r.TID] == nil {
+			recs[r.TID] = map[string]txstats.ServerRecord{}
+		}
+		recs[r.TID][r.Rec] = r
+	}
+	if start := recs[cp.TID][txstats.RecStart]; start.Path != "/" {
+		t.Fatalf("copy start record %+v", start)
+	}
+	end := recs[cp.TID][txstats.RecEnd]
+	if end.Complete == nil || !*end.Complete || end.Files != 3 || end.Bytes != 300_005 || end.LogicalBytes != 300_005 || len(end.SendPath) == 0 {
+		t.Fatalf("copy end record %+v", end)
+	}
+	if start := recs[gt.TID][txstats.RecStart]; start.Path != "/sub/b.txt" {
+		t.Fatalf("get start record should carry the file name: %+v", start)
+	}
+	if process == nil || process.ConnsAccepted == 0 || process.PeakConns == 0 || process.Transfers != 2 || process.Exit != "test" {
+		t.Fatalf("process record %+v", process)
+	}
+}
+
+func TestRootErrorSkipsCancellations(t *testing.T) {
+	canceled := fmt.Errorf("batch first-id=1: dial tcp: %w", context.Canceled)
+	opCanceled := errors.New("batch first-id=2: dial tcp 1.2.3.4:3453: operation was canceled")
+	root := errors.New("batch first-id=3: dial tcp 1.2.3.4:3453: connect: cannot assign requested address")
+	if got := rootError([]error{canceled, opCanceled, root}); got != root {
+		t.Fatalf("rootError = %v", got)
+	}
+	if got := rootError([]error{opCanceled}); got != opCanceled {
+		t.Fatalf("all-canceled rootError = %v", got)
 	}
 }

@@ -29,7 +29,7 @@ Prepare a benchmark dataset: generate or import it, check it, and set its
 page-cache state. Each step runs only when its options are given.
 
   BENCH_DIR    bench root; generated data lives in BENCH_DIR/data
-               (default ./tx-bench)
+               (default ./tx-bench-src)
 
 Steps, in order:
   generate   any of --size, --fill, --profile, --mix, --seed
@@ -94,7 +94,7 @@ usage: tx-bench remote send-tree [options] [BENCH_DIR] [-- TX_ARGS...]
 Prepare a benchmark dataset, serve it with a forked 'tx send tree', and print
 the matching 'tx-bench remote recv-copy' command.
 
-  BENCH_DIR    bench root (default ./tx-bench)
+  BENCH_DIR    bench root (default ./tx-bench-src)
   TX_ARGS      passed to tx send tree as given (see 'tx send tree --help')
 
 Behavior:
@@ -135,8 +135,8 @@ Options:
                                    count) (default 0)
       --silesia-cache string       Silesia corpus cache directory (default:
                                    $XDG_CACHE_HOME/tx-bench/silesia)
-      --tx string                  tx binary to fork (default: tx next to tx-bench, then
-                                   $PATH)
+      --tx string                  tx binary to fork (default: $TX_BIN, then tx next to
+                                   tx-bench, then $PATH)
   -l, --listen string              Listen address (host:port) (default "0.0.0.0:3453")
       --advertise string           Host printed in the recv-copy command (default: first
                                    non-loopback address)
@@ -180,6 +180,10 @@ Behavior:
     tx recv get fetches of sender state
   - After each copy, DST/data is checked against the sender's files.tsv;
     --skip-write in TX_ARGS turns that check off
+  - --forever keeps copying until interrupted; an interrupt always stops the
+    copy in flight, flushes, and reports
+  - --metrics streams: .jsonl and text get one record per run as it completes
+    (a FIFO works, for exporting); .json is rewritten after each run
   - Exit codes: 0 ok, 1 failed run(s), 2 usage or --expect mismatch,
     3 corruption (stops immediately and keeps DST)
 
@@ -205,8 +209,13 @@ Options:
                                    runs/server-<tid>.json (default "2m")
       --fail-fast                  Stop at the first failed run (default false)
       --keep                       Keep DST after the last run (default false)
-      --tx string                  tx binary to fork (default: tx next to tx-bench, then
-                                   $PATH)
+      --forever                    After the warmups, copy and verify until interrupted
+                                   instead of --iterations times; metrics default to
+                                   .jsonl
+      --stop-sender                After the last run, fetch runs/stop so send-tree
+                                   records it and exits (default false)
+      --tx string                  tx binary to fork (default: $TX_BIN, then tx next to
+                                   tx-bench, then $PATH)
 ```
 
 ### `tx-bench local`
@@ -263,43 +272,63 @@ Options:
 
 ```text
 host-a$ ./tx-bench remote send-tree --size 10GiB
-prep    ./tx-bench/data  profile=mixed size=10GiB seed=1  generating (-j 16)
-  0-rand        4.0GiB       4 x 1GiB
-  1-silesia     3.0GiB     192 x 16MiB   osdb+dickens+nci+xml
-  2-rand        3.0GiB  52,240 x 4KiB..256KiB
+dataset ./tx-bench-src/data  profile=mixed size=10GiB seed=1  generating (-j 16)
+  part            bytes        files  sizes           corpus
+  0-rand         4.0GiB            4  1GiB            -
+  1-silesia      3.0GiB          192  16MiB           osdb+dickens+nci+xml
+  2-rand         3.0GiB       52,240  4KiB..256KiB    -
 generated 52,436 files, 10.0GiB in 41s  fingerprint 7f3a9c21e0b4d8aa
 cache-warm unset (hot 3.1%)  auth off (generated data)  trace off
-tx #1   ./tx (xxh128:5e0c…91)  pid 48213  serving tx://10.0.4.17:3453 (root ./tx-bench)
+tx #1   ./tx (xxh128:5e0c…91)  pid 48213  serving tx://10.0.4.17:3453 (root ./tx-bench-src)
 
 Run the bench client with:
   ./tx-bench remote recv-copy 10.0.4.17:3453 --expect 7f3a9c21e0b4d8aa
 
-prep    seq=1  for tid=a01f  hot 3.0%  0.4s  tx #2 pid 48290
-run     tx #2  tid=8c1e  52,436 files  10.0GiB  8.41s  rss 188MiB  cpu 11.2s
-prep    seq=2  for tid=b7c3  hot 3.0%  0.4s  tx #3 pid 48377
+event   seq    tx  tid             files      bytes       dur     hot        rss       cpu
+prep      1    #2  a01f6c3e            -          -     412ms    3.0%          -         -  pid 48290
+run       -    #2  8c1e04b7       52,436    10.0GiB      8.4s       -   188.0MiB     11.2s
+prep      2    #3  b7c3e912            -          -     398ms    3.0%          -         -  pid 48377
 ...
 ```
 
-Each `prep` line is one `recv-copy` request. It stops the previous `tx send
-tree`, records that run's line from its exact rusage, and starts the next.
+Every output is a fixed-width table, so rows line up with their header and
+details that do not fit a column (a pid, an error) trail the row. Each `prep`
+row is one `recv-copy` request: its `tid` is the request's, and `tx` is the
+fresh `tx send tree` it started. Handling it stops the previous process,
+whose `run` row (exact rusage, data-transfer `tid`) is printed first. The
+report lists every metric with min, p50, and max in one unit per row, then
+any failed runs, one per row with the error at the end.
 
 ```text
 host-b$ ./tx-bench remote recv-copy 10.0.4.17:3453 -e 7f3a9c21e0b4d8aa
 tx      ./tx (xxh128:5e0c…91)  matches sender
-warmup 1/1   10.0GiB  9.80s
-run    1/3   10.0GiB  8.41s  1.19GiB/s  verify ok
-run    2/3   10.0GiB  8.37s  1.19GiB/s  verify ok
-run    3/3   10.0GiB  8.55s  1.17GiB/s  verify ok
+run   tid             files      bytes      wall         rate     hot  status
+w1    a01f6c3e       52,436    10.0GiB      9.8s     1.0GiB/s    3.0%  ok
+1     8c1e04b7       52,436    10.0GiB      8.4s     1.2GiB/s    3.0%  ok
+2     3f90a2d1       52,436    10.0GiB      8.4s     1.2GiB/s    3.0%  ok
+3     e4b1c077       52,436    10.0GiB      8.6s     1.2GiB/s    3.0%  ok
 
-tx-bench  10.0GiB / 52,436 files  sender hot 3.0%  compress=adapt  encrypt=none
-            min      p50      max
-  wall      8.37s    8.41s    8.55s     probe 3ms  manifest 0.21s  data 8.10s  | verify 6.2s
-  rate      1.17     1.19     1.19 GiB/s   wire 0.94 GiB/s (ratio 1.27)
-  client    rss 412MiB  cpu 2.1 core-s/GiB  majflt 0
-  sender    rss 188MiB  cpu 1.1 core-s/GiB  conns 36 (peak 34)
-  conns     dials 34  reuse 9,812  sync-fallback 0  heartbeat-fail 0
-  errors    0   ack-retries 0   failed runs 0/3
-  verify    52,436/52,436 files  fingerprint ok
+tx-bench report
+  dataset   10.0GiB  52,436 files  profile=mixed  fingerprint 7f3a9c21e0b4d8aa
+  client    compress=adapt  encrypt=none  oracle=full
+  sender    cache left as found  sendfile 100% of windows
+  runs      3 measured, 0 failed, 1 warmup
+  verify    52,436/52,436 files, fingerprint ok
+
+  metric                     min         p50         max  unit
+  wall                      8.37        8.41        8.55  s
+    probe                    3.1         3.2         3.4  ms
+    manifest               208.0       211.0       215.0  ms
+    data                    8.06        8.10        8.24  s
+    finalize                 210         262         301  µs
+  verify (oracle)           6.10        6.20        6.31  s
+
+  rate                       1.2         1.2         1.2  GiB/s
+  wire rate                963.1       967.4       972.0  MiB/s
+  files/s                  6,132       6,235       6,265  count
+  compress ratio            1.26        1.27        1.27  x
+  sender hot                 3.0         3.0         3.0  %
+  ...
 metrics: ./tx-bench-20261001T142233Z.json
 ```
 

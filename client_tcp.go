@@ -21,9 +21,11 @@ import (
 
 	"filippo.io/age"
 	"github.com/jolynch/tx/internal/aead"
+	"github.com/jolynch/tx/internal/events"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	ftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	intlimit "github.com/jolynch/tx/internal/filexfer/limit"
+	"github.com/jolynch/tx/internal/metrics"
 	"github.com/jolynch/tx/internal/utils"
 	"golang.org/x/sys/unix"
 )
@@ -374,12 +376,19 @@ func (p *tcpConnPool) heartbeatIdleConns(c *Client, interval time.Duration) {
 			defer func() { <-p.hbSem }()
 			_, rttMillis, err := c.probeKeepAliveSessionConn(sc, p.authState)
 			if err != nil {
-				c.clientMetrics.IncHeartbeatFailure()
+				c.metrics().IncHeartbeatFailure()
+				if s := c.sink(); s.Enabled() {
+					s.Emit("heartbeat_fail", "", events.F("conn", c.connID(sc)), events.F("err", err.Error()))
+					c.noteConnEvent("conn_close", sc, "heartbeat_fail")
+				}
 				_ = sc.Close()
 				p.triggerRefill(c)
 				return
 			}
-			c.clientMetrics.ObserveHeartbeat(rttMillis)
+			c.metrics().ObserveHeartbeat(rttMillis)
+			if s := c.sink(); s.Enabled() {
+				s.Emit("heartbeat", "", events.F("conn", c.connID(sc)), events.Dur("rtt", time.Duration(rttMillis)*time.Millisecond))
+			}
 			sc.lastActive = time.Now()
 			if !p.enqueue(sc) {
 				_ = sc.Close()
@@ -405,14 +414,14 @@ func (c *Client) probeKeepAliveSessionConn(conn net.Conn, state tcpAuthState) (b
 	if err != nil {
 		return false, 0, err
 	}
-	if err := parseErrControlFrame(line); err != nil {
+	if err := parseErrControlFrame(c.metrics(), line); err != nil {
 		return false, 0, err
 	}
 	resp, err := parseProbeResponseLine(line)
 	if err != nil {
 		return false, 0, err
 	}
-	if _, err := readTCPStatus(br); err != nil {
+	if _, err := readTCPStatus(c.metrics(), br); err != nil {
 		return false, 0, err
 	}
 	rttMillis := time.Since(start).Milliseconds()
@@ -467,11 +476,12 @@ func (c *Client) acquireManagedTCPConn(ctx context.Context) (net.Conn, tcpAuthSt
 			}
 			// Dead session (e.g. server restarted since the last
 			// heartbeat) — evict and try the next pooled connection.
+			c.noteConnEvent("conn_close", sc, "dead")
 			_ = sc.Close()
 			pool.triggerRefill(c)
 		}
-		c.clientMetrics.IncSyncConnectionFallback()
-		conn, err := c.dialAndAuthWithState(ctx, pool.authState)
+		c.metrics().IncSyncConnectionFallback()
+		conn, err := c.dialAndAuthWithState(context.WithValue(ctx, syncDialKey{}, true), pool.authState)
 		if err != nil {
 			return nil, tcpAuthState{}, pool, err
 		}
@@ -491,6 +501,7 @@ func (c *Client) releaseManagedTCPConn(conn net.Conn, pool *tcpConnPool) error {
 		}
 		return nil
 	}
+	c.noteConnEvent("conn_close", conn, "released")
 	err := conn.Close()
 	if pool != nil {
 		pool.triggerRefill(c)
@@ -542,7 +553,8 @@ func (c *Client) recycleManagedTCPConn(conn net.Conn, pool *tcpConnPool) error {
 	if !pool.enqueue(sc) {
 		return c.releaseManagedTCPConn(conn, pool)
 	}
-	c.clientMetrics.IncConnectionReuse()
+	c.metrics().IncConnectionReuse()
+	c.noteConnEvent("conn_reuse", conn, "")
 	return nil
 }
 
@@ -587,10 +599,13 @@ func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
 		return nil, errors.New("missing file listener address")
 	}
 	dialer := c.contextDialer
+	c.metrics().IncDial()
+	start := time.Now()
 	if dialer == nil {
 		dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
+			c.metrics().IncRequestError()
 			return nil, err
 		}
 		if tc, ok := conn.(*net.TCPConn); ok {
@@ -599,10 +614,12 @@ func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
 				_ = tc.SetReadBuffer(c.SocketReadBufferBytes)
 			}
 		}
+		c.noteDial(ctx, conn, start)
 		return conn, nil
 	}
 	conn, err := dialer(ctx, addr)
 	if err != nil {
+		c.metrics().IncRequestError()
 		return nil, err
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
@@ -611,6 +628,7 @@ func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
 			_ = tc.SetReadBuffer(c.SocketReadBufferBytes)
 		}
 	}
+	c.noteDial(ctx, conn, start)
 	return conn, nil
 }
 
@@ -618,11 +636,14 @@ func makeLenToken(raw string) string {
 	return strconv.Itoa(len(raw)) + ":" + raw
 }
 
-func parseErrControlFrame(line string) error {
+// parseErrControlFrame returns the error an ERR line carries, counting it in
+// m, or nil for any other line.
+func parseErrControlFrame(m *metrics.ClientMetrics, line string) error {
 	code, msg, ok := parseErrControlPayload(line)
 	if !ok {
 		return nil
 	}
+	m.IncRequestError()
 	return controlFrameError{Code: code, Message: msg}
 }
 
@@ -756,7 +777,7 @@ func (c *Client) discoverServerKey(ctx context.Context) (recommendedCipher strin
 	}
 	msg, ok := parseOKStatusLine(line)
 	if !ok {
-		if lineErr := parseErrControlFrame(line); lineErr != nil {
+		if lineErr := parseErrControlFrame(c.metrics(), line); lineErr != nil {
 			return "", "", lineErr
 		}
 		return "", "", fmt.Errorf("unexpected key exchange response: %s", line)
@@ -1033,6 +1054,7 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 
 	mr := intencoding.NewFramedBodyReader(br, intencoding.FramedBodyReaderOpts{
 		MaxLogicalBytes: maxResponseBodyBytes,
+		OnServerError:   c.metrics().IncRequestError,
 		RawSink:         request.RawSink,
 		OnFrame: func(s intencoding.FrameStats) {
 			if request.ManifestProgress == nil {
@@ -1060,7 +1082,7 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 		return GetManifestResponse{}, fmt.Errorf("read TXFER status: %w", err)
 	}
 	if _, ok := parseOKStatusLine(statusLine); !ok {
-		if err := parseErrControlFrame(statusLine); err != nil {
+		if err := parseErrControlFrame(c.metrics(), statusLine); err != nil {
 			return GetManifestResponse{}, err
 		}
 		return GetManifestResponse{}, fmt.Errorf("unexpected TXFER terminator: %q", statusLine)
@@ -1155,6 +1177,7 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 	br := bufio.NewReader(responseReader)
 	mr := intencoding.NewFramedBodyReader(br, intencoding.FramedBodyReaderOpts{
 		MaxLogicalBytes: maxResponseBodyBytes,
+		OnServerError:   c.metrics().IncRequestError,
 	})
 
 	manifestBuf := c.acquireScratchBuffer(maxTCPLineBytes)
@@ -1194,7 +1217,7 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 		return SyncManifestResponse{}, fmt.Errorf("read SYNC status: %w", err)
 	}
 	if _, ok := parseOKStatusLine(statusLine); !ok {
-		if err := parseErrControlFrame(statusLine); err != nil {
+		if err := parseErrControlFrame(c.metrics(), statusLine); err != nil {
 			return SyncManifestResponse{}, err
 		}
 		return SyncManifestResponse{}, fmt.Errorf("unexpected SYNC terminator: %q", statusLine)
@@ -1249,13 +1272,14 @@ func (c *Client) fetchFileBatchBodyTCP(
 	// Pointer guard: ownership passes to the returned ReadCloser on success,
 	// so it must outlive this call.
 	closer := &managedTCPConnCloser{client: c, conn: conn, pool: pool}
+	c.emitReqStart(ctx, "SEND", txferID, conn, body.body)
 	cmd := "SEND " + txferID + " mode=" + normalizeLoadStrategy(c.LoadStrategy)
 	br, err := c.sendAndReadTCPWithBody(conn, state, cmd, body.body)
 	if err != nil {
 		_ = closer.Close()
 		return nil, fmt.Errorf("SEND batch: %w", err)
 	}
-	firstLine, err := readSENDFirstLine(br)
+	firstLine, err := readSENDFirstLine(c.metrics(), br)
 	if err != nil {
 		_ = closer.Close()
 		return nil, err
@@ -1263,12 +1287,12 @@ func (c *Client) fetchFileBatchBodyTCP(
 	return newManagedTCPReadCloser(io.MultiReader(strings.NewReader(firstLine), br), closer), nil
 }
 
-func readTCPStatus(br *bufio.Reader) (string, error) {
+func readTCPStatus(m *metrics.ClientMetrics, br *bufio.Reader) (string, error) {
 	line, err := readTCPLine(br, maxTCPLineBytes)
 	if err != nil {
 		return "", err
 	}
-	if err := parseErrControlFrame(line); err != nil {
+	if err := parseErrControlFrame(m, line); err != nil {
 		return "", err
 	}
 	message, ok := parseOKStatusLine(line)
@@ -1282,13 +1306,13 @@ func readTCPStatus(br *bufio.Reader) (string, error) {
 // response (SEND, CXSUM). Returns the raw first line (including trailing
 // newline) for prefixing back onto the stream, or an error if the server
 // sent ERR or an unexpected OK.
-func readStreamFirstLine(br *bufio.Reader, verb string) (string, error) {
+func readStreamFirstLine(m *metrics.ClientMetrics, br *bufio.Reader, verb string) (string, error) {
 	firstLine, err := br.ReadString('\n')
 	if err != nil {
 		return "", fmt.Errorf("read %s response: %w", verb, err)
 	}
 	trimmed := strings.TrimRight(firstLine, "\r\n")
-	if err := parseErrControlFrame(trimmed); err != nil {
+	if err := parseErrControlFrame(m, trimmed); err != nil {
 		return "", err
 	}
 	if _, ok := parseOKStatusLine(trimmed); ok {
@@ -1299,8 +1323,8 @@ func readStreamFirstLine(br *bufio.Reader, verb string) (string, error) {
 
 // readSENDFirstLine reads the first line of a SEND streaming response,
 // wrapping NOT_FOUND errors as ErrFileMissing.
-func readSENDFirstLine(br *bufio.Reader) (string, error) {
-	firstLine, err := readStreamFirstLine(br, "SEND")
+func readSENDFirstLine(m *metrics.ClientMetrics, br *bufio.Reader) (string, error) {
+	firstLine, err := readStreamFirstLine(m, br, "SEND")
 	if err != nil {
 		var controlErr controlFrameError
 		if errors.As(err, &controlErr) && strings.EqualFold(controlErr.Code, "NOT_FOUND") {
@@ -1348,7 +1372,7 @@ func (c *Client) probeTCP(ctx context.Context, req ProbeRequest, probeBytes int6
 	if err != nil {
 		return probeResponse{}, fmt.Errorf("read PROBE response line: %w", err)
 	}
-	if err := parseErrControlFrame(line); err != nil {
+	if err := parseErrControlFrame(c.metrics(), line); err != nil {
 		return probeResponse{}, err
 	}
 	probeResp, err := parseProbeResponseLine(line)
@@ -1361,7 +1385,7 @@ func (c *Client) probeTCP(ctx context.Context, req ProbeRequest, probeBytes int6
 	if _, err := io.CopyN(io.Discard, br, probeResp.ProbeBytes); err != nil {
 		return probeResponse{}, fmt.Errorf("read PROBE payload: %w", err)
 	}
-	if _, err := readTCPStatus(br); err != nil {
+	if _, err := readTCPStatus(c.metrics(), br); err != nil {
 		return probeResponse{}, fmt.Errorf("read PROBE status: %w", err)
 	}
 	probeResp.CTS1 = capture.FirstTS()
@@ -1539,14 +1563,36 @@ func (c *Client) acknowledgeFileProgressGroupTCP(ctx context.Context, commands [
 	closer := managedTCPConnCloser{client: c, conn: conn, pool: pool}
 	defer closer.Close()
 
+	rt := c.beginReq("ACK", txferID)
+	if rt != nil {
+		c.emitReqStart(withReqTrace(ctx, rt), "ACK", txferID, conn, body.body)
+	}
+	resp, err := c.ackOnConn(conn, state, txferID, body)
+	if err == nil {
+		closer.markReusable()
+	}
+	if rt != nil {
+		rt.end(c, err)
+		var delta int64
+		for _, cmd := range commands {
+			delta += max(cmd.request.DeltaBytes, 0)
+		}
+		attempt, _ := ctx.Value(ackAttemptKey{}).(int)
+		ok := err == nil
+		c.sink().Emit("ack", txferID, events.F("files", len(commands)), events.F("bytes", delta),
+			events.Dur("dur", time.Since(rt.start)), events.F("attempt", max(attempt, 1)), events.F("ok", ok))
+	}
+	return resp, err
+}
+
+func (c *Client) ackOnConn(conn net.Conn, state tcpAuthState, txferID string, body encodedRequest) (AcknowledgeFileProgressResponse, error) {
 	br, err := c.sendAndReadTCPWithBody(conn, state, "ACK "+txferID, body.body)
 	if err != nil {
 		return AcknowledgeFileProgressResponse{}, fmt.Errorf("ACK: %w", err)
 	}
-	if _, err := readTCPStatus(br); err != nil {
+	if _, err := readTCPStatus(c.metrics(), br); err != nil {
 		return AcknowledgeFileProgressResponse{}, fmt.Errorf("read ACK response: %w", err)
 	}
-	closer.markReusable()
 	return AcknowledgeFileProgressResponse{}, nil
 }
 
@@ -1562,7 +1608,7 @@ func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (Ge
 	if err != nil {
 		return GetStatusResponse{}, fmt.Errorf("STATUS: %w", err)
 	}
-	message, err := readTCPStatus(br)
+	message, err := readTCPStatus(c.metrics(), br)
 	if err != nil {
 		return GetStatusResponse{}, fmt.Errorf("read STATUS response: %w", err)
 	}
@@ -1592,6 +1638,7 @@ func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesReques
 	// One framed body carrying a JSON object per line, then the verb-level OK.
 	body := intencoding.NewFramedBodyReader(br, intencoding.FramedBodyReaderOpts{
 		MaxLogicalBytes: maxResponseBodyBytes,
+		OnServerError:   c.metrics().IncRequestError,
 	})
 	var statuses []TransferStatus
 	bodyReader := bufio.NewReader(body)
@@ -1617,7 +1664,7 @@ func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesReques
 		return ListStatusesResponse{}, fmt.Errorf("read STATUS terminator: %w", err)
 	}
 	if _, ok := parseOKStatusLine(statusLine); !ok {
-		if ctrlErr := parseErrControlFrame(statusLine); ctrlErr != nil {
+		if ctrlErr := parseErrControlFrame(c.metrics(), statusLine); ctrlErr != nil {
 			return ListStatusesResponse{}, ctrlErr
 		}
 		return ListStatusesResponse{}, fmt.Errorf("unexpected STATUS terminator: %q", statusLine)
@@ -1644,20 +1691,33 @@ func (c *Client) getChecksumBodyTCP(ctx context.Context, transferID string, body
 	}
 	stopWatch := watchManagedTCPConnContext(ctx, conn)
 	closer := &managedTCPConnCloser{client: c, conn: conn, pool: pool}
+	rt := c.beginReq("CXSUM", transferID)
+	if rt != nil {
+		c.emitReqStart(withReqTrace(ctx, rt), "CXSUM", transferID, conn, body.body)
+	}
 	br, err := c.sendAndReadTCPWithBody(conn, state, "CXSUM "+transferID, body.body)
 	if err != nil {
 		stopWatch()
 		_ = closer.Close()
-		return nil, fmt.Errorf("CXSUM: %w", err)
+		err = fmt.Errorf("CXSUM: %w", err)
+		rt.end(c, err)
+		return nil, err
 	}
-	firstLine, err := readStreamFirstLine(br, "CXSUM")
+	firstLine, err := readStreamFirstLine(c.metrics(), br, "CXSUM")
 	if err != nil {
 		stopWatch()
 		_ = closer.Close()
+		rt.end(c, err)
 		return nil, err
+	}
+	stop := stopWatch
+	if rt != nil {
+		// The caller reads the checksum stream; the request ends when it
+		// closes it.
+		stop = func() { stopWatch(); rt.end(c, nil) }
 	}
 	return &contextManagedTCPReadCloser{
 		ReadCloser: newManagedTCPReadCloser(io.MultiReader(strings.NewReader(firstLine), br), closer),
-		stopWatch:  stopWatch,
+		stopWatch:  stop,
 	}, nil
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/fsync"
+	"github.com/jolynch/tx/internal/txstats"
 )
 
 type startArgs struct {
@@ -39,6 +40,7 @@ type startArgs struct {
 	progressTargets     []filexfer.ProgressTarget
 	progressInterval    time.Duration
 	metadataFailures    *metadataFailureCollector
+	stats               *txstats.Recorder
 }
 
 func formatStartBatchCause(plan tx.BatchSizePlan) string {
@@ -107,7 +109,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	cf.BoolVar(&progress, "", "progress", true, "Show transfer progress every 2s")
 	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
 	cf.StringSliceVar(&progressFilePaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
-	cf.StringSliceVar(&progressFormats, "f", "progress-format", "Progress format: json|int; 1 applies to all targets, or one per target (default json)")
+	cf.StringSliceVar(&progressFormats, "f", "progress-format", "Progress format: json|int|events; 1 applies to all targets, or one per target (default json)")
 	cf.StringVar(&progressIntervalRaw, "", "progress-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
 	cf.BoolVar(&discard, "", "skip-write", false, "Discard downloaded file contents instead of writing to the target directory")
 	cf.BoolVar(&discard, "", "discard", false, "Discard downloaded file contents instead of writing to the target directory")
@@ -316,7 +318,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 			stopProgress()
 		}
 	}()
-	client := tx.NewClient(serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...))
+	client := tx.NewClient(serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
 	defer client.Close()
 	startAll := time.Now()
 	var completed int64
@@ -519,7 +521,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 	failuresMu.Lock()
 	finalFailures := append([]error(nil), failures...)
 	failuresMu.Unlock()
-	printTransferErrors(stderr, "start", finalFailures, cfg.verbosity)
+	printTransferErrors(stderr, cfg.stats, "start", finalFailures, cfg.verbosity)
 
 	elapsedAll := time.Since(startAll)
 	overallSpeed := 0.0

@@ -128,3 +128,78 @@ func TestRunSendTreeRequireAuth(t *testing.T) {
 		t.Fatal("server was not called")
 	}
 }
+
+func TestRunSendTreeExitWithStdin(t *testing.T) {
+	root := t.TempDir()
+	statsPath := filepath.Join(t.TempDir(), "stats.jsonl")
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Close()
+	sendTreeStdin = pr
+	t.Cleanup(func() { sendTreeStdin = os.Stdin })
+	serve := func(ln net.Listener, _ ftcp.ServerOptions) error {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return nil // the listener closed: shutdown began
+			}
+			conn.Close()
+		}
+	}
+	done := make(chan int, 1)
+	go func() {
+		done <- runSendTree([]string{"--listen", "127.0.0.1:0", "--keys", t.TempDir(), "--exit-after", "never",
+			"--exit-with", "stdin", "--stats", statsPath, root}, io.Discard, serve)
+	}()
+	select {
+	case code := <-done:
+		t.Fatalf("exited before stdin closed: %d", code)
+	case <-time.After(200 * time.Millisecond):
+	}
+	pw.Close()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("exit code %d", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("still running after stdin closed")
+	}
+	data, err := os.ReadFile(statsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"exit":"exit-with:stdin"`) {
+		t.Fatalf("stats lack the exit-with:stdin exit:\n%s", data)
+	}
+}
+
+func TestRunSendTreeExitWithValidation(t *testing.T) {
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devNull.Close()
+	sendTreeStdin = devNull
+	t.Cleanup(func() { sendTreeStdin = os.Stdin })
+	served := false
+	serve := func(net.Listener, ftcp.ServerOptions) error { served = true; return nil }
+	run := func(args ...string) (int, string) {
+		var stderr bytes.Buffer
+		code := runSendTree(append([]string{"--listen", "127.0.0.1:0", "--keys", t.TempDir()}, append(args, t.TempDir())...), &stderr, serve)
+		return code, stderr.String()
+	}
+	// stdin on /dev/null would mean an instant exit: refused up front.
+	if code, out := run("--exit-with", "stdin"); code != 2 || !strings.Contains(out, "pipe or socket") || served {
+		t.Fatalf("stdin=/dev/null: code %d served %v: %s", code, served, out)
+	}
+	if code, out := run("--exit-with", "pid:1"); code != 2 || !strings.Contains(out, "supported: none, stdin") {
+		t.Fatalf("unknown mode: code %d: %s", code, out)
+	}
+	// The default never looks at stdin, so /dev/null is fine.
+	if code, out := run(); code != 0 || !served {
+		t.Fatalf("default: code %d served %v: %s", code, served, out)
+	}
+}
