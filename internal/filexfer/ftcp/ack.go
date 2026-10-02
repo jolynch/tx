@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 )
 
@@ -78,8 +79,9 @@ func handleACK(ctx context.Context, req Request, out io.Writer, deps Deps) error
 }
 
 type ackRequestRecord struct {
-	FileID   uint64
-	AckBytes int64
+	FileID     uint64
+	AckBytes   int64
+	DeltaBytes int64
 }
 
 // Validate every acknowledgment before applying any. This does not lock the
@@ -95,7 +97,7 @@ func handleACKWithInput(ctx context.Context, req Request, in io.Reader, out io.W
 			return ackRequestRecord{}, err
 		}
 		ackBytes, err := validateACKItem(item, deps)
-		return ackRequestRecord{FileID: item.FileID, AckBytes: ackBytes}, err
+		return ackRequestRecord{FileID: item.FileID, AckBytes: ackBytes, DeltaBytes: item.DeltaBytes}, err
 	})
 	if err != nil {
 		return err
@@ -116,6 +118,13 @@ func handleACKWithInput(ctx context.Context, req Request, in io.Reader, out io.W
 		if !ok {
 			return protocolErr{code: "INTERNAL", message: "failed to acknowledge file progress"}
 		}
+	}
+	if scope := events.FromContext(ctx); scope.Sink.Enabled() {
+		var delta int64
+		for _, r := range records {
+			delta += max(r.DeltaBytes, 0)
+		}
+		scope.Sink.Emit("ack", txferID, events.F("conn", scope.Conn), events.F("files", len(records)), events.F("bytes", delta))
 	}
 	return writeOKLine(out, "")
 }

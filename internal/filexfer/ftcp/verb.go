@@ -41,3 +41,26 @@ func ParseVerb(token string) (Verb, error) {
 		return VerbUnknown, fmt.Errorf("unknown verb: %s", token)
 	}
 }
+
+// String returns the wire spelling of v.
+func (v Verb) String() string {
+	switch v {
+	case VerbAUTH:
+		return "AUTH"
+	case VerbTXFER:
+		return "TXFER"
+	case VerbSEND:
+		return "SEND"
+	case VerbACK:
+		return "ACK"
+	case VerbCXSUM:
+		return "CXSUM"
+	case VerbSTATUS:
+		return "STATUS"
+	case VerbPROBE:
+		return "PROBE"
+	case VerbSYNC:
+		return "SYNC"
+	}
+	return "UNKNOWN"
+}

@@ -197,6 +197,9 @@ type FramedBodyReaderOpts struct {
 	MaxLogicalBytes int64
 	// OnFrame, if set, is invoked after each validated frame.
 	OnFrame func(FrameStats)
+	// OnServerError, if set, is invoked when the server sends an ERR status
+	// line in place of a frame.
+	OnServerError func()
 	// RawSink, if set, receives the raw wire bytes of frames whose codec is
 	// "zstd". Concatenated, the bytes form a standalone multi-frame zstd
 	// archive that decodes to the full logical manifest.
@@ -281,6 +284,9 @@ func (r *FramedBodyReader) readNextFrame() error {
 	// A status line here means the server aborted before (or instead of)
 	// streaming frames — surface its message rather than a frame parse error.
 	if rest, ok := strings.CutPrefix(headerLine, "ERR "); ok {
+		if r.opts.OnServerError != nil {
+			r.opts.OnServerError()
+		}
 		return fmt.Errorf("server error: %s", strings.TrimSpace(rest))
 	}
 	if headerLine == "OK" || strings.HasPrefix(headerLine, "OK ") {

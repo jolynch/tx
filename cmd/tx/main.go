@@ -7,22 +7,61 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"runtime/trace"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"filippo.io/age"
+	"golang.org/x/sys/unix"
 
 	"github.com/jolynch/tx/internal/aead"
 	"github.com/jolynch/tx/internal/cliflags"
 	"github.com/jolynch/tx/internal/cmd/filexfercli"
+	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/filexfer/ftcp"
 	"github.com/jolynch/tx/internal/filexfer/limit"
+	"github.com/jolynch/tx/internal/txstats"
 	"github.com/jolynch/tx/internal/utils"
 )
 
 const defaultFileListener = "127.0.0.1:3453"
+
+// sendTreeStdin is what --exit-with stdin watches; tests replace it.
+var sendTreeStdin = os.Stdin
+
+// --exit-with modes. "none" keeps tx's lifetime its own; every other mode
+// ties it to something outside the process. New modes (pid:N, fd:N) can be
+// added without changing the flag.
+const (
+	exitWithNone  = "none"
+	exitWithStdin = "stdin"
+)
+
+// parseExitWith validates an --exit-with mode.
+func parseExitWith(raw string) (string, error) {
+	switch mode := strings.ToLower(strings.TrimSpace(raw)); mode {
+	case exitWithNone, exitWithStdin:
+		return mode, nil
+	}
+	return "", fmt.Errorf("unsupported --exit-with %q (supported: none, stdin)", raw)
+}
+
+// checkExitWithStdin requires stdin to be a pipe or socket: anything else
+// (/dev/null, a terminal, a file) would make tx exit at once or never.
+func checkExitWithStdin(f *os.File) error {
+	st, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("--exit-with stdin: stat stdin: %w", err)
+	}
+	if st.Mode()&(os.ModeNamedPipe|os.ModeSocket) == 0 {
+		return fmt.Errorf("--exit-with stdin needs stdin to be a pipe or socket held open by the process tx should exit with; it is %v", st.Mode().Type())
+	}
+	return nil
+}
 
 var (
 	keysDir     = "/var/lib/tx/keys"
@@ -149,6 +188,8 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 		progressPaths     []string
 		progressFormats   []string
 		progressIntervalR string
+		statsPath         string
+		exitWithRaw       string
 	)
 
 	cf.StringVar(&listenAddr, "", "listen", defaultFileListener, "Listen address (host:port)")
@@ -165,8 +206,10 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 	cf.StringVar(&idleTimeoutRaw, "", "idle-timeout", "60s", "Close kept-alive connections idle for this duration; 0 disables keep-alive (e.g. 10s, 1m)")
 	cf.StringVar(&traceFile, "", "trace", "", "Write runtime/trace output to this file")
 	cf.StringSliceVar(&progressPaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
-	cf.StringSliceVar(&progressFormats, "f", "progress-format", "Progress format: json|int; 1 applies to all targets, or one per target (default json)")
+	cf.StringSliceVar(&progressFormats, "f", "progress-format", "Progress format: json|int|events; 1 applies to all targets, or one per target (default json)")
 	cf.StringVar(&progressIntervalR, "", "progress-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
+	cf.StringVar(&statsPath, "", "stats", "", "Write JSON-lines transfer and process statistics to this file")
+	cf.StringVar(&exitWithRaw, "", "exit-with", exitWithNone, "Shut down cleanly, as on SIGTERM, when this ends: none|stdin. stdin exits when stdin (a pipe or socket) closes, tying tx to whoever holds it")
 
 	cf.FlagSet().Usage = func() {
 		fmt.Fprintln(stderr, "usage: tx send tree [--listen <addr>] [options] [CHROOT]")
@@ -189,6 +232,17 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 	if err := utils.ValidateHostPort(listenAddr); err != nil {
 		fmt.Fprintf(stderr, "invalid --listen: %v\n", err)
 		return 2
+	}
+	exitWith, err := parseExitWith(exitWithRaw)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if exitWith == exitWithStdin {
+		if err := checkExitWithStdin(sendTreeStdin); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
 	}
 
 	chroot := ""
@@ -296,11 +350,73 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 	socketWriteBufBytes := utils.MaxSocketWriteBufferBytes()
 	log.Printf("Detected ideal socket write buffer of size %d", socketWriteBufBytes)
 
+	var sink *events.Sink
+	var stats *txstats.ServerWriter
+	eventTargets := cliflags.EventTargets(progressTargets)
+	if statsPath != "" || len(eventTargets) > 0 {
+		sink = events.NewSink()
+	}
+	if statsPath != "" {
+		stats, err = txstats.NewServerWriter(statsPath, sink)
+		if err != nil {
+			log.Fatalf("Invalid --stats: %v", err)
+		}
+	}
+	if len(eventTargets) > 0 {
+		eventWriter := events.StartTargetWriter(sink, events.Header{Side: "s"}, progressInterval, eventTargets)
+		defer eventWriter.Stop()
+	}
+
 	fileLn, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		log.Fatalf("Failed to bind file listener at %s: %v", listenAddr, err)
 	}
 	defer fileLn.Close()
+
+	// SIGTERM, SIGINT, and the --exit-with target ending all close
+	// the listener, so Serve returns and flushes its progress targets, and
+	// the deferred stats close writes the final records before the process
+	// exits.
+	exitReason := "exit-after"
+	var exitMu sync.Mutex
+	var shutdownOnce sync.Once
+	shutdown := func(reason string) {
+		shutdownOnce.Do(func() {
+			exitMu.Lock()
+			exitReason = reason
+			exitMu.Unlock()
+			log.Printf("%s, shutting down", reason)
+			fileLn.Close()
+		})
+	}
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+	go func() {
+		sig, ok := <-sigCh
+		if !ok {
+			return
+		}
+		shutdown(strings.ToLower(unix.SignalName(sig.(syscall.Signal))))
+	}()
+	if exitWith == exitWithStdin {
+		go func() {
+			// Whatever arrives is discarded; only EOF (or a read error, as
+			// when the writer dies) matters.
+			_, _ = io.Copy(io.Discard, sendTreeStdin)
+			shutdown("exit-with:stdin")
+		}()
+	}
+	if stats != nil {
+		defer func() {
+			exitMu.Lock()
+			reason := exitReason
+			exitMu.Unlock()
+			if err := stats.Close(reason); err != nil {
+				log.Printf("write --stats: %v", err)
+			}
+		}()
+	}
 
 	log.Printf("File transfer listener at %s (root=%s)", listenAddr, chroot)
 	if serveErr := serve(fileLn, ftcp.ServerOptions{
@@ -318,6 +434,7 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 		TargetIODepth:          targetIODepth,
 		ExitAfter:              exitAfter,
 		KeepAliveTimeout:       idleTimeout,
+		Events:                 sink,
 	}); serveErr != nil {
 		log.Fatalf("File transfer listener stopped: %v", serveErr)
 	}

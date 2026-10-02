@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/pagecache"
 	"github.com/jolynch/tx/internal/utils"
 	"github.com/zeebo/xxh3"
@@ -117,6 +118,7 @@ func handleTXFERWithCallback(ctx context.Context, req Request, out io.Writer, de
 	if err != nil {
 		return err
 	}
+	requestPath := cleanRequestPath(parsed.Directory)
 	parsed.Directory, err = resolveUnderRoot(deps.Root(), parsed.Directory)
 	if err != nil {
 		return err
@@ -132,7 +134,7 @@ func handleTXFERWithCallback(ctx context.Context, req Request, out io.Writer, de
 		singleFileName = filepath.Base(root)
 		root = filepath.Dir(root)
 	}
-	transfer, err := deps.NewTransfer(root, 0, 0)
+	transfer, err := deps.NewTransfer(root, 0, 0, store.WithRequestPath(requestPath))
 	if err != nil {
 		return protocolErr{code: "INTERNAL", message: "failed to initialize transfer"}
 	}
@@ -191,6 +193,12 @@ func handleTXFERWithCallback(ctx context.Context, req Request, out io.Writer, de
 
 func handleTXFER(ctx context.Context, req Request, out io.Writer, deps Deps) error {
 	return handleTXFERWithCallback(ctx, req, out, deps, nil)
+}
+
+// cleanRequestPath is the requested path as the client sees it under the
+// server root, recorded on the transfer for stats and events.
+func cleanRequestPath(requested string) string {
+	return filepath.Clean("/" + requested)
 }
 
 // resolveUnderRoot joins a requested path onto the server root and rejects

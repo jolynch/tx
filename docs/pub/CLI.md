@@ -61,10 +61,15 @@ Options:
       --trace string               Write runtime/trace output to this file (default "")
   -p, --progress-path string       Progress output target; repeatable, use - for stdout
                                    (default "")
-  -f, --progress-format string     Progress format: json|int; 1 applies to all targets,
-                                   or one per target (default json)
+  -f, --progress-format string     Progress format: json|int|events; 1 applies to all
+                                   targets, or one per target (default json)
       --progress-interval string   Progress write interval (e.g. 500ms, 10s) (default
                                    "1s")
+      --stats string               Write JSON-lines transfer and process statistics to
+                                   this file (default "")
+      --exit-with string           Shut down cleanly, as on SIGTERM, when this ends:
+                                   none|stdin. stdin exits when stdin (a pipe or socket)
+                                   closes, tying tx to whoever holds it (default "none")
 ```
 
 ### `tx recv`
@@ -135,8 +140,8 @@ Options:
   -v, --verbose                   Per-file progress output (default false)
   -p, --progress-path string      Progress output target; repeatable, use - for stdout
                                   (default "")
-  -f, --progress-format string    Progress format: json|int; 1 applies to all targets,
-                                  or one per target (default json)
+  -f, --progress-format string    Progress format: json|int|events; 1 applies to all
+                                  targets, or one per target (default json)
       --progress-interval string  Progress write interval (e.g. 500ms, 10s) (default
                                   "1s")
   -y, --yes                       Skip confirmation prompt on sync paths (default false)
@@ -146,6 +151,8 @@ Options:
                                   MiB")
       --deadline string           Transfer deadline (e.g. 60s, 5m) (default "")
       --trace string              Write runtime/trace output to this file (default "")
+      --stats string              Write a JSON statistics object for this run to this
+                                  file at exit (default "")
 ```
 
 #### `tx recv get`
@@ -178,8 +185,8 @@ Options:
   -v, --verbose                   Per-file progress output (default false)
   -p, --progress-path string      Progress output target; repeatable, use - for stdout
                                   (default "")
-  -f, --progress-format string    Progress format: json|int; 1 applies to all targets,
-                                  or one per target (default json)
+  -f, --progress-format string    Progress format: json|int|events; 1 applies to all
+                                  targets, or one per target (default json)
       --progress-interval string  Progress write interval (e.g. 500ms, 10s) (default
                                   "1s")
       --cache-load string         Load downloaded file into page cache after success:
@@ -188,6 +195,8 @@ Options:
                                   (default "128.00 MiB")
       --deadline string           Transfer deadline (e.g. 60s, 5m) (default "")
       --trace string              Write runtime/trace output to this file (default "")
+      --stats string              Write a JSON statistics object for this run to this
+                                  file at exit (default "")
 ```
 
 #### `tx recv status`
@@ -369,6 +378,66 @@ Local copies:
 
 `.tx/` state (resume, persisted manifests) is not used for local copies — they
 are fast and simply re-run.
+
+### Event Timelines (`-f events`)
+
+`-f events` is a progress format for `tx send tree`, `tx recv copy`, and
+`tx recv get`. Instead of one snapshot per tick it writes every event (connections,
+commands and requests, files, windows, fsyncs, ACKs, retries) as JSON lines,
+each stamped with when it happened; the event schema is in
+[Trace](../bench/TRACE.md). It pairs with the other formats through the usual
+one-format-per-target rule, for example `-p progress.json -p events.jsonl -f json
+-f events`.
+
+- `--progress-interval` sets how often buffered events are written, not their
+  timestamp resolution.
+- Nothing is skipped silently. A target that cannot be opened (a FIFO with no
+  reader) keeps its events until a later write succeeds. If 1 MiB of encoded
+  events builds up first, the oldest are dropped and a `dropped` event with
+  their count takes their place.
+- The final write happens at exit, after the last event, so the file is
+  complete when the process ends.
+
+### Statistics (`--stats`)
+
+`--stats PATH` writes machine-readable statistics. It changes nothing else
+about a run, and costs nothing when absent.
+
+**`tx send tree`** truncates `PATH` at startup and appends one JSON object per
+line:
+
+| `rec` | When | Fields |
+|-------|------|--------|
+| `start` | A TXFER or SYNC creates a transfer | `tid`, `path` (the requested path, including a single file's name), `t` |
+| `end` | The transfer completes, or at exit for one that never did | `tid`, `path`, `complete`, `files`, `bytes`, `logical_bytes` and `wire_bytes` of the windows sent, `windows` per codec, `send_path` (`sendfile` or `buffered`) per window, `dur_ns` |
+| `process` | At exit | `conns_accepted`, `peak_conns`, `heartbeats` (keep-alive PROBEs), `transfers`, `exit` (`sigterm`, `sigint`, or `exit-after`) |
+
+`t` is unix nanoseconds. SIGTERM and SIGINT stop the server cleanly: the
+listener closes, progress targets get their final write, and the `end` and
+`process` records are written before the process exits.
+
+`--exit-with MODE` ties `tx send tree`'s lifetime to something outside it,
+with the same clean shutdown when that ends. The default, `none`, ties it to
+nothing: tx runs until signaled or `--exit-after` fires. `stdin` shuts down
+when stdin closes (`exit` is `exit-with:stdin`). A process that holds the
+write end of tx's stdin, and never writes to it, ties tx to its own lifetime,
+since the kernel closes the pipe however that process dies; over ssh, stdin is
+the ssh channel, so the tie reaches across hosts. tx refuses to start with
+`--exit-with stdin` unless stdin is a pipe or socket, since `/dev/null`, a
+terminal, or a file would mean exiting at once or never. The flag takes a
+mode so further ties (a process ID, an inherited descriptor) can be added
+without a new flag. It combines with `--exit-after`; whichever fires first
+wins.
+
+**`tx recv copy`** and **`tx recv get`** write one JSON object at exit:
+`command`, `tid`, `status` (`ok` or `error`), `error` (the failure that
+ended the run, for example `start failed with 748 errors; first: ...`, or the
+last line written to stderr when no step reported one), `exit_code`, `start`, `end`, `wall_ns`, `phases_ns` (`probe`,
+`manifest`, `data`, `finalize`), `files` and `bytes` requested,
+`logical_bytes` and `wire_bytes` received, `windows` per codec, and the
+connection counters `dials`, `sync_fallbacks`, `reuses`, `heartbeats`,
+`heartbeat_failures`, `ack_retries`, and `request_errors` (failed dials plus
+ERR responses). A run that fails before its manifest arrives has no `tid`.
 
 ## State Directory
 

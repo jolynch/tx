@@ -44,8 +44,8 @@ Companion references:
 - **Real binaries end to end.** Every byte on the wire comes from a forked
   `tx`; `tx-bench` only prepares data, supervises processes, and verifies
   results.
-  - The `tx` binary is `--tx`, which defaults to the `tx` next to `tx-bench`,
-    then `$PATH`.
+  - The `tx` binary is `--tx`, which defaults to `$TX_BIN`, then the `tx`
+    next to `tx-bench`, then `$PATH`.
   - Its path and xxh128 are recorded on both sides, and `recv-copy` warns when
     the two hosts run different builds.
 - **One process per run on both sides.** Every measured run has its own
@@ -59,7 +59,7 @@ Companion references:
   - Data is only written when a shape is given (`send-tree --size 10GiB`),
     and every unspecified shape setting has a default: size `10GiB`, profile
     `mixed`.
-  - Paths (`./tx-bench`, `./tx-bench-dst`), port (`3453`), and run counts
+  - Paths (`./tx-bench-src`, `./tx-bench-dst`), port (`3453`), and run counts
     (`-w 1 -n 3`) are defaulted too.
 - **No side channel.** The sender writes all coordination state as ordinary
   files under its served root. The receiver reads them, and requests preps,
@@ -78,11 +78,11 @@ Companion references:
 
 ## Served Root
 
-Each forked `tx send tree` uses `BENCH_DIR` (default `./tx-bench`) as its
+Each forked `tx send tree` uses `BENCH_DIR` (default `./tx-bench-src`) as its
 chroot:
 
 ```text
-tx-bench/                      BENCH_DIR
+tx-bench-src/                  BENCH_DIR
   .tx-bench                    ownership marker (Directory Ownership)
   bench.json                   dataset description, fingerprint, remote paths (DATASET.md)
   files.tsv                    every entry's type, mode, size, hash, mtime, path: the oracle
@@ -92,6 +92,7 @@ tx-bench/                      BENCH_DIR
   runs/
     prep                       1-byte file; fetching it requests a prep
     flush                      1-byte file; fetching it records the last run without a prep
+    stop                       1-byte file; fetching it records the last run and ends send-tree
     prep.json                  result of the latest prep or flush
     server-<tid>.json          sender metrics for the run whose data transfer had this tid
     server-<tid>.trace.jsonl   that run's tx send tree events (--trace only)
@@ -168,6 +169,9 @@ only deletes or regenerates inside a marked directory:
    - `-p <file> -f events` when tracing, and `--trace` for `--go-trace`;
    - `--require-auth-token` when auth is on;
    - `--exit-after never` as an overridable default;
+   - `--exit-with stdin`, with tx's stdin a pipe that `tx-bench` holds
+     open and never writes. If `tx-bench` dies, even by SIGKILL, the kernel
+     closes the pipe and tx shuts down cleanly instead of serving forever;
    - everything after `--` on the `send-tree` command line
      ([Pass-Through Arguments](./CLI.md#pass-through-arguments)).
 4. **Ready.** Wait until the port accepts connections. If tx exits first,
@@ -194,6 +198,10 @@ only deletes or regenerates inside a marked directory:
      7. Start tx #k+1 (step 3) and wait for it to be ready (step 4).
      8. Write `runs/prep.json` with `seq` incremented, `served_tid: T`, and
         the cache results.
+   - **`runs/stop`, `start`:** wait for its `end`, stop tx #k and record its
+     run as above, then exit 0 without starting another tx. The receiver
+     fetches it last (`recv-copy --stop-sender`), after the final flush has
+     recorded the last run, since nothing answers once the sender is gone.
    - **Anything else:** ignored. These are coordination fetches such as
      `bench.json` and `prep.json`. They never become runs and never trigger
      a prep.
@@ -307,9 +315,26 @@ touches the filesystem `DST` is on. Polls back off from 50 ms to 1 s.
       is never part of transfer time; see
       [Failure Semantics](#failure-semantics).
 3. **Flush the last run.** `tx recv get` `runs/flush`, wait for `prep.json`
-   to acknowledge it, then fetch the last `server-<tid>.json`.
+   to acknowledge it, then fetch the last `server-<tid>.json`. With
+   `--stop-sender`, then fetch `runs/stop`.
 4. **Report.** Aggregate the measured runs, print the report, and write
    `--metrics`.
+
+**Forever mode.** `--forever` replaces `--iterations`: after the warmups,
+measured runs continue until tx-bench is interrupted. An interrupt, with or
+without `--forever`, stops the copy in flight (which does not count), then
+flushes, reports, and writes metrics as usual; a second interrupt quits at
+once. Forked tx processes run in their own process group, so a terminal
+Ctrl-C reaches only tx-bench, which stops them after recording what it needs.
+
+**Streaming metrics.** `--metrics` to a `.jsonl` or text path is written as
+the benchmark runs: a header record, one record per run once its sender
+metrics are in (when the next run starts, or at the final flush), and a
+summary record at the end. A FIFO works, for exporting metrics while a
+`--forever` run goes on: the stream never blocks the benchmark, holds
+records while no reader is attached, and replaces the oldest with a
+`dropped` record if more than 1 MiB waits. A `.json` path is one object,
+rewritten after each run, so it cannot be a FIFO or a `--forever` target.
 
 Only one receiver may run against a sender at a time. The tid-matched
 handshake keeps a second receiver from corrupting the first one's cache
@@ -384,10 +409,13 @@ therefore run against hot metadata even at `--cache-warm 0%`.
 
 - `prep.json` records `meta_cold: false`, and the report labels the run
   "data-cold".
-- `--cache-drop-meta` (requires root) also writes `2` to
-  `/proc/sys/vm/drop_caches` after evicting. That is host-wide, so it says so
-  when it runs. It records `meta_cold: true`, and the report labels the run
-  "cold".
+- `--cache-drop-meta` (requires root) writes `2` to
+  `/proc/sys/vm/drop_caches` after warming data pages, measuring residency,
+  and checking imported sources. That is host-wide, so it says so when it
+  runs. It records `meta_cold: true`, and the report labels the run "cold".
+  The kernel does not reclaim inodes that still have cached pages, so the
+  inodes of warmed files stay cached: with `--cache-warm 30%`, metadata is
+  cold only for the files outside the warm set.
 - ZFS ignores `fadvise` (the ARC is separate). On ZFS, `prep` warns that
   `--cache-warm` cannot be honored, and `hot_pct` reports what was actually
   measured.
@@ -425,6 +453,7 @@ runtime startup and the few small coordination fetches listed under
 | Prep not acknowledged within `--server-wait`                              | Mark the run failed (unknown cache state) and continue |
 | `runs/server-<tid>.json` not available within `--server-wait`             | Warn; sender columns show `-` for that run; does not change the exit code |
 | `tx send tree` exits while serving                                        | `send-tree` exits non-zero with the tail of its log |
+| Cleaning `DST` fails (removal or `syncfs`)                                | Stop before the next run, without the final flush, so the last run has no sender metrics; exit 1 |
 | All runs succeeded and verified                                           | Exit 0 |
 
 ## Changes to tx
@@ -452,6 +481,7 @@ them changes behavior when its flag is absent.
 | `--stats PATH` | `tx recv copy`, `tx recv get` | One JSON object at exit: tid, status and error, phase timings, bytes, wire bytes, windows per codec, dials, sync fallbacks, reuses, heartbeats and failures, ACK retries, request errors |
 | `-f events` | `tx send tree`, `tx recv copy`, `tx recv get` | A new `--progress-format` value: the event timeline in [Trace](./TRACE.md) as JSON lines, written to the matching `-p/--progress-path` target |
 | SIGTERM | `tx send tree` | A clean shutdown that writes the final `--stats` and progress records before exiting |
+| `--exit-with none\|stdin` | `tx send tree` | Default `none`: no change. `stdin`: the same clean shutdown when stdin (which must be a pipe or socket) closes, so whoever holds the pipe ties tx's lifetime to its own. A mode, not a boolean, so ties to a pid or descriptor can follow |
 
 To record the full requested path, the store must keep a single-file
 transfer's file name. Today it records only the parent directory.
@@ -485,8 +515,8 @@ Internally:
 
 ## Code Layout
 
-- `cmd/tx-bench`: entry point; `make build-bench` builds `bench/tx-bench`
-  next to `bench/tx`.
+- `cmd/tx-bench`: entry point; `make build` builds `tx-bench` next to `tx`
+  in the repo root.
 - `internal/bench/dataset`: generation, import, reuse, fingerprint, oracle
   verify, cache-warm selection.
 - `internal/bench/harness`: `prep`, `remote send-tree`, `remote recv-copy`,

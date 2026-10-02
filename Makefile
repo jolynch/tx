@@ -1,4 +1,4 @@
-.PHONY: all acceptance fuzz-short fuzz-long vet build build-bench test unit bench
+.PHONY: all acceptance fuzz-short fuzz-long vet build test unit bench
 
 FUZZTIME_SHORT ?= 5s
 FUZZTIME_LONG ?= 30s
@@ -7,18 +7,15 @@ FUZZTIME_LONG ?= 30s
 FUZZDEADLINE_SHORT ?= 30s
 FUZZDEADLINE_LONG ?= 2m
 
-all: build build-bench test
+all: build test
 
 vet:
 	go vet ./...
 
+# Both binaries land in the repo root; tx-bench forks the tx next to it.
 build: vet
 	CGO_ENABLED=0 go build -tags netgo -ldflags='-s -w -extldflags "-static"' -o tx ./cmd/tx
-
-build-bench: build
-	@mkdir -p bench
-	go build -o bench/bench ./internal/bench
-	cp tx bench/tx
+	CGO_ENABLED=0 go build -tags netgo -ldflags='-s -w -extldflags "-static"' -o tx-bench ./cmd/tx-bench
 
 test: build unit acceptance
 
@@ -43,6 +40,8 @@ fuzz-short:
 	go test -race ./internal/sampler        -run=^$$ -fuzz=FuzzGeneratorFullCoverageNoRepeats -fuzztime=$(FUZZTIME_SHORT) -timeout=$(FUZZDEADLINE_SHORT)
 	go test -race ./internal/utils          -run=^$$ -fuzz=FuzzCommonPrefixLen -fuzztime=$(FUZZTIME_SHORT) -timeout=$(FUZZDEADLINE_SHORT)
 	go test .                               -run=^$$ -fuzz=FuzzSuggestBatchMaxBytes -fuzztime=$(FUZZTIME_SHORT) -timeout=$(FUZZDEADLINE_SHORT) -parallel=1
+	go test -race ./internal/bench/dataset  -run=^$$ -fuzz=FuzzPlan -fuzztime=$(FUZZTIME_SHORT) -timeout=$(FUZZDEADLINE_SHORT)
+	go test -race ./internal/bench/dataset  -run=^$$ -fuzz=FuzzSelectWarmBlocks -fuzztime=$(FUZZTIME_SHORT) -timeout=$(FUZZDEADLINE_SHORT)
 
 # End-to-end properties driving the whole system. These are still finding new
 # coverage past 10s, so CI gives them a larger budget to keep exploring.
@@ -53,12 +52,15 @@ fuzz-long:
 	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzSync -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
 	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzResolveUnderRoot -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
 	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzServeZeroCopySEND -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG) -parallel=1
+	go test -race ./internal/events        -run=^$$ -fuzz=FuzzAppendJSON -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
+	go test -race ./internal/bench/report  -run=^$$ -fuzz=FuzzTraceRecordText -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
+	go test -race ./internal/bench/dataset -run=^$$ -fuzz=FuzzFilesTSVRoundTrip -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
+	go test -race ./internal/bench/dataset -run=^$$ -fuzz=FuzzVerifyDetectsCorruption -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
 
 # internal/bench holds benchmarks of exported code. Benchmarks that need
 # unexported access live with their package; both sets are registered here so
-# the Makefile stays the single place that lists them.
+# the Makefile stays the single place that lists them. End-to-end benchmarks
+# between hosts are tx-bench's job (docs/bench).
 bench: build
 	@mkdir -p bench/results
 	go test -bench=. -run=^$$ -benchmem ./internal/bench . ./internal/filexfer/ftcp | tee bench/results/latest.txt
-	@echo
-	@go run ./internal/bench report bench/results/latest.txt

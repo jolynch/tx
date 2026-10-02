@@ -18,10 +18,12 @@ import (
 	"github.com/jolynch/tx"
 	"github.com/jolynch/tx/internal/bufpool"
 	"github.com/jolynch/tx/internal/cliflags"
+	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/pagecache"
 	"github.com/jolynch/tx/internal/sampler"
+	"github.com/jolynch/tx/internal/txstats"
 	"github.com/zeebo/xxh3"
 )
 
@@ -107,6 +109,8 @@ type copyCLIConfig struct {
 	verbose             bool
 	progress            bool
 	yes                 bool
+	statsPath           string
+	stats               *txstats.Recorder
 }
 
 // cacheMapValue maps the boolean "did the caller enable --cache-load?"
@@ -133,7 +137,7 @@ func cleanupCopyState(targetDir string, stderr io.Writer) int {
 	return 0
 }
 
-func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) int {
+func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 	cf := cliflags.New("copy")
 	cf.SetOutput(stderr)
 	cf.FlagSet().Usage = func() {
@@ -181,18 +185,37 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	cf.BoolVar(&cfg.progress, "", "progress", true, "Show transfer progress every 2s")
 	cf.BoolVar(&cfg.verbose, "v", "verbose", false, "Per-file progress output")
 	cf.StringSliceVar(&cfg.progressFilePaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
-	cf.StringSliceVar(&cfg.progressFormats, "f", "progress-format", "Progress format: json|int; 1 applies to all targets, or one per target (default json)")
+	cf.StringSliceVar(&cfg.progressFormats, "f", "progress-format", "Progress format: json|int|events; 1 applies to all targets, or one per target (default json)")
 	cf.StringVar(&cfg.progressIntervalRaw, "", "progress-interval", cfg.progressIntervalRaw, "Progress write interval (e.g. 500ms, 10s)")
 	cf.BoolVar(&cfg.yes, "y", "yes", false, "Skip confirmation prompt on sync paths")
 	cf.StringVar(&cfg.ackEveryRaw, "a", "ack-every", cfg.ackEveryRaw, "Bytes between progress acks; e.g. 1B, 4KiB, 8MiB")
 	cf.StringVar(&cfg.probeSizeRaw, "", "probe-size", cfg.probeSizeRaw, "Probe payload size; e.g. 1B, 4KiB, 8MiB")
 	cf.StringVar(&cfg.deadlineRaw, "", "deadline", "", "Transfer deadline (e.g. 60s, 5m)")
 	cf.StringVar(&cfg.traceFile, "", "trace", "", "Write runtime/trace output to this file")
+	cf.StringVar(&cfg.statsPath, "", "stats", "", "Write a JSON statistics object for this run to this file at exit")
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
 		return 2
+	}
+	eventTargets := resolveEventTargets(cfg.progressFilePaths, cfg.progressFormats)
+	var sink *events.Sink
+	if len(eventTargets) > 0 {
+		sink = events.NewSink()
+		interval, _ := time.ParseDuration(cfg.progressIntervalRaw)
+		// Registered before the stats defer so it runs after it: the final
+		// write includes run_end.
+		defer events.StartTargetWriter(sink, events.Header{Side: "c"}, interval, eventTargets).Stop()
+	}
+	if cfg.stats = txstats.NewRecorder(cfg.statsPath, "copy", sink); cfg.stats != nil {
+		lastErr := newLastLineWriter(stderr)
+		stderr = lastErr
+		defer func() {
+			if err := cfg.stats.Finish(code, lastErr.Last()); err != nil {
+				fmt.Fprintf(lastErr, "write --stats: %v\n", err)
+			}
+		}()
 	}
 	if cf.NArg() != 2 {
 		fmt.Fprintln(stderr, "copy requires exactly two positional arguments: REMOTE_SRC LOCAL_DST")
@@ -204,6 +227,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		return 2
 	}
 	cfg.localDst = cf.Arg(1)
+	cfg.stats.Begin(cfg.localDst)
 	if src.IsLocal {
 		cfg.remoteSrc = src.LocalPath
 	} else {
@@ -355,6 +379,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		verbosity:    0,
 		deadlineMS:   deadlineMS,
 		cacheLoad:    cfg.cacheLoadEnabled,
+		stats:        cfg.stats,
 	}
 	// Resume path: prior .tx/<dst>/manifest.server exists from an interrupted
 	// run, and the user has not re-created LOCAL_DST. Refresh via SYNC and
@@ -377,6 +402,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		return 0
 	}
 
+	cfg.stats.Phase("data")
 	if localExists {
 		syncCfg := syncArgs{
 			sourceDir:           cfg.remoteSrc,
@@ -399,6 +425,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 			progressTargets:     progressTargets,
 			progressInterval:    progressInterval,
 			metadataFailures:    metadataFailures,
+			stats:               cfg.stats,
 		}
 		if code := runSync(serverURL, syncCfg, stdout, stderr); code != 0 {
 			printMetadataMirrorWarnings(stderr, "copy", metadataFailures.snapshot(), copyVerbosity)
@@ -424,6 +451,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 			progressTargets:     progressTargets,
 			progressInterval:    progressInterval,
 			metadataFailures:    metadataFailures,
+			stats:               cfg.stats,
 		}
 		if code := runStart(serverURL, startCfg, stdout, stderr); code != 0 {
 			printMetadataMirrorWarnings(stderr, "copy", metadataFailures.snapshot(), copyVerbosity)
@@ -431,6 +459,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		}
 	}
 
+	cfg.stats.Phase("finalize")
 	// When --verify or --cache-load is requested, run an end-of-copy SYNC
 	// to detect drift the server tree may have accumulated mid-transfer.
 	// The same loop also carries the cache-map=recv snapshot back when the
@@ -897,7 +926,7 @@ func verifyCopyRemoteMetadata(serverURL string, cfg copyCLIConfig, manifest *tx.
 	if err != nil {
 		return fmt.Errorf("invalid --encrypt: %w", err)
 	}
-	client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...))
+	client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
 	defer client.Close()
 	probeCtx, cancel := context.WithTimeout(context.Background(), verifyChecksumRequestTimeout)
 	_, err = client.ProbeLink(probeCtx, tx.ProbeRequest{ProbeBytes: 1})
@@ -1032,7 +1061,7 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 	budgetExpired := func() bool {
 		return cfg.verifyBudget > 0 && budgetCtx.Err() == context.DeadlineExceeded
 	}
-	client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...))
+	client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
 	defer client.Close()
 	probeCtx, probeCancel := context.WithTimeout(workerCtx, verifyChecksumRequestTimeout)
 	_, err = client.ProbeLink(probeCtx, tx.ProbeRequest{ProbeBytes: 1})

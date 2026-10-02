@@ -1,9 +1,2 @@
-data/src/*
-!data/src/.keep
-data/dst/*
-data/silesia/*
-!data/silesia/.keep
-data/.tx/
+data/
 results/
-bench
-tx

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/filexfer"
 )
 
@@ -25,6 +26,17 @@ func (f *StringSliceFlag) String() string {
 func (f *StringSliceFlag) Set(val string) error {
 	*f.Values = append(*f.Values, val)
 	return nil
+}
+
+// EventTargets converts the events targets among targets for
+// events.StartTargetWriter.
+func EventTargets(targets []filexfer.ProgressTarget) []events.Target {
+	_, ev := filexfer.SplitEventTargets(targets)
+	out := make([]events.Target, len(ev))
+	for i, t := range ev {
+		out[i] = events.Target{Path: t.Path, Stdout: t.Stdout}
+	}
+	return out
 }
 
 // ResolveProgressTargets pairs progress paths with formats.
@@ -56,9 +68,9 @@ func ResolveProgressTargets(paths, formats []string) ([]filexfer.ProgressTarget,
 			f = filexfer.ProgressFormat(formats[i])
 		}
 		switch f {
-		case filexfer.ProgressFormatJSON, filexfer.ProgressFormatInt:
+		case filexfer.ProgressFormatJSON, filexfer.ProgressFormatInt, filexfer.ProgressFormatEvents:
 		default:
-			return nil, fmt.Errorf("unsupported --progress-format %q (supported: json, int)", f)
+			return nil, fmt.Errorf("unsupported --progress-format %q (supported: json, int, events)", f)
 		}
 		targets[i] = filexfer.ProgressTarget{Path: p, Format: f}
 	}

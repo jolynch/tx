@@ -71,7 +71,7 @@ type mockDeps struct {
 	reportCalled     bool
 }
 
-func (m *mockDeps) NewTransfer(string, int, int64) (Transfer, error) {
+func (m *mockDeps) NewTransfer(string, int, int64, ...store.TransferOption) (Transfer, error) {
 	return Transfer{ID: "tx123"}, nil
 }
 

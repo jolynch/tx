@@ -59,6 +59,9 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
 
 - Completion requires clean `gofmt`, `go vet ./...`, and `go test ./...`; run
   `-race` for packages involving goroutines.
+- Never commit. Leave finished work staged (`git add`) for review; the
+  maintainer writes the commit. Do not amend, squash, or rewrite existing
+  commits unless asked.
 - Prefer option structs or functional options to long positional argument
   lists, especially repeated types.
 - Keep unrelated constants out of `iota` blocks to avoid shifting values.
@@ -67,19 +70,38 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
 - Update this architecture summary when layout, protocol, or package ownership
   changes.
 
+### Writing
+
+- Write all prose (docs, comments, help text, commit messages, PR
+  descriptions) in the style of the
+  [Microsoft Writing Style Guide](https://learn.microsoft.com/en-us/style-guide/welcome/):
+  plain, direct, active voice, and no longer than the reader needs.
+- Avoid filler and AI-sounding phrasing: no preambles, recaps of what was just
+  said, hedging stacks, or words like "seamless", "robust", "comprehensive",
+  or "leverage".
+- Describe the current state: briefly what it is and why. Do not narrate how
+  it got there ("we first tried X, then switched to Y"); history belongs in
+  git. Mention a rejected alternative only when it is the obvious choice a
+  reader would otherwise expect, and say briefly why it was not taken.
+- Commit messages: a short imperative subject (about 60 characters or fewer)
+  and, when needed, a body of no more than a few sentences on what changed and
+  why. No per-file inventories or bullet lists of every change.
+- PR descriptions: four short sections, a few sentences each — **Problem**,
+  **Proposal**, **Rejected alternatives**, and **Verification**.
+
 ```sh
 make test         # build + unit + acceptance
 make unit         # go test -race ./...
 make fuzz-short   # unit-test replacements; 5s each
 make fuzz-long    # whole-system properties; 30s each
 make acceptance   # fuzz-short, then fuzz-long
-make bench        # regression benchmarks + report
+make bench        # Go microbenchmarks into bench/results/latest.txt
 
 go test ./...
 go test ./internal/filexfer/...
 go test -run TestRunCLI ./internal/cmd/filexfercli/
 go test -bench=. ./internal/bench/
-go run ./internal/bench
+go run ./cmd/tx-bench local -s 256MiB -n 1
 ```
 
 ## Architecture
@@ -89,6 +111,8 @@ go run ./internal/bench
 - Root package (`client.go`, `client_tcp.go`): public `tx.Client`, requests,
   responses, metrics, TCP transport, and keep-alive pool.
 - `cmd/tx`: binary entry point for `send` and `recv`.
+- `cmd/tx-bench`: the benchmark harness binary (`prep`, `remote send-tree`,
+  `remote recv-copy`, `local`, `report`); see the tx-bench docs.
 - `internal/cmd/filexfercli`: recv-side copy/get/status orchestration, remote
   transfers, resume/sync, and daemonless local copies.
 - `internal/cliflags`: shared flags, short/long aliases, repeatable strings,
@@ -105,7 +129,13 @@ go run ./internal/bench
   size a peer declared.
 - `internal/{aead,pagecache,fsync,sampler,utils,metrics}`: encryption/auth,
   cache restore, fsync batching, sampling, network/string helpers, and metrics.
-- `internal/bench`: benchmark runner and regression benchmarks.
+- `internal/events`: the nil-safe event `Sink`, its JSON-lines encoding, and
+  the `events` progress-target writer. `internal/txstats` writes `--stats`.
+- `internal/bench`: Go microbenchmarks only (tests). `internal/bench/dataset`
+  generates, imports, and verifies datasets and sets page-cache state;
+  `internal/bench/harness` supervises forked tx processes for each tx-bench
+  command; `internal/bench/report` owns the metrics schema, the report, and
+  trace analysis.
 - The [documentation map](#documentation-map) links the authoritative design,
   wire-format, and CLI references.
 
@@ -160,6 +190,10 @@ are promoted rather than forwarded. Build it with
 `NewRuntimeDeps(st, WithRoot(...), WithPool(...))` — the store is a required
 argument because there is no process-wide fallback. `Serve` creates and closes
 one when `ServerOptions.Deps` is nil, exactly as it does the restore pool.
+`ServerOptions.Events` (also handed to that store via `store.WithEvents`)
+turns on the event timeline: the store emits `transfer_start`/`transfer_done`
+and keeps each transfer's requested path; the server emits connection,
+command, file, window, and ACK events. A nil sink costs one nil check.
 
 - `TXFER` emits a directory or single-file manifest, then `ClipTransfer` seals
   the file count.
@@ -209,8 +243,11 @@ tokens inside AUTH; `WithContextDialer` supplies custom connections. The TCP
 pool refills asynchronously to concurrency +25%; without keep-alive or when
 empty, connections are single-use and synchronous fallbacks increment
 `SyncConnectionCount`. Add counters in `internal/metrics`; exported
-`tx.ClientMetrics` aliases the snapshot type. `TransferStatus` mirrors STATUS
-JSON.
+`tx.ClientMetrics` aliases the snapshot type. `tx.ClientMetricCounters` is the
+shared counter set for `WithClientMetrics`. `tx.NewClientEventSink` and
+`tx.ClientEvent` make `WithEventSink` usable outside this module for the
+client event timeline (connections, requests, files, windows, ACKs, retries).
+`TransferStatus` mirrors STATUS JSON.
 
 ### CLI
 
@@ -227,6 +264,9 @@ JSON.
 - `tx recv status [REMOTE_HOST] [LOCAL_DST]` reads the local server manifest and
   combines server/client progress. `--tid` is server-only; `--all` lists active
   transfers. Host and destination have the defaults above and cwd respectively.
+- `--stats PATH` (send tree, recv copy, recv get) writes machine-readable
+  statistics, and `-f events` writes every event as JSON lines; tx-bench
+  drives both. SIGTERM stops `tx send tree` cleanly, flushing them.
 
 ### Test-specific guidance
 
@@ -235,6 +275,9 @@ JSON.
   validation or server-loop behavior), not merely recorded calls.
 - CLI end-to-end tests run `RunCLI` against a minimal in-process
   `net.Listener` FTCP server; extend that pattern for complete flows.
+- tx-bench integration tests in `internal/bench/harness` build `tx` once in
+  `TestMain` and run `local` against tiny generated datasets (rand only, so
+  nothing downloads Silesia).
 - Benchmarks cover AEAD, codec pools, manifest prefix encoding, and store
   operations under `internal/bench`. Benchmarks that must reach unexported
   functions — request splitting and body parsing — live in their own package

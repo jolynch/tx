@@ -16,6 +16,7 @@ import (
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/fsync"
+	"github.com/jolynch/tx/internal/txstats"
 )
 
 type syncArgs struct {
@@ -39,6 +40,7 @@ type syncArgs struct {
 	progressTargets     []filexfer.ProgressTarget
 	progressInterval    time.Duration
 	metadataFailures    *metadataFailureCollector
+	stats               *txstats.Recorder
 
 	// initialOldManifest, when non-nil, is used as the round-0 oldManifest
 	// supplied to SyncManifest instead of scanning the local target dir.
@@ -158,7 +160,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		}
 
 		// Probe link bandwidth.
-		client := tx.NewClient(serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...))
+		client := tx.NewClient(serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
 		defer client.Close()
 		probeResult, err := client.ProbeLink(context.Background(), tx.ProbeRequest{
 			ProbeBytes:   cfg.probeBytes,
@@ -187,7 +189,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			CacheMap:    cfg.cacheMap,
 		})
 		if err != nil {
-			fmt.Fprintf(stderr, "sync failed: %v\n", err)
+			failf(stderr, cfg.stats, "sync failed: %v", err)
 			return 1
 		}
 		newManifest := syncResp.Manifest
@@ -464,7 +466,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		failuresMu.Lock()
 		finalFailures := append([]error(nil), failures...)
 		failuresMu.Unlock()
-		printTransferErrors(stderr, "sync", finalFailures, cfg.verbosity)
+		printTransferErrors(stderr, cfg.stats, "sync", finalFailures, cfg.verbosity)
 
 		elapsedAll := time.Since(startAll)
 		overallSpeed := 0.0

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/pagecache"
 	"github.com/zeebo/xxh3"
 )
@@ -115,6 +116,7 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	if err != nil {
 		return err
 	}
+	requestPath := cleanRequestPath(parsed.Directory)
 	parsed.Directory, err = resolveUnderRoot(deps.Root(), parsed.Directory)
 	if err != nil {
 		return err
@@ -141,7 +143,7 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	}
 
 	// Create transfer and set hints (same pattern as TXFER).
-	transfer, err := deps.NewTransfer(root, 0, 0)
+	transfer, err := deps.NewTransfer(root, 0, 0, store.WithRequestPath(requestPath))
 	if err != nil {
 		return protocolErr{code: "INTERNAL", message: "failed to initialize transfer"}
 	}

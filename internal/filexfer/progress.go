@@ -18,7 +18,22 @@ type ProgressFormat string
 const (
 	ProgressFormatJSON ProgressFormat = "json"
 	ProgressFormatInt  ProgressFormat = "int"
+	// ProgressFormatEvents writes every event (internal/events) instead of
+	// periodic snapshots; its targets are served by events.TargetWriter.
+	ProgressFormatEvents ProgressFormat = "events"
 )
+
+// SplitEventTargets separates events targets from snapshot targets.
+func SplitEventTargets(targets []ProgressTarget) (snapshots, eventTargets []ProgressTarget) {
+	for _, t := range targets {
+		if t.Format == ProgressFormatEvents {
+			eventTargets = append(eventTargets, t)
+		} else {
+			snapshots = append(snapshots, t)
+		}
+	}
+	return snapshots, eventTargets
+}
 
 type ProgressTarget struct {
 	Path   string
@@ -61,7 +76,8 @@ func formatProgressOutput(format ProgressFormat, s ProgressStatus) string {
 }
 
 // StartProgressFileWriter starts a background goroutine that periodically
-// writes progress records to one or more targets.
+// writes progress records to one or more targets. Events targets are
+// ignored here.
 // File targets are opened non-blocking so FIFOs without a reader don't hang.
 // If a file/pipe doesn't exist or can't be opened, it silently retries
 // on the next tick. Targets with Path "-" write to Stdout (or os.Stdout).
@@ -72,6 +88,7 @@ func formatProgressOutput(format ProgressFormat, s ProgressStatus) string {
 // the percentage to 100; otherwise the current percentage from statusFn is
 // written. Returns a no-op stop if targets is empty.
 func StartProgressFileWriter(ctx context.Context, targets []ProgressTarget, interval time.Duration, statusFn func() ProgressStatus) (stop func(success bool)) {
+	targets, _ = SplitEventTargets(targets)
 	if len(targets) == 0 {
 		return func(bool) {}
 	}
