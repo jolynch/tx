@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Usage: scripts/fuzz [-race] PACKAGE TARGET DURATION DEADLINE [test flags...]
+#
+# Fuzzes TARGET in PACKAGE for DURATION. It builds the test binary first, so
+# compile time does not count against the budget, then ends fuzzing with
+# SIGINT rather than -fuzztime. Go reports a -fuzztime expiry that races its
+# own shutdown as "context deadline exceeded", failing a run that found
+# nothing; an interrupt ends fuzzing through a path without that race.
+# DEADLINE is the test binary's -test.timeout. A TARGET that matches no fuzz
+# test fails instead of silently passing.
+set -euo pipefail
+
+race=()
+if [ "${1:-}" = "-race" ]; then
+	race=(-race)
+	shift
+fi
+if [ $# -lt 4 ]; then
+	echo "usage: $0 [-race] PACKAGE TARGET DURATION DEADLINE [test flags...]" >&2
+	exit 2
+fi
+pkg=$1 target=$2 duration=$3 deadline=$4
+shift 4
+
+importpath=$(go list "$pkg")
+dir=$(go list -f '{{.Dir}}' "$pkg")
+bin=$(mktemp -d)/fuzz.test
+log=$(mktemp)
+trap 'rm -rf "$(dirname "$bin")" "$log"' EXIT
+
+go test "${race[@]}" -c -o "$bin" "$pkg"
+
+flags=()
+for f in "$@"; do
+	flags+=("-test.${f#-}") # -parallel=1 -> -test.parallel=1
+done
+
+echo "fuzz $importpath $target for $duration"
+cd "$dir"
+set +e
+timeout -s INT --preserve-status --kill-after=60s "$duration" \
+	"$bin" -test.run='^$' -test.fuzz="^${target}\$" -test.timeout="$deadline" \
+	-test.fuzzcachedir="$(go env GOCACHE)/fuzz/$importpath" -test.paniconexit0 \
+	"${flags[@]}" 2>&1 | tee "$log"
+rc=${PIPESTATUS[0]}
+set -e
+if [ "$rc" -eq 0 ] && ! grep -q '^fuzz: elapsed' "$log"; then
+	echo "fuzz: $target in $importpath ran no fuzzing; check the package and target name" >&2
+	exit 1
+fi
+exit "$rc"

@@ -6,6 +6,9 @@ FUZZTIME_LONG ?= 30s
 # worker shutdown, and slower race-enabled executions in CI.
 FUZZDEADLINE_SHORT ?= 30s
 FUZZDEADLINE_LONG ?= 2m
+# Fuzzes one target for a time budget, ending it with SIGINT rather than
+# -fuzztime (see scripts/fuzz): [-race] PACKAGE TARGET DURATION DEADLINE.
+FUZZ := ./scripts/fuzz
 # bench-acceptance: dataset size and where its metrics land.
 BENCH_SIZE ?= 5GiB
 BENCH_OUT ?= bench/acceptance
@@ -29,9 +32,8 @@ unit:
 # pick a tier, probe the new test with -fuzztime=10s: if it is still reporting
 # `new interesting:` at 10s it belongs in fuzz-long, otherwise fuzz-short.
 #
-# Note that `go test -fuzz=X` against a package with no matching target exits 0
-# without fuzzing anything, so a wrong package path here silently disables
-# coverage rather than failing.
+# scripts/fuzz fails when a package and target fuzz nothing, which plain
+# `go test -fuzz=X` would let pass silently.
 acceptance:
 	$(MAKE) fuzz-short
 	$(MAKE) fuzz-long
@@ -39,26 +41,26 @@ acceptance:
 # Unit-test replacements: one function or invariant over a small input space.
 # Their corpus saturates well before 10s, so a longer budget buys nothing.
 fuzz-short:
-	go test -race ./internal/aead           -run=^$$ -fuzz=FuzzRoundTrip -fuzztime=$(FUZZTIME_SHORT) -timeout=$(FUZZDEADLINE_SHORT)
-	go test -race ./internal/sampler        -run=^$$ -fuzz=FuzzGeneratorFullCoverageNoRepeats -fuzztime=$(FUZZTIME_SHORT) -timeout=$(FUZZDEADLINE_SHORT)
-	go test -race ./internal/utils          -run=^$$ -fuzz=FuzzCommonPrefixLen -fuzztime=$(FUZZTIME_SHORT) -timeout=$(FUZZDEADLINE_SHORT)
-	go test .                               -run=^$$ -fuzz=FuzzSuggestBatchMaxBytes -fuzztime=$(FUZZTIME_SHORT) -timeout=$(FUZZDEADLINE_SHORT) -parallel=1
-	go test -race ./internal/bench/dataset  -run=^$$ -fuzz=FuzzPlan -fuzztime=$(FUZZTIME_SHORT) -timeout=$(FUZZDEADLINE_SHORT)
-	go test -race ./internal/bench/dataset  -run=^$$ -fuzz=FuzzSelectWarmBlocks -fuzztime=$(FUZZTIME_SHORT) -timeout=$(FUZZDEADLINE_SHORT)
+	$(FUZZ) -race ./internal/aead FuzzRoundTrip $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
+	$(FUZZ) -race ./internal/sampler FuzzGeneratorFullCoverageNoRepeats $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
+	$(FUZZ) -race ./internal/utils FuzzCommonPrefixLen $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
+	$(FUZZ) . FuzzSuggestBatchMaxBytes $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT) -parallel=1
+	$(FUZZ) -race ./internal/bench/dataset FuzzPlan $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
+	$(FUZZ) -race ./internal/bench/dataset FuzzSelectWarmBlocks $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 
 # End-to-end properties driving the whole system. These are still finding new
 # coverage past 10s, so CI gives them a larger budget to keep exploring.
 fuzz-long:
-	go test -race ./internal/filexfer/encoding -run=^$$ -fuzz=FuzzManifestEntryRoundTrip -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
-	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzFramedItemRoundTrip -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
-	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzFramedBodyHeader -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
-	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzSync -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
-	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzResolveUnderRoot -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
-	go test -race ./internal/filexfer/ftcp -run=^$$ -fuzz=FuzzServeZeroCopySEND -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG) -parallel=1
-	go test -race ./internal/events        -run=^$$ -fuzz=FuzzAppendJSON -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
-	go test -race ./internal/bench/report  -run=^$$ -fuzz=FuzzTraceRecordText -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
-	go test -race ./internal/bench/dataset -run=^$$ -fuzz=FuzzFilesTSVRoundTrip -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
-	go test -race ./internal/bench/dataset -run=^$$ -fuzz=FuzzVerifyDetectsCorruption -fuzztime=$(FUZZTIME_LONG) -timeout=$(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/filexfer/encoding FuzzManifestEntryRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/filexfer/ftcp FuzzFramedItemRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/filexfer/ftcp FuzzFramedBodyHeader $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/filexfer/ftcp FuzzSync $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/filexfer/ftcp FuzzResolveUnderRoot $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/filexfer/ftcp FuzzServeZeroCopySEND $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG) -parallel=1
+	$(FUZZ) -race ./internal/events FuzzAppendJSON $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/bench/report FuzzTraceRecordText $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/bench/dataset FuzzFilesTSVRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/bench/dataset FuzzVerifyDetectsCorruption $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 
 # internal/bench holds benchmarks of exported code. Benchmarks that need
 # unexported access live with their package; both sets are registered here so
