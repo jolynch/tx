@@ -30,3 +30,36 @@ jobs:
           cache-dependency-path: "**/go.sum"
       - name: Run acceptance tests
         run: make acceptance
+
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: "**/go.sum"
+      - name: Cache Silesia corpus
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tx-bench/silesia
+          key: silesia-v1
+      - name: Disk space
+        run: df -h
+      # The client dials far more connections than it needs; widen the
+      # ephemeral port range so that known bug does not mask other failures.
+      - name: Widen ephemeral port range
+        run: sudo sysctl -w net.ipv4.ip_local_port_range="1024 65000"
+      - name: Run bench acceptance
+        run: make bench-acceptance
+      - name: Check dial budget (expected to fail until the dialing fix)
+        continue-on-error: true
+        run: make bench-acceptance-dials
+      - name: Upload bench metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-acceptance
+          path: bench/acceptance/
+          if-no-files-found: ignore

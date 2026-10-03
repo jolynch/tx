@@ -1,4 +1,4 @@
-.PHONY: all acceptance fuzz-short fuzz-long vet build test unit bench
+.PHONY: all acceptance fuzz-short fuzz-long vet build test unit bench bench-acceptance bench-acceptance-dials
 
 FUZZTIME_SHORT ?= 5s
 FUZZTIME_LONG ?= 30s
@@ -6,6 +6,9 @@ FUZZTIME_LONG ?= 30s
 # worker shutdown, and slower race-enabled executions in CI.
 FUZZDEADLINE_SHORT ?= 30s
 FUZZDEADLINE_LONG ?= 2m
+# bench-acceptance: dataset size and where its metrics land.
+BENCH_SIZE ?= 5GiB
+BENCH_OUT ?= bench/acceptance
 
 all: build test
 
@@ -64,3 +67,17 @@ fuzz-long:
 bench: build
 	@mkdir -p bench/results
 	go test -bench=. -run=^$$ -benchmem ./internal/bench . ./internal/filexfer/ftcp | tee bench/results/latest.txt
+
+# Runs tx-bench remote send-tree and recv-copy as separate processes on a
+# BENCH_SIZE dataset and checks correctness, liveness and shutdown, and
+# resource budgets. The dataset and one receiver copy need about 2.5x
+# BENCH_SIZE of free disk; set TX_BENCH_ACCEPTANCE_DIR to pick the disk.
+bench-acceptance:
+	TX_BENCH_ACCEPTANCE_SIZE=$(BENCH_SIZE) TX_BENCH_ACCEPTANCE_OUT=$(abspath $(BENCH_OUT)) \
+		go test -count=1 -timeout 45m -run '^TestBenchAcceptance$$' -v ./internal/bench/harness
+
+# Checks the dials of the last bench-acceptance run. Expected to fail until
+# the client stops dialing a connection per request.
+bench-acceptance-dials:
+	TX_BENCH_ACCEPTANCE_OUT=$(abspath $(BENCH_OUT)) \
+		go test -count=1 -run '^TestBenchAcceptanceDialBudget$$' -v ./internal/bench/harness

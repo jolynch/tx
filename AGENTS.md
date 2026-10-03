@@ -96,6 +96,8 @@ make fuzz-short   # unit-test replacements; 5s each
 make fuzz-long    # whole-system properties; 30s each
 make acceptance   # fuzz-short, then fuzz-long
 make bench        # Go microbenchmarks into bench/results/latest.txt
+make bench-acceptance        # tx-bench end to end on a 5GiB dataset (BENCH_SIZE)
+make bench-acceptance-dials  # dial budget of that run; fails until the dialing fix
 
 go test ./...
 go test ./internal/filexfer/...
@@ -278,6 +280,10 @@ client event timeline (connections, requests, files, windows, ACKs, retries).
 - tx-bench integration tests in `internal/bench/harness` build `tx` once in
   `TestMain` and run `local` against tiny generated datasets (rand only, so
   nothing downloads Silesia).
+- `acceptance_test.go` in the same package forks the real `tx-bench` binaries
+  on a `BENCH_SIZE` dataset (default 5GiB, about 2.5x that in free disk). It
+  is skipped unless `TX_BENCH_ACCEPTANCE_SIZE` is set and runs in its own CI
+  job.
 - Benchmarks cover AEAD, codec pools, manifest prefix encoding, and store
   operations under `internal/bench`. Benchmarks that must reach unexported
   functions — request splitting and body parsing — live in their own package
