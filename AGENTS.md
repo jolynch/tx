@@ -42,6 +42,10 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
     CI gives it 30s to keep exploring. Saturated well before 10s → leave it in
     `fuzz-short` at 5s, since more time buys nothing. Re-probe when a test's
     scope changes.
+  - Each Makefile fuzz line runs through `scripts/fuzz-retry`, which retries
+    once when Go reports its own `-fuzztime` deadline as a failure
+    (`context deadline exceeded` with no failing input). Keep new lines in
+    that form.
   - The tiers are a budget, not a ranking. Fuzzing exists to discover
     interesting behavior, not to finish quickly: a test that keeps finding new
     states is the better test. Never narrow one to make it fit `fuzz-short`.
