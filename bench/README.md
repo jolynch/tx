@@ -45,6 +45,15 @@ ahead of time and sets the sender's page cache.
 CPU flamegraphs are an external `perf record` against the forked processes,
 for example `perf record -g -p "$(pgrep -f 'tx recv copy')"`.
 
+## Acceptance
+
+```bash
+make bench-acceptance BENCH_SIZE=1GiB   # default 5GiB; needs ~2.5x free disk
+```
+
+It runs `remote send-tree` and `remote recv-copy` as separate processes and
+checks correctness, shutdown, and resource budgets; CI runs it at 5GiB.
+
 ## Microbenchmarks
 
 ```bash
