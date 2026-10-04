@@ -42,10 +42,11 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
     CI gives it 30s to keep exploring. Saturated well before 10s → leave it in
     `fuzz-short` at 5s, since more time buys nothing. Re-probe when a test's
     scope changes.
-  - Each Makefile fuzz line runs through `scripts/fuzz-retry`, which retries
-    once when Go reports its own `-fuzztime` deadline as a failure
-    (`context deadline exceeded` with no failing input). Keep new lines in
-    that form.
+  - Each Makefile fuzz line runs through `scripts/fuzz`
+    (`$(FUZZ) [-race] PACKAGE TARGET DURATION DEADLINE`). It ends fuzzing with
+    SIGINT rather than `-fuzztime`, whose expiry Go can misreport as a
+    `context deadline exceeded` failure, and it fails a target that fuzzes
+    nothing.
   - The tiers are a budget, not a ranking. Fuzzing exists to discover
     interesting behavior, not to finish quickly: a test that keeps finding new
     states is the better test. Never narrow one to make it fit `fuzz-short`.
@@ -101,7 +102,7 @@ make fuzz-long    # whole-system properties; 30s each
 make acceptance   # fuzz-short, then fuzz-long
 make bench        # Go microbenchmarks into bench/results/latest.txt
 make bench-acceptance        # tx-bench end to end on a 5GiB dataset (BENCH_SIZE)
-make bench-acceptance-dials  # dial budget of that run; fails until the dialing fix
+make bench-acceptance-dials  # dial budget of that run
 
 go test ./...
 go test ./internal/filexfer/...
@@ -114,8 +115,9 @@ go run ./cmd/tx-bench local -s 256MiB -n 1
 
 ### Map
 
-- Root package (`client.go`, `client_tcp.go`): public `tx.Client`, requests,
-  responses, metrics, TCP transport, and keep-alive pool.
+- Root package (`client.go`, `client_tcp.go`, `client_pool.go`): public
+  `tx.Client`, requests, responses, metrics, TCP transport, and the data and
+  control connection pools.
 - `cmd/tx`: binary entry point for `send` and `recv`.
 - `cmd/tx-bench`: the benchmark harness binary (`prep`, `remote send-tree`,
   `remote recv-copy`, `local`, `report`); see the tx-bench docs.
@@ -244,16 +246,25 @@ response reader until its synchronous consumer returns. Direct `GetChecksum`
 remains a single request. Encoded request bodies carry their captured maximum;
 SEND checks that budget before acquiring a connection.
 
-Client age keys apply automatically. `WithClientAuthTokens` sends bearer
-tokens inside AUTH; `WithContextDialer` supplies custom connections. The TCP
-pool refills asynchronously to concurrency +25%; without keep-alive or when
-empty, connections are single-use and synchronous fallbacks increment
-`SyncConnectionCount`. Add counters in `internal/metrics`; exported
-`tx.ClientMetrics` aliases the snapshot type. `tx.ClientMetricCounters` is the
-shared counter set for `WithClientMetrics`. `tx.NewClientEventSink` and
-`tx.ClientEvent` make `WithEventSink` usable outside this module for the
-client event timeline (connections, requests, files, windows, ACKs, retries).
-`TransferStatus` mirrors STATUS JSON.
+Client age keys apply automatically. `WithClientAuthTokens` sends bearer tokens
+inside AUTH; `WithContextDialer` supplies custom connections. `client_pool.go`
+keeps two TCP pools that never share connections, one for SEND/CXSUM and one
+for ACK/STATUS/TXFER/SYNC. Both open the concurrency (`WithConcurrency`, else
+the probe's suggestion) up front, lend the most recently used idle connection,
+and once per heartbeat interval scale down to peak use plus a quarter. Only the
+control pool grows past its size; a full data pool makes callers wait. Refills
+restore a pool only to the size it last scaled to, and the data pool's
+open-connection slots cap it at its size. `StartFromManifest` gives a transfer
+at most one SEND slot per data connection and splits batches and large files
+only into free slots, so its SENDs never wait for a connection. `tx recv copy`
+shares one client across its phases. Dials made because a pool had no idle
+connection increment `SyncConnectionCount`; without keep-alive, connections are
+single-use. Add counters in `internal/metrics`; exported `tx.ClientMetrics`
+aliases the snapshot type. `tx.ClientMetricCounters` is the shared counter set
+for `WithClientMetrics`. `tx.NewClientEventSink` and `tx.ClientEvent` make
+`WithEventSink` usable outside this module for the client event timeline
+(connections, requests, files, windows, ACKs, retries). `TransferStatus`
+mirrors STATUS JSON.
 
 ### CLI
 

@@ -105,6 +105,16 @@ func WithSocketReadBufferBytes(bufferBytes int) ClientOption {
 	})
 }
 
+// WithConcurrency sets how many connections each connection pool opens at the
+// client's first ProbeLink, which also caps how many SENDs a transfer runs at
+// once; 0 keeps the server's PROBE suggestion. It does not set the worker
+// count, StartFromManifestRequest.Concurrency.
+func WithConcurrency(concurrency int) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.Concurrency = concurrency
+	})
+}
+
 func WithLoadStrategy(strategy string) ClientOption {
 	return clientOptionFunc(func(c *Client) {
 		c.LoadStrategy = normalizeLoadStrategy(strategy)
@@ -239,6 +249,7 @@ type Client struct {
 	AckRequestTimeout       time.Duration
 	SocketReadBufferBytes   int
 	WindowConcurrency       int
+	Concurrency             int // connections per pool, set at the first ProbeLink; 0 uses the PROBE suggestion
 	LoadStrategy            string
 	Comp                    string // adapt|none|lz4|zstd; empty means server default (adapt)
 	ClientAgePublicKey      string
@@ -251,8 +262,9 @@ type Client struct {
 	// For example injecting TLS
 	contextDialer func(context.Context, string) (net.Conn, error)
 
-	tcpPoolMu sync.Mutex
-	tcpPool   *tcpConnPool
+	tcpPoolMu   sync.Mutex
+	dataPool    *tcpConnPool
+	controlPool *tcpConnPool
 
 	// bufferPool caches reusable frame-read buffers keyed by bucketed size.
 
@@ -443,6 +455,9 @@ type GetFilesRequest struct {
 	// FileRequestWindowBytes/BatchMaxBytes.
 	SplitWindowWorkers int
 	ProgressUpdates    chan<- DownloadProgressUpdate
+	// sendSlots, set by StartFromManifest, limits SENDs across all of a
+	// transfer's concurrent batches; splits then use only free slots.
+	sendSlots sendSlots
 }
 
 // emitProgress sends a progress update on the ProgressUpdates channel if set.
@@ -554,7 +569,7 @@ type ProbeResponse struct {
 	AggregateMbps          int64 // sum across parallel conns (== LinkMbps in fast, equal to PerConnMbps in gentle)
 	ParallelConns          int   // connections used in the throughput phase
 	SuggestedConcurrency   int
-	WarmConnectionPoolSize int // warmed client connection pool target opened after probe
+	WarmConnectionPoolSize int // connections each pool opens, set at the client's first probe
 	ServerSendBufBytes     int64
 	SuggestedCipher        string // resolved cipher suggested for this connection (e.g. "aes", "chacha20", or "" if none)
 	ServerLimiterBps       int64  // server's current rate limiter in bytes/sec (0 = unlimited)
@@ -726,12 +741,11 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.tcpPoolMu.Lock()
-	pool := c.tcpPool
-	c.tcpPool = nil
+	data, control := c.dataPool, c.controlPool
+	c.dataPool, c.controlPool = nil, nil
 	c.tcpPoolMu.Unlock()
-	if pool != nil {
-		pool.stop()
-	}
+	data.stop()
+	control.stop()
 	return nil
 }
 
@@ -1628,6 +1642,12 @@ func (c *Client) downloadManifestBatchSequential(
 		windowBytes = defaultClientRequestWindowBytes
 	}
 	k := maxSplitWindowWorkers(windowBytes, req.BatchMaxBytes, req.SplitWindowWorkers, len(plans))
+	// Each group streams on its own slot. The batch waits for one, splits only
+	// into slots free now, and frees each as its group finishes, before the ACK.
+	if err := req.sendSlots.acquire(ctx); err != nil {
+		return GetFilesResponse{}, err
+	}
+	k = 1 + req.sendSlots.tryAcquire(k-1)
 
 	var (
 		allFiles    []DownloadFileResponse
@@ -1637,6 +1657,7 @@ func (c *Client) downloadManifestBatchSequential(
 
 	if k <= 1 {
 		files, acks, progresses, err := c.downloadManifestGroupSequential(ctx, req, plans, targets, req.emitProgress)
+		req.sendSlots.release(1)
 		if err != nil {
 			return GetFilesResponse{}, err
 		}
@@ -1645,6 +1666,7 @@ func (c *Client) downloadManifestBatchSequential(
 		allProgress = progresses
 	} else {
 		planGroups, targetGroups := splitSequentialGroups(plans, targets, k)
+		req.sendSlots.release(k - len(planGroups))
 		type groupResult struct {
 			files      []DownloadFileResponse
 			acks       []AcknowledgeFileProgressRequest
@@ -1659,6 +1681,7 @@ func (c *Client) downloadManifestBatchSequential(
 			wg.Add(1)
 			go func(i int, pg []downloadBatchPlan, tg []FetchFileTarget) {
 				defer wg.Done()
+				defer req.sendSlots.release(1)
 				files, acks, progresses, err := c.downloadManifestGroupSequential(groupCtx, req, pg, tg, req.emitProgress)
 				results[i] = groupResult{files, acks, progresses}
 				errs[i] = err
@@ -1767,6 +1790,30 @@ func (c *Client) downloadWindows(
 		}
 	}
 
+	// The file's windows share one slot it waits for, one window at a time,
+	// plus any transfer slot free when a window is ready to start.
+	if err := req.sendSlots.acquire(ctx); err != nil {
+		return GetFilesResponse{}, err
+	}
+	own := make(chan struct{}, 1)
+	own <- struct{}{}
+	takeSlot := func() (release func(), ok bool) {
+		select {
+		case <-own:
+			return func() { own <- struct{}{} }, true
+		default:
+		}
+		if req.sendSlots.tryAcquire(1) == 1 {
+			return func() { req.sendSlots.release(1) }, true
+		}
+		select {
+		case <-own:
+			return func() { own <- struct{}{} }, true
+		case <-ctx.Done():
+			return nil, false
+		}
+	}
+
 	maxWorkers := maxSplitWindowWorkers(c.FileRequestWindowBytes, req.BatchMaxBytes, req.SplitWindowWorkers, len(windows))
 	limiter := make(chan struct{}, maxWorkers)
 	results := make(chan splitWindowResult, len(windows))
@@ -1785,36 +1832,50 @@ func (c *Client) downloadWindows(
 		})
 	}
 
-	// windows[0].start == plan.resumeFrom always, so initialWriter is only ever used by i==0.
-	for i, window := range windows {
-		w, s := io.WriteCloser(nil), func() error { return nil }
-		if i == 0 && initialWriter != nil {
-			w, s = initialWriter, initialSync
-		}
-		wg.Add(1)
-		go func(window splitWindow, w io.WriteCloser, s func() error) {
-			defer wg.Done()
+	// One goroutine starts the windows in file order, each once it has a
+	// slot, while the loop below acknowledges completed ones. ACKs advance
+	// only over a contiguous prefix, so starting windows out of order would
+	// stall progress, and a file sharing one slot could wait on a window that
+	// never gets to run.
+	go func() {
+		defer func() {
+			wg.Wait()
+			req.sendSlots.release(1)
+			close(results)
+		}()
+		// windows[0].start == plan.resumeFrom always, so initialWriter is only ever used by i==0.
+		for i, window := range windows {
+			w, s := io.WriteCloser(nil), func() error { return nil }
+			if i == 0 && initialWriter != nil {
+				w, s = initialWriter, initialSync
+			}
 			select {
 			case limiter <- struct{}{}:
 			case <-ctx.Done():
 				return
 			}
-			defer func() { <-limiter }()
-
-			result, err := c.downloadSplitWindow(ctx, req, plan, window, w, s, req.emitProgress)
-			if err != nil {
-				setErr(err)
+			releaseSlot, ok := takeSlot()
+			if !ok {
+				<-limiter
 				return
 			}
-			select {
-			case results <- result:
-			case <-ctx.Done():
-			}
-		}(window, w, s)
-	}
-	go func() {
-		wg.Wait()
-		close(results)
+			wg.Add(1)
+			go func(window splitWindow, w io.WriteCloser, s func() error, releaseSlot func()) {
+				defer wg.Done()
+				defer func() { <-limiter }()
+				defer releaseSlot()
+
+				result, err := c.downloadSplitWindow(ctx, req, plan, window, w, s, req.emitProgress)
+				if err != nil {
+					setErr(err)
+					return
+				}
+				select {
+				case results <- result:
+				case <-ctx.Done():
+				}
+			}(window, w, s, releaseSlot)
+		}
 	}()
 
 	completions := make(map[int64]splitWindowResult, len(windows))
@@ -2159,6 +2220,13 @@ func (c *Client) StartFromManifest(ctx context.Context, req StartFromManifestReq
 		}
 	}
 	req.Concurrency = clampConcurrency(req.Concurrency)
+	// One SEND slot per worker, but no more than the data pool holds, so no
+	// SEND waits for a connection.
+	sends := req.Concurrency
+	if data := c.tcpPool(poolData); data != nil {
+		sends = min(sends, data.opts.limit)
+	}
+	slots := make(sendSlots, sends)
 	batchMaxBytes := c.effectiveBatchMaxBytes(req.BatchMaxBytes)
 	batches := buildManifestBatchesByBytes(entries, batchMaxBytes)
 	workCh := make(chan []ManifestEntry)
@@ -2185,6 +2253,7 @@ func (c *Client) StartFromManifest(ctx context.Context, req StartFromManifestReq
 				BatchMaxBytes:      batchMaxBytes,
 				SplitWindowWorkers: req.SplitWindowWorkers,
 				ProgressUpdates:    req.ProgressUpdates,
+				sendSlots:          slots,
 			})
 			if err != nil {
 				c.sink().Emit("error", req.Manifest.TransferID, events.F("verb", "SEND"), events.F("file", batch[0].ID),
@@ -2493,7 +2562,11 @@ func (c *Client) probeLink(ctx context.Context, req ProbeRequest) (ProbeResponse
 		if authState.hasAuth {
 			response.SuggestedCipher = authState.encMode
 		}
-		response.WarmConnectionPoolSize = c.ensureTCPPool(authState, response.SuggestedConcurrency)
+		poolSize := response.SuggestedConcurrency
+		if c.Concurrency > 0 {
+			poolSize = clampConcurrency(c.Concurrency)
+		}
+		response.WarmConnectionPoolSize = c.ensureTCPPools(authState, poolSize)
 	}
 
 	// Mini-probe caller: discovery only.

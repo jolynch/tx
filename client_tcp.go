@@ -16,7 +16,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"filippo.io/age"
@@ -27,7 +26,6 @@ import (
 	intlimit "github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/metrics"
 	"github.com/jolynch/tx/internal/utils"
-	"golang.org/x/sys/unix"
 )
 
 const maxTCPLineBytes = 4 * 1024 * 1024
@@ -35,28 +33,6 @@ const maxTCPLineBytes = 4 * 1024 * 1024
 // maxResponseBodyBytes caps server-supplied framed responses at the same size
 // as the server's SYNC manifest limit.
 const maxResponseBodyBytes int64 = 1 << 30
-
-const (
-	// minKeepAliveHeartbeatInterval floors the heartbeat cadence so tiny
-	// server grants cannot busy-loop the pool.
-	minKeepAliveHeartbeatInterval = 100 * time.Millisecond
-	// keepAliveHeartbeatTimeout bounds one heartbeat round trip.
-	keepAliveHeartbeatTimeout = 5 * time.Second
-	// keepAliveHeartbeatConcurrency caps concurrent heartbeat probes so a
-	// tick never drains the whole pool at once.
-	keepAliveHeartbeatConcurrency = 16
-)
-
-// heartbeatIntervalForGrant returns how often idle session connections are
-// probed: one quarter of the server's granted idle window, so a healthy
-// connection is always refreshed well before the server-side reaper fires.
-func heartbeatIntervalForGrant(grantMS int64) time.Duration {
-	interval := time.Duration(grantMS) * time.Millisecond / 4
-	if interval < minKeepAliveHeartbeatInterval {
-		return minKeepAliveHeartbeatInterval
-	}
-	return interval
-}
 
 type tcpAuthState struct {
 	publicKey      string // client's age public key
@@ -83,37 +59,6 @@ type probeResponse struct {
 	TargetRequestBytes  int64
 	MaxRequestBytes     int64
 	MaxSyncRequestBytes int64
-}
-
-type tcpConnPool struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	authState tcpAuthState
-	target    int
-	ready     chan net.Conn
-
-	// sessionMS is the server's keep-alive grant in milliseconds when the
-	// pool warms reusable session connections; zero selects legacy
-	// single-use warm connections.
-	sessionMS atomic.Int64
-	refilling atomic.Int64
-	stopped   atomic.Bool
-
-	// hbSem bounds concurrent heartbeat probes; pool-lifetime so ticks don't
-	// reallocate it.
-	hbSem chan struct{}
-}
-
-// sessionTCPConn marks a pooled connection that negotiated keep-alive via
-// PROBE. Only session connections are recycled back into the pool; sync
-// fallback dials stay single-use because the server closes them after one
-// command.
-type sessionTCPConn struct {
-	net.Conn
-	// lastActive is touched whenever the connection completes a command or
-	// heartbeat. Owned by whichever goroutine currently holds the
-	// connection (it is never in the ready channel at the same time).
-	lastActive time.Time
 }
 
 type managedTCPConnCloser struct {
@@ -184,220 +129,6 @@ func (r *contextManagedTCPReadCloser) Close() error {
 	return r.err
 }
 
-func warmTCPPoolTarget(suggestedConcurrency int) int {
-	if suggestedConcurrency <= 0 {
-		return 0
-	}
-	// 25% extra connections
-	return max(1, (suggestedConcurrency*5+3)/4)
-}
-
-func newTCPConnPool(state tcpAuthState, target int, sessionMS int64) *tcpConnPool {
-	if target <= 0 {
-		return nil
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	p := &tcpConnPool{
-		ctx:       ctx,
-		cancel:    cancel,
-		authState: state,
-		target:    target,
-		ready:     make(chan net.Conn, target),
-		hbSem:     make(chan struct{}, keepAliveHeartbeatConcurrency),
-	}
-	p.sessionMS.Store(sessionMS)
-	return p
-}
-
-func (p *tcpConnPool) borrow() (net.Conn, bool) {
-	if p == nil {
-		return nil, false
-	}
-	if p.stopped.Load() {
-		return nil, false
-	}
-	// Non blocking, if there isn't one ready
-	// just proceed
-	select {
-	case conn := <-p.ready:
-		if conn == nil {
-			return nil, false
-		}
-		return conn, true
-	default:
-		return nil, false
-	}
-}
-
-func (p *tcpConnPool) enqueue(conn net.Conn) bool {
-	if p == nil || conn == nil {
-		return false
-	}
-	if p.stopped.Load() {
-		return false
-	}
-	select {
-	case p.ready <- conn:
-		return true
-	default:
-		return false
-	}
-}
-
-func (p *tcpConnPool) stop() {
-	if p == nil {
-		return
-	}
-	if p.stopped.Swap(true) {
-		return
-	}
-	p.cancel()
-	for {
-		select {
-		case conn := <-p.ready:
-			if conn != nil {
-				_ = conn.Close()
-			}
-		default:
-			return
-		}
-	}
-}
-
-func (p *tcpConnPool) triggerRefill(c *Client) {
-	if p == nil || c == nil {
-		return
-	}
-	for {
-		if p.stopped.Load() {
-			return
-		}
-		inFlight := int(p.refilling.Add(1))
-		if len(p.ready)+inFlight > p.target {
-			remaining := int(p.refilling.Add(-1))
-			if p.stopped.Load() || len(p.ready)+remaining >= p.target {
-				return
-			}
-			continue
-		}
-		go c.fillTCPPoolConn(p, p.ctx, p.authState)
-	}
-}
-
-func (c *Client) fillTCPPoolConn(pool *tcpConnPool, ctx context.Context, state tcpAuthState) {
-	defer func() {
-		remaining := int(pool.refilling.Add(-1))
-		needMore := !pool.stopped.Load() && len(pool.ready)+remaining < pool.target
-		if needMore {
-			pool.triggerRefill(c)
-		}
-	}()
-
-	conn, err := c.dialAndAuthWithState(ctx, state)
-	if err != nil {
-		return
-	}
-	if pool.sessionMS.Load() > 0 {
-		granted, _, probeErr := c.probeKeepAliveSessionConn(conn, state)
-		if probeErr != nil {
-			_ = conn.Close()
-			return
-		}
-		if !granted {
-			// The server stopped granting keep-alive (e.g. restarted with
-			// it disabled) and will close this connection after the probe;
-			// fall back to single-use warm connections.
-			pool.sessionMS.Store(0)
-			_ = conn.Close()
-			return
-		}
-		conn = &sessionTCPConn{Conn: conn, lastActive: time.Now()}
-	}
-	if !pool.enqueue(conn) {
-		_ = conn.Close()
-	}
-}
-
-// startHeartbeats launches the pool's keep-alive loop: idle pooled session
-// connections get a zero-payload PROBE round trip at least once per
-// interval, so a silently dead connection is evicted here instead of
-// failing a borrower mid-transfer.
-func (p *tcpConnPool) startHeartbeats(c *Client) {
-	if p == nil || p.sessionMS.Load() <= 0 {
-		return
-	}
-	interval := heartbeatIntervalForGrant(p.sessionMS.Load())
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-p.ctx.Done():
-				return
-			case <-ticker.C:
-				p.heartbeatIdleConns(c, interval)
-			}
-		}
-	}()
-}
-
-// heartbeatIdleConns is only ever called from the single ticker goroutine in
-// startHeartbeats, serially, and it wg.Wait()s for all probe goroutines (each
-// of which releases its p.hbSem slot) before returning — so p.hbSem is fully
-// drained at the start of every tick, making pool-lifetime reuse safe.
-func (p *tcpConnPool) heartbeatIdleConns(c *Client, interval time.Duration) {
-	n := len(p.ready)
-	if n == 0 {
-		return
-	}
-	var wg sync.WaitGroup
-	// Each tick momentarily borrows all ready connections to check lastActive
-	// and re-enqueues those that don't need probing, briefly draining the
-	// pool — acceptable because a concurrent borrower racing the tick simply
-	// falls through to the sync-dial fallback.
-	for i := 0; i < n; i++ {
-		conn, ok := p.borrow()
-		if !ok {
-			break
-		}
-		sc, isSession := conn.(*sessionTCPConn)
-		if !isSession || time.Since(sc.lastActive) < interval {
-			// Legacy warm connection, or one that just carried traffic —
-			// no probe needed this tick.
-			if !p.enqueue(conn) {
-				_ = conn.Close()
-			}
-			continue
-		}
-		wg.Add(1)
-		p.hbSem <- struct{}{}
-		go func(sc *sessionTCPConn) {
-			defer wg.Done()
-			defer func() { <-p.hbSem }()
-			_, rttMillis, err := c.probeKeepAliveSessionConn(sc, p.authState)
-			if err != nil {
-				c.metrics().IncHeartbeatFailure()
-				if s := c.sink(); s.Enabled() {
-					s.Emit("heartbeat_fail", "", events.F("conn", c.connID(sc)), events.F("err", err.Error()))
-					c.noteConnEvent("conn_close", sc, "heartbeat_fail")
-				}
-				_ = sc.Close()
-				p.triggerRefill(c)
-				return
-			}
-			c.metrics().ObserveHeartbeat(rttMillis)
-			if s := c.sink(); s.Enabled() {
-				s.Emit("heartbeat", "", events.F("conn", c.connID(sc)), events.Dur("rtt", time.Duration(rttMillis)*time.Millisecond))
-			}
-			sc.lastActive = time.Now()
-			if !p.enqueue(sc) {
-				_ = sc.Close()
-			}
-		}(sc)
-	}
-	wg.Wait()
-}
-
 // probeKeepAliveSessionConn sends a zero-payload keep-alive PROBE on conn and
 // reads the full response. Callers decide whether the probe is pool warm-up
 // negotiation or a scheduled heartbeat and record metrics accordingly.
@@ -432,132 +163,6 @@ func (c *Client) probeKeepAliveSessionConn(conn net.Conn, state tcpAuthState) (b
 	return false, rttMillis, nil
 }
 
-func (c *Client) ensureTCPPool(state tcpAuthState, suggestedConcurrency int) int {
-	target := warmTCPPoolTarget(suggestedConcurrency)
-	if target <= 0 {
-		return 0
-	}
-	c.tcpPoolMu.Lock()
-	if c.tcpPool != nil {
-		target = c.tcpPool.target
-		c.tcpPoolMu.Unlock()
-		return target
-	}
-	pool := newTCPConnPool(state, target, c.sessionKeepAliveMS())
-	c.tcpPool = pool
-	c.tcpPoolMu.Unlock()
-	pool.startHeartbeats(c)
-	pool.triggerRefill(c)
-	return target
-}
-
-// sessionKeepAliveMS returns the cached server keep-alive grant, or zero
-// when reuse is disabled or no probe has observed support yet.
-func (c *Client) sessionKeepAliveMS() int64 {
-	if c == nil || c.DisableKeepAlive {
-		return 0
-	}
-	return c.keepAliveMS.Load()
-}
-
-func (c *Client) acquireManagedTCPConn(ctx context.Context) (net.Conn, tcpAuthState, *tcpConnPool, error) {
-	c.tcpPoolMu.Lock()
-	pool := c.tcpPool
-	c.tcpPoolMu.Unlock()
-	if pool != nil {
-		for {
-			conn, ok := pool.borrow()
-			if !ok {
-				break
-			}
-			sc, isSession := conn.(*sessionTCPConn)
-			if !isSession || sessionConnAlive(sc) {
-				return conn, pool.authState, pool, nil
-			}
-			// Dead session (e.g. server restarted since the last
-			// heartbeat) — evict and try the next pooled connection.
-			c.noteConnEvent("conn_close", sc, "dead")
-			_ = sc.Close()
-			pool.triggerRefill(c)
-		}
-		c.metrics().IncSyncConnectionFallback()
-		conn, err := c.dialAndAuthWithState(context.WithValue(ctx, syncDialKey{}, true), pool.authState)
-		if err != nil {
-			return nil, tcpAuthState{}, pool, err
-		}
-		return conn, pool.authState, pool, nil
-	}
-	conn, state, err := c.dialAndAuth(ctx)
-	if err != nil {
-		return nil, tcpAuthState{}, nil, err
-	}
-	return conn, state, nil, nil
-}
-
-func (c *Client) releaseManagedTCPConn(conn net.Conn, pool *tcpConnPool) error {
-	if conn == nil {
-		if pool != nil {
-			pool.triggerRefill(c)
-		}
-		return nil
-	}
-	c.noteConnEvent("conn_close", conn, "released")
-	err := conn.Close()
-	if pool != nil {
-		pool.triggerRefill(c)
-	}
-	return err
-}
-
-// sessionConnAlive does a non-blocking peek on an idle session connection: a
-// healthy idle connection has nothing to read (EAGAIN), a server-closed one
-// has a pending EOF/RST, and pending data means protocol desync. This closes
-// the borrow-time race where the server went away after the last heartbeat.
-func sessionConnAlive(sc *sessionTCPConn) bool {
-	syscallConn, ok := sc.Conn.(syscall.Conn)
-	if !ok {
-		// Cannot peek this transport (custom dialer); assume alive rather
-		// than evicting every pooled connection.
-		return true
-	}
-	raw, err := syscallConn.SyscallConn()
-	if err != nil {
-		return true
-	}
-	alive := true
-	// The closure runs synchronously inside raw.Read before this function
-	// returns, so capturing the stack array by reference keeps the peek
-	// buffer off-heap on this per-borrow hot path.
-	var peek [1]byte
-	ctrlErr := raw.Read(func(fd uintptr) bool {
-		_, _, recvErr := unix.Recvfrom(int(fd), peek[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
-		alive = recvErr == unix.EAGAIN || recvErr == unix.EWOULDBLOCK
-		return true // never block waiting for readability
-	})
-	if ctrlErr != nil {
-		return true
-	}
-	return alive
-}
-
-// recycleManagedTCPConn returns a session connection to the pool for reuse;
-// non-session connections (sync fallback dials, legacy warm connections)
-// close as before. Callers must only recycle a connection whose response was
-// consumed through its terminal status line.
-func (c *Client) recycleManagedTCPConn(conn net.Conn, pool *tcpConnPool) error {
-	sc, ok := conn.(*sessionTCPConn)
-	if !ok || pool == nil {
-		return c.releaseManagedTCPConn(conn, pool)
-	}
-	sc.lastActive = time.Now()
-	if !pool.enqueue(sc) {
-		return c.releaseManagedTCPConn(conn, pool)
-	}
-	c.metrics().IncConnectionReuse()
-	c.noteConnEvent("conn_reuse", conn, "")
-	return nil
-}
-
 // newManagedTCPReadCloser hands a connection's lifecycle to the caller: the
 // returned ReadCloser owns closer, which recycles or releases the connection
 // exactly once. Callers pass in the same guard they used for their error
@@ -574,18 +179,18 @@ func watchManagedTCPConnContext(ctx context.Context, conn net.Conn) func() {
 		return func() {}
 	}
 	done := make(chan struct{})
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		_ = conn.Close()
+		close(done)
+	})
 	var once sync.Once
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.SetDeadline(time.Now())
-			_ = conn.Close()
-		case <-done:
-		}
-	}()
 	return func() {
 		once.Do(func() {
-			close(done)
+			if !stopCancel() {
+				// Join cancellation before the connection can change owners.
+				<-done
+			}
 		})
 	}
 }
@@ -1021,7 +626,7 @@ func (c *Client) sendAndReadTCPWithBody(conn net.Conn, state tcpAuthState, cmd s
 }
 
 func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {
-	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx, poolControl)
 	if err != nil {
 		return GetManifestResponse{}, err
 	}
@@ -1110,7 +715,7 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 			"prior manifest is %d bytes, above the server's %d byte SYNC limit", len(oldManifestBytes), limit)
 	}
 
-	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx, poolControl)
 	if err != nil {
 		return SyncManifestResponse{}, err
 	}
@@ -1265,7 +870,7 @@ func (c *Client) fetchFileBatchBodyTCP(
 	if err := body.validate(); err != nil {
 		return nil, err
 	}
-	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx, poolData)
 	if err != nil {
 		return nil, err
 	}
@@ -1556,7 +1161,7 @@ func (c *Client) acknowledgeFileProgressGroupTCP(ctx context.Context, commands [
 	if err := body.validate(); err != nil {
 		return AcknowledgeFileProgressResponse{}, err
 	}
-	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx, poolControl)
 	if err != nil {
 		return AcknowledgeFileProgressResponse{}, err
 	}
@@ -1597,7 +1202,7 @@ func (c *Client) ackOnConn(conn net.Conn, state tcpAuthState, txferID string, bo
 }
 
 func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (GetStatusResponse, error) {
-	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx, poolControl)
 	if err != nil {
 		return GetStatusResponse{}, err
 	}
@@ -1624,7 +1229,7 @@ func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (Ge
 }
 
 func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesRequest) (ListStatusesResponse, error) {
-	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx, poolControl)
 	if err != nil {
 		return ListStatusesResponse{}, err
 	}
@@ -1685,7 +1290,7 @@ func (c *Client) getChecksumBodyTCP(ctx context.Context, transferID string, body
 	if err := body.validate(); err != nil {
 		return nil, err
 	}
-	conn, state, pool, err := c.acquireManagedTCPConn(ctx)
+	conn, state, pool, err := c.acquireManagedTCPConn(ctx, poolData)
 	if err != nil {
 		return nil, err
 	}

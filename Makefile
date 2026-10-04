@@ -51,6 +51,7 @@ fuzz-short:
 # End-to-end properties driving the whole system. These are still finding new
 # coverage past 10s, so CI gives them a larger budget to keep exploring.
 fuzz-long:
+	$(FUZZ) -race . FuzzTCPConnPool $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/encoding FuzzManifestEntryRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/ftcp FuzzFramedItemRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/ftcp FuzzFramedBodyHeader $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
@@ -78,8 +79,7 @@ bench-acceptance:
 	TX_BENCH_ACCEPTANCE_SIZE=$(BENCH_SIZE) TX_BENCH_ACCEPTANCE_OUT=$(abspath $(BENCH_OUT)) \
 		go test -count=1 -timeout 45m -run '^TestBenchAcceptance$$' -v ./internal/bench/harness
 
-# Checks the dials of the last bench-acceptance run. Expected to fail until
-# the client stops dialing a connection per request.
+# Checks the dials of the last bench-acceptance run.
 bench-acceptance-dials:
 	TX_BENCH_ACCEPTANCE_OUT=$(abspath $(BENCH_OUT)) \
 		go test -count=1 -run '^TestBenchAcceptanceDialBudget$$' -v ./internal/bench/harness

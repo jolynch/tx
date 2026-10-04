@@ -41,6 +41,8 @@ type startArgs struct {
 	progressInterval    time.Duration
 	metadataFailures    *metadataFailureCollector
 	stats               *txstats.Recorder
+	// client is the copy's shared client; nil makes the phase build its own.
+	client *tx.Client
 }
 
 func formatStartBatchCause(plan tx.BatchSizePlan) string {
@@ -113,7 +115,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	cf.StringVar(&progressIntervalRaw, "", "progress-interval", "1s", "Progress write interval (e.g. 500ms, 10s)")
 	cf.BoolVar(&discard, "", "skip-write", false, "Discard downloaded file contents instead of writing to the target directory")
 	cf.BoolVar(&discard, "", "discard", false, "Discard downloaded file contents instead of writing to the target directory")
-	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=manifest default)")
+	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers and data connections (0=manifest default)")
 	ackEveryRaw = encoding.HumanBytes(defaultCLIAckEveryBytes)
 	cf.StringVar(&ackEveryRaw, "a", "ack-every", ackEveryRaw, "Bytes between progress acks; 1B, 4KiB, 8MiB")
 	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
@@ -318,8 +320,11 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 			stopProgress()
 		}
 	}()
-	client := tx.NewClient(serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
-	defer client.Close()
+	client, closeClient := phaseClient(cfg.client, serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()), tx.WithConcurrency(effectiveConcurrency))
+	defer closeClient()
+	// A shared client was built before the manifest's mode was known; a
+	// resumed transfer keeps the mode it started with.
+	client.LoadStrategy = loadStrategy
 	startAll := time.Now()
 	var completed int64
 	var totalTransferred int64
@@ -417,7 +422,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		} else {
 			fmt.Fprintf(stderr, "  concurrency: %d\n", effectiveConcurrency)
 		}
-		fmt.Fprintf(stderr, "  conn-pool: %d\n", miniProbe.WarmConnectionPoolSize)
+		fmt.Fprintf(stderr, "  conn-pool: %d data, %d control\n", miniProbe.WarmConnectionPoolSize, miniProbe.WarmConnectionPoolSize)
 		fmt.Fprintf(stderr, "    window: %d\n", batchPlan.EffectiveWinConc)
 		fmt.Fprintf(stderr, "    batch-per-window: %d\n", batchPlan.PerFileWorkers)
 		fmt.Fprintf(stderr, "  batch: %s (from %s)\n",
