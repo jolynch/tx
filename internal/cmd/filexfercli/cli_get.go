@@ -60,7 +60,7 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 	cf.StringVar(&keysDir, "k", "keys", "", "Persistent age keys directory (default: ephemeral)")
 	cf.StringSliceVar(&authTokens, "t", "auth-token", "Client auth token presented in encrypted AUTH blob; repeatable")
 	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
-	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers (0=auto)")
+	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers and data connections (0=auto)")
 	cf.BoolVar(&skipWrite, "", "skip-write", false, "Do not write the file; fetch to discard instead")
 	cf.BoolVar(&skipFsync, "", "skip-fsync", false, "Acknowledge writes without fdatasync")
 	fsyncIntervalRaw = "512MiB"
@@ -207,7 +207,7 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 		effectiveConcurrency = concurrency
 	}
 
-	client := tx.NewClient(serverURL, tx.WithLoadStrategy(tx.LoadStrategyFast), tx.WithComp(compress), tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(resolvedEncMode), tx.WithClientAuthTokens(authTokens...), tx.WithClientMetrics(stats.ClientMetrics()), tx.WithEventSink(stats.EventSink()))
+	client := tx.NewClient(serverURL, tx.WithLoadStrategy(tx.LoadStrategyFast), tx.WithComp(compress), tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(resolvedEncMode), tx.WithClientAuthTokens(authTokens...), tx.WithClientMetrics(stats.ClientMetrics()), tx.WithEventSink(stats.EventSink()), tx.WithConcurrency(concurrency))
 	defer client.Close()
 
 	// Fetch manifest for the single file (skip full probe).

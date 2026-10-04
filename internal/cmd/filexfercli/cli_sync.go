@@ -41,6 +41,8 @@ type syncArgs struct {
 	progressInterval    time.Duration
 	metadataFailures    *metadataFailureCollector
 	stats               *txstats.Recorder
+	// client is the copy's shared client; nil makes the phase build its own.
+	client *tx.Client
 
 	// initialOldManifest, when non-nil, is used as the round-0 oldManifest
 	// supplied to SyncManifest instead of scanning the local target dir.
@@ -160,8 +162,8 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		}
 
 		// Probe link bandwidth.
-		client := tx.NewClient(serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
-		defer client.Close()
+		client, closeClient := phaseClient(cfg.client, serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()), tx.WithConcurrency(cfg.concurrency))
+		defer closeClient()
 		probeResult, err := client.ProbeLink(context.Background(), tx.ProbeRequest{
 			ProbeBytes:   cfg.probeBytes,
 			LoadStrategy: loadStrategy,

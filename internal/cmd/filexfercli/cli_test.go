@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -4491,6 +4492,57 @@ func TestRunCLIStartProgressFileShowsResumedBytes(t *testing.T) {
 		if done < 5 {
 			t.Errorf("line %d: bytes.done=%d should be >= 5 (resume baseline): %s", i, done, line)
 		}
+	}
+}
+
+// TestRunCLICopySharesOneClient runs the copy phases (transfer, start,
+// converge, and metadata verification) and checks they share one client: the
+// copy dials one pair of connection pools plus probes, where a client per
+// phase would warm a pair of pools per phase. It leaves out data
+// verification, whose CXSUM connections are single-use by design.
+func TestRunCLICopySharesOneClient(t *testing.T) {
+	const concurrency = 4
+	src := t.TempDir()
+	for i := 0; i < 20; i++ {
+		if err := os.WriteFile(filepath.Join(src, fmt.Sprintf("f%02d", i)), bytes.Repeat([]byte{byte(i)}, 4096), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := store.NewStore()
+	t.Cleanup(st.Close)
+	go func() {
+		_ = intftcp.Serve(ln, intftcp.ServerOptions{
+			Deps:             intftcp.NewRuntimeDeps(st, intftcp.WithRoot(src)),
+			KeepAliveTimeout: 5 * time.Second,
+		})
+	}()
+	t.Cleanup(func() { _ = ln.Close() })
+
+	tmp := t.TempDir()
+	statsPath := filepath.Join(tmp, "copy.json")
+	var stdout, stderr bytes.Buffer
+	if code := RunCLI([]string{"copy", "--progress=false", "--verify", "meta", "--concurrency", strconv.Itoa(concurrency),
+		"--stats", statsPath, "tx://" + ln.Addr().String() + "/", filepath.Join(tmp, "dst")}, &stdout, &stderr); code != 0 {
+		t.Fatalf("copy exit %d: %s", code, stderr.String())
+	}
+	data, err := os.ReadFile(statsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stats txstats.Client
+	if err := json.Unmarshal(data, &stats); err != nil {
+		t.Fatal(err)
+	}
+	// Two throughput probes (transfer and converge) fan out one connection
+	// each plus one per server CPU, each later phase's discovery probe dials
+	// one, and the two pools warm concurrency connections each.
+	maxDials := int64(2*(runtime.NumCPU()+1) + 4 + 2*concurrency)
+	if stats.Dials > maxDials {
+		t.Fatalf("copy dialed %d connections, want at most %d: phases are not sharing one client", stats.Dials, maxDials)
 	}
 }
 

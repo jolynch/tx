@@ -430,9 +430,8 @@ func countRunRecords(path string) int {
 	return n
 }
 
-// TestBenchAcceptanceDialBudget checks the dials of the main acceptance run.
-// It fails until the client stops dialing a connection per request (make
-// bench-acceptance-dials; CI allows the failure).
+// TestBenchAcceptanceDialBudget checks the dials of the main acceptance run
+// (make bench-acceptance-dials).
 func TestBenchAcceptanceDialBudget(t *testing.T) {
 	outDir := os.Getenv(envOut)
 	if outDir == "" {

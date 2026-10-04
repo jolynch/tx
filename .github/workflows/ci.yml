@@ -47,14 +47,9 @@ jobs:
           key: silesia-v1
       - name: Disk space
         run: df -h
-      # The client dials far more connections than it needs; widen the
-      # ephemeral port range so that known bug does not mask other failures.
-      - name: Widen ephemeral port range
-        run: sudo sysctl -w net.ipv4.ip_local_port_range="1024 65000"
       - name: Run bench acceptance
         run: make bench-acceptance
-      - name: Check dial budget (expected to fail until the dialing fix)
-        continue-on-error: true
+      - name: Check dial budget
         run: make bench-acceptance-dials
       - name: Upload bench metrics
         if: always()

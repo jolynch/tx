@@ -29,6 +29,8 @@ type transferArgs struct {
 	deadlineMS   int64
 	cacheLoad    bool
 	stats        *txstats.Recorder
+	// client is the copy's shared client; nil makes the phase build its own.
+	client *tx.Client
 }
 
 func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
@@ -119,8 +121,8 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 
 	fmt.Fprintf(stderr, "transfer(addr=[%s], source=[%s])\n", serverURL, cfg.sourceDir)
 
-	client := tx.NewClient(serverURL, tx.WithLoadStrategy(cfg.loadStrategy), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
-	defer client.Close()
+	client, closeClient := phaseClient(cfg.client, serverURL, tx.WithLoadStrategy(cfg.loadStrategy), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
+	defer closeClient()
 	start := time.Now()
 	cfg.stats.Phase("probe")
 	probeResult, err := client.ProbeLink(context.Background(), tx.ProbeRequest{
@@ -278,7 +280,7 @@ func runResumeRefresh(serverURL string, cfg transferArgs, stderr io.Writer) int 
 
 	fmt.Fprintf(stderr, "resume(addr=[%s], source=[%s])\n", serverURL, cfg.sourceDir)
 
-	client := tx.NewClient(serverURL,
+	client, closeClient := phaseClient(cfg.client, serverURL,
 		tx.WithLoadStrategy(cfg.loadStrategy),
 		tx.WithClientAgePublicKey(cfg.agePublicKey),
 		tx.WithClientAgeIdentity(cfg.ageIdentity),
@@ -286,7 +288,7 @@ func runResumeRefresh(serverURL string, cfg transferArgs, stderr io.Writer) int 
 		tx.WithClientAuthTokens(cfg.authTokens...),
 		tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()),
 	)
-	defer client.Close()
+	defer closeClient()
 
 	start := time.Now()
 	cfg.stats.Phase("probe")

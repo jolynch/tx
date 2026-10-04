@@ -134,8 +134,8 @@ Options:
                                   repeatable (default "")
       --compress string           Compression algorithm: adapt|none|lz4|zstd (default:
                                   adapt)
-      --concurrency int           Parallel download / verification workers (0=adapt from
-                                  server) (default 0)
+      --concurrency int           Parallel download / verification workers and data
+                                  connections (0=adapt from server) (default 0)
       --progress                  Show transfer progress every 2s (default true)
   -v, --verbose                   Per-file progress output (default false)
   -p, --progress-path string      Progress output target; repeatable, use - for stdout
@@ -175,7 +175,8 @@ Options:
                                   repeatable (default "")
       --compress string           Compression algorithm: adapt|none|lz4|zstd (default:
                                   adapt)
-      --concurrency int           Parallel download workers (0=auto) (default 0)
+      --concurrency int           Parallel download workers and data connections (0=auto)
+                                  (default 0)
       --skip-write                Do not write the file; fetch to discard instead
                                   (default false)
       --skip-fsync                Acknowledge writes without fdatasync (default false)
@@ -430,14 +431,16 @@ without a new flag. It combines with `--exit-after`; whichever fires first
 wins.
 
 **`tx recv copy`** and **`tx recv get`** write one JSON object at exit:
-`command`, `tid`, `status` (`ok` or `error`), `error` (the failure that
-ended the run, for example `start failed with 748 errors; first: ...`, or the
-last line written to stderr when no step reported one), `exit_code`, `start`, `end`, `wall_ns`, `phases_ns` (`probe`,
-`manifest`, `data`, `finalize`), `files` and `bytes` requested,
-`logical_bytes` and `wire_bytes` received, `windows` per codec, and the
-connection counters `dials`, `sync_fallbacks`, `reuses`, `heartbeats`,
-`heartbeat_failures`, `ack_retries`, and `request_errors` (failed dials plus
-ERR responses). A run that fails before its manifest arrives has no `tid`.
+`command`, `tid`, `status` (`ok` or `error`), `error` (the failure that ended
+the run, for example `start failed with 748 errors; first: ...`, or the last
+line written to stderr when no step reported one), `exit_code`, `start`, `end`,
+`wall_ns`, `phases_ns` (`probe`, `manifest`, `data`, `finalize`), `files` and
+`bytes` requested, `logical_bytes` and `wire_bytes` received, `windows` per
+codec, and the connection counters `dials`, `sync_fallbacks`, `reuses`,
+`heartbeats`, `heartbeat_failures`, `ack_retries`, and `request_errors` (failed
+dials plus ERR responses). `sync_fallbacks` counts the dials made because a
+connection pool had no idle connection to lend. A run that fails before its
+manifest arrives has no `tid`.
 
 ## State Directory
 

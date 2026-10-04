@@ -63,8 +63,8 @@ t side run tid ev file off len dur k=v...
 | `run_start` / `run_end`      | `dst`, `command`; end: `status`, `bytes`, `files`, `err`, `exit_code` |
 | `probe`                      | `dur`, `rtt`, `keepalive_ms`, advertised limits (`target_request_bytes`, `max_request_bytes`, `max_sync_request_bytes`), `concurrency`, `link_mbps` |
 | `manifest_start` / `manifest_end` | start: `path`; end: `files`, `bytes`, `dur`, `err` |
-| `conn_dial`                  | `conn`, `dur`, `sync` (true for synchronous pool fallback) |
-| `conn_reuse` / `conn_close`  | `conn`; close: `reason` (`released`, `dead`, `heartbeat_fail`) |
+| `conn_dial`                  | `conn`, `dur`, `sync` (true when dialed because a pool had no idle connection) |
+| `conn_reuse` / `conn_close`  | `conn`; close: `reason` (`released`, `dead`, `heartbeat_fail`, `idle_full`, `idle`, `stopped`) |
 | `heartbeat` / `heartbeat_fail` | `conn`, `rtt` / `err` |
 | `req_start` / `req_end`      | `verb` (SEND, ACK, CXSUM), `conn`, `items`, `body_bytes`; end: `dur`, `err` |
 | `file_start` / `file_done`   | `file`, `path`, `len`, `off` (resume offset); done: `dur` |

@@ -111,6 +111,8 @@ type copyCLIConfig struct {
 	yes                 bool
 	statsPath           string
 	stats               *txstats.Recorder
+	// client is the copy's shared client; nil makes the phase build its own.
+	client *tx.Client
 }
 
 // cacheMapValue maps the boolean "did the caller enable --cache-load?"
@@ -181,7 +183,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 	cf.StringVar(&cfg.keysDir, "k", "keys", "", "Persistent age keys directory (default: ephemeral)")
 	cf.StringSliceVar(&cfg.authTokens, "t", "auth-token", "Client auth token presented in encrypted AUTH blob; repeatable")
 	cf.StringVar(&cfg.compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
-	cf.IntVar(&cfg.concurrency, "", "concurrency", 0, "Parallel download / verification workers (0=adapt from server)")
+	cf.IntVar(&cfg.concurrency, "", "concurrency", 0, "Parallel download / verification workers and data connections (0=adapt from server)")
 	cf.BoolVar(&cfg.progress, "", "progress", true, "Show transfer progress every 2s")
 	cf.BoolVar(&cfg.verbose, "v", "verbose", false, "Per-file progress output")
 	cf.StringSliceVar(&cfg.progressFilePaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
@@ -341,6 +343,11 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 		deadlineMS = d.Milliseconds()
 	}
 
+	// One client serves every phase, so its connection pools warm once, during
+	// the probe and manifest walk, rather than per phase.
+	cfg.client = tx.NewClient(serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(compress), tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()), tx.WithConcurrency(cfg.concurrency))
+	defer cfg.client.Close()
+
 	localExists := pathExists(cfg.localDst)
 	if cfg.verifyMeta && cfg.skipFetch && !localExists {
 		fmt.Fprintln(stderr, "--verify with --skip-fetch requires an existing LOCAL_DST")
@@ -380,6 +387,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 		deadlineMS:   deadlineMS,
 		cacheLoad:    cfg.cacheLoadEnabled,
 		stats:        cfg.stats,
+		client:       cfg.client,
 	}
 	// Resume path: prior .tx/<dst>/manifest.server exists from an interrupted
 	// run, and the user has not re-created LOCAL_DST. Refresh via SYNC and
@@ -426,6 +434,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 			progressInterval:    progressInterval,
 			metadataFailures:    metadataFailures,
 			stats:               cfg.stats,
+			client:              cfg.client,
 		}
 		if code := runSync(serverURL, syncCfg, stdout, stderr); code != 0 {
 			printMetadataMirrorWarnings(stderr, "copy", metadataFailures.snapshot(), copyVerbosity)
@@ -452,6 +461,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 			progressInterval:    progressInterval,
 			metadataFailures:    metadataFailures,
 			stats:               cfg.stats,
+			client:              cfg.client,
 		}
 		if code := runStart(serverURL, startCfg, stdout, stderr); code != 0 {
 			printMetadataMirrorWarnings(stderr, "copy", metadataFailures.snapshot(), copyVerbosity)
@@ -651,6 +661,7 @@ func runEndOfCopyConvergence(
 		progressTargets:     progressTargets,
 		progressInterval:    progressInterval,
 		metadataFailures:    metadataFailures,
+		client:              cfg.client,
 		initialOldManifest:  saved,
 		cacheMap:            cacheMap,
 		logPrefix:           "copy-converge",
@@ -926,8 +937,8 @@ func verifyCopyRemoteMetadata(serverURL string, cfg copyCLIConfig, manifest *tx.
 	if err != nil {
 		return fmt.Errorf("invalid --encrypt: %w", err)
 	}
-	client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
-	defer client.Close()
+	client, closeClient := phaseClient(cfg.client, serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
+	defer closeClient()
 	probeCtx, cancel := context.WithTimeout(context.Background(), verifyChecksumRequestTimeout)
 	_, err = client.ProbeLink(probeCtx, tx.ProbeRequest{ProbeBytes: 1})
 	cancel()
@@ -1061,8 +1072,8 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 	budgetExpired := func() bool {
 		return cfg.verifyBudget > 0 && budgetCtx.Err() == context.DeadlineExceeded
 	}
-	client := tx.NewClient(serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
-	defer client.Close()
+	client, closeClient := phaseClient(cfg.client, serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
+	defer closeClient()
 	probeCtx, probeCancel := context.WithTimeout(workerCtx, verifyChecksumRequestTimeout)
 	_, err = client.ProbeLink(probeCtx, tx.ProbeRequest{ProbeBytes: 1})
 	probeCancel()

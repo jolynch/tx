@@ -78,6 +78,16 @@ var syncPromptIsTerminal = func() bool {
 	return err == nil && stat != nil && (stat.Mode()&os.ModeCharDevice) != 0
 }
 
+// phaseClient returns a copy's shared client with a no-op close, or a new
+// client the caller owns when the phase runs on its own.
+func phaseClient(shared *tx.Client, serverURL string, opts ...tx.ClientOption) (*tx.Client, func()) {
+	if shared != nil {
+		return shared, func() {}
+	}
+	client := tx.NewClient(serverURL, opts...)
+	return client, func() { _ = client.Close() }
+}
+
 // formatProbeLinkSummary is a one-liner summary of the probe link estimate
 // used inside existing status lines (sync-delta, start-plan). Fast mode expands
 // to "<agg>Mbps (<N>x<per-conn>)"; gentle/single collapses to "<link>Mbps".

@@ -43,28 +43,58 @@ From these measurements the client computes:
 
 ### Connection pool
 
-Once the probe completes, the client pre-warms a TCP connection pool sized to
-`concurrency × 1.25` (25 % headroom). Every connection in the pool has already
-completed the AUTH handshake, so SEND requests start immediately.
+Once the probe completes, the client opens two connection pools that never
+share connections, so quick commands never queue behind file transfers:
 
-When the server grants keep-alive (negotiated on the discovery probe via
-`keep-alive=auto` / `keep-alive-ms`), pool connections are long-lived sessions:
-each is upgraded with a zero-payload keep-alive PROBE at warm time, and a
-connection whose response was cleanly consumed returns to the pool for reuse
+| Pool    | Commands                         | Size                                  |
+|---------|----------------------------------|---------------------------------------|
+| data    | `SEND`, `CXSUM`                  | at most `concurrency`                 |
+| control | `ACK`, `STATUS`, `TXFER`, `SYNC` | `concurrency`, grows during a burst   |
+
+`concurrency` is the probe's suggestion, or `--concurrency` when set. Both
+pools work the same way and differ only in growth:
+
+- **Warm.** Each pool opens `concurrency` connections up front, during the
+  probe, so the first `SEND` and `ACK` requests find a connection ready.
+- **Most recently used first.** Idle connections form a stack. A borrower
+  always gets the most recently used one, so steady traffic reuses the same
+  connections and the unused ones sink to the bottom.
+- **Scale down.** When the server grants keep-alive, once per heartbeat
+  interval (one quarter of the keep-alive window: 15s at the default 60s), a
+  pool that has been used keeps the most connections it had in use at once
+  during that interval, plus a quarter for bursts, and at least one. It closes
+  the rest from the bottom of the stack. For example, 90 open connections with
+  at most 40 in use shrink to 50. Because borrowers take from the top, this
+  never closes a connection that steady traffic is about to reuse.
+- **Grow.** A pool below its size dials on demand. The data pool never grows
+  past `concurrency`: when every data connection is busy, a `SEND` waits for
+  one to come back. A transfer is scheduled so that this does not happen; see
+  [Parallel execution](#parallel-execution). The control pool dials past
+  `concurrency` during a burst and keeps up to `concurrency` idle afterwards.
+
+`tx recv copy` uses one client for all its phases (transfer, data, converge,
+and verification), so the pools warm once.
+
+Every pooled connection has already completed the AUTH handshake. When the
+server grants keep-alive (negotiated on the discovery probe via
+`keep-alive=auto` / `keep-alive-ms`), pooled connections are long-lived
+sessions: each is upgraded with a zero-payload keep-alive PROBE when dialed,
+and a connection whose response was cleanly consumed returns to its pool
 instead of being closed. Reused connections skip the TCP and AUTH handshakes
 and keep their congestion window warm across batches. Two guardrails keep
-silently dead connections out of the pool: a background loop heartbeats every
-idle pooled connection at one quarter of the granted idle window with a
-zero-payload PROBE round trip (a failed heartbeat evicts the connection and
-triggers a refill, and borrowers peek for a pending EOF before reuse), and
+silently dead connections out of the pools: a background loop heartbeats
+every idle pooled connection at one quarter of the granted idle window with
+a zero-payload PROBE round trip (a failed heartbeat closes the connection and
+starts a replacement, and borrowers peek for a pending EOF before reuse), and
 the server independently reaps connections that send nothing for the
 keep-alive window (`--idle-timeout`, default 60s).
 
 Against servers without keep-alive, or after a dirty response (error
-mid-stream), a connection is closed after one use and a background goroutine
-opens and authenticates a fresh replacement — the pool is continuously
-refilled without blocking the data path. If the pool is empty when a worker
-needs a connection it falls back to a synchronous single-use dial.
+mid-stream, or any `CXSUM` stream), a connection is closed after one use and
+a background goroutine opens and authenticates a replacement. Replacements
+restore a pool only to the size it last scaled to, and fill a slot the
+closed connection freed, so they never push a pool past its size or undo a
+scale-down.
 
 ### Windowing and batching
 
@@ -90,8 +120,9 @@ the ceiling is the window size.
 **Small files → packed batches.** The manifest is walked in order and files are
 packed into batches until the next file would exceed `batchMaxBytes`. A batch
 of 1000 tiny files and a batch containing one 32 MiB file are the same unit of
-work. Each normally becomes one multi-file `SEND` request; metadata-heavy
-batches can require several requests on the same worker.
+work. Each becomes one multi-file `SEND` request, or several in parallel when
+SEND slots are free (see [Parallel execution](#parallel-execution));
+metadata-heavy batches can require several requests on the same worker.
 This avoids the per-connection overhead that makes small-file transfers slow in
 tools that open one connection per file.
 
@@ -116,8 +147,8 @@ is checked before transmission, without splitting the manifest.
 
 **Large files → split windows.** When a single file exceeds `batchMaxBytes`,
 it is split into windows of that size. Each window is downloaded on its own TCP
-connection in parallel, with the number of concurrent windows capped by
-`windowBytes / batchMaxBytes`. The pieces are written to the correct offsets in
+connection, in parallel when SEND slots are free, with the number of
+concurrent windows capped by `windowBytes / batchMaxBytes`. The pieces are written to the correct offsets in
 the output file and acknowledged independently. This means a 1 GB file on a
 fast link is not bottlenecked by a single TCP stream — it is sliced into
 parallel chunks that saturate the NIC.
@@ -131,14 +162,22 @@ avoids fragmenting work on a resource-constrained server.
 
 ### Parallel execution
 
-With batches planned and the pool warm, the client issues `SEND` requests
-across concurrent workers. Each worker:
+With batches planned and the pools warm, `concurrency` workers each take a
+batch and issue `SEND` requests. A transfer holds at most one SEND slot per
+data connection, so it never issues a `SEND` that would wait for a connection.
+Each worker:
 
-1. Borrows a pre-authenticated connection from the pool.
-2. Sends a `SEND` command requesting one or more file windows.
-3. Reads the `FX/1` frame stream and writes frames to disk.
-4. Sends a batched `ACK` confirming received windows.
-5. Returns the connection to the pool.
+1. Waits for one SEND slot, then takes any other slots free at that moment
+   to split the batch into parallel `SEND` requests, or the large file into
+   parallel windows. A batch never waits for extra slots, so splits use only
+   idle capacity, such as when other workers are acknowledging or the
+   transfer is near its end.
+2. Borrows a pre-authenticated connection from the data pool for each slot.
+3. Sends a `SEND` command requesting one or more file windows, reads the
+   `FX/1` frame stream, and writes frames to disk.
+4. Returns each connection to the data pool and frees its slot.
+5. Sends a batched `ACK` confirming received windows on a control
+   connection.
 
 Because every worker has its own TCP connection, there is no head-of-line
 blocking: a slow file on one connection does not stall transfers on the others.

@@ -66,7 +66,7 @@ client                                             server
   |<=================================================| aggregate link estimate
   |                                                  |
   | compute concurrency = server_cpu * io_depth      |
-  | warm authenticated connection pool               |
+  | warm authenticated data + control conn pools     |
   | plan batch size from concurrency/window/link     |
   |                                                  |
   | TXFER mode=fast link-mbps=N concurrency=C        |
