@@ -10,7 +10,7 @@ The events come from the forked tx processes themselves, through tx's
 [Changes to tx](./OVERVIEW.md#changes-to-tx)). tx always writes JSON lines.
 `tx-bench` adds only:
 - the `run` label;
-- its own `prep_*` and `rss` events;
+- its own `prep_*`, `verify_*`, and `rss` events;
 - the per-transfer split;
 - conversion to text when the output path asks for it.
 
@@ -72,10 +72,10 @@ t side run tid ev file off len dur k=v...
 | `fsync`                      | `file`, `dur` |
 | `ack`                        | `files`, `bytes`, `dur`, `attempt`, `ok` |
 | `retry`                      | `verb`, `attempt`, `err` |
-| `error`                      | `verb`, `file`, `err` |
+| `error`                      | `verb`, `file`, `files`, `err` |
 | `rss`                        | Emitted by `tx-bench` from `/proc/<tx pid>/status`. `bytes`; sampled every `--trace-rss-interval` (default 100ms) |
 | `verify_start` / `verify_end`| end: `files`, `bytes`, `dur`, `mismatches` |
-| `verify_fail`                | `path`, `expected`, `got` |
+| `verify_fail`                | `path`, `field`, `expected`, `got` |
 
 Both sides also emit:
 
@@ -87,13 +87,13 @@ Both sides also emit:
 
 | Event                        | Fields |
 |------------------------------|--------|
-| `prep_start` / `prep_end`    | Emitted by `tx-bench`, not tx. `seq`, `warm`, `skew`; end: `evicted`, `warmed`, `hot_pct`, `dur` |
+| `prep_start` / `prep_end`    | Emitted by `tx-bench`, not tx. `seq`, `kind`, `warm`, `skew`; end: `kind`, `evicted`, `warmed`, `hot_pct`, `dur` |
 | `accept` / `conn_close`      | `conn`, `remote`; close: `reason` |
 | `cmd_start` / `cmd_end`      | `verb`, `conn`; end: `req_bytes` and `resp_bytes` (from the kernel's TCP counters, so they include zero-copy payloads), `dur`, `err` |
 | `heartbeat`                  | `conn` (a keep-alive PROBE) |
-| `file_open`                  | `file`, `path`, `len`, `dur` |
-| `window`                     | `file`, `off`, `len`, `wire`, `codec`, `send_path` (`sendfile` or `buffered`), `read_dur`, `comp_dur`, `write_dur` |
-| `file_done`                  | `file`, `dur` (first window start to last window end) |
+| `file_open`                  | `conn`, `file`, `path`, `len`, `dur` |
+| `window`                     | `conn`, `file`, `off`, `len`, `wire`, `codec`, `send_path` (`sendfile` or `buffered`), `read_dur`, `comp_dur`, `write_dur` |
+| `file_done`                  | `conn`, `file`, `dur` (first window start to last window end) |
 | `ack`                        | `conn`, `files`, `bytes` |
 | `transfer_start` / `transfer_done` | `path`; done: `files`, `bytes`, `dur` |
 | `rss`                        | `bytes`, sampled as on the client |
@@ -125,11 +125,11 @@ PTP-synchronized.
 ## Trace Analysis in `report`
 
 ```text
-tx-bench report [--run 1] [--top 20] [--format text|json] CLIENT_TRACE [SERVER_TRACE]
+tx-bench report [--run 1] [--top 20] [--format text|json] [--clock-offset OFFSET] FILE [FILE...]
 ```
 
 When `report` is given a trace, it adds a timeline analysis to the summary.
-`SERVER_TRACE` defaults to the trace's `.server` sibling. `report` shifts
+Sender events come from the trace's `.server` sibling. `report` shifts
 sender events by the clock offset, joins the two sides on
 `(tid, file, off)`, and reports:
 

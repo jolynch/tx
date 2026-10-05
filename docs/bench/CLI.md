@@ -345,7 +345,7 @@ whose flags differ. For `local`, `--` goes to `tx recv copy` and repeatable
 | Kind | `tx send tree` | `tx recv copy` | Rule |
 |------|----------------|----------------|------|
 | Defaults | `--exit-after never` | `--verify none` | Placed before `TX_ARGS`, so yours win (Go flags keep the last value) |
-| Managed | `--listen`, `--stats`, `--trace`, `CHROOT`; `-p`/`-f` only with `--trace` | `--stats`, `--trace`, `REMOTE_SRC`, `LOCAL_DST`; `-p`/`-f` only with `--trace` | Set by `tx-bench`; passing one in `TX_ARGS` is a usage error naming the `tx-bench` option to use instead (`-l`, `--trace`, `--go-trace`, …). Without `--trace`, your own `-p`/`-f` progress targets pass through. |
+| Managed | `--listen`, `--exit-with stdin`, `--stats`, `--trace`, `CHROOT`; `-p`/`-f` only with `--trace` | `--stats`, `--trace`, `REMOTE_SRC`, `LOCAL_DST`; `-p`/`-f` only with `--trace` | Set by `tx-bench`; passing one in `TX_ARGS` is a usage error naming the `tx-bench` option to use instead (`-l`, `--trace`, `--go-trace`, …). Without `--trace`, your own `-p`/`-f` progress targets pass through. |
 | Read, then passed through | `--require-auth-token` | `--skip-write`, `--encrypt`, `-k`, `-t` | `--skip-write` turns off the `DST` check. `--encrypt`, `-k`, and `-t` are also given to the `tx recv get` fetches of sender state. A user-supplied `--require-auth-token` turns `--auth` off and is not echoed into the printed `recv-copy` command. |
 
 `tx-bench` recognizes these flags in every form Go's `flag` package accepts:

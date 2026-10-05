@@ -1,6 +1,6 @@
 # Documentation
 
-The docs are organized into three top-level sections:
+The docs are organized into four top-level sections:
 
 - [Architecture](./arch/OVERVIEW.md): system design, data flow, performance model, and integrity verification
 - [Public Interface](./pub/CLI.md): CLI usage, flags, and operator-facing workflows
@@ -10,6 +10,7 @@ The docs are organized into three top-level sections:
 ## Architecture
 
 - [Overview](./arch/OVERVIEW.md)
+- [Transfer Modes](./arch/TRANSFER.md)
 - [Verification](./arch/VERIFICATION.md)
 
 ## Public Interface

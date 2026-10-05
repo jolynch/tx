@@ -1,10 +1,10 @@
-# FTCP Protocol (`-file-listen`)
+# FTCP Protocol
 
 This document defines the TCP file-transfer command protocol implemented by tx.
 
 ## Transport
 
-- Listener: `-file-listen` (for example `127.0.0.1:3453`)
+- Listener: `tx send tree --listen` (default `127.0.0.1:3453`)
 - By default one connection serves one command (optionally preceded by
   `AUTH`) and the server closes after completion (or on error)
 - A `PROBE` carrying `keep-alive=auto` upgrades its connection to a kept-alive
@@ -149,12 +149,12 @@ allocator without ever exceeding a limit.
 
 1. Client connects.
 2. Client sends either:
-   - command line (`TXFER|SEND|ACK|CXSUM|STATUS|PROBE`), or
+   - command line (`TXFER|SYNC|SEND|ACK|CXSUM|STATUS|PROBE`), or
    - `AUTH` first, then exactly one command line.
 3. Server writes response.
 4. Server closes connection.
 
-If `-fs-require-auth=true`, first line must be `AUTH`.
+With `--require-auth` (or `--require-auth-token`), the first line must be `AUTH`.
 
 ## Keep-Alive
 
@@ -243,16 +243,16 @@ After `AUTH aes <blob>` or `AUTH chacha20 <blob>`:
   zero or more opaque identity tokens. A token is any printable string with
   length > 8 bytes, no ASCII spaces, and no newlines (arbitrary encoding —
   hex, base64, bech32, an `age1…` recipient, a UUID, etc.).
-- Authorization check (only if the server was started with
-  `--require-auth-token`):
+- Authorization check (whenever AUTH is required; `--require-auth` without
+  `--require-auth-token` allowlists a generated token):
   - Build the presented set `{client_age_public_key} ∪ {token1, token2, ...}`.
   - At least one presented value must exactly match an allowlisted token
     configured on the server. The client's age public key counts as an
     identity token, so an operator may allowlist the `age1…` string directly
     without a shared secret.
   - Comparison is constant-time (`crypto/subtle.ConstantTimeCompare`).
-- If the allowlist is empty, any decryptable client is accepted (any tokens
-  presented are ignored).
+- If AUTH is not required, the allowlist is empty and any decryptable client is
+  accepted (any tokens presented are ignored).
 - If valid:
   - subsequent command bytes from the client must be encrypted to the server's
     public key using that same AEAD algorithm.
@@ -277,24 +277,25 @@ Creates a transfer and streams a manifest.
 - `<path>` is resolved under the server root (`CHROOT`). A path that
   lexically leaves the root via `..` is rejected with
   `ERR UNPROCESSABLE path must be within server root` before anything is
-  stat-ed; symlinks inside the root are followed. The resolved directory
-  must exist and be readable.
+  stat-ed; symlinks inside the root are followed. The resolved path
+  must exist and be readable; a file yields a single-file manifest.
 - `mode`, `link-mbps`, and `concurrency` are required.
 - `link-mbps` must be `>= 0`.
 - `concurrency` must be `> 0`.
+- `verbose=1|true` turns off front-coding: every entry has `prefix_len` 0.
 - `cache-map` selects whether per-file page-cache residency is exchanged.
   `none` (default) sends no hints. `send` asks the server to attach a
   `pc:<hex>` trailing token to each F entry (see [MANIFEST.md](./MANIFEST.md));
   Linux-only on the server, no-op on other platforms. `recv` is **not**
   accepted on TXFER (TXFER has no client-supplied body to carry a map);
   see SYNC for the recv direction. Legacy boolean values (`1`, `true`,
-  `0`, `false`) are rejected.
+  `0`, `false`) are rejected, as is any value but `none` with `mode=gentle`.
 - `comp` selects the per-frame wire compression. Supported values are `none`
   (literal FM/1 bytes per frame) and `zstd` (each frame is an independent
   zstd frame). Default is `zstd`. The framing is unconditional — `comp` only
   affects per-frame compression, not whether framing is present.
 - unknown `key=value` options are rejected with `ERR BAD_REQUEST` (unlike
-  `SEND`/`ACK`/`PROBE`, which ignore unknown fields).
+  `SEND` and `PROBE`, which ignore unknown keys).
 
 ### Response
 
@@ -333,13 +334,12 @@ hash. This is intentionally stricter than SEND file-frame validation because
 the manifest is control data for the rest of the transfer.
 
 Chunks are produced by the server on a streaming basis: a frame flushes
-when either ~4 MiB of logical bytes have accumulated or ~1 s has passed
+when either ~4 MiB of logical bytes have accumulated or ~2 s has passed
 since the last frame, whichever comes first. This lets clients display
 real-time progress even when walking large directory trees.
 
-A successful empty-manifest response still contains exactly one terminal
-FX/1+FXT/1 pair (`size=0 next=0`; `wsize` follows `comp`), so the protocol
-is uniformly self-delimiting via the `OK\r\n` line.
+The last frame has `next=0`. A manifest is never empty: it always holds the
+`FM/1` header and `D0`.
 
 The wire payloads (concatenated, without the FX/1/FXT/1 headers) form a
 standalone multi-frame zstd archive when `comp=zstd` — clients may tee
@@ -364,8 +364,8 @@ manifest comes from the client-supplied body.
 - `<path>` is resolved under the server root (`CHROOT`). A path that
   lexically leaves the root via `..` is rejected with
   `ERR UNPROCESSABLE path must be within server root` before anything is
-  stat-ed; symlinks inside the root are followed. The resolved directory
-  must exist and be readable.
+  stat-ed; symlinks inside the root are followed. The resolved path
+  must be a readable directory.
 - `mode`, `link-mbps`, and `concurrency` are required.
 - `link-mbps` must be `>= 0`.
 - `concurrency` must be `> 0`.
@@ -390,6 +390,7 @@ manifest comes from the client-supplied body.
     `pc:<hex>` blob on each matching F entry and falls back to a fresh
     server-side probe for new-on-disk entries. No-op on non-Linux
     platforms.
+  - Any value but `none` is rejected with `mode=gentle`.
 - unknown `key=value` options are rejected with `ERR BAD_REQUEST`.
 
 ### Request body
@@ -444,8 +445,8 @@ ones the client supplied in the request body). Because the server retains no
 path strings from the request, clients must keep their own `fileID → path`
 index from the manifest they uploaded and resolve `RM` IDs locally.
 
-A successful response always contains at least one terminal frame, even when
-the on-disk tree is empty (single frame with `size=0 next=0`).
+The last frame has `next=0`. An empty tree still returns the `FM/1` header
+and `D0`.
 
 ## SEND
 
@@ -570,7 +571,7 @@ fd=<fid> <path> ...\n
 Returns transfer status JSON. Two forms:
 
 - `STATUS <txferid>` — single transfer lookup
-- `STATUS` (no argument) — list all active transfers
+- `STATUS` (no argument) — list all transfers, including completed ones until TTL expiry
 
 ### Request
 
@@ -634,7 +635,7 @@ server's observed link estimate for gentle limiting.
 
 ### Response
 
-- first line:
+- first line (ends in `\n`, not `\r\n`):
   - `PROBE cpu=<server-cpu> io-depth=<int> cts0=<echo-client-cts0> sts0=<unix-ms> sts1=<unix-ms> probe-bytes=<n> wmem=<bytes> gentle-cpu-pct=<int> gentle-bw-pct=<int> limiter-bps=<bytes/sec> target-request-bytes=<bytes> max-request-bytes=<bytes> max-sync-request-bytes=<bytes> [keep-alive-ms=<int>]`
 - `io-depth`, `wmem`, and `limiter-bps` are always present; `limiter-bps` is `0`
   when no per-transfer limiter applies. `keep-alive-ms` is the only conditional
@@ -658,4 +659,6 @@ server's observed link estimate for gentle limiting.
   (see [Keep-Alive](#keep-alive)).
 - `PROBE` traffic itself is not rate-limited.
 
-Clients typically run 3 probes, compute a rounded link estimate, choose mode/concurrency, then issue `TXFER` with those required hints.
+Clients send a 1-byte discovery probe, then 1 MiB throughput probes (`cpu`
+in parallel in fast mode, 3 in sequence in gentle mode), and pass the
+resulting link estimate, mode, and concurrency to `TXFER`.

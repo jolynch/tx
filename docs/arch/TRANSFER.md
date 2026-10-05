@@ -224,9 +224,9 @@ closing SYNC cache-map=recv      client sends desired cache map back
 server restore pool              evict + WILLNEED/touch matching source pages
 ```
 
-That cache-restore work is asynchronous and advisory. It is separate from
-gentle mode, but it complements gentle transfers when the goal is to leave the
-source page cache close to how it looked before the copy.
+That cache-restore work is asynchronous and advisory, and fast mode only: the
+server rejects `cache-map` with gentle mode, and the CLI rejects `--cache-load`
+with `--mode gentle`.
 
 ## Choosing a Mode
 
