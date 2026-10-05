@@ -20,7 +20,8 @@ tx-bench-src/
 ```
 
 - Each mix part gets its own directory, `<part index>-<source>`.
-- `<index>` is zero-padded to the width of the part's file count.
+- `<index>` is zero-padded to the digit count of the part's file count, and
+  to at least 4 digits.
 - The hash is the lowercase hex xxh128 of the file's full contents: the same
   algorithm as the `file-hash` tokens in [FX/1](../ftcp/FRAMING.md). With the
   hash in the name, generated data can be checked by any tool, without
@@ -153,10 +154,11 @@ files.
 | `25%mem`   | Percent of MemTotal; above 100% guarantees a dataset larger than the page cache |
 | `10%disk`  | Percent of the capacity of the filesystem holding `BENCH_DIR` |
 
-`--fill N%` replaces `--size`. It sizes the dataset so that the filesystem
-holding `BENCH_DIR` ends up N% used: `N% × capacity − used`, counting any
-existing dataset as reclaimable. A result of zero or less is an error. Use it
-to measure behavior on a disk that is, for example, half full.
+`--fill N%` replaces `--size`; giving both is a usage error. It sizes the
+dataset so that the filesystem holding `BENCH_DIR` ends up N% used:
+`N% × capacity − used`, counting any existing dataset as reclaimable. A result of zero
+or less is an error. Use it to measure behavior on a disk that is, for example,
+half full.
 
 ## bench.json
 

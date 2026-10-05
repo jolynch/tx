@@ -1,6 +1,6 @@
 # Filexfer Manifest Specification (FM/1)
 
-This document defines the strict manifest format emitted by `TXFER` and consumed by `start`/`get`.
+This document defines the strict manifest format emitted by `TXFER` and consumed by `tx recv copy` and `tx recv get`.
 
 When requesting a manifest via `TXFER`, clients may first issue `AUTH`.
 If `AUTH` provides a client recipient, the manifest stream is age-encrypted for that recipient.
@@ -19,7 +19,8 @@ Manifest is line-oriented UTF-8 text:
 2. Root entry (`D0`)
 3. Child entry lines
 
-Empty lines and `#` comments are ignored.
+Readers ignore empty lines and `#` comments, except in a `SYNC` request body,
+where an empty line ends the manifest and `#` lines are rejected.
 
 ## Header
 
@@ -92,7 +93,8 @@ Decoded value:
 - first entry: `<suffix_data>` (`prefix_len` must be `0`)
 - next entries: `prev_mtime[:prefix_len] + suffix_data`
 
-Decoded mtime must be unsigned Unix nanoseconds.
+`<suffix_data>` must be non-empty. Decoded mtime must be unsigned Unix
+nanoseconds.
 
 ## Path Front Coding
 
@@ -111,8 +113,8 @@ Path constraints:
 
 - `D0` must be the first entry and carries the absolute transfer root path
 - child entries must be relative (no leading `/`)
-- `..` traversal is rejected
-- `\\` is rejected; use `/`
+- paths that clean to `.`, `..`, or `../…` are rejected
+- `\` is rejected; use `/`
 
 ## Validation Rules
 
@@ -138,7 +140,7 @@ Path constraints:
 ```text
 FM/1 9f83ab12 mode=fast link-mbps=1200 concurrency=16
 D0 0 0:1735771234000000000 0755 0:10:/repo-root
-F1 4096 13:567890123 0644 0:14:data/chunk-000
+F1 4096 13:567890 0644 0:14:data/chunk-000
 F2 4096 14:90123 0644 11:3:001
 F3 1024 15:1350 0644 11:3:002
 F4 88 0:1736000000000000000 0600 0:15:logs/result.txt

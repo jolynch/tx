@@ -246,6 +246,8 @@ Behavior:
   delta needed to converge the local tree to the remote tree
 - `--clean` removes both `LOCAL_DST` and the `.tx/<dst>/` state directory before
   starting, forcing a fresh transfer with no resume
+- `--skip-write` requires `--verify none`; `--skip-fetch` allows only `none` or
+  `meta`
 - successful non-`--skip-fetch` runs clean up `.tx` after they finish
 
 `copy` validates a `manifest.progress` file against the manifest it was written
@@ -341,8 +343,7 @@ Use `gentle` when:
 - you want a lower-impact first pass
 - you expect to converge over multiple runs instead of finishing in one shot
 
-Both `copy` (`--mode fast|gentle`) and the lower-level transfer phase support
-strategy selection.
+`copy` selects the strategy with `--mode fast|gentle`.
 
 ### Local (daemonless) copy
 
@@ -444,7 +445,7 @@ manifest arrives has no `tid`.
 
 ## State Directory
 
-State is stored in `<LOCAL_DST>/../.tx/`:
+State is stored in `<LOCAL_DST>/../.tx/<basename of LOCAL_DST>/`:
 
 - `manifest.server.zst`: the last remote manifest snapshot (zstd-compressed FM/1)
 - `manifest.zst`: the local manifest after a successful write (zstd-compressed FM/1)

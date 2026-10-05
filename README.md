@@ -20,25 +20,25 @@ Four capabilities make this possible:
   overhead.
 
 - **Background durability.** Per-file `fdatasync` is moved off the download
-  critical path into a bounded background batcher that deduplicates by inode.
+  critical path into a background batcher that deduplicates by inode.
   It starts with a 512 MiB flush target, grows the batch size under backlog
-  pressure, and never lets fsync work fan out into unbounded goroutines. A
+  pressure. A
   final `syncfs` ensures the entire filesystem is durable before the transfer
   reports success.
 
 - **Lightweight verification.** Metadata checks (size, mtime, permissions) run
   by default after every copy. Sampled data verification (`--verify 5%data`)
-  reads 5% of bytes and catches corruption without a full re-read *or* time
-  budget verification (`--verify 30s`) verifies all metadata and as much
-  sampled data as it can in the time budget - practical on slow network
-  attached drives such as EBS.
+  checks an 8-byte sample in 5% of each file's 4 MiB frames and catches
+  corruption without a full re-read *or* time budget verification
+  (`--verify 30s`) verifies all metadata and as much sampled data as it can in the time
+  budget - practical on slow network attached drives such as EBS.
 
 See [docs/README.md](docs/README.md) for the documentation index and
 [docs/arch/OVERVIEW.md](docs/arch/OVERVIEW.md) for a deeper dive. If you
 are curious about benchmarking on your own setup check out
 [bench/README.md](bench/README.md) which has a data generator that can both
 generate incompressible (random) and
-compressible ([Selesia](https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia))
+compressible ([Silesia](https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia))
 test datasets as well as run `tx` or alternative `rsync` commands.
 
 ## Quick start

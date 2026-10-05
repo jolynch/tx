@@ -34,7 +34,7 @@ server manifest captured during transfer. It checks:
 If any file is missing, stale, or unexpectedly present, the CLI reports:
 
 ```text
-copy-verify-meta: [fail] mismatch new=<n> stale=<n> rm=<n>
+copy-verify-meta: [fail] mismatch new=<n> (<bytes>) stale=<n> (<bytes>) rm=<n>
 ```
 
 On success it reports a typed summary:
@@ -88,10 +88,9 @@ The verifier does not send one giant `CXSUM` request per file. Instead it:
 
 - generates samples incrementally
 - batches checksum targets per request
-- caps each command under an internal size budget so it stays comfortably below
-  the FTCP 4 MiB command-line limit
+- caps each request body at 3 MiB, or the server's target if smaller
 
-This keeps both memory usage and command size bounded on very large files.
+This keeps memory use and request size bounded on very large files.
 
 ## Deterministic Sampling Algorithm
 
@@ -185,7 +184,8 @@ During `SEND`, the server computes and emits a per-window checksum token in the
 final `FXT/1` trailer. The client includes that token in its `ACK`:
 
 ```text
-ACK <txferid> fd=<fid> <path> ack-token=<ack-bytes>@<server-ts>@<hash-token>
+ACK <txferid>
+fd=<fid> <path> ack-token=<ack-bytes>@<server-ts>@<hash-token>   (one framed body line per file)
 ```
 
 The server compares the presented hash token against the stored hash for the

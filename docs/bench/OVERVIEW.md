@@ -97,6 +97,7 @@ tx-bench-src/                  BENCH_DIR
     server-<tid>.json          sender metrics for the run whose data transfer had this tid
     server-<tid>.trace.jsonl   that run's tx send tree events (--trace only)
     tx-send.<k>.stats.jsonl    --stats output of tx send tree #k, tailed by tx-bench
+    tx-send.<k>.events.jsonl   tx send tree #k events (--trace only)
     tx-send.<k>.log            stderr of tx send tree #k
 ```
 
@@ -160,8 +161,8 @@ only deletes or regenerates inside a marked directory:
 1. **Startup prep.** Run [prep](#prep) with every enabled step: `generate` or
    `import`, then `check`, then `cache`.
 2. **Coordination files.** Write `server.json`, the request files
-   `runs/prep` and `runs/flush`, and `runs/prep.json` with `seq: 0` and
-   `served_tid: null`.
+   `runs/prep`, `runs/flush`, and `runs/stop`, and `runs/prep.json` (with
+   `seq: 0` and `served_tid: null`).
 3. **Start `tx send tree` #k** (k starts at 1). Its command line is
    assembled from:
    - `--listen` and the chroot;
@@ -458,21 +459,10 @@ runtime startup and the few small coordination fetches listed under
 
 ## Changes to tx
 
-### Prerequisite Fixes
-
-These are bugs in tx today that affect normal use, not just benchmarks. They
-are fixed as their own change, before any bench work:
-
-| Bug | Where | Effect | Fix |
-|-----|-------|--------|-----|
-| Transfer TTL counts from creation and is never refreshed | `store.go`: `ExpiresAt` set once at creation; the reaper ignores activity | Any transfer still running 10 minutes after TXFER is reaped mid-flight; SEND then fails with "transfer not found" | Refresh `ExpiresAt` on SEND/ACK activity, so the TTL counts from the last activity |
-| The chroot is not a boundary | `txfer.go`: `filepath.Join(root, dir)` with only an `IsAbs` check | `TXFER directory=/../../etc` serves `/etc` | Reject any path that leaves the root after joining (an `os.Root`-style or `filepath.Rel` check), including through symlinks |
-| Zero-byte files never complete | `store.go`: the ACK path returns on `target <= prev` before `Done++` when both are 0 | A transfer containing any empty file never reaches `Done == NumFiles`, so it is never logged as complete | Count a zero-byte file as done when it is acknowledged (or when it is sent) |
-
 ### New Features
 
 These are user-facing tx features, useful outside `tx-bench`. They are
-mirrored in the [CLI reference](../pub/CLI.md) when implemented, and none of
+documented in the [CLI reference](../pub/CLI.md), and none of
 them changes behavior when its flag is absent.
 
 | Flag | On | Writes |
@@ -482,9 +472,6 @@ them changes behavior when its flag is absent.
 | `-f events` | `tx send tree`, `tx recv copy`, `tx recv get` | A new `--progress-format` value: the event timeline in [Trace](./TRACE.md) as JSON lines, written to the matching `-p/--progress-path` target |
 | SIGTERM | `tx send tree` | A clean shutdown that writes the final `--stats` and progress records before exiting |
 | `--exit-with none\|stdin` | `tx send tree` | Default `none`: no change. `stdin`: the same clean shutdown when stdin (which must be a pipe or socket) closes, so whoever holds the pipe ties tx's lifetime to its own. A mode, not a boolean, so ties to a pid or descriptor can follow |
-
-To record the full requested path, the store must keep a single-file
-transfer's file name. Today it records only the parent directory.
 
 **The `events` progress format.** It uses the existing progress targets:
 files, FIFOs, and `-` for stdout, mixed freely with `json` and `int` targets
@@ -528,8 +515,6 @@ Internally:
     `bench/results/latest.txt`, without a summary step.
   - The old `bench generate` and `bench report` helpers (`generate.go`,
     `report.go`, `main.go`) are removed.
-- `bench/run` is retired once `tx-bench local` reaches parity (rsync baseline
-  as `--baseline rsync`; perf flamegraphs stay an external `perf record`).
 
 ## Delivery Order
 

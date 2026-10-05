@@ -11,10 +11,9 @@ file transfers over plain TCP sockets.
   the command protocol — any body whose size grows with the transfer. See
   [OVERVIEW.md](./OVERVIEW.md#request-and-response-bodies) for which verbs use
   which bodies.
-- `file_id` is an integer index into that exchanged manifest (0-based).
-  `file_id=0` is reserved as a sentinel meaning "this frame carries a byte
-  stream, not a manifest file" — used by manifest streams, request item lists,
-  and the `STATUS` list response.
+- `file_id` is the manifest entry ID; `0` is the root `D0`. Framed bodies
+  (manifest streams, request item lists, and the `STATUS` list response) also
+  use `file_id=0`, meaning "a byte stream, not a file".
 
 ## Frame Structure
 
@@ -55,13 +54,13 @@ FXT/1 <file_id> status=ok ts=<unix_ms> [file-hash=<algo>:<value>] next=<offset> 
   implementation emits `file-hash=xxh128:<hex32>`.
 - `next=<offset>`: the offset the following frame starts at
   (`offset + size`). The final trailer uses `next=0` as a terminal marker.
-- `meta:*=<value>`: file metadata tokens on `SEND` final trailers (see
-  [TCP Command Contract](#tcp-command-contract)).
+- `meta:*=<value>`: file metadata tokens on `SEND` and `CXSUM` final trailers
+  (see [TCP Command Contract](#tcp-command-contract)).
 - `hash=<algo>:<value>`: whole-frame checksum, always the last token when
-  present. Computed as `xxh64` over the header line, the payload bytes, and
-  the trailer bytes preceding ` hash=`. Emitted on manifest (`TXFER`/`SYNC`)
-  and `CXSUM` frames; **not** emitted on `SEND` file frames, which rely on
-  the window `file-hash` plus `ACK` validation instead.
+  present. Computed as XXH3-64 (labeled `xxh64`) over the header line, the
+  payload bytes, and the trailer bytes preceding ` hash=`. Emitted on
+  framed-body and `CXSUM` frames; **not** emitted on `SEND` file frames, which
+  rely on the window `file-hash` plus `ACK` validation instead.
 
 ### Example
 
@@ -86,11 +85,11 @@ Properties are ASCII and case-sensitive.
 ### Optional
 
 - `hash=<algo>:<value>`: per-chunk checksum of this frame's logical
-  (decompressed) bytes. Emitted on manifest (`TXFER`/`SYNC`) and `CXSUM`
-  frame headers (currently `xxh128`); not emitted on `SEND` file frames.
-  At most one `hash` token per header.
+  (decompressed) bytes. Emitted on framed-body frame headers (`xxh128`) and
+  `CXSUM` frame headers (the first requested algorithm, or `none:0`); not
+  emitted on `SEND` file frames. At most one `hash` token per header.
 - `max-wsize=<bytes>`: server hint for maximum wire payload bytes per frame for this response window.
-  - Emitted on the first frame of a `SEND` response.
+  - Emitted on the first frame of each requested window.
   - Current bucket algorithm is ceiling in `{1,2,4,8,16,32,64} MiB`.
 
 ## Compression

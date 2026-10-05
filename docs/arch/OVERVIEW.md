@@ -51,7 +51,8 @@ share connections, so quick commands never queue behind file transfers:
 | data    | `SEND`, `CXSUM`                  | at most `concurrency`                 |
 | control | `ACK`, `STATUS`, `TXFER`, `SYNC` | `concurrency`, grows during a burst   |
 
-`concurrency` is the probe's suggestion, or `--concurrency` when set. Both
+`concurrency` is the probe's suggestion, or `--concurrency` when set, clamped
+to `[2, 256]`. Both
 pools work the same way and differ only in growth:
 
 - **Warm.** Each pool opens `concurrency` connections up front, during the
@@ -78,16 +79,16 @@ and verification), so the pools warm once.
 Every pooled connection has already completed the AUTH handshake. When the
 server grants keep-alive (negotiated on the discovery probe via
 `keep-alive=auto` / `keep-alive-ms`), pooled connections are long-lived
-sessions: each is upgraded with a zero-payload keep-alive PROBE when dialed,
-and a connection whose response was cleanly consumed returns to its pool
-instead of being closed. Reused connections skip the TCP and AUTH handshakes
-and keep their congestion window warm across batches. Two guardrails keep
-silently dead connections out of the pools: a background loop heartbeats
-every idle pooled connection at one quarter of the granted idle window with
-a zero-payload PROBE round trip (a failed heartbeat closes the connection and
+sessions: each is upgraded with a zero-payload keep-alive PROBE when dialed, and
+a connection whose response was cleanly consumed returns to its pool instead of
+being closed. Reused connections skip the TCP and AUTH handshakes and keep their
+congestion window warm across batches. Two guardrails keep silently dead
+connections out of the pools: once per quarter of the granted idle window, a
+background loop heartbeats each pooled connection idle for that long with a
+zero-payload PROBE round trip (a failed heartbeat closes the connection and
 starts a replacement, and borrowers peek for a pending EOF before reuse), and
-the server independently reaps connections that send nothing for the
-keep-alive window (`--idle-timeout`, default 60s).
+the server independently reaps connections that send nothing for the keep-alive
+window (`--idle-timeout`, default 60s).
 
 Against servers without keep-alive, or after a dirty response (error
 mid-stream, or any `CXSUM` stream), a connection is closed after one use and
@@ -107,15 +108,16 @@ roughly the same amount of work.
 
 ```
 perFileWorkers = suggestedConcurrency / windowConcurrency
-batchMaxBytes  = windowBytes / perFileWorkers          (rounded to power-of-2 MiB)
+batchMaxBytes  = windowBytes / perFileWorkers          (rounded up to power-of-2 MiB)
 ```
 
-The default window is 512 MiB with a window concurrency of 4. On a 24-CPU
-server in fast mode (IO depth 4), suggested concurrency is 96, giving
-`perFileWorkers = 24` and a batch size of ~32 MiB. The result is clamped: the
-floor is the larger of the server and client socket buffers (no point making a
-batch smaller than what the OS has already allocated for the connection), and
-the ceiling is the window size.
+The default window is 512 MiB with a window concurrency of 4. On a 24-CPU server
+in fast mode (IO depth 4), suggested concurrency is 96, giving
+`perFileWorkers = 24` and a batch size of ~32 MiB. The result is capped at half a second of
+per-connection link bandwidth, then clamped: the floor is the larger of the
+server and client socket buffers (no point making a batch smaller than what the
+OS has already allocated for the connection), and the ceiling is the window
+size.
 
 **Small files → packed batches.** The manifest is walked in order and files are
 packed into batches until the next file would exceed `batchMaxBytes`. A batch
@@ -181,12 +183,12 @@ Each worker:
 
 Because every worker has its own TCP connection, there is no head-of-line
 blocking: a slow file on one connection does not stall transfers on the others.
-On the server side, each `SEND` handler uses `fadvise(SEQUENTIAL)` and
+On the server side, each fast-mode `SEND` handler uses `fadvise(SEQUENTIAL)` and
 background `readahead(2)` to prefetch the next frame into the page cache while
-the current frame is being written to the socket. When encryption is disabled
-and the output is a raw TCP socket, the server uses a zero-copy
-`splice`/`tee` path that moves file data from the page cache to the NIC
-without copying through userspace.
+the current frame is being written to the socket. When encryption and
+compression are off and the output is a raw TCP socket, the server uses a
+zero-copy `splice`/`tee` path that moves file data from the page cache to the
+NIC without copying through userspace.
 
 The net effect is that disk reads, compression, network writes, and disk writes
 on the receiver all overlap — keeping SSD, CPU, and NIC busy simultaneously.
@@ -221,10 +223,10 @@ direction (hysteresis streak = 2).
 
 ### Compression ladder
 
-The adaptation walks a four-rung ladder:
+The adaptation walks a three-rung ladder:
 
 ```
-none (default) → lz4 → zstd (level 1) → zstd (default)
+none (default) → lz4 → zstd (level 1)
 ```
 
 The default starting point is `none`. On slow links with compressible data, the
@@ -270,10 +272,10 @@ by `--fsync-interval` (default 512 MiB).
 
 ### Background batch fdatasync (default)
 
-After each file's writes complete, the file descriptor is `dup()`'d and
-enqueued to a background channel along with its written byte count. A reader
-goroutine accumulates requests; when the accumulated bytes reach the
-threshold (512 MiB by default), it spawns a worker goroutine that:
+After each file's writes complete, the file descriptor is `dup()`'d and enqueued
+to a background channel along with its written byte count. A reader goroutine
+accumulates requests; when the accumulated bytes reach the threshold (512 MiB by
+default, raised under backlog) or 4096 files, it spawns a worker goroutine that:
 
 1. Groups requests by `(dev, ino)` via `fstat` — hardlinked files are synced
    once.
