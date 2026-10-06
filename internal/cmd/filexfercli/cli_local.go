@@ -20,7 +20,6 @@ import (
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/fsync"
 	"github.com/jolynch/tx/internal/pagecache"
-	"github.com/jolynch/tx/internal/sampler"
 )
 
 const localCopyBufferBytes = 1 << 20
@@ -931,148 +930,9 @@ func verifyLocalCopy(srcRoot, dstRoot string, entries []localEntry, cfg copyCLIC
 		fmt.Fprintf(stderr, "local-verify-meta: [ok] total=%d files=%d hardlinks=%d symlinks=%d dirs=%d\n",
 			len(srcManifest.Entries), files, hardlinks, symlinks, dirs)
 	}
-	if cfg.verifyDataSamplePct <= 0 {
-		if metaFailed {
-			return 1
-		}
-		return 0
-	}
-	files, samples, elapsed, partial, err := verifyLocalCopyData(srcRoot, dstRoot, entries, cfg.verifyDataSamplePct, cfg.verifyBudget, concurrency)
-	if err != nil {
-		fmt.Fprintf(stderr, "local-verify-data: [fail] %v\n", err)
-		return 1
-	}
-	status := "[ok]"
-	if partial {
-		status = "[partial-ok]"
-	}
-	fmt.Fprintf(stderr, "local-verify-data: %s files=%d samples=%d pct=%d elapsed=%s\n",
-		status, files, samples, cfg.verifyDataSamplePct, elapsed.Round(time.Millisecond))
-	if metaFailed {
-		return 1
-	}
-	return 0
-}
-
-func verifyLocalCopyData(srcRoot, dstRoot string, entries []localEntry, pct int, budget time.Duration, concurrency int) (files int, samples int, elapsed time.Duration, partial bool, err error) {
-	start := time.Now()
-	type task struct {
-		rel string
-		gen sampler.Generator
-	}
-	var tasks []task
-	for _, le := range entries {
-		if !isRegularFileEntry(le.entry.Type) {
-			continue
-		}
-		gen, ok := sampler.New(srcRoot, le.entry.Path, le.entry.ID, le.entry.Size, pct, defaultVerifySampleFrameSize, verifySampleBytes)
-		if !ok {
-			continue
-		}
-		tasks = append(tasks, task{rel: le.entry.Path, gen: gen})
-	}
-	if len(tasks) == 0 {
-		return 0, 0, time.Since(start), false, nil
-	}
-	if concurrency <= 0 {
-		concurrency = 1
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if budget > 0 {
-		var budgetCancel context.CancelFunc
-		ctx, budgetCancel = context.WithTimeout(ctx, budget)
-		defer budgetCancel()
-	}
-	var (
-		mu         sync.Mutex
-		firstErr   error
-		doneFiles  int
-		doneRanges int
-	)
-	jobs := make(chan task)
-	var wg sync.WaitGroup
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// Samples are smaller than the pool's 4 KiB minimum.
-			scratch := make([]byte, verifySampleBytes)
-			for t := range jobs {
-				if ctx.Err() != nil {
-					continue
-				}
-				total := int(t.gen.TotalSamples())
-				e := verifyLocalSampleFile(srcRoot, dstRoot, t.rel, t.gen, scratch)
-				mu.Lock()
-				if e != nil {
-					if firstErr == nil {
-						firstErr = e
-						cancel()
-					}
-				} else {
-					doneFiles++
-					doneRanges += total
-				}
-				mu.Unlock()
-			}
-		}()
-	}
-	dispatched := true
-	for _, t := range tasks {
-		if ctx.Err() != nil {
-			dispatched = false
-			break
-		}
-		select {
-		case <-ctx.Done():
-			dispatched = false
-		case jobs <- t:
-			continue
-		}
-		break
-	}
-	close(jobs)
-	wg.Wait()
-	if firstErr != nil {
-		return 0, 0, time.Since(start), false, firstErr
-	}
-	partial = !dispatched && budget > 0
-	return doneFiles, doneRanges, time.Since(start), partial, nil
-}
-
-func verifyLocalSampleFile(srcRoot, dstRoot, rel string, gen sampler.Generator, scratch []byte) error {
-	srcPath := filepath.Join(srcRoot, filepath.FromSlash(rel))
-	dstPath := filepath.Join(dstRoot, filepath.FromSlash(rel))
-	srcFd, err := os.Open(srcPath)
-	if err != nil {
-		return fmt.Errorf("open src %s: %w", rel, err)
-	}
-	defer srcFd.Close()
-	dstFd, err := os.Open(dstPath)
-	if err != nil {
-		return fmt.Errorf("open dst %s: %w", rel, err)
-	}
-	defer dstFd.Close()
-	for gen.Remaining() > 0 {
-		s, ok := gen.Peek()
-		if !ok {
-			break
-		}
-		gen.Advance()
-		srcHash, err := computeLocalSampleHash(srcFd, s.Offset, s.Size, scratch)
-		if err != nil {
-			return fmt.Errorf("hash src %s@%d: %w", rel, s.Offset, err)
-		}
-		dstHash, err := computeLocalSampleHash(dstFd, s.Offset, s.Size, scratch)
-		if err != nil {
-			return fmt.Errorf("hash dst %s@%d: %w", rel, s.Offset, err)
-		}
-		if !strings.EqualFold(srcHash, dstHash) {
-			return fmt.Errorf("data mismatch %s at offset=%d size=%d", rel, s.Offset, s.Size)
-		}
-	}
-	return nil
+	return finishDataVerify(stderr, "local-verify-data", cfg, metaFailed, func() (verifyDataResult, error) {
+		return verifyLocalCopyData(srcRoot, dstRoot, entries, cfg.verifyOptions(), concurrency)
+	})
 }
 
 // --- progress ---

@@ -329,3 +329,95 @@ func TestChecksumBatchResponseLifecycle(t *testing.T) {
 		})
 	}
 }
+
+// TestChecksumBatchRequestLimits checks how VisitChecksumBatches splits
+// targets under the limits a server advertises: a request grows to the soft
+// target but never past the maximum, and a single target over the maximum
+// fails before any request is sent.
+func TestChecksumBatchRequestLimits(t *testing.T) {
+	targets := make([]ChecksumTarget, 30)
+	for i := range targets {
+		targets[i] = ChecksumTarget{FileID: uint64(i + 1), FullPath: "/" + strings.Repeat("p", 30), Size: 4096}
+	}
+	for _, tc := range []struct {
+		name            string
+		target, maximum int64
+		wantErr         bool
+	}{
+		{name: "soft target", target: 180, maximum: 400},
+		{name: "hard maximum", target: 180, maximum: 180},
+		{name: "oversized target", target: 1, maximum: 1, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests atomic.Int64
+			srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+				requests.Add(1)
+				_, err := io.WriteString(out, "FX/1 1 offset=0 size=0 wsize=0 comp=none ts=1\nFXT/1 1 status=ok ts=1 next=0\nOK\r\n")
+				return err
+			})
+			defer srv.Close()
+			c := NewClient(srv.URL)
+			defer c.Close()
+			c.cacheRequestLimits(tc.target, tc.maximum, 1<<30)
+			var sizes []int64
+			var visited int
+			err := c.VisitChecksumBatches(context.Background(), GetChecksumRequest{TransferID: "tid", Targets: targets}, ChecksumBatchOptions{},
+				func(batch []ChecksumTarget, resp GetChecksumResponse) error {
+					var size int64
+					for _, target := range batch {
+						item, err := checksumTargetItemBytes(target)
+						if err != nil {
+							return err
+						}
+						size += int64(len(item))
+					}
+					sizes = append(sizes, size)
+					visited += len(batch)
+					_, err := io.Copy(io.Discard, resp.Reader)
+					return err
+				})
+			if tc.wantErr {
+				if err == nil || requests.Load() != 0 {
+					t.Fatalf("err = %v, requests = %d; want an error before any request", err, requests.Load())
+				}
+				return
+			}
+			if err != nil || visited != len(targets) || len(sizes) < 2 {
+				t.Fatalf("err = %v, visited %d of %d targets in %d requests", err, visited, len(targets), len(sizes))
+			}
+			for i, size := range sizes {
+				if size > tc.maximum {
+					t.Fatalf("request %d is %d bytes, over the maximum %d", i, size, tc.maximum)
+				}
+				// Only the last request may stop short of the soft target.
+				if tc.maximum > tc.target && i < len(sizes)-1 && size < tc.target {
+					t.Fatalf("request %d is %d bytes, below the soft target %d", i, size, tc.target)
+				}
+			}
+		})
+	}
+}
+
+// TestChecksumResponseTimeout pins the deadline to the bytes requested, not
+// the number of targets, so a batch of many small files cannot stretch it.
+func TestChecksumResponseTimeout(t *testing.T) {
+	const per = 30 * time.Second
+	small := make([]ChecksumTarget, 1024)
+	for i := range small {
+		small[i].Size = 4 << 10
+	}
+	for _, tc := range []struct {
+		name    string
+		targets []ChecksumTarget
+		want    time.Duration
+	}{
+		{name: "many small targets", targets: small, want: per},
+		{name: "four slots", targets: []ChecksumTarget{{Size: 4 << 20}, {Size: 4 << 20}, {Size: 4 << 20}, {Size: 4 << 20}}, want: 4 * per},
+		{name: "partial unit rounds up", targets: []ChecksumTarget{{Size: 4<<20 + 1}}, want: 2 * per},
+		{name: "unsized target", targets: []ChecksumTarget{{}}, want: per},
+	} {
+		if got := checksumResponseTimeout(per, tc.targets); got != tc.want {
+			t.Errorf("%s: checksumResponseTimeout = %s, want %s", tc.name, got, tc.want)
+		}
+	}
+}

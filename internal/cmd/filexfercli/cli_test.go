@@ -34,7 +34,6 @@ import (
 	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/fsync"
 	"github.com/jolynch/tx/internal/pagecache"
-	"github.com/jolynch/tx/internal/sampler"
 	"github.com/jolynch/tx/internal/txstats"
 	"github.com/zeebo/xxh3"
 )
@@ -387,6 +386,12 @@ func writeChecksumFrame(out io.Writer, fileID uint64, offset int64, size int64, 
 		FileHashes: []string{hash},
 		Next:       0,
 	})
+	return err
+}
+
+// writeChecksumOK ends a fake CXSUM response the way the real server does.
+func writeChecksumOK(out io.Writer) error {
+	_, err := io.WriteString(out, "OK\r\n")
 	return err
 }
 
@@ -2260,388 +2265,6 @@ func TestFormatCacheVerifyLine(t *testing.T) {
 	}
 }
 
-func TestFormatVerifyDataSummaryLine(t *testing.T) {
-	t.Run("budgeted", func(t *testing.T) {
-		got := formatVerifyDataSummaryLine(10011, 14224, 100, 10*time.Second, 9876*time.Millisecond, false)
-		want := "copy-verify-data: [ok] files=10011 samples=14224 budget=10s elapsed=9.876s"
-		if got != want {
-			t.Fatalf("formatVerifyDataSummaryLine() = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("sampled-percent", func(t *testing.T) {
-		got := formatVerifyDataSummaryLine(42, 84, 5, 0, 1500*time.Microsecond, false)
-		want := "copy-verify-data: [ok] files=42 samples=84 pct=5 elapsed=2ms"
-		if got != want {
-			t.Fatalf("formatVerifyDataSummaryLine() = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("partial-budgeted", func(t *testing.T) {
-		got := formatVerifyDataSummaryLine(12, 34, 100, 10*time.Second, 1500*time.Millisecond, true)
-		want := "copy-verify-data: [partial-ok] files=12 samples=34 budget=10s elapsed=1.5s"
-		if got != want {
-			t.Fatalf("formatVerifyDataSummaryLine() = %q, want %q", got, want)
-		}
-	})
-}
-
-func TestVerifyCopyDataSamplesBatchesChecksumRequests(t *testing.T) {
-	for _, tc := range []struct {
-		name            string
-		count           int
-		pathLength      int
-		target, maximum int64
-		encrypted       bool
-	}{
-		{name: "fallback", count: 1200, pathLength: 3000},
-		{name: "soft-target", count: 30, pathLength: 30, target: 180, maximum: 400},
-		{name: "hard-maximum", count: 30, pathLength: 30, target: 180, maximum: 180},
-		{name: "encrypted", count: 30, pathLength: 30, target: 180, maximum: 400, encrypted: true},
-		{name: "oversized-target", count: 1, pathLength: 30, target: 1, maximum: 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			tmp := t.TempDir()
-			localPath := filepath.Join(tmp, "huge.bin")
-			fd, err := os.Create(localPath)
-			if err != nil {
-				t.Fatalf("create local file: %v", err)
-			}
-			fileSize := int64(tc.count) * defaultVerifySampleFrameSize
-			if err := fd.Truncate(fileSize); err != nil {
-				_ = fd.Close()
-				t.Fatalf("truncate local file: %v", err)
-			}
-			if err := fd.Close(); err != nil {
-				t.Fatalf("close local file: %v", err)
-			}
-
-			manifest := &tx.Manifest{
-				TransferID:  "txverify-batch",
-				Root:        "/" + strings.Repeat("r", tc.pathLength),
-				Concurrency: 1,
-				Entries: []tx.ManifestEntry{
-					{ID: 1, Size: fileSize, Path: "huge.bin"},
-				},
-			}
-			cfg := copyCLIConfig{
-				localDst:            tmp,
-				verifyDataSamplePct: 100,
-				concurrency:         1,
-			}
-
-			var serverID *age.X25519Identity
-			if tc.encrypted {
-				serverID, err = age.GenerateX25519Identity()
-				if err != nil {
-					t.Fatal(err)
-				}
-				cfg.encryptMode = "auto"
-			}
-			var reqCount atomic.Int64
-			var maxBodyBytes atomic.Int64
-			expected, _ := sampler.New(manifest.Root, "huge.bin", 1, fileSize, 100, defaultVerifySampleFrameSize, verifySampleBytes)
-			var zero [verifySampleBytes]byte
-			zeroHash := encoding.FormatXXH128HashToken(xxh3.Hash128(zero[:]))
-			srv := newFTCPTestServerWithIdentity(t, serverID, func(req intftcp.Request, out io.Writer) error {
-				if req.Verb == intftcp.VerbPROBE {
-					if tc.maximum == 0 {
-						return writeCLIProbeResponse(req, out)
-					}
-					_, err := fmt.Fprintf(out, "PROBE cpu=1 io-depth=1 cts0=%s sts0=10 sts1=11 probe-bytes=1 target-request-bytes=%d max-request-bytes=%d\nXOK\r\n", req.Params[0]["cts0"], tc.target, tc.maximum)
-					return err
-				}
-				if req.Verb != intftcp.VerbCXSUM {
-					return fmt.Errorf("unexpected verb: %v", req.Verb)
-				}
-				targets := checksumTargetsFromRequest(t, req)
-				var bodyBytes int64
-				for _, target := range targets {
-					line := fmt.Sprintf("fd=%d %d:%s", target.FileID, len(target.FullPath), target.FullPath)
-					if target.Offset > 0 {
-						line += fmt.Sprintf(" offset=%d", target.Offset)
-					}
-					if target.Size > 0 {
-						line += fmt.Sprintf(" size=%d", target.Size)
-					}
-					if target.Algo != "" {
-						line += " algo=" + target.Algo
-					}
-					bodyBytes += int64(len(line) + 1)
-				}
-				reqCount.Add(1)
-				for {
-					current := maxBodyBytes.Load()
-					if int64(bodyBytes) <= current || maxBodyBytes.CompareAndSwap(current, int64(bodyBytes)) {
-						break
-					}
-				}
-				if tc.maximum > 0 && bodyBytes > tc.maximum {
-					return fmt.Errorf("request %d exceeds maximum %d", bodyBytes, tc.maximum)
-				}
-				for _, target := range targets {
-					want, ok := expected.Peek()
-					if !ok || target.Offset != want.Offset || target.Size != want.Size {
-						return fmt.Errorf("checksum targets changed order or range: %+v, want %+v", target, want)
-					}
-					expected.Advance()
-					hash := zeroHash
-					if target.Size > 0 && target.Size < verifySampleBytes {
-						hash = encoding.FormatXXH128HashToken(xxh3.Hash128(zero[:target.Size]))
-					}
-					if err := writeChecksumFrame(out, target.FileID, target.Offset, target.Size, hash); err != nil {
-						return err
-					}
-				}
-				return nil
-			})
-			defer srv.Close()
-
-			files, samples, _, partial, err := verifyCopyDataSamples(srv.URL, cfg, manifest, io.Discard)
-			if tc.maximum == 1 {
-				if err == nil || reqCount.Load() != 0 {
-					t.Fatalf("oversized target: error=%v, requests=%d", err, reqCount.Load())
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("verifyCopyDataSamples() err = %v", err)
-			}
-			if partial {
-				t.Fatal("expected partial=false")
-			}
-			if files != 1 || samples != tc.count {
-				t.Fatalf("verifyCopyDataSamples() = files=%d samples=%d, want 1/%d", files, samples, tc.count)
-			}
-			if got := reqCount.Load(); got <= 1 {
-				t.Fatalf("expected multiple checksum requests, got %d", got)
-			}
-			if got := maxBodyBytes.Load(); got > verifyChecksumRequestTargetBytes+4096 {
-				t.Fatalf("expected request bytes near target %d, got %d", verifyChecksumRequestTargetBytes, got)
-			}
-			if tc.maximum > tc.target && maxBodyBytes.Load() < tc.target {
-				t.Fatalf("requests stopped before soft target %d: max=%d", tc.target, maxBodyBytes.Load())
-			}
-		})
-	}
-}
-
-func TestVerifyCopyDataSamplesStopsDispatchAfterBudget(t *testing.T) {
-	withVerifyBudgetGracePeriod(t, 100*time.Millisecond)
-
-	tmp := t.TempDir()
-	serverFiles := map[string][]byte{
-		"/remote/a.txt": []byte("abcdefghijklmno"),
-		"/remote/b.txt": []byte("pqrstuvwxyz0123"),
-	}
-	for serverPath, body := range serverFiles {
-		localPath := filepath.Join(tmp, filepath.Base(serverPath))
-		if err := os.WriteFile(localPath, body, 0o644); err != nil {
-			t.Fatalf("write %s: %v", localPath, err)
-		}
-	}
-
-	manifest := &tx.Manifest{
-		TransferID:  "txverify-budget",
-		Root:        "/remote",
-		Concurrency: 1,
-		Entries: []tx.ManifestEntry{
-			{ID: 1, Size: int64(len(serverFiles["/remote/a.txt"])), Path: "a.txt"},
-			{ID: 2, Size: int64(len(serverFiles["/remote/b.txt"])), Path: "b.txt"},
-		},
-	}
-	cfg := copyCLIConfig{
-		localDst:            tmp,
-		verifyDataSamplePct: 100,
-		verifyBudget:        10 * time.Millisecond,
-		concurrency:         1,
-	}
-
-	var stderr bytes.Buffer
-	var started atomic.Int64
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		if req.Verb == intftcp.VerbPROBE {
-			return writeCLIProbeResponse(req, out)
-		}
-		if req.Verb != intftcp.VerbCXSUM {
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-		if started.Add(1) == 1 {
-			time.Sleep(30 * time.Millisecond)
-		}
-		item := req.Params[1]
-		fileID, err := strconv.ParseUint(item["fid"], 10, 64)
-		if err != nil {
-			return err
-		}
-		offset, err := parseOptionalInt64(item["offset"])
-		if err != nil {
-			return err
-		}
-		size, err := strconv.ParseInt(item["size"], 10, 64)
-		if err != nil {
-			return err
-		}
-		body := serverFiles[item["path"]]
-		return writeChecksumFrame(out, fileID, offset, size, checksumTokenForRange(body, offset, size))
-	})
-	defer srv.Close()
-
-	files, samples, _, partial, err := verifyCopyDataSamples(srv.URL, cfg, manifest, &stderr)
-	if err != nil {
-		t.Fatalf("verifyCopyDataSamples() err = %v", err)
-	}
-	if !partial {
-		t.Fatal("expected partial=true")
-	}
-	if files != 1 || samples != 1 {
-		t.Fatalf("verifyCopyDataSamples() = files=%d samples=%d, want 1/1", files, samples)
-	}
-	if got := started.Load(); got != 1 {
-		t.Fatalf("expected exactly one checksum request, got %d", got)
-	}
-	if !strings.Contains(stderr.String(), "copy-verify-data: budget expired, verified 1/2 files 1 samples") {
-		t.Fatalf("expected partial verify budget log, got %q", stderr.String())
-	}
-}
-
-func TestVerifyCopyDataSamplesReturnsMismatchDuringGrace(t *testing.T) {
-	withVerifyBudgetGracePeriod(t, 100*time.Millisecond)
-
-	tmp := t.TempDir()
-	body := []byte("abcdefghijklmno")
-	if err := os.WriteFile(filepath.Join(tmp, "a.txt"), body, 0o644); err != nil {
-		t.Fatalf("write local file: %v", err)
-	}
-
-	manifest := &tx.Manifest{
-		TransferID:  "txverify-mismatch",
-		Root:        "/remote",
-		Concurrency: 1,
-		Entries: []tx.ManifestEntry{
-			{ID: 1, Size: int64(len(body)), Path: "a.txt"},
-		},
-	}
-	cfg := copyCLIConfig{
-		localDst:            tmp,
-		verifyDataSamplePct: 100,
-		verifyBudget:        10 * time.Millisecond,
-		concurrency:         1,
-	}
-
-	var started atomic.Int64
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		if req.Verb == intftcp.VerbPROBE {
-			return writeCLIProbeResponse(req, out)
-		}
-		if req.Verb != intftcp.VerbCXSUM {
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-		started.Add(1)
-		time.Sleep(30 * time.Millisecond)
-		item := req.Params[1]
-		fileID, err := strconv.ParseUint(item["fid"], 10, 64)
-		if err != nil {
-			return err
-		}
-		offset, err := parseOptionalInt64(item["offset"])
-		if err != nil {
-			return err
-		}
-		size, err := strconv.ParseInt(item["size"], 10, 64)
-		if err != nil {
-			return err
-		}
-		return writeChecksumFrame(out, fileID, offset, size, encoding.FormatXXH128HashToken(xxh3.Hash128([]byte("wrong!!!"))))
-	})
-	defer srv.Close()
-
-	_, _, _, partial, err := verifyCopyDataSamples(srv.URL, cfg, manifest, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
-		t.Fatalf("verifyCopyDataSamples() err = %v, want checksum mismatch", err)
-	}
-	if partial {
-		t.Fatal("expected partial=false on mismatch")
-	}
-	if got := started.Load(); got != 1 {
-		t.Fatalf("expected one checksum request, got %d", got)
-	}
-}
-
-func TestVerifyCopyDataSamplesForcedStopReturnsSuccess(t *testing.T) {
-	withVerifyBudgetGracePeriod(t, 20*time.Millisecond)
-
-	tmp := t.TempDir()
-	body := []byte("abcdefghijklmno")
-	if err := os.WriteFile(filepath.Join(tmp, "a.txt"), body, 0o644); err != nil {
-		t.Fatalf("write local file: %v", err)
-	}
-
-	manifest := &tx.Manifest{
-		TransferID:  "txverify-forced-stop",
-		Root:        "/remote",
-		Concurrency: 1,
-		Entries: []tx.ManifestEntry{
-			{ID: 1, Size: int64(len(body)), Path: "a.txt"},
-		},
-	}
-	cfg := copyCLIConfig{
-		localDst:            tmp,
-		verifyDataSamplePct: 100,
-		verifyBudget:        10 * time.Millisecond,
-		concurrency:         1,
-	}
-
-	var stderr bytes.Buffer
-	var started atomic.Int64
-	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
-		if req.Verb == intftcp.VerbPROBE {
-			return writeCLIProbeResponse(req, out)
-		}
-		if req.Verb != intftcp.VerbCXSUM {
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-		started.Add(1)
-		time.Sleep(200 * time.Millisecond)
-		return nil
-	})
-	defer srv.Close()
-
-	type result struct {
-		files   int
-		samples int
-		partial bool
-		err     error
-	}
-	done := make(chan result, 1)
-	go func() {
-		files, samples, _, partial, err := verifyCopyDataSamples(srv.URL, cfg, manifest, &stderr)
-		done <- result{files: files, samples: samples, partial: partial, err: err}
-	}()
-
-	select {
-	case got := <-done:
-		if got.err != nil {
-			t.Fatalf("verifyCopyDataSamples() err = %v", got.err)
-		}
-		if !got.partial {
-			t.Fatal("expected partial=true")
-		}
-		if got.files != 0 || got.samples != 0 {
-			t.Fatalf("verifyCopyDataSamples() = files=%d samples=%d, want 0/0", got.files, got.samples)
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("verifyCopyDataSamples() did not return after forced stop")
-	}
-
-	if got := started.Load(); got != 1 {
-		t.Fatalf("expected one checksum request, got %d", got)
-	}
-	if !strings.Contains(stderr.String(), "copy-verify-data: budget expired, verified 0/1 files 0 samples") {
-		t.Fatalf("expected forced-stop budget log, got %q", stderr.String())
-	}
-}
-
 func TestCompactETAUsesFractionalUnitsEarly(t *testing.T) {
 	tests := []struct {
 		in   time.Duration
@@ -3722,7 +3345,7 @@ func TestRunCLICopyMetadataApplyWarningStillRunsVerifyData(t *testing.T) {
 					return err
 				}
 			}
-			return nil
+			return writeChecksumOK(out)
 		default:
 			return fmt.Errorf("unexpected verb: %v", req.Verb)
 		}
@@ -4498,8 +4121,8 @@ func TestRunCLIStartProgressFileShowsResumedBytes(t *testing.T) {
 // TestRunCLICopySharesOneClient runs the copy phases (transfer, start,
 // converge, and metadata verification) and checks they share one client: the
 // copy dials one pair of connection pools plus probes, where a client per
-// phase would warm a pair of pools per phase. It leaves out data
-// verification, whose CXSUM connections are single-use by design.
+// phase would warm a pair of pools per phase. Data verification reuses the
+// data pool, so its CXSUM requests add no dials.
 func TestRunCLICopySharesOneClient(t *testing.T) {
 	const concurrency = 4
 	src := t.TempDir()
@@ -4525,7 +4148,7 @@ func TestRunCLICopySharesOneClient(t *testing.T) {
 	tmp := t.TempDir()
 	statsPath := filepath.Join(tmp, "copy.json")
 	var stdout, stderr bytes.Buffer
-	if code := RunCLI([]string{"copy", "--progress=false", "--verify", "meta", "--concurrency", strconv.Itoa(concurrency),
+	if code := RunCLI([]string{"copy", "--progress=false", "--verify", "full", "--concurrency", strconv.Itoa(concurrency),
 		"--stats", statsPath, "tx://" + ln.Addr().String() + "/", filepath.Join(tmp, "dst")}, &stdout, &stderr); code != 0 {
 		t.Fatalf("copy exit %d: %s", code, stderr.String())
 	}

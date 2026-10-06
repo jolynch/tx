@@ -29,3 +29,7 @@ The docs are organized into four top-level sections:
 - [CLI](./bench/CLI.md)
 - [Dataset](./bench/DATASET.md)
 - [Trace](./bench/TRACE.md)
+
+## Ideas
+
+- [Future work](./IDEAS.md)

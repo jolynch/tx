@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -100,33 +101,143 @@ func (c *managedTCPConnCloser) Close() error {
 	return c.client.releaseManagedTCPConn(c.conn, c.pool)
 }
 
-// contextManagedTCPReadCloser wraps a managed connection read-closer with
-// context-cancellation cleanup (stopWatch) for streaming reads (CXSUM). It
-// deliberately never marks the underlying connection reusable: a CXSUM stream
-// may be cancelled mid-response by the verifier's context, leaving the
-// connection at an indeterminate boundary, so on Close the connection is
-// always released (single-use) rather than recycled into the keep-alive pool.
-type contextManagedTCPReadCloser struct {
-	io.ReadCloser
-	stopWatch func()
+// checksumStream passes a CXSUM response through to its caller while
+// tracking the FX/1 frame structure. Close recycles the connection only when
+// the caller read through the terminal OK line, nothing followed it, and the
+// request context did not cancel the read. Any other ending (an ERR line, a
+// malformed or short response, a cancelled request, or a caller that stopped
+// early) leaves the connection at an unknown boundary, so Close releases it.
+type checksumStream struct {
+	br      *bufio.Reader
+	pending []byte // current line, not yet handed to the caller
+	payload int64  // payload bytes left in the current frame
+	trailer bool   // the next line is the current frame's trailer
+	status  bool   // a status line ended the response
+	ok      bool   // that status line was OK
+	err     error  // sticky read error
 
-	once sync.Once
-	err  error
+	fileID uint64 // file id of the current frame, for the trailer check
+
+	// timeout is the read deadline the caller set on the connection for the
+	// whole response, or zero. ctx is the request's context.
+	timeout time.Duration
+	ctx     context.Context
+
+	closer    *managedTCPConnCloser
+	stopWatch func() bool
+	end       func()
+
+	once     sync.Once
+	closeErr error
 }
 
-func (r *contextManagedTCPReadCloser) Close() error {
-	if r == nil {
+func newChecksumStream(ctx context.Context, br *bufio.Reader, firstLine []byte, timeout time.Duration, closer *managedTCPConnCloser, stopWatch func() bool, end func()) (*checksumStream, error) {
+	s := &checksumStream{ctx: ctx, br: br, timeout: timeout, closer: closer, stopWatch: stopWatch, end: end}
+	if err := s.accept(firstLine); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// accept classifies one response line and queues it for the caller.
+func (s *checksumStream) accept(line []byte) error {
+	trimmed := strings.TrimRight(string(line), "\r\n")
+	switch {
+	case s.trailer:
+		if !strings.HasPrefix(trimmed+" ", "FXT/1 "+strconv.FormatUint(s.fileID, 10)+" ") {
+			return fmt.Errorf("CXSUM frame trailer does not match file %d: %q", s.fileID, trimmed)
+		}
+		s.trailer = false
+	case strings.HasPrefix(trimmed, "FX/1 "):
+		meta, err := parseFXHeader(trimmed)
+		if err != nil {
+			return err
+		}
+		s.payload = meta.WireSize
+		s.fileID = meta.FileID
+		s.trailer = true
+	case isStatusLine(trimmed):
+		s.status = true
+		_, s.ok = parseOKStatusLine(trimmed)
+	default:
+		return fmt.Errorf("unexpected CXSUM response line: %q", trimmed)
+	}
+	s.pending = line
+	return nil
+}
+
+func (s *checksumStream) Read(p []byte) (int, error) {
+	for {
+		switch {
+		case len(s.pending) > 0:
+			n := copy(p, s.pending)
+			s.pending = s.pending[n:]
+			return n, nil
+		case s.err != nil:
+			return 0, s.err
+		case s.payload > 0:
+			n, err := s.br.Read(p[:min(int64(len(p)), s.payload)])
+			s.payload -= int64(n)
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+			s.err = s.wrapReadErr(err)
+			return n, s.err
+		case s.status:
+			return 0, io.EOF
+		}
+		line, err := utils.ReadLineLimit(s.br, maxTCPLineBytes)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+			s.err = fmt.Errorf("read CXSUM response: %w", s.wrapReadErr(err))
+			continue
+		}
+		if err := s.accept(line); err != nil {
+			s.err = err
+		}
+	}
+}
+
+// wrapReadErr names an expired response deadline.
+func (s *checksumStream) wrapReadErr(err error) error {
+	return checksumReadErr(s.ctx, s.timeout, err)
+}
+
+// checksumReadErr names why a response read failed. Cancelling ctx expires
+// the deadline and closes the connection, so once ctx is done any read error
+// is reported as the cancellation.
+func checksumReadErr(ctx context.Context, timeout time.Duration, err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case ctx.Err() != nil:
+		return fmt.Errorf("%w: %w", context.Cause(ctx), err)
+	case timeout > 0 && errors.Is(err, os.ErrDeadlineExceeded):
+		return fmt.Errorf("CXSUM response not complete within %s: %w", timeout, err)
+	}
+	return err
+}
+
+func (s *checksumStream) Close() error {
+	if s == nil {
 		return nil
 	}
-	r.once.Do(func() {
-		if r.stopWatch != nil {
-			r.stopWatch()
+	s.once.Do(func() {
+		cancelled := s.stopWatch()
+		if s.ok && len(s.pending) == 0 && s.br.Buffered() == 0 && !cancelled {
+			// A pooled connection must not carry the response deadline.
+			if s.timeout == 0 || s.closer.conn.SetReadDeadline(time.Time{}) == nil {
+				s.closer.markReusable()
+			}
 		}
-		if r.ReadCloser != nil {
-			r.err = r.ReadCloser.Close()
+		s.closeErr = s.closer.Close()
+		if s.end != nil {
+			s.end()
 		}
 	})
-	return r.err
+	return s.closeErr
 }
 
 // probeKeepAliveSessionConn sends a zero-payload keep-alive PROBE on conn and
@@ -174,9 +285,12 @@ func newManagedTCPReadCloser(reader io.Reader, closer *managedTCPConnCloser) io.
 	}
 }
 
-func watchManagedTCPConnContext(ctx context.Context, conn net.Conn) func() {
+// watchManagedTCPConnContext closes conn when ctx ends. The returned stop
+// function reports whether that happened, so a caller never recycles a
+// connection the context closed.
+func watchManagedTCPConnContext(ctx context.Context, conn net.Conn) func() bool {
 	if ctx == nil || conn == nil {
-		return func() {}
+		return func() bool { return false }
 	}
 	done := make(chan struct{})
 	stopCancel := context.AfterFunc(ctx, func() {
@@ -185,13 +299,16 @@ func watchManagedTCPConnContext(ctx context.Context, conn net.Conn) func() {
 		close(done)
 	})
 	var once sync.Once
-	return func() {
+	var cancelled bool
+	return func() bool {
 		once.Do(func() {
 			if !stopCancel() {
 				// Join cancellation before the connection can change owners.
 				<-done
+				cancelled = true
 			}
 		})
+		return cancelled
 	}
 }
 
@@ -494,12 +611,19 @@ func (c *Client) dialAndAuthWithState(ctx context.Context, state tcpAuthState) (
 	if err != nil {
 		return nil, fmt.Errorf("dial file listener: %w", err)
 	}
+	stopWatch := func() bool { return false }
 	if state.hasAuth {
-		defer watchManagedTCPConnContext(ctx, conn)()
+		stopWatch = watchManagedTCPConnContext(ctx, conn)
 	}
 	if err := c.sendTCPAuth(conn, state); err != nil {
+		stopWatch()
 		_ = conn.Close()
 		return nil, fmt.Errorf("send AUTH: %w", err)
+	}
+	if stopWatch() {
+		// The context closed conn while AUTH was in flight.
+		_ = conn.Close()
+		return nil, fmt.Errorf("send AUTH: %w", context.Cause(ctx))
 	}
 	return conn, nil
 }
@@ -912,10 +1036,11 @@ func readTCPStatus(m *metrics.ClientMetrics, br *bufio.Reader) (string, error) {
 // newline) for prefixing back onto the stream, or an error if the server
 // sent ERR or an unexpected OK.
 func readStreamFirstLine(m *metrics.ClientMetrics, br *bufio.Reader, verb string) (string, error) {
-	firstLine, err := br.ReadString('\n')
+	line, err := utils.ReadLineLimit(br, maxTCPLineBytes)
 	if err != nil {
 		return "", fmt.Errorf("read %s response: %w", verb, err)
 	}
+	firstLine := string(line)
 	trimmed := strings.TrimRight(firstLine, "\r\n")
 	if err := parseErrControlFrame(m, trimmed); err != nil {
 		return "", err
@@ -1283,10 +1408,25 @@ func (c *Client) getChecksumTCP(ctx context.Context, request GetChecksumRequest)
 	if err != nil {
 		return nil, err
 	}
-	return c.getChecksumBodyTCP(ctx, request.TransferID, body)
+	return c.getChecksumBodyTCP(ctx, request.TransferID, body, 0)
 }
 
-func (c *Client) getChecksumBodyTCP(ctx context.Context, transferID string, body encodedRequest) (io.ReadCloser, error) {
+// checksumTimeoutUnitBytes is the hashing work one ChecksumBatchOptions
+// HashTimeout covers: the largest range the verifier requests.
+const checksumTimeoutUnitBytes = 4 << 20
+
+// checksumResponseTimeout sizes a response's deadline to the hashing it asks
+// for: perUnit for each started checksumTimeoutUnitBytes of all targets
+// together, and at least perUnit.
+func checksumResponseTimeout(perUnit time.Duration, targets []ChecksumTarget) time.Duration {
+	var bytes int64
+	for _, t := range targets {
+		bytes += t.Size
+	}
+	return perUnit * time.Duration(max(1, (bytes+checksumTimeoutUnitBytes-1)/checksumTimeoutUnitBytes))
+}
+
+func (c *Client) getChecksumBodyTCP(ctx context.Context, transferID string, body encodedRequest, timeout time.Duration) (io.ReadCloser, error) {
 	if err := body.validate(); err != nil {
 		return nil, err
 	}
@@ -1300,29 +1440,35 @@ func (c *Client) getChecksumBodyTCP(ctx context.Context, transferID string, body
 	if rt != nil {
 		c.emitReqStart(withReqTrace(ctx, rt), "CXSUM", transferID, conn, body.body)
 	}
-	br, err := c.sendAndReadTCPWithBody(conn, state, "CXSUM "+transferID, body.body)
-	if err != nil {
+	if timeout > 0 {
+		// One deadline for the whole response, set before sending: an
+		// encrypted response's reader reads its header as soon as it is
+		// created, and its frames arrive only as 64 KiB AEAD chunks fill.
+		_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	}
+	fail := func(err error) (io.ReadCloser, error) {
 		stopWatch()
 		_ = closer.Close()
-		err = fmt.Errorf("CXSUM: %w", err)
 		rt.end(c, err)
 		return nil, err
+	}
+	br, err := c.sendAndReadTCPWithBody(conn, state, "CXSUM "+transferID, body.body)
+	if err != nil {
+		return fail(fmt.Errorf("CXSUM: %w", checksumReadErr(ctx, timeout, err)))
 	}
 	firstLine, err := readStreamFirstLine(c.metrics(), br, "CXSUM")
 	if err != nil {
-		stopWatch()
-		_ = closer.Close()
-		rt.end(c, err)
-		return nil, err
+		return fail(checksumReadErr(ctx, timeout, err))
 	}
-	stop := stopWatch
+	var end func()
 	if rt != nil {
 		// The caller reads the checksum stream; the request ends when it
 		// closes it.
-		stop = func() { stopWatch(); rt.end(c, nil) }
+		end = func() { rt.end(c, nil) }
 	}
-	return &contextManagedTCPReadCloser{
-		ReadCloser: newManagedTCPReadCloser(io.MultiReader(strings.NewReader(firstLine), br), closer),
-		stopWatch:  stop,
-	}, nil
+	stream, err := newChecksumStream(ctx, br, []byte(firstLine), timeout, closer, stopWatch, end)
+	if err != nil {
+		return fail(err)
+	}
+	return stream, nil
 }

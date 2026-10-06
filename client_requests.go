@@ -139,7 +139,15 @@ func acknowledgeItemBytes(command acknowledgeFileProgressCommand) ([]byte, error
 // Zero values use the advertised target and the parent context's deadline.
 type ChecksumBatchOptions struct {
 	TargetRequestBytes int64
-	RequestTimeout     time.Duration
+	// RequestTimeout bounds each request end to end, including the wait for
+	// a pool connection.
+	RequestTimeout time.Duration
+	// HashTimeout bounds each response by the work it asks for: HashTimeout
+	// per started 4 MiB of the request's targets together, and at least
+	// HashTimeout, from when the request is sent. A target without a Size
+	// counts as no bytes. The wait for a pool connection does not count.
+	// Zero disables it.
+	HashTimeout time.Duration
 }
 
 // VisitChecksumBatches sends ordered, bounded CXSUM requests without re-encoding
@@ -154,7 +162,7 @@ func (c *Client) VisitChecksumBatches(ctx context.Context, request GetChecksumRe
 	if err := validateChecksumRequest(request); err != nil {
 		return err
 	}
-	if options.TargetRequestBytes < 0 || options.RequestTimeout < 0 {
+	if options.TargetRequestBytes < 0 || options.RequestTimeout < 0 || options.HashTimeout < 0 {
 		return errors.New("negative checksum batch option")
 	}
 	if consume == nil {
@@ -170,7 +178,8 @@ func (c *Client) VisitChecksumBatches(ctx context.Context, request GetChecksumRe
 			requestCtx, cancel = context.WithTimeout(ctx, options.RequestTimeout)
 			defer cancel()
 		}
-		reader, err := c.getChecksumBodyTCP(requestCtx, request.TransferID, chunk.encodedRequest)
+		timeout := checksumResponseTimeout(options.HashTimeout, request.Targets[chunk.lo:chunk.hi])
+		reader, err := c.getChecksumBodyTCP(requestCtx, request.TransferID, chunk.encodedRequest, timeout)
 		if err != nil {
 			return err
 		}

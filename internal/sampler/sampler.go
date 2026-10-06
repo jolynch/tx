@@ -1,8 +1,12 @@
 // Package sampler provides a deterministic, low-memory sample generator for
-// large files.
+// trees of large files.
 //
-// The generator divides a file into fixed-size frame slots and emits one small
-// sample per selected slot. It has two operating modes:
+// A Plan walks the tree's files in order and gives each a Generator. Each
+// generator divides its file into fixed-size frame slots and emits selected
+// slots whole, so sampling N% of slots reads N% of the bytes. Slot counts
+// use systematic rounding over the tree's concatenated slots (see Plan), so
+// the total is within one slot of N% and small files are not each rounded up
+// to a whole slot. A Generator has two operating modes:
 //
 //   - Partial sampling (`sampleCount < frameSlots`): the slot domain is split
 //     into `sampleCount` buckets and the generator picks exactly one slot from
@@ -13,16 +17,16 @@
 //     exactly once using an O(1)-state modular walk over `[0, frameSlots)`.
 //     The walk starts from a deterministic seed-derived slot and advances by a
 //     seed-derived step that is coprime with `frameSlots`, which guarantees the
-//     traversal is a permutation rather than repeating early.
+//     traversal is a permutation rather than repeating early. With
+//     PlanOptions.Sequential the walk starts at slot 0 with step 1, so slots
+//     come in ascending order and reads stay sequential.
 //
-// Within each chosen slot, the final byte offset is jittered deterministically
-// so repeated runs on the same file produce the same sample layout without
-// allocating a large permutation or sample list up front.
+// The same seed and tree always produce the same samples, without allocating
+// a permutation or sample list up front. Callers pick a new seed per run.
 package sampler
 
 import (
 	"encoding/binary"
-	"io"
 	"path/filepath"
 
 	"github.com/zeebo/xxh3"
@@ -36,12 +40,11 @@ type Sample struct {
 // Generator streams deterministic samples for one file without materializing
 // the entire sample set in memory.
 //
-// Callers typically create a generator with New, then repeatedly call Peek and
+// Callers get a generator from Plan.Next, then repeatedly call Peek and
 // Advance until Remaining reaches zero.
 type Generator struct {
 	fileSize     int64
 	frameSize    int64
-	sampleBytes  int64
 	frameSlots   int64
 	sampleCount  int64
 	nextIndex    int64
@@ -52,44 +55,111 @@ type Generator struct {
 	permStep     int64
 }
 
-// New constructs a deterministic generator for a single file.
+// PlanOptions configures a tree-wide sampling plan.
+type PlanOptions struct {
+	Root      string
+	Pct       int   // percentage of slots to sample, 1 to 100
+	FrameSize int64 // slot size in bytes
+	// TotalSlots is the slot count of every file the plan will see, as
+	// summed by SlotCount. The plan needs it to guarantee one slot when
+	// the tree's share rounds to zero.
+	TotalSlots int64
+	// Seed selects the rounding offset and every file's slots. The same
+	// seed and tree give the same plan.
+	Seed uint64
+	// Sequential visits a file's slots in ascending order when the plan
+	// covers all of them. Leave it false when the run can stop early, so the
+	// walk spreads partial coverage across each file.
+	Sequential bool
+}
+
+// Plan hands out each file's Generator in order, choosing slot counts by
+// systematic rounding over the tree's concatenated slots.
 //
-// The seed is derived from the file identity (`root`, `path`, `fileID`,
-// `fileSize`) so the same file produces the same sample sequence across runs.
-// `pct` is interpreted as a percentage of frame slots, rounded up the same way
-// the CLI verify path expects. The returned bool is false when sampling is not
-// meaningful for the provided inputs.
-func New(root string, path string, fileID uint64, fileSize int64, pct int, frameSize int64, sampleBytes int64) (Generator, bool) {
-	if fileSize <= 0 || pct <= 0 || frameSize <= 0 || sampleBytes <= 0 {
+// With acc slots seen so far, a start u in [0,1) drawn from the seed, and a
+// file of s slots, the file gets floor((acc+s)*N/100+u) - floor(acc*N/100+u)
+// slots. Each file's expected count is N% of its slots, and the total is
+// within one slot of N% of the tree. If that total would be zero for a tree
+// with data, the file holding a seed-chosen slot gets one slot instead.
+type Plan struct {
+	opts  PlanOptions
+	start int64 // u in hundredths
+	acc   int64
+	// forced is the tree slot index that gets the single slot when the
+	// rounded total is zero, or -1.
+	forced int64
+}
+
+// NewPlan returns a plan for a tree. Call Next for every file in the same
+// order the slots were totalled.
+func NewPlan(opts PlanOptions) *Plan {
+	opts.Pct = max(min(opts.Pct, 100), 0)
+	p := &Plan{opts: opts, forced: -1}
+	p.start = int64(seedHash(opts.Seed, 'u') % 100)
+	if opts.TotalSlots > 0 && opts.Pct > 0 && p.rounded(opts.TotalSlots) == 0 {
+		p.forced = int64(seedHash(opts.Seed, 'f') % uint64(opts.TotalSlots))
+	}
+	return p
+}
+
+// SlotCount is the number of frame slots in a file of the given size.
+func SlotCount(size, frameSize int64) int64 {
+	if size <= 0 || frameSize <= 0 {
+		return 0
+	}
+	return (size + frameSize - 1) / frameSize
+}
+
+// rounded is floor(slots*N/100+u) for slots seen so far.
+func (p *Plan) rounded(slots int64) int64 {
+	// Split so tiny frame sizes cannot overflow slots*pct.
+	pct := int64(p.opts.Pct)
+	return slots/100*pct + (slots%100*pct+p.start)/100
+}
+
+// Next returns the Generator for the next file. The bool is false when the
+// file draws no slots. Files with no data do not advance the plan.
+func (p *Plan) Next(path string, fileID uint64, fileSize int64) (Generator, bool) {
+	slots := SlotCount(fileSize, p.opts.FrameSize)
+	if slots == 0 || p.opts.Pct <= 0 {
 		return Generator{}, false
 	}
-	frameSlots := (fileSize + frameSize - 1) / frameSize
-	if frameSlots <= 0 {
+	count := p.rounded(p.acc+slots) - p.rounded(p.acc)
+	if p.forced >= 0 {
+		count = 0
+		if p.forced >= p.acc && p.forced < p.acc+slots {
+			count = 1
+		}
+	}
+	p.acc += slots
+	if count <= 0 {
 		return Generator{}, false
 	}
-	sampleCount := (frameSlots*int64(pct) + 99) / 100
-	if sampleCount <= 0 {
-		sampleCount = 1
-	}
-	if sampleCount > frameSlots {
-		sampleCount = frameSlots
-	}
-	seedLo, seedHi := buildSeed(root, path, fileID, fileSize)
+	seedLo, seedHi := buildSeed(p.opts.Root, path, fileID, fileSize, p.opts.Seed)
 	gen := Generator{
 		fileSize:     fileSize,
-		frameSize:    frameSize,
-		sampleBytes:  sampleBytes,
-		frameSlots:   frameSlots,
-		sampleCount:  sampleCount,
+		frameSize:    p.opts.FrameSize,
+		frameSlots:   slots,
+		sampleCount:  count,
 		seedLo:       seedLo,
 		seedHi:       seedHi,
-		fullCoverage: sampleCount == frameSlots,
+		fullCoverage: count == slots,
 	}
 	if gen.fullCoverage {
-		gen.permCurrent = int64(seedLo % uint64(frameSlots))
-		gen.permStep = coprimeStep(frameSlots, seedHi)
+		gen.permStep = 1
+		if !p.opts.Sequential {
+			gen.permCurrent = int64(seedLo % uint64(slots))
+			gen.permStep = coprimeStep(slots, seedHi)
+		}
 	}
 	return gen, true
+}
+
+func seedHash(seed uint64, tag byte) uint64 {
+	var buf [9]byte
+	binary.LittleEndian.PutUint64(buf[0:8], seed)
+	buf[8] = tag
+	return xxh3.Hash(buf[:])
 }
 
 func (g Generator) TotalSamples() int64 {
@@ -98,9 +168,6 @@ func (g Generator) TotalSamples() int64 {
 
 // Remaining reports how many samples are left to emit.
 func (g *Generator) Remaining() int64 {
-	if g == nil {
-		return 0
-	}
 	return g.sampleCount - g.nextIndex
 }
 
@@ -109,7 +176,7 @@ func (g *Generator) Remaining() int64 {
 // In partial mode, Peek chooses one slot from the current bucket. In full
 // coverage mode, Peek returns the current slot in the modular permutation.
 func (g *Generator) Peek() (Sample, bool) {
-	if g == nil || g.nextIndex >= g.sampleCount {
+	if g.nextIndex >= g.sampleCount {
 		return Sample{}, false
 	}
 	var slotIndex int64
@@ -131,7 +198,7 @@ func (g *Generator) Peek() (Sample, bool) {
 // In full coverage mode this advances the modular permutation by the coprime
 // step chosen during construction.
 func (g *Generator) Advance() {
-	if g == nil || g.nextIndex >= g.sampleCount {
+	if g.nextIndex >= g.sampleCount {
 		return
 	}
 	g.nextIndex++
@@ -143,30 +210,24 @@ func (g *Generator) Advance() {
 	}
 }
 
-func buildSeed(root string, path string, fileID uint64, fileSize int64) (uint64, uint64) {
-	h := xxh3.New128()
-	_, _ = io.WriteString(h, filepath.Clean(root))
-	_, _ = h.Write([]byte{0})
-	_, _ = io.WriteString(h, filepath.ToSlash(path))
-	var buf [16]byte
-	binary.LittleEndian.PutUint64(buf[0:8], uint64(fileSize))
-	binary.LittleEndian.PutUint64(buf[8:16], fileID)
-	_, _ = h.Write(buf[:])
-	sum := h.Sum128()
+func buildSeed(root string, path string, fileID uint64, fileSize int64, runSeed uint64) (uint64, uint64) {
+	// One stack buffer holds root, a NUL, the path and three words; the
+	// bytes match what a streaming hasher would see.
+	var arr [256]byte
+	buf := append(arr[:0], filepath.Clean(root)...)
+	buf = append(buf, 0)
+	buf = append(buf, filepath.ToSlash(path)...)
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(fileSize))
+	buf = binary.LittleEndian.AppendUint64(buf, fileID)
+	buf = binary.LittleEndian.AppendUint64(buf, runSeed)
+	sum := xxh3.Hash128(buf)
 	return sum.Lo, sum.Hi
 }
 
-// sampleForSlot converts a slot index into a concrete byte sample within that
-// slot. The intra-slot jitter is deterministic and bounded to the slot.
+// sampleForSlot returns the whole slot; the last one may be short.
 func (g Generator) sampleForSlot(slotIndex int64) Sample {
 	slotStart := slotIndex * g.frameSize
-	slotLen := minInt64(g.frameSize, g.fileSize-slotStart)
-	size := minInt64(g.sampleBytes, slotLen)
-	offset := slotStart
-	if maxJitter := slotLen - size; maxJitter > 0 {
-		offset += int64(g.hash64('j', uint64(slotIndex)) % uint64(maxJitter+1))
-	}
-	return Sample{Offset: offset, Size: size}
+	return Sample{Offset: slotStart, Size: min(g.frameSize, g.fileSize-slotStart)}
 }
 
 func (g Generator) hash64(tag byte, value uint64) uint64 {
@@ -207,11 +268,4 @@ func gcd(a int64, b int64) int64 {
 		return 1
 	}
 	return a
-}
-
-func minInt64(a int64, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
 }

@@ -42,9 +42,11 @@ acceptance:
 # Their corpus saturates well before 10s, so a longer budget buys nothing.
 fuzz-short:
 	$(FUZZ) -race ./internal/aead FuzzRoundTrip $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
-	$(FUZZ) -race ./internal/sampler FuzzGeneratorFullCoverageNoRepeats $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
+	$(FUZZ) -race ./internal/sampler FuzzGeneratorSlots $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race ./internal/utils FuzzCommonPrefixLen $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) . FuzzSuggestBatchMaxBytes $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT) -parallel=1
+	$(FUZZ) -race . FuzzChecksumStreamReuse $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
+	$(FUZZ) -race ./internal/cmd/filexfercli FuzzVerifyCursor $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race ./internal/bench/dataset FuzzPlan $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race ./internal/bench/dataset FuzzSelectWarmBlocks $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 
@@ -62,6 +64,7 @@ fuzz-long:
 	$(FUZZ) -race ./internal/bench/report FuzzTraceRecordText $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/bench/dataset FuzzFilesTSVRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/bench/dataset FuzzVerifyDetectsCorruption $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/cmd/filexfercli FuzzCopyVerifyDetectsCorruption $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG) -parallel=4
 
 # internal/bench holds benchmarks of exported code. Benchmarks that need
 # unexported access live with their package; both sets are registered here so

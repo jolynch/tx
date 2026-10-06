@@ -1,6 +1,7 @@
 package ftcp
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -151,12 +152,16 @@ func handleCXSUMWithInput(_ context.Context, req Request, in io.Reader, out io.W
 	}
 	defer release()
 
+	// Buffer the small frames so each costs no write syscall. Flush before
+	// any return, so an ERR line written after an error follows the frames.
+	w := bufio.NewWriterSize(out, 64<<10)
 	for _, record := range records {
-		if err := streamChecksumItem(out, deps, txferID, record.item(), buf); err != nil {
+		if err := streamChecksumItem(w, deps, txferID, record.item(), buf); err != nil {
+			_ = w.Flush()
 			return err
 		}
 	}
-	return nil
+	return w.Flush()
 }
 
 func streamChecksumItem(out io.Writer, deps Deps, txferID string, item cxsumItem, buf []byte) error {

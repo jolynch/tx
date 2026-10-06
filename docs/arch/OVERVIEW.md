@@ -39,12 +39,12 @@ From these measurements the client computes:
   IO depth is 4), or a server-advertised percentage of CPUs in gentle mode.
   Clamped to `[2, 256]`.
 - **Suggested cipher** — resolved during the AUTH key exchange if encryption
-  is enabled.
+  is enabled. Hardware acceleration is preferred if present.
 
 ### Connection pool
 
-Once the probe completes, the client opens two connection pools that never
-share connections, so quick commands never queue behind file transfers:
+Once the probe completes, the client opens two independent connection pools:
+one for large (potentially slow) data transfers, and one for quick commands.
 
 | Pool    | Commands                         | Size                                  |
 |---------|----------------------------------|---------------------------------------|
@@ -52,8 +52,7 @@ share connections, so quick commands never queue behind file transfers:
 | control | `ACK`, `STATUS`, `TXFER`, `SYNC` | `concurrency`, grows during a burst   |
 
 `concurrency` is the probe's suggestion, or `--concurrency` when set, clamped
-to `[2, 256]`. Both
-pools work the same way and differ only in growth:
+to `[2, 256]`. Both pools work the same way and differ only in growth:
 
 - **Warm.** Each pool opens `concurrency` connections up front, during the
   probe, so the first `SEND` and `ACK` requests find a connection ready.
@@ -63,7 +62,7 @@ pools work the same way and differ only in growth:
 - **Scale down.** When the server grants keep-alive, once per heartbeat
   interval (one quarter of the keep-alive window: 15s at the default 60s), a
   pool that has been used keeps the most connections it had in use at once
-  during that interval, plus a quarter for bursts, and at least one. It closes
+  during that interval, plus `.25x` buffer for bursts, and at least one. It closes
   the rest from the bottom of the stack. For example, 90 open connections with
   at most 40 in use shrink to 50. Because borrowers take from the top, this
   never closes a connection that steady traffic is about to reuse.
@@ -90,12 +89,24 @@ starts a replacement, and borrowers peek for a pending EOF before reuse), and
 the server independently reaps connections that send nothing for the keep-alive
 window (`--idle-timeout`, default 60s).
 
-Against servers without keep-alive, or after a dirty response (error
-mid-stream, or any `CXSUM` stream), a connection is closed after one use and
-a background goroutine opens and authenticates a replacement. Replacements
+Against servers without keep-alive, or when a response is not read through
+its terminal `OK` line (an `ERR`, a malformed or truncated stream, a cancelled
+request, or a caller that stops early), a connection is closed after one use
+and a background goroutine opens and authenticates a replacement. Replacements
 restore a pool only to the size it last scaled to, and fill a slot the
 closed connection freed, so they never push a pool past its size or undo a
 scale-down.
+
+A `CXSUM` response is checked as it streams: frame trailers must match their
+header's file ID, and lines are bounded like every other response. The
+client's `ChecksumBatchOptions.HashTimeout` sets one read deadline for the
+whole response: that long per started 4 MiB of hashing the request asks for
+in total, set before the request is sent. There is no per-read re-arming:
+the server buffers frames 64 KiB at a time, and an encrypted response
+arrives only when a 64 KiB AEAD chunk fills or the response ends, so
+progress shows in bursts. The wait for a pool connection does not count
+against it. A timed-out
+connection is closed, not pooled.
 
 ### Windowing and batching
 

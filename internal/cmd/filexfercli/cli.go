@@ -56,10 +56,7 @@ const defaultVerboseStatusInterval = 10 * time.Second
 const defaultCLIAckEveryBytes int64 = 128 * 1024 * 1024
 const defaultVerboseProgressInterval = 2 * time.Second
 const defaultCLIProbeBytes int64 = 1 * 1024 * 1024
-const defaultVerifySampleFrameSize int64 = 4 * 1024 * 1024
-const verifySampleBytes int64 = 8
-const verifyChecksumRequestTargetBytes = 3 * 1024 * 1024
-const verifyChecksumRequestTimeout = 30 * time.Second
+
 const defaultTransferProbeRefreshInterval = 10 * time.Second
 const defaultFsyncTimeout = 60 * time.Second
 const defaultSyncfsTimeout = 10 * time.Second
@@ -69,7 +66,6 @@ const maxTransferErrorLines = 5
 const maxMetadataWarningLines = 10
 
 var transferProbeRefreshInterval = defaultTransferProbeRefreshInterval
-var verifyBudgetGracePeriod = 10 * time.Second
 
 var syncPromptInput io.Reader = os.Stdin
 
