@@ -50,68 +50,97 @@ and link-target drift without rereading file contents.
 
 Data verification extends the metadata pass. Available modes are:
 
-- `--verify N%data`: sample `N%` of 4 MiB frame slots from each file
-- `--verify full`: verify every frame slot of every file
+- `--verify N%data`: read and compare about `N%` of the bytes, as whole
+  4 MiB frame slots
+- `--verify full`: verify every byte of every file
 - `--verify <duration>`: run full data verification under a wall-clock budget
 
 The data path is:
 
-1. Build a deterministic sample generator per file.
+1. Draw a random run seed and build a sample generator per file from it.
 2. Read the selected ranges locally and hash them with `xxh128`.
 3. Issue `CXSUM` requests to the server for the same ranges.
 4. Compare returned checksum tokens to the local hashes.
 
-The verifier prints one final summary line:
+The verifier prints one final summary line. `files` and `bytes` report how
+much was verified out of every regular file with data:
 
 ```text
-copy-verify-data: [ok] files=<n> samples=<n> pct=<n> elapsed=<dur>
-copy-verify-data: [partial-ok] files=<n> samples=<n> budget=<dur> elapsed=<dur>
-copy-verify-data: [fail] <reason>
+copy-verify-data: [ok] files=<n>/<n> (<pct>) bytes=<size>/<size> (<pct>) samples=<n> pct=<n> seed=<16 hex> elapsed=<dur>
+copy-verify-data: [partial-ok] files=<n>/<n> (<pct>) bytes=<size>/<size> (<pct>) samples=<n> budget=<dur> seed=<16 hex> elapsed=<dur>
+copy-verify-data: [fail] seed=<16 hex> <reason>
 ```
+
+The seed identifies the run's samples. There is no flag to set it; tests
+replay a run from the printed value.
+
+Local copies print the same lines with the `local-verify-data` prefix.
 
 ### Partial Verification Under a Time Budget
 
 When `--verify` is a duration, the client behaves as a bounded full verifier:
 
-- it stops dispatching new file verification tasks when the budget expires
-- it allows already-started checksum work to finish for a short grace period
-- if the grace period also expires, it cancels in-flight checksum transport,
-  logs how much verification completed, and returns success
+- it visits each file's slots in a permuted order, so a run cut short has
+  covered slots spread across the file (see Full Sampling)
+- it stops dispatching new verification batches when the budget expires
+- remote copies let already-started checksum work finish for a short grace
+  period; if that also expires, in-flight checksum transport is cancelled
+- it logs how much verification completed and returns success
 
 This is why a budgeted verify can end in `[partial-ok]` instead of `[ok]`.
 
 Real checksum mismatches found before the forced stop still fail the command.
+Local copies have no grace period: hashing in progress stops at its next
+1 MiB read.
 
 ### Checksum Batching
 
 The verifier does not send one giant `CXSUM` request per file. Instead it:
 
 - generates samples incrementally
-- batches checksum targets per request
+- packs samples into batches of at most 16 MiB or 1024 samples, filled from
+  consecutive files, so a tree of small files costs about one request per
+  16 MiB instead of one per file, and a batch may span files. A large file
+  splits across batches that workers verify in parallel, so it uses every
+  worker. A file counts as verified once all its samples pass, in whichever
+  batches they ran. A single slot larger than the cap still forms a batch
+- runs twice as many workers as data connections, so one worker hashes local
+  ranges while another waits on the server. Each worker hashes its batch's
+  local ranges, sends the `CXSUM` request, then compares every item in order:
+  file ID, offset, size, and hash. Local copies hash source and destination
+  in the same worker
+- scales each batch's sample cap with the worker count so every worker gets
+  work on small runs
 - caps each request body at 3 MiB, or the server's target if smaller
+- sets one read deadline for the whole `CXSUM` response, 30 seconds per
+  started 4 MiB requested in total (`HashTimeout`), for plaintext and encrypted
+  connections alike
 
-This keeps memory use and request size bounded on very large files.
+This keeps memory use, request size, and the server's hashing per request
+bounded on very large files.
 
 ## Deterministic Sampling Algorithm
 
 The sampler lives in `internal/sampler` and is designed to be:
 
-- deterministic per file across runs
+- deterministic for a given seed and tree
 - bounded-memory even for multi-TiB files
 - broad in coverage
 - friendly to mostly sequential I/O for partial sampling
 
-### File Identity and Seed
+### Seed and Determinism
 
-Each file's sample sequence is seeded from:
+Each run draws a random 64-bit seed from `crypto/rand` and prints it as
+`seed=<16 hex>`. Each file's sample sequence is seeded from:
 
+- the run seed
 - manifest root path
 - entry path
 - file size
 - file ID
 
-The resulting seed is stable for the same file identity, so repeated runs pick
-the same sample layout.
+The same seed over the same tree gives the same samples. Each run picks a
+new seed, so repeated `N%data` runs cover different data over time.
 
 ### Frame Slots
 
@@ -122,16 +151,22 @@ frame size. For a file of size `S` and frame size `F`, the number of slots is:
 frameSlots = ceil(S / F)
 ```
 
-The sample count for `N%data` is computed from frame slots, not from raw bytes,
-using the same rounded-up percentage rule the CLI already used before the
-sampler rewrite:
+Each sample is a whole slot (the last may be shorter), so sampling `N%` of
+slots reads `N%` of the bytes. Slot counts use systematic rounding over the
+tree's slots, concatenated in manifest order. The seed gives a start `u` in
+`[0, 1)`. With `acc` slots in the files before it and `s` slots of its own, a
+file gets:
 
 ```text
-sampleCount = ceil(frameSlots * N / 100)
+sampleCount = floor((acc + s) * N / 100 + u) - floor(acc * N / 100 + u)
 ```
 
-That keeps user-visible sampling density stable while avoiding a giant
-precomputed permutation.
+computed in integers. Each file's expected slot count is `N%` of its slots,
+and the tree's total is `floor` or `ceil` of `totalSlots * N / 100`. A small file may
+get no slot, and rounding every file up instead would read small files in
+full. If the tree has data but the total would be zero, the file holding one
+seed-chosen slot gets exactly that one, so a data check never passes after
+reading nothing. At `100%` every slot of every file is read.
 
 ### Partial Sampling: Stratified Buckets
 
@@ -165,16 +200,13 @@ gcd(step, frameSlots) = 1
 ```
 
 That property guarantees the walk is a permutation of all slots rather than a
-short cycle. In practice this means `--verify full` can stop early under a time
-budget and still have touched slots spread across the file instead of only the
-front of the file.
+short cycle. Under a time budget (`--verify <duration>`), this means a run cut
+short has touched slots spread across the file instead of only the front.
 
-### Intra-slot Jitter
-
-Selecting a slot does not force sampling the slot's first bytes. For each chosen
-slot, the sampler also derives a deterministic intra-slot jitter and selects a
-small byte range within the slot. That keeps the sample reproducible while
-avoiding always hashing the same leading bytes of each 4 MiB region.
+Without a budget (`--verify full` or `100%data`) nothing cuts the run short, so
+the plan sets `Sequential`: each file's slots come in ascending order, which
+keeps reads sequential on both hosts. The walk then starts at slot 0 with
+step 1. The set of slots does not change.
 
 ## In-flight Integrity
 
@@ -213,7 +245,7 @@ Verification fails immediately on:
 Budgeted verification may still succeed with `[partial-ok]` when:
 
 - the time budget expires
-- already-started work is allowed to finish for the grace period
+- already-started remote work is allowed to finish for the grace period
 - remaining in-flight work is force-stopped afterward
 
 When that happens, the CLI logs how many files and samples were verified before

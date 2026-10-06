@@ -186,7 +186,7 @@ func TestTCPPoolsIsolateDataFromControl(t *testing.T) {
 			_, err := io.WriteString(out, "OK {\"transfer_id\":\"tx123\"}\r\n")
 			return err
 		case intftcp.VerbCXSUM:
-			_, err := io.WriteString(out, "CXSUM fid=1 algo=xxh128 token=deadbeef\r\n")
+			_, err := io.WriteString(out, "FX/1 1 offset=0 size=0 wsize=0 comp=none ts=1\n")
 			return err
 		default:
 			return fmt.Errorf("unexpected verb: %v", req.Verb)
@@ -293,7 +293,7 @@ func TestTCPPoolRefillsAfterStreamClose(t *testing.T) {
 			_, err := io.WriteString(out, "OK {\"transfer_id\":\"tx123\"}\r\n")
 			return err
 		case intftcp.VerbCXSUM:
-			_, err := io.WriteString(out, "CXSUM fid=1 algo=xxh128 token=deadbeef\r\n")
+			_, err := io.WriteString(out, "FX/1 1 offset=0 size=0 wsize=0 comp=none ts=1\n")
 			return err
 		default:
 			return fmt.Errorf("unexpected verb: %v", req.Verb)

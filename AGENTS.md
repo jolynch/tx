@@ -17,11 +17,20 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
 - [CLI reference](docs/pub/CLI.md): commands, flags, workflows, and `.tx/` state.
 - [tx-bench](docs/bench/OVERVIEW.md): two-host benchmark harness, dataset
   oracle, cache warming, and traces.
+- [Ideas](docs/IDEAS.md): future work, by kind.
 
 ## Code standards
 
 ### Testing
 
+- Iterate with unit tests (`go test ./that/pkg`, `make unit`), and run
+  `make acceptance` when a change needs it; it is slower. Run the benchmark
+  targets (`make bench`, `make bench-acceptance`) only at the end, before
+  committing or merging: they saturate the machine's CPU, disk, and network.
+- Ask before saturating the development machine. That includes benchmark
+  targets, artificial load (`yes`, stress tools, busy loops), and long,
+  parallel, or high-`-count` test and fuzz runs. Pass this rule on to any
+  agent you delegate test runs to.
 - Prefer Go fuzz tests (`FuzzX`) for invariants and input variation; use unit
   tests for awkward properties, known regressions, exact protocol errors,
   timing/expiry, and goroutine lifecycle. Models: `FuzzCommonPrefixLen` in
@@ -64,6 +73,8 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
 
 - Completion requires clean `gofmt`, `go vet ./...`, and `go test ./...`; run
   `-race` for packages involving goroutines.
+- When you find a bug, performance idea, or test gap outside the current task,
+  add it to [IDEAS.md](docs/IDEAS.md) instead of widening the change.
 - Never commit. Leave finished work staged (`git add`) for review; the
   maintainer writes the commit. Do not amend, squash, or rewrite existing
   commits unless asked.
@@ -100,7 +111,7 @@ make unit         # go test -race ./...
 make fuzz-short   # unit-test replacements; 5s each
 make fuzz-long    # whole-system properties; 30s each
 make acceptance   # fuzz-short, then fuzz-long
-make bench        # Go microbenchmarks into bench/results/latest.txt
+make bench        # Go microbenchmarks; pre-commit only (pegs the machine)
 make bench-acceptance        # tx-bench end to end on a 5GiB dataset (BENCH_SIZE)
 make bench-acceptance-dials  # dial budget of that run
 

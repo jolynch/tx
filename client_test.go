@@ -3578,31 +3578,193 @@ func TestFetchFileBatchConnClosesExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestChecksumStreamNeverMarksConnReusable pins the one property the CXSUM
-// hand-off depends on: a CXSUM stream can be cancelled mid-response by the
-// verifier's context, so its connection is never provably at a command
-// boundary and must never return to the keep-alive pool.
-//
-// This holds only because contextManagedTCPReadCloser embeds io.ReadCloser as
-// an *interface*, which promotes Read and Close but not markReusable. Embedding
-// the concrete type instead would silently start recycling desynced
-// connections, and nothing else in the suite would notice.
-func TestChecksumStreamNeverMarksConnReusable(t *testing.T) {
-	var rc io.ReadCloser = &contextManagedTCPReadCloser{}
-	if _, ok := rc.(connReuseMarker); ok {
-		t.Fatalf("contextManagedTCPReadCloser must not expose markReusable: CXSUM connections are never at a known protocol boundary")
-	}
+// FuzzChecksumStreamReuse pins when a CXSUM connection may return to the
+// keep-alive pool: only when the response is well formed and ends in OK, the
+// caller read through it, nothing followed it, and the request context did not
+// cancel. Whatever the caller reads must be a byte-exact prefix of the input.
+func FuzzChecksumStreamReuse(f *testing.F) {
+	// ending: 0 OK, 1 ERR, 2 truncated at cut, 3 garbage line, 4 bytes after
+	// OK, 5 mismatched trailer id.
+	f.Add([]byte{0, 0}, uint8(0), uint16(0), true, false)       // empty frames, ok
+	f.Add([]byte{5, 1, 1, 0}, uint8(0), uint16(0), true, false) // payload frame, ok
+	f.Add([]byte{6, 1}, uint8(2), uint16(0), true, false)       // payload mimics OK, truncated
+	f.Add([]byte{0, 0}, uint8(1), uint16(0), true, false)       // ERR line
+	f.Add([]byte{0, 0}, uint8(2), uint16(40), true, false)      // truncated
+	f.Add([]byte{0, 0}, uint8(3), uint16(0), true, false)       // garbage line
+	f.Add([]byte{0, 0}, uint8(4), uint16(0), true, false)       // bytes after OK
+	f.Add([]byte{0, 0}, uint8(5), uint16(0), true, false)       // mismatched trailer
+	f.Add([]byte{0, 0}, uint8(0), uint16(4), false, false)      // caller stopped early
+	f.Add([]byte{0, 0}, uint8(0), uint16(80), false, false)     // caller stopped at the end
+	f.Add([]byte{0, 0}, uint8(0), uint16(0), true, true)        // cancelled
+	f.Fuzz(func(t *testing.T, shape []byte, ending uint8, cut uint16, readAll bool, cancelled bool) {
+		const mimic = "x\nOK\r\n"
+		var resp strings.Builder
+		frames := 1
+		if len(shape) > 0 {
+			frames += int(shape[0]) % 4
+		}
+		for i := 0; i < frames; i++ {
+			size := 0
+			if len(shape) > 1+i {
+				size = int(shape[1+i]) % 24
+			}
+			id := uint64(i + 1)
+			fmt.Fprintf(&resp, "FX/1 %d offset=0 size=%d wsize=%d comp=none ts=1\n", id, size, size)
+			for j := 0; j < size; j++ {
+				resp.WriteByte(mimic[(i+j)%len(mimic)])
+			}
+			trailerID := id
+			if ending%6 == 5 && i == frames-1 {
+				trailerID++
+			}
+			fmt.Fprintf(&resp, "FXT/1 %d status=ok ts=1 next=0\n", trailerID)
+		}
+		extra := false
+		switch ending % 6 {
+		case 0, 2, 5:
+			resp.WriteString("OK\r\n")
+		case 1:
+			resp.WriteString("ERR INTERNAL boom\r\n")
+		case 3:
+			resp.WriteString("what\n")
+		case 4:
+			resp.WriteString("OK\r\nFX/1 9 offset=0")
+			extra = true
+		}
+		input := resp.String()
+		wellFormed := ending%6 == 0 || ending%6 == 2
+		if ending%6 == 2 {
+			n := int(cut) % (len(input) + 1)
+			input = input[:n]
+			wellFormed = n == len(resp.String())
+		}
+		first, rest, found := strings.Cut(input, "\n")
+		if !found {
+			t.Skip("cut inside the first line")
+		}
+		clientConn, serverConn := net.Pipe()
+		defer serverConn.Close()
+		guard := &managedTCPConnCloser{client: &Client{}, conn: clientConn}
+		size := 16
+		if extra {
+			size = len(rest) + 16
+		}
+		stream, err := newChecksumStream(context.Background(), bufio.NewReaderSize(strings.NewReader(rest), size), []byte(first+"\n"), 0, guard,
+			func() bool { return cancelled }, nil)
+		if err != nil {
+			t.Fatalf("newChecksumStream: %v", err)
+		}
+		var got []byte
+		if readAll {
+			var readErr error
+			got, readErr = io.ReadAll(stream)
+			// Garbage, a mismatched trailer, and a cut-short response are
+			// errors; an ERR line or trailing bytes read as a clean end.
+			if wantErr := ending%6 == 3 || ending%6 == 5 || (ending%6 == 2 && !wellFormed); (readErr != nil) != wantErr {
+				t.Fatalf("ReadAll error = %v, want error %v (ending %d, well formed %v)", readErr, wantErr, ending%6, wellFormed)
+			}
+		} else {
+			buf := make([]byte, int(cut)%(len(input)+1))
+			n, _ := io.ReadFull(stream, buf)
+			got = buf[:n]
+		}
+		_ = stream.Close()
+		if !strings.HasPrefix(input, string(got)) {
+			t.Fatalf("stream altered the response: got %q from %q", got, input)
+		}
+		want := wellFormed && !extra && len(got) == len(input) && !cancelled
+		if reusable := guard.reusable.Load(); reusable != want {
+			t.Fatalf("reusable = %v, want %v (ending %d, read %d of %d bytes, cancelled %v)",
+				reusable, want, ending%6, len(got), len(input), cancelled)
+		}
+	})
+}
 
-	// markStreamReusable is the path callers actually use; through a CXSUM
-	// stream it must not reach the underlying connection guard.
-	guard := &managedTCPConnCloser{}
-	stream := &contextManagedTCPReadCloser{
-		ReadCloser: newManagedTCPReadCloser(strings.NewReader(""), guard),
-		stopWatch:  func() {},
-	}
-	markStreamReusable(stream)
-	if guard.reusable.Load() {
-		t.Fatalf("markStreamReusable reached the connection guard through a CXSUM stream")
+// TestChecksumReusesKeepAliveConnections runs CXSUM requests against the real
+// server and checks each fully read response returns its connection to the
+// pool, with and without encryption.
+func TestChecksumReusesKeepAliveConnections(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("encrypted=%v", encrypted), func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "data.bin"), bytes.Repeat([]byte("tx"), 64<<10), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			st := store.NewStore()
+			t.Cleanup(st.Close)
+			opts := intftcp.ServerOptions{Deps: intftcp.NewRuntimeDeps(st, intftcp.WithRoot(root)), KeepAliveTimeout: 5 * time.Second}
+			var clientOpts []ClientOption
+			if encrypted {
+				id, err := age.GenerateX25519Identity()
+				if err != nil {
+					t.Fatal(err)
+				}
+				opts.ServerIdentity = id
+				clientOpts = append(clientOpts, WithEncryptMode("auto"))
+			}
+			var dials atomic.Int64
+			clientOpts = append(clientOpts, WithConcurrency(2), WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+				dials.Add(1)
+				return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+			}))
+			client := NewClient(startRealKeepAliveServer(t, opts), clientOpts...)
+			defer client.Close()
+
+			ctx := context.Background()
+			if _, err := client.ProbeLink(ctx, ProbeRequest{ProbeBytes: 1}); err != nil {
+				t.Fatalf("ProbeLink: %v", err)
+			}
+			manifestResp, err := client.GetManifest(ctx, GetManifestRequest{Directory: "/", Mode: "fast", LinkMbps: 100, Concurrency: 2})
+			if err != nil {
+				t.Fatalf("GetManifest: %v", err)
+			}
+			var target ChecksumTarget
+			for _, entry := range manifestResp.Manifest.Entries {
+				if entry.Type == intencoding.EntryTypeFile {
+					target = ChecksumTarget{FileID: entry.ID, FullPath: filepath.Join(manifestResp.Manifest.Root, entry.Path), Size: entry.Size, Algo: "xxh128"}
+				}
+			}
+			// Let pool warm-up dials finish so the loop's dials are its own.
+			for stable := dials.Load(); ; {
+				time.Sleep(150 * time.Millisecond)
+				if now := dials.Load(); now == stable {
+					break
+				} else {
+					stable = now
+				}
+			}
+			dialsBefore := dials.Load()
+			before := client.MetricSnapshot().ConnectionReuseCount
+			const requests = 10
+			const hashTimeout = 100 * time.Millisecond
+			for i := 0; i < requests; i++ {
+				// Alternate deadlined and undeadlined requests, waiting past
+				// the deadline before each undeadlined one: a recycled
+				// connection that kept its read deadline would fail it.
+				opts := ChecksumBatchOptions{HashTimeout: hashTimeout}
+				if i%2 == 1 {
+					opts.HashTimeout = 0
+					time.Sleep(3 * hashTimeout / 2)
+				}
+				err := client.VisitChecksumBatches(ctx, GetChecksumRequest{TransferID: manifestResp.Manifest.TransferID, Targets: []ChecksumTarget{target}}, opts,
+					func(_ []ChecksumTarget, resp GetChecksumResponse) error {
+						body, err := io.ReadAll(resp.Reader)
+						if err == nil && !strings.HasSuffix(string(body), "OK\r\n") {
+							err = fmt.Errorf("did not end in OK: %q", body)
+						}
+						return err
+					})
+				if err != nil {
+					t.Fatalf("checksum %d: %v", i, err)
+				}
+			}
+			if got := client.MetricSnapshot().ConnectionReuseCount - before; got != requests {
+				t.Fatalf("recycled %d of %d CXSUM connections", got, requests)
+			}
+			if got := dials.Load() - dialsBefore; got != 0 {
+				t.Fatalf("CXSUM loop dialed %d new connections; the server or client dropped pooled ones", got)
+			}
+		})
 	}
 }
 
