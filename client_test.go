@@ -3682,7 +3682,9 @@ func FuzzChecksumStreamReuse(f *testing.F) {
 
 // TestChecksumReusesKeepAliveConnections runs CXSUM requests against the real
 // server and checks each fully read response returns its connection to the
-// pool, with and without encryption.
+// pool without the response's read deadline, with and without encryption. It
+// inspects the connections directly instead of waiting for a deadline to
+// pass, so it does not depend on timing.
 func TestChecksumReusesKeepAliveConnections(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
 		t.Run(fmt.Sprintf("encrypted=%v", encrypted), func(t *testing.T) {
@@ -3692,7 +3694,9 @@ func TestChecksumReusesKeepAliveConnections(t *testing.T) {
 			}
 			st := store.NewStore()
 			t.Cleanup(st.Close)
-			opts := intftcp.ServerOptions{Deps: intftcp.NewRuntimeDeps(st, intftcp.WithRoot(root)), KeepAliveTimeout: 5 * time.Second}
+			// A long window keeps heartbeats, which set deadlines of their
+			// own, out of the test.
+			opts := intftcp.ServerOptions{Deps: intftcp.NewRuntimeDeps(st, intftcp.WithRoot(root)), KeepAliveTimeout: time.Hour}
 			var clientOpts []ClientOption
 			if encrypted {
 				id, err := age.GenerateX25519Identity()
@@ -3702,10 +3706,18 @@ func TestChecksumReusesKeepAliveConnections(t *testing.T) {
 				opts.ServerIdentity = id
 				clientOpts = append(clientOpts, WithEncryptMode("auto"))
 			}
-			var dials atomic.Int64
+			var mu sync.Mutex
+			var conns []*deadlineConn
 			clientOpts = append(clientOpts, WithConcurrency(2), WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-				dials.Add(1)
-				return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+				conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+				if err != nil {
+					return nil, err
+				}
+				dc := &deadlineConn{TCPConn: conn.(*net.TCPConn)}
+				mu.Lock()
+				conns = append(conns, dc)
+				mu.Unlock()
+				return dc, nil
 			}))
 			client := NewClient(startRealKeepAliveServer(t, opts), clientOpts...)
 			defer client.Close()
@@ -3724,29 +3736,9 @@ func TestChecksumReusesKeepAliveConnections(t *testing.T) {
 					target = ChecksumTarget{FileID: entry.ID, FullPath: filepath.Join(manifestResp.Manifest.Root, entry.Path), Size: entry.Size, Algo: "xxh128"}
 				}
 			}
-			// Let pool warm-up dials finish so the loop's dials are its own.
-			for stable := dials.Load(); ; {
-				time.Sleep(150 * time.Millisecond)
-				if now := dials.Load(); now == stable {
-					break
-				} else {
-					stable = now
-				}
-			}
-			dialsBefore := dials.Load()
-			before := client.MetricSnapshot().ConnectionReuseCount
 			const requests = 10
-			const hashTimeout = 100 * time.Millisecond
 			for i := 0; i < requests; i++ {
-				// Alternate deadlined and undeadlined requests, waiting past
-				// the deadline before each undeadlined one: a recycled
-				// connection that kept its read deadline would fail it.
-				opts := ChecksumBatchOptions{HashTimeout: hashTimeout}
-				if i%2 == 1 {
-					opts.HashTimeout = 0
-					time.Sleep(3 * hashTimeout / 2)
-				}
-				err := client.VisitChecksumBatches(ctx, GetChecksumRequest{TransferID: manifestResp.Manifest.TransferID, Targets: []ChecksumTarget{target}}, opts,
+				err := client.VisitChecksumBatches(ctx, GetChecksumRequest{TransferID: manifestResp.Manifest.TransferID, Targets: []ChecksumTarget{target}}, ChecksumBatchOptions{HashTimeout: time.Hour},
 					func(_ []ChecksumTarget, resp GetChecksumResponse) error {
 						body, err := io.ReadAll(resp.Reader)
 						if err == nil && !strings.HasSuffix(string(body), "OK\r\n") {
@@ -3757,15 +3749,72 @@ func TestChecksumReusesKeepAliveConnections(t *testing.T) {
 				if err != nil {
 					t.Fatalf("checksum %d: %v", i, err)
 				}
-			}
-			if got := client.MetricSnapshot().ConnectionReuseCount - before; got != requests {
-				t.Fatalf("recycled %d of %d CXSUM connections", got, requests)
-			}
-			if got := dials.Load() - dialsBefore; got != 0 {
-				t.Fatalf("CXSUM loop dialed %d new connections; the server or client dropped pooled ones", got)
+				// The response is closed, so every connection that served a
+				// CXSUM is back in the pool: open and without a deadline.
+				var served int
+				mu.Lock()
+				for _, c := range conns {
+					sets, deadline, closed := c.state()
+					if sets == 0 {
+						continue
+					}
+					served += sets
+					if closed {
+						t.Fatalf("checksum %d: a connection that served CXSUM was closed, not pooled", i)
+					}
+					if !deadline.IsZero() {
+						t.Fatalf("checksum %d: pooled connection kept read deadline %v", i, deadline)
+					}
+				}
+				mu.Unlock()
+				if served != i+1 {
+					t.Fatalf("checksum %d: %d response deadlines set, want %d", i, served, i+1)
+				}
 			}
 		})
 	}
+}
+
+// deadlineConn records the read deadline a connection carries, how many
+// read-only deadlines it was given (only a CXSUM response sets one), and
+// whether it was closed. It embeds *net.TCPConn so the pool can still peek
+// idle connections through syscall.Conn.
+type deadlineConn struct {
+	*net.TCPConn
+	mu       sync.Mutex
+	sets     int
+	deadline time.Time
+	closed   bool
+}
+
+func (c *deadlineConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	if !t.IsZero() {
+		c.sets++
+	}
+	c.deadline = t
+	c.mu.Unlock()
+	return c.TCPConn.SetReadDeadline(t)
+}
+
+func (c *deadlineConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+	return c.TCPConn.SetDeadline(t)
+}
+
+func (c *deadlineConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return c.TCPConn.Close()
+}
+
+func (c *deadlineConn) state() (sets int, deadline time.Time, closed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sets, c.deadline, c.closed
 }
 
 // A path carrying '\n' cannot be encoded into a framed body: the receiver splits
