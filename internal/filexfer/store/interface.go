@@ -17,8 +17,9 @@ type Interface interface {
 	RegisterTransferFileState(txferID string, updatesCh <-chan TransferFileStateUpdate, state uint8) <-chan struct{}
 	ClipTransfer(txferID string) bool
 
-	// Reads and transfer-level hints. GetTransfer and ListTransfers copy every
-	// per-file slice; per-request and per-file paths use GetTransferSummary.
+	// Reads and transfer-level hints. GetTransfer copies every per-file slice;
+	// per-request and per-file paths use GetTransferSummary, and ListTransfers
+	// returns summaries.
 	GetTransfer(txferID string) (Transfer, bool)
 	GetTransferSummary(txferID string) (Transfer, bool)
 	ListTransfers() []Transfer

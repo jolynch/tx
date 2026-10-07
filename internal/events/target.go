@@ -204,13 +204,27 @@ func (w *TargetWriter) writeTarget(t *targetState, queue [][]byte, dropped int64
 	}
 	t.wrote = true
 
-	var droppedRec []byte
-	if dropped > 0 {
-		droppedRec = AppendJSON(nil, w.header, Event{T: time.Now(), Name: "dropped", Fields: []Field{F("n", dropped)}})
+	// A partly written head goes first: anything ahead of it, including the
+	// "dropped" record, would land inside a record already begun.
+	type segment struct {
+		b      []byte
+		marker bool // the "dropped" record
 	}
-	t.buf = append(t.buf[:0], droppedRec...)
+	segs := make([]segment, 0, len(queue)+1)
+	if partial && len(queue) > 0 {
+		segs = append(segs, segment{b: queue[0]})
+		queue = queue[1:]
+	}
+	if dropped > 0 {
+		rec := AppendJSON(nil, w.header, Event{T: time.Now(), Name: "dropped", Fields: []Field{F("n", dropped)}})
+		segs = append(segs, segment{b: rec, marker: true})
+	}
 	for _, r := range queue {
-		t.buf = append(t.buf, r...)
+		segs = append(segs, segment{b: r})
+	}
+	t.buf = t.buf[:0]
+	for _, seg := range segs {
+		t.buf = append(t.buf, seg.b...)
 	}
 	n, err := out.Write(t.buf)
 	// A write error other than a full pipe means the reader left: drop the
@@ -219,30 +233,30 @@ func (w *TargetWriter) writeTarget(t *targetState, queue [][]byte, dropped int64
 		t.f.Close()
 		t.f = nil
 	}
-	if n >= len(t.buf) {
-		return nil, 0, false
-	}
 
-	// The target took n bytes: keep the rest, splitting the record it
-	// stopped in.
-	if n < len(droppedRec) {
-		if n == 0 {
-			return queue, dropped, partial
+	// Keep what the target did not take, splitting the record it stopped in.
+	// An unbegun "dropped" record goes back as its count.
+	var rest [][]byte
+	var restDropped int64
+	restPartial := false
+	for i, seg := range segs {
+		if n >= len(seg.b) {
+			n -= len(seg.b)
+			continue
 		}
-		return append([][]byte{droppedRec[n:]}, queue...), 0, true
-	}
-	n -= len(droppedRec)
-	for i, r := range queue {
-		if n < len(r) {
-			if n == 0 {
-				return queue[i:], 0, i == 0 && partial
-			}
-			queue[i] = r[n:]
-			return queue[i:], 0, true
+		switch {
+		case n > 0:
+			rest = append(rest, seg.b[n:])
+			restPartial = len(rest) == 1
+			n = 0
+		case seg.marker:
+			restDropped = dropped
+		default:
+			rest = append(rest, seg.b)
+			restPartial = restPartial || (i == 0 && partial && len(rest) == 1)
 		}
-		n -= len(r)
 	}
-	return nil, 0, false
+	return rest, restDropped, restPartial
 }
 
 // Stop ends the periodic writes and makes a final one, so a file target is

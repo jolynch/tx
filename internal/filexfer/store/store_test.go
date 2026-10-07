@@ -973,8 +973,9 @@ func TestStoreCloseWaitsForActiveReap(t *testing.T) {
 	// Hold the per-transfer lock until a reaper pass has started; it cannot
 	// finish without that lock. Close must then wait for the pass.
 	managed.mu.Lock()
+	base := s.reapPasses.Load()
 	deadline := time.Now().Add(time.Second)
-	for s.reapPasses.Load() == 0 {
+	for s.reapPasses.Load() == base {
 		if time.Now().After(deadline) {
 			managed.mu.Unlock()
 			s.Close()
@@ -1021,9 +1022,11 @@ func TestStoreReapConcurrentACK(t *testing.T) {
 	managed.transfer.FileSize[0] = 10
 	managed.transfer.ExpiresAt = time.Now().Add(-time.Second)
 
-	// Block the reaper on this transfer once its pass has started.
+	// Block the reaper on this transfer: a pass that starts after we hold
+	// the lock cannot finish without it.
+	base := s.reapPasses.Load()
 	deadline := time.Now().Add(5 * time.Second)
-	for s.reapPasses.Load() == 0 {
+	for s.reapPasses.Load() == base {
 		if time.Now().After(deadline) {
 			managed.mu.Unlock()
 			t.Fatal("reaper did not start")

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -159,7 +160,7 @@ func TestTargetWriterFIFOWaitsThenDrops(t *testing.T) {
 // lockCheckWriter records each Write and fails the test if the writer's
 // emitter mutex is held during one: a slow target must never block emitters.
 type lockCheckWriter struct {
-	t      *testing.T
+	t      *testing.T // nil skips the lock check
 	w      *TargetWriter
 	mu     sync.Mutex
 	writes int
@@ -167,10 +168,12 @@ type lockCheckWriter struct {
 }
 
 func (c *lockCheckWriter) Write(p []byte) (int, error) {
-	if !c.w.mu.TryLock() {
-		c.t.Error("target written while holding the emitter mutex")
-	} else {
-		c.w.mu.Unlock()
+	if c.t != nil {
+		if !c.w.mu.TryLock() {
+			c.t.Error("target written while holding the emitter mutex")
+		} else {
+			c.w.mu.Unlock()
+		}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -199,8 +202,10 @@ func TestTargetWriterWritesOutsideEmitterLock(t *testing.T) {
 		t.Fatalf("got %d records in %d writes, want 100 in 1", strings.Count(got, "\n"), writes)
 	}
 
+	// Emitters still hold mu here while the early flush writes, so this half
+	// checks only that the flush happens.
 	s = NewSink()
-	out = &lockCheckWriter{t: t}
+	out = &lockCheckWriter{}
 	out.w = StartTargetWriter(s, Header{Side: "c"}, time.Hour, []Target{{Path: "-", Stdout: out}})
 	defer out.w.Stop()
 	pad := strings.Repeat("x", 1000)
@@ -216,5 +221,54 @@ func TestTargetWriterWritesOutsideEmitterLock(t *testing.T) {
 			t.Fatal("a half-full buffer was not flushed before the interval")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// stallingWriter takes the first n bytes it is given, then reports a full pipe
+// until open is set.
+type stallingWriter struct {
+	mu   sync.Mutex
+	n    int
+	open bool
+	buf  bytes.Buffer
+}
+
+func (w *stallingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.open {
+		return w.buf.Write(p)
+	}
+	k := min(w.n, len(p))
+	w.n -= k
+	w.buf.Write(p[:k])
+	return k, syscall.EAGAIN
+}
+
+// A record cut short by a full pipe is finished before anything else, even a
+// "dropped" record for an overflow while the pipe was full.
+func TestTargetWriterFinishesPartialRecordFirst(t *testing.T) {
+	s := NewSink()
+	out := &stallingWriter{n: 10}
+	w := StartTargetWriter(s, Header{Side: "c"}, time.Hour, []Target{{Path: "-", Stdout: out}})
+	s.Emit("first", "t1", F("pad", strings.Repeat("a", 100)))
+	w.flush()
+	pad := strings.Repeat("x", 1000)
+	for i := range 2 * TargetBufferLimit / 1000 {
+		s.Emit("window", "t1", F("i", i), F("pad", pad))
+	}
+	out.mu.Lock()
+	out.open = true
+	out.mu.Unlock()
+	w.Stop()
+	lines := strings.Split(strings.TrimSuffix(out.buf.String(), "\n"), "\n")
+	for i, line := range lines {
+		var v map[string]any
+		if err := json.Unmarshal([]byte(line), &v); err != nil {
+			t.Fatalf("line %d is not JSON: %.120q", i, line)
+		}
+		if i == 1 && v["ev"] != "dropped" {
+			t.Fatalf("line 1 = %v, want the dropped record after the finished first one", v)
+		}
 	}
 }
