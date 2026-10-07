@@ -28,7 +28,8 @@ bin=$(mktemp -d)/fuzz.test
 log=$(mktemp)
 trap 'rm -rf "$(dirname "$bin")" "$log"' EXIT
 
-go test "${race[@]}" -c -o "$bin" "$pkg"
+# -fuzz at build time adds the coverage instrumentation fuzzing is guided by.
+go test "${race[@]}" -fuzz="^${target}\$" -c -o "$bin" "$pkg"
 
 flags=()
 for f in "$@"; do
