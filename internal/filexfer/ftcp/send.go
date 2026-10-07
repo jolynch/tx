@@ -224,7 +224,7 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 		return protocolErr{code: "BAD_REQUEST", message: "SEND requires at least one item"}
 	}
 
-	transfer, hasTransfer := deps.GetTransfer(header.TransferID)
+	transfer, hasTransfer := deps.GetTransferSummary(header.TransferID)
 	for _, record := range records {
 		item := record.item(header.Mode)
 		itemOut := out

@@ -41,7 +41,7 @@ type mockDeps struct {
 	// Inputs.
 	filePath   string // GetFile/GetFileRef serve this file when non-empty
 	entryType  byte
-	transfer   Transfer // returned by GetTransfer when transferOK
+	transfer   Transfer // returned by GetTransfer and GetTransferSummary when transferOK
 	transferOK bool
 
 	// ReportTransferObservedLink return values.
@@ -59,6 +59,8 @@ type mockDeps struct {
 	cacheRestoreTxID string
 	ackCalls         []ackCall
 	completeCalls    int
+	progressCalls    int
+	getTransferCalls int // full per-file clones; per-request paths must not call it
 	windowHashEnd    int64
 	windowHash       string
 	setStateCalls    int
@@ -85,7 +87,12 @@ func (m *mockDeps) RegisterTransferFileState(string, <-chan TransferFileStateUpd
 
 func (m *mockDeps) ClipTransfer(string) bool { return true }
 
-func (m *mockDeps) GetTransfer(string) (Transfer, bool) { return m.transfer, m.transferOK }
+func (m *mockDeps) GetTransfer(string) (Transfer, bool) {
+	m.getTransferCalls++
+	return m.transfer, m.transferOK
+}
+
+func (m *mockDeps) GetTransferSummary(string) (Transfer, bool) { return m.transfer, m.transferOK }
 
 func (m *mockDeps) ListTransfers() []Transfer { return nil }
 
@@ -166,8 +173,10 @@ func (m *mockDeps) SetTransferFileWindowHash(_ string, _ uint64, endBytes int64,
 
 func (m *mockDeps) VerifyTransferFileWindowHash(string, uint64, int64, string) bool { return true }
 
-func (m *mockDeps) AcknowledgeTransferFile(_ string, fileID uint64, ackBytes int64) bool {
-	m.ackCalls = append(m.ackCalls, ackCall{fileID: fileID, ackBytes: ackBytes})
+func (m *mockDeps) AcknowledgeTransferFiles(entries []AckEntry) bool {
+	for _, e := range entries {
+		m.ackCalls = append(m.ackCalls, ackCall{fileID: e.FileID, ackBytes: e.AckBytes})
+	}
 	return true
 }
 
@@ -176,9 +185,12 @@ func (m *mockDeps) SetTransferPageCache(string, uint64, []byte) bool { return tr
 func (m *mockDeps) SetTransferDeadline(string, int64) bool           { return false }
 func (m *mockDeps) RecordTransferFirstSend(string) (time.Time, bool) { return time.Time{}, false }
 func (m *mockDeps) MarkTransferTooSlow(string) bool                  { return false }
-func (m *mockDeps) MaybeLogTransferProgress(string)                  {}
-func (m *mockDeps) MaybeLogTransferComplete(string)                  { m.completeCalls++ }
-func (m *mockDeps) Root() string                                     { return "/" }
+func (m *mockDeps) MaybeLogTransferProgress(string)                  { m.progressCalls++ }
+func (m *mockDeps) MaybeLogTransferComplete(string) bool {
+	m.completeCalls++
+	return false
+}
+func (m *mockDeps) Root() string { return "/" }
 
 func (m *mockDeps) EnqueueCacheRestoreBatch(txferID string, items []pagecache.TouchEntry) {
 	m.cacheRestoreCh = append(m.cacheRestoreCh, items...)

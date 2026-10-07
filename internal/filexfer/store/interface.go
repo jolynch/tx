@@ -17,8 +17,10 @@ type Interface interface {
 	RegisterTransferFileState(txferID string, updatesCh <-chan TransferFileStateUpdate, state uint8) <-chan struct{}
 	ClipTransfer(txferID string) bool
 
-	// Reads and transfer-level hints.
+	// Reads and transfer-level hints. GetTransfer and ListTransfers copy every
+	// per-file slice; per-request and per-file paths use GetTransferSummary.
 	GetTransfer(txferID string) (Transfer, bool)
+	GetTransferSummary(txferID string) (Transfer, bool)
 	ListTransfers() []Transfer
 	SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool
 	GetTransferGentleLimiter(txferID string, fallbackLinkMbps int64, gentleBWPct int, burstBytes int64) *limit.Limiter
@@ -31,7 +33,7 @@ type Interface interface {
 	SetTransferFileState(txferID string, fileID uint64, state uint8) bool
 	SetTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool
 	VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool
-	AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool
+	AcknowledgeTransferFiles(entries []AckEntry) bool
 	SetTransferPageCache(txferID string, fileID uint64, blob []byte) bool
 
 	// Deadlines, backing --exit-after.
@@ -40,7 +42,7 @@ type Interface interface {
 	MarkTransferTooSlow(txferID string) bool
 
 	MaybeLogTransferProgress(txferID string)
-	MaybeLogTransferComplete(txferID string)
+	MaybeLogTransferComplete(txferID string) bool
 }
 
 var _ Interface = (*Store)(nil)

@@ -159,7 +159,7 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	manifestMode := parsed.Mode
 	manifestLinkMbps := parsed.LinkMbps
 	manifestConcurrency := parsed.Concurrency
-	if stored, ok := deps.GetTransfer(transfer.ID); ok {
+	if stored, ok := deps.GetTransferSummary(transfer.ID); ok {
 		if strings.TrimSpace(stored.Mode) != "" {
 			manifestMode = strings.ToLower(strings.TrimSpace(stored.Mode))
 		}
@@ -377,8 +377,12 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	// Drain the file-state goroutine before auto-acking so the slots
 	// the acks index into have been populated with their FileSize.
 	closeUpdates()
-	for _, m := range matchedAcks {
-		deps.AcknowledgeTransferFile(transfer.ID, m.fileID, m.size)
+	if len(matchedAcks) > 0 {
+		acks := make([]AckEntry, len(matchedAcks))
+		for i, m := range matchedAcks {
+			acks[i] = AckEntry{TxferID: transfer.ID, FileID: m.fileID, AckBytes: m.size}
+		}
+		deps.AcknowledgeTransferFiles(acks)
 	}
 	deps.ClipTransfer(transfer.ID)
 	// Zero-delta SYNC: Done == NumFiles right now, so this fires the

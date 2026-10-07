@@ -42,26 +42,32 @@ func TestHandleSTATUSWritesStatusLine(t *testing.T) {
 	}
 }
 
-func TestTransferToStatusUsesRegularFilesOnly(t *testing.T) {
-	status := transferToStatus("tx1", Transfer{
+// transferToStatus reports the store's per-state counts; which entries count
+// (regular files only) is the store's invariant, checked by FuzzStoreStateCounts.
+func TestTransferToStatusReportsStateCounts(t *testing.T) {
+	tr := Transfer{
 		ID:         "tx1",
 		Directory:  "/tmp",
-		NumEntries: 3,
-		NumFiles:   1,
+		NumEntries: 12,
+		NumFiles:   10,
 		TotalSize:  100,
-		Done:       1,
+		Done:       5,
 		DoneSize:   100,
-		State:      []uint8{TransferStateDone, TransferStateDone, TransferStateStarted},
-		EntryType:  []byte{encoding.EntryTypeFile, encoding.EntryTypeDir, encoding.EntryTypeSymlink},
-	})
+	}
+	tr.StateCounts[TransferStateStarted] = 2
+	tr.StateCounts[TransferStateRunning] = 3
+	tr.StateCounts[TransferStateDone] = 1
+	tr.StateCounts[TransferStateMissing] = 4
+	status := transferToStatus("tx1", tr)
 
-	if status.NumEntries != 3 || status.NumFiles != 1 {
+	if status.NumEntries != 12 || status.NumFiles != 10 {
 		t.Fatalf("unexpected status counts: entries=%d files=%d", status.NumEntries, status.NumFiles)
 	}
-	if status.PercentFiles != 100 {
-		t.Fatalf("expected 100%% file progress, got %.1f", status.PercentFiles)
+	if status.PercentFiles != 50 {
+		t.Fatalf("expected 50%% file progress, got %.1f", status.PercentFiles)
 	}
-	if status.DownloadStatus.Done != 1 || status.DownloadStatus.Started != 0 || status.DownloadStatus.Running != 0 || status.DownloadStatus.Missing != 0 {
-		t.Fatalf("unexpected download status: %+v", status.DownloadStatus)
+	want := encoding.DownloadStatus{Started: 2, Running: 3, Done: 1, Missing: 4}
+	if status.DownloadStatus != want {
+		t.Fatalf("download status = %+v, want %+v", status.DownloadStatus, want)
 	}
 }
