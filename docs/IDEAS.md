@@ -52,10 +52,6 @@ instead of widening the current change; remove an entry when it ships.
   finish with correct data or fail loudly. The per-call syscall struct behind
   the zero-copy `SEND` tests is a model for injecting faults without global
   hooks.
-- **Fuzz targets run without coverage guidance.** `scripts/fuzz` builds the
-  test binary without fuzz instrumentation, so every Makefile target fuzzes
-  blind and prints "the test binary was not built with coverage
-  instrumentation".
 - **Untested failure paths.** `mapLookupError` (every `ACK`, `CXSUM`, and
   `SEND` file-lookup failure), `checkTransferDeadline` (gentle-mode
   `TOO_SLOW`), `isDirectIOReadError`, and `EnqueueCacheRestoreBatch` have no
