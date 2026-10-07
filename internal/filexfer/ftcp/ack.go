@@ -115,13 +115,13 @@ func handleACKWithInput(ctx context.Context, req Request, in io.Reader, out io.W
 		entries[i] = AckEntry{TxferID: txferID, FileID: record.FileID, AckBytes: record.AckBytes}
 		progressed = progressed || record.AckBytes >= 0
 	}
+	// Records that failed do not undo the rest, so check progress and
+	// completion either way.
 	ok := deps.AcknowledgeTransferFiles(entries)
-	if ok {
-		if progressed {
-			deps.MaybeLogTransferProgress(txferID)
-		}
-		deps.MaybeLogTransferComplete(txferID)
+	if progressed {
+		deps.MaybeLogTransferProgress(txferID)
 	}
+	deps.MaybeLogTransferComplete(txferID)
 	task.End()
 	if !ok {
 		return protocolErr{code: "INTERNAL", message: "failed to acknowledge file progress"}
