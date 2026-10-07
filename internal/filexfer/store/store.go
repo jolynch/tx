@@ -40,16 +40,19 @@ type Transfer struct {
 	Directory string
 	// RequestPath is the path the client asked for, including a single
 	// file's name; Directory holds only that file's parent.
-	RequestPath     string
-	Mode            string
-	LinkMbps        int64
-	Concurrency     int
-	NumEntries      int
-	NumFiles        int
-	TotalSize       int64
-	Done            uint64
-	DoneSize        int64
-	State           []uint8
+	RequestPath string
+	Mode        string
+	LinkMbps    int64
+	Concurrency int
+	NumEntries  int
+	NumFiles    int
+	TotalSize   int64
+	Done        uint64
+	DoneSize    int64
+	State       []uint8
+	// StateCounts counts regular-file entries by State, kept current on
+	// every change so status reads need not scan State.
+	StateCounts     [TransferStateMissing + 1]int
 	EntryType       []byte
 	PathHash        []xxh3.Uint128
 	FileSize        []int64
@@ -95,26 +98,33 @@ func (e *FileLookupError) Error() string {
 }
 
 type managedTransfer struct {
-	mu           sync.RWMutex
-	deleted      bool
-	transfer     Transfer
-	windowHashes map[windowHashKey]*windowHashState
-	observedEMA  float64
-	limiterBps   int64
-	limiter      atomic.Pointer[limit.Limiter]
+	mu          sync.RWMutex
+	deleted     bool
+	transfer    Transfer
+	observedEMA float64
+	limiterBps  int64
+	limiter     atomic.Pointer[limit.Limiter]
+
+	// hashMu guards windowHashes alone, so recording or checking a window
+	// hash needs only a shared hold of mu. Lock order: mu, then hashMu.
+	hashMu       sync.Mutex
+	windowHashes map[windowHashKey]windowHashState
 }
 
 // Store holds transfer state for a server. There is no process-wide
 // instance: whoever runs a server owns a Store and closes it, and tests
 // build their own so they cannot see each other's transfers.
 type Store struct {
-	mu        sync.RWMutex
-	transfers map[string]*managedTransfer
-	ttl       time.Duration
-	done      chan struct{}
-	stopped   chan struct{}
-	closeOnce sync.Once
-	events    *events.Sink
+	// transfers maps a transfer ID to its *managedTransfer. Entries are
+	// written once and read on every request, which sync.Map serves without
+	// a store-wide lock.
+	transfers  sync.Map
+	reapPasses atomic.Int64 // reaper passes started; lets tests observe one in flight
+	ttl        time.Duration
+	done       chan struct{}
+	stopped    chan struct{}
+	closeOnce  sync.Once
+	events     *events.Sink
 }
 
 type windowHashKey struct {
@@ -186,10 +196,9 @@ func (s *Store) emitDone(t Transfer) {
 // are responsible for calling Close to stop that goroutine.
 func NewStore(opts ...StoreOption) *Store {
 	s := &Store{
-		transfers: make(map[string]*managedTransfer),
-		ttl:       defaultTransferTTL,
-		done:      make(chan struct{}),
-		stopped:   make(chan struct{}),
+		ttl:     defaultTransferTTL,
+		done:    make(chan struct{}),
+		stopped: make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -210,12 +219,31 @@ func (s *Store) Close() {
 func newManagedTransfer(transfer Transfer) *managedTransfer {
 	return &managedTransfer{
 		transfer:     transfer,
-		windowHashes: make(map[windowHashKey]*windowHashState),
+		windowHashes: make(map[windowHashKey]windowHashState),
 	}
 }
 
 func shouldAdvanceState(current uint8, next uint8) bool {
 	return next >= current
+}
+
+// countEntry adds delta to the StateCounts slot of entry idx, if it is a
+// regular file. Callers uncount an entry before changing its State or
+// EntryType and count it again afterwards.
+func (t *Transfer) countEntry(idx int, delta int) {
+	if !isRegularFileEntryType(t.EntryType[idx]) {
+		return
+	}
+	if st := int(t.State[idx]); st < len(t.StateCounts) {
+		t.StateCounts[st] += delta
+	}
+}
+
+// setState moves entry idx to state, keeping StateCounts current.
+func (t *Transfer) setState(idx int, state uint8) {
+	t.countEntry(idx, -1)
+	t.State[idx] = state
+	t.countEntry(idx, 1)
 }
 
 func cloneTransfer(transfer Transfer) Transfer {
@@ -231,17 +259,34 @@ func cloneTransfer(transfer Transfer) Transfer {
 	return out
 }
 
+// summarizeTransfer copies only the transfer's scalar fields. The per-file
+// slices are O(files), so a caller that runs per request or per file must use
+// this rather than cloneTransfer.
+func summarizeTransfer(transfer Transfer) Transfer {
+	out := transfer
+	out.State = nil
+	out.EntryType = nil
+	out.PathHash = nil
+	out.FileSize = nil
+	out.AckedSize = nil
+	out.PageCache = nil
+	return out
+}
+
 func isRegularFileEntryType(entryType byte) bool {
 	return entryType == 0 || entryType == intencoding.EntryTypeFile
 }
 
-func logTransferComplete(t *Transfer) {
+// formatTransferComplete returns the completion log line. Callers format it
+// under the transfer lock and write it after releasing the lock, so a slow log
+// destination never stalls the transfer.
+func formatTransferComplete(t *Transfer) string {
 	elapsed := time.Since(t.CreatedAt)
 	speed := 0.0
 	if elapsed.Seconds() > 0 {
 		speed = float64(t.TotalSize) / elapsed.Seconds()
 	}
-	log.Printf(
+	return fmt.Sprintf(
 		"txfer-complete: tid=%s files=%d size=%s elapsed=%s speed=%s",
 		t.ID,
 		t.NumFiles,
@@ -251,44 +296,48 @@ func logTransferComplete(t *Transfer) {
 	)
 }
 
-func (s *Store) MaybeLogTransferComplete(txferID string) {
+// MaybeLogTransferComplete logs the transfer's completion the first time every
+// file is counted, and reports whether the transfer is complete.
+func (s *Store) MaybeLogTransferComplete(txferID string) bool {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
-		return
+		return false
 	}
 
 	managed.mu.Lock()
 	if managed.deleted {
 		managed.mu.Unlock()
-		return
+		return false
 	}
 	t := &managed.transfer
-	if t.CompleteLogged || t.NumFiles <= 0 || t.Done != uint64(t.NumFiles) {
+	if t.CompleteLogged {
 		managed.mu.Unlock()
-		return
+		return true
+	}
+	if t.NumFiles <= 0 || t.Done != uint64(t.NumFiles) {
+		managed.mu.Unlock()
+		return false
 	}
 	t.CompleteLogged = true
-	logTransferComplete(t)
-	done := *t
+	line := formatTransferComplete(t)
+	done := summarizeTransfer(*t)
 	managed.mu.Unlock()
+	log.Print(line)
 	s.emitDone(done)
+	return true
 }
 
 func (s *Store) getManagedTransfer(txferID string) (*managedTransfer, bool) {
-	s.mu.RLock()
-	managed, ok := s.transfers[txferID]
-	s.mu.RUnlock()
-	return managed, ok
+	v, ok := s.transfers.Load(txferID)
+	if !ok {
+		return nil, false
+	}
+	return v.(*managedTransfer), true
 }
 
 func (s *Store) create(transfer Transfer) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, exists := s.transfers[transfer.ID]; exists {
-		return false
-	}
-	s.transfers[transfer.ID] = newManagedTransfer(transfer)
-	return true
+	_, exists := s.transfers.LoadOrStore(transfer.ID, newManagedTransfer(transfer))
+	return !exists
 }
 
 func (s *Store) SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool {
@@ -505,6 +554,7 @@ func (s *Store) RegisterTransferFileStates(txferID string, updates []TransferFil
 		}
 		for i := oldLen; i < n; i++ {
 			managed.transfer.State[i] = TransferStateStarted
+			managed.transfer.countEntry(i, 1)
 		}
 	}
 
@@ -519,6 +569,7 @@ func (s *Store) RegisterTransferFileStates(txferID string, updates []TransferFil
 		if update.FileID != intencoding.RootFileID && idx >= oldLen {
 			managed.transfer.NumEntries++
 		}
+		managed.transfer.countEntry(idx, -1)
 		managed.transfer.EntryType[idx] = update.EntryType
 		isRegularFile := isRegularFileEntryType(update.EntryType)
 		if !wasRegularFile && isRegularFile {
@@ -534,6 +585,7 @@ func (s *Store) RegisterTransferFileStates(txferID string, updates []TransferFil
 		if shouldAdvanceState(managed.transfer.State[idx], state) {
 			managed.transfer.State[idx] = state
 		}
+		managed.transfer.countEntry(idx, 1)
 	}
 	// A batch that grows the transfer is manifest-walk progress. Re-registering
 	// known entries is not, and entries are finite, so this stays bounded.
@@ -543,17 +595,14 @@ func (s *Store) RegisterTransferFileStates(txferID string, updates []TransferFil
 }
 
 func (s *Store) DeleteTransfer(txferID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	managed, ok := s.transfers[txferID]
+	v, ok := s.transfers.LoadAndDelete(txferID)
 	if !ok {
 		return false
 	}
+	managed := v.(*managedTransfer)
 	managed.mu.Lock()
 	managed.deleted = true
 	managed.mu.Unlock()
-	delete(s.transfers, txferID)
 	return true
 }
 
@@ -569,6 +618,22 @@ func (s *Store) GetTransfer(txferID string) (Transfer, bool) {
 		return Transfer{}, false
 	}
 	return cloneTransfer(managed.transfer), true
+}
+
+// GetTransferSummary returns the transfer without its per-file slices, at a
+// cost independent of the file count.
+func (s *Store) GetTransferSummary(txferID string) (Transfer, bool) {
+	managed, ok := s.getManagedTransfer(txferID)
+	if !ok {
+		return Transfer{}, false
+	}
+
+	managed.mu.RLock()
+	defer managed.mu.RUnlock()
+	if managed.deleted {
+		return Transfer{}, false
+	}
+	return summarizeTransfer(managed.transfer), true
 }
 
 func (s *Store) GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {
@@ -633,22 +698,19 @@ func (s *Store) GetFileRef(txferID string, fileID uint64, fullPathRaw string) (F
 	}, nil
 }
 
+// ListTransfers returns a summary of every transfer: scalars only, as
+// GetTransferSummary returns.
 func (s *Store) ListTransfers() []Transfer {
-	s.mu.RLock()
-	transfers := make([]*managedTransfer, 0, len(s.transfers))
-	for _, managed := range s.transfers {
-		transfers = append(transfers, managed)
-	}
-	s.mu.RUnlock()
-
-	out := make([]Transfer, 0, len(transfers))
-	for _, managed := range transfers {
+	var out []Transfer
+	s.transfers.Range(func(_, v any) bool {
+		managed := v.(*managedTransfer)
 		managed.mu.RLock()
 		if !managed.deleted {
-			out = append(out, cloneTransfer(managed.transfer))
+			out = append(out, summarizeTransfer(managed.transfer))
 		}
 		managed.mu.RUnlock()
-	}
+		return true
+	})
 	return out
 }
 
@@ -692,7 +754,7 @@ func (s *Store) SetTransferFileState(txferID string, fileID uint64, state uint8)
 	if !shouldAdvanceState(managed.transfer.State[idx], state) || managed.transfer.State[idx] == state {
 		return true
 	}
-	managed.transfer.State[idx] = state
+	managed.transfer.setState(idx, state)
 	s.touchLocked(managed, time.Now())
 	return true
 }
@@ -748,7 +810,7 @@ func (s *Store) acknowledgeFileLocked(managed *managedTransfer, fileID uint64, a
 	if ackBytes == -1 {
 		if shouldAdvanceState(currentState, TransferStateMissing) {
 			wasTerminal := currentState == TransferStateDone || currentState == TransferStateMissing
-			managed.transfer.State[idx] = TransferStateMissing
+			managed.transfer.setState(idx, TransferStateMissing)
 			// NumFiles counts only regular files and completion needs
 			// Done == NumFiles exactly, so a missing directory or
 			// symlink must not be counted.
@@ -784,12 +846,14 @@ func (s *Store) acknowledgeFileLocked(managed *managedTransfer, fileID uint64, a
 	// not been counted yet. This runs even when target did not advance,
 	// which is the only way an empty file is ever counted.
 	if target == maxAck && managed.transfer.State[idx] < TransferStateDone && isRegularFileEntryType(managed.transfer.EntryType[idx]) {
-		managed.transfer.State[idx] = TransferStateDone
+		managed.transfer.setState(idx, TransferStateDone)
 		managed.transfer.Done++
 		s.touchLocked(managed, now)
 	}
 
+	managed.hashMu.Lock()
 	delete(managed.windowHashes, windowHashKey{fileID: fileID, endBytes: target})
+	managed.hashMu.Unlock()
 	return true
 }
 
@@ -828,21 +892,24 @@ func (s *Store) ClipTransfer(txferID string) bool {
 	// transfer of those files needs.
 	s.touchLocked(managed, time.Now())
 	t := &managed.transfer
-	log.Printf(
+	lines := []string{fmt.Sprintf(
 		"txfer-start: tid=%s dir=%s mode=%s entries=%d files=%d size=%s link=%dMbps concurrency=%d",
 		t.ID, t.Directory, t.Mode,
 		t.NumEntries,
 		t.NumFiles,
 		intencoding.HumanBytes(t.TotalSize),
 		t.LinkMbps, t.Concurrency,
-	)
+	)}
 	emptyDone := t.NumFiles == 0
 	if emptyDone {
 		t.CompleteLogged = true
-		logTransferComplete(t)
+		lines = append(lines, formatTransferComplete(t))
 	}
-	done := *t
+	done := summarizeTransfer(*t)
 	managed.mu.Unlock()
+	for _, line := range lines {
+		log.Print(line)
+	}
 	if emptyDone {
 		s.emitDone(done)
 	}
@@ -870,12 +937,12 @@ func (s *Store) reapExpiredLoop() {
 		case now = <-ticker.C:
 		}
 
-		s.mu.Lock()
-		survivors := make([]*managedTransfer, 0, len(s.transfers))
-		for txferID, managed := range s.transfers {
+		s.reapPasses.Add(1)
+		s.transfers.Range(func(id, v any) bool {
+			managed := v.(*managedTransfer)
 			// Progress can renew the deadline after an ACK has looked up
-			// this transfer, even while we hold the store lock. Check and
-			// mark deletion under one lock so that renewal cannot be lost.
+			// this transfer. Check and mark deletion under one lock so that
+			// renewal cannot be lost; a later lookup sees deleted.
 			managed.mu.Lock()
 			expired := !managed.deleted && !managed.transfer.ExpiresAt.After(now)
 			if expired {
@@ -883,26 +950,18 @@ func (s *Store) reapExpiredLoop() {
 			}
 			managed.mu.Unlock()
 			if expired {
-				delete(s.transfers, txferID)
-				continue
+				s.transfers.CompareAndDelete(id, managed)
+				return true
 			}
-			survivors = append(survivors, managed)
-		}
-		s.mu.Unlock()
-
-		for _, managed := range survivors {
-			managed.mu.Lock()
-			if managed.deleted {
-				managed.mu.Unlock()
-				continue
-			}
+			managed.hashMu.Lock()
 			for key, state := range managed.windowHashes {
 				if !state.expiresAt.After(now) {
 					delete(managed.windowHashes, key)
 				}
 			}
-			managed.mu.Unlock()
-		}
+			managed.hashMu.Unlock()
+			return true
+		})
 	}
 }
 
@@ -925,21 +984,24 @@ func (s *Store) SetTransferFileWindowHash(txferID string, fileID uint64, endByte
 		return false
 	}
 
-	managed.mu.Lock()
-	defer managed.mu.Unlock()
+	if !validHashToken(token) {
+		return false
+	}
+	state := windowHashState{
+		hashToken: normalizeHashToken(token),
+		expiresAt: time.Now().Add(s.ttl),
+	}
+	managed.mu.RLock()
+	defer managed.mu.RUnlock()
 	if managed.deleted {
 		return false
 	}
 	if fileID >= uint64(len(managed.transfer.State)) || endBytes < 0 {
 		return false
 	}
-	if !validHashToken(token) {
-		return false
-	}
-	managed.windowHashes[windowHashKey{fileID: fileID, endBytes: endBytes}] = &windowHashState{
-		hashToken: normalizeHashToken(token),
-		expiresAt: time.Now().Add(s.ttl),
-	}
+	managed.hashMu.Lock()
+	managed.windowHashes[windowHashKey{fileID: fileID, endBytes: endBytes}] = state
+	managed.hashMu.Unlock()
 	return true
 }
 
@@ -954,7 +1016,9 @@ func (s *Store) VerifyTransferFileWindowHash(txferID string, fileID uint64, endB
 	if managed.deleted || endBytes < 0 {
 		return false
 	}
+	managed.hashMu.Lock()
 	state, ok := managed.windowHashes[windowHashKey{fileID: fileID, endBytes: endBytes}]
+	managed.hashMu.Unlock()
 	if !ok {
 		return false
 	}
@@ -991,6 +1055,7 @@ func (s *Store) NewTransfer(directory string, numFiles int, totalSize int64, opt
 			transfer.State[i] = TransferStateStarted
 			transfer.EntryType[i] = intencoding.EntryTypeFile
 		}
+		transfer.StateCounts[TransferStateStarted] = numFiles
 		for _, opt := range opts {
 			opt(&transfer)
 		}
@@ -1067,23 +1132,32 @@ func (s *Store) MaybeLogTransferProgress(txferID string) {
 	}
 
 	managed.mu.Lock()
-	defer managed.mu.Unlock()
-	if managed.deleted {
-		return
+	line, ok := managed.progressLineLocked(time.Now())
+	managed.mu.Unlock()
+	if ok {
+		log.Print(line)
 	}
-	t := &managed.transfer
+}
+
+// progressLineLocked returns the progress log line when a percent bucket or
+// the time interval has passed since the last one, and records that it was
+// logged. The caller holds m.mu and writes the line after releasing it.
+func (m *managedTransfer) progressLineLocked(now time.Time) (string, bool) {
+	if m.deleted {
+		return "", false
+	}
+	t := &m.transfer
 	if t.TotalSize <= 0 {
-		return
+		return "", false
 	}
 
 	currentPct := int(t.DoneSize * 100 / t.TotalSize)
 	pctBucket := (currentPct / progressLogPctInterval) * progressLogPctInterval
-	now := time.Now()
 
 	pctCrossed := pctBucket > t.LastLogPct
 	timeCrossed := !t.LastLogTime.IsZero() && now.Sub(t.LastLogTime) >= progressLogTimeInterval && t.DoneSize > t.LastLogDoneSize
 	if !pctCrossed && !timeCrossed {
-		return
+		return "", false
 	}
 
 	t.LastLogPct = pctBucket
@@ -1101,7 +1175,7 @@ func (s *Store) MaybeLogTransferProgress(txferID string) {
 	}
 	bytesPct = float64(t.DoneSize) * 100.0 / float64(t.TotalSize)
 
-	log.Printf(
+	return fmt.Sprintf(
 		"txfer-progress:[%s] [%s/%s](%5.1f%%) [%s/%s](%5.1f%%) elapsed=%4s rate=%s",
 		t.ID,
 		intencoding.HumanCount(t.Done, progressLogCountWidth),
@@ -1112,7 +1186,7 @@ func (s *Store) MaybeLogTransferProgress(txferID string) {
 		bytesPct,
 		elapsed.Truncate(time.Second),
 		intencoding.HumanRateFixedWidth(rate, progressLogRateWidth),
-	)
+	), true
 }
 
 func transferID() (string, error) {

@@ -77,6 +77,42 @@ func TestHandleACKLogsCompleteAfterFinalProgress(t *testing.T) {
 	}
 }
 
+// An ACK applies all its records in one store call and checks progress and
+// completion once per request, never per file. Under --exit-after it must not
+// clone the transfer: that copy is O(files), which made each ACKed file cost
+// O(files) and stalled every SEND behind the transfer lock.
+func TestHandleACKTouchesTransferOncePerRequest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.bin")
+	if err := os.WriteFile(path, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+	mock := &mockDeps{filePath: path}
+	deps := &exitAfterDeps{Deps: mock, onComplete: func(string) {}}
+
+	const items = 8
+	lines := make([]string, items)
+	for i := range lines {
+		lines[i] = fmt.Sprintf(`fd=%d %q ack-token=5@1@xxh128:0000000000000000000000000000000a`, i+1, path)
+	}
+	req, err := ParseRequest([]byte("ACK tx123"))
+	if err != nil {
+		t.Fatalf("ParseRequest ACK: %v", err)
+	}
+	var out bytes.Buffer
+	if err := handleACKWithInput(context.Background(), req, framedItemBody(t, lines...), &out, deps); err != nil {
+		t.Fatalf("handleACKWithInput: %v", err)
+	}
+	if len(mock.ackCalls) != items {
+		t.Fatalf("applied %d acks, want %d", len(mock.ackCalls), items)
+	}
+	if mock.progressCalls != 1 || mock.completeCalls != 1 {
+		t.Fatalf("progress checked %d times and completion %d times, want once each", mock.progressCalls, mock.completeCalls)
+	}
+	if mock.getTransferCalls != 0 {
+		t.Fatalf("ACK cloned the transfer %d times", mock.getTransferCalls)
+	}
+}
+
 // A later invalid acknowledgment must leave real store state untouched.
 func TestHandleACKInvalidLateItemAppliesNothing(t *testing.T) {
 	root := t.TempDir()

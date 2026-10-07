@@ -283,10 +283,18 @@ func TestMaybeLogTransferCompleteLogsForMixedEntries(t *testing.T) {
 	if ok := s.ClipTransfer(transfer.ID); !ok {
 		t.Fatalf("ClipTransfer returned false")
 	}
+	if s.MaybeLogTransferComplete(transfer.ID) {
+		t.Fatal("MaybeLogTransferComplete reported an incomplete transfer as complete")
+	}
 	if ok := s.AcknowledgeTransferFile(transfer.ID, 1, 10); !ok {
 		t.Fatalf("AcknowledgeTransferFile returned false")
 	}
-	s.MaybeLogTransferComplete(transfer.ID)
+	if !s.MaybeLogTransferComplete(transfer.ID) {
+		t.Fatal("MaybeLogTransferComplete did not report completion")
+	}
+	if !s.MaybeLogTransferComplete(transfer.ID) {
+		t.Fatal("MaybeLogTransferComplete stopped reporting completion once logged")
+	}
 
 	stored, ok := s.GetTransfer(transfer.ID)
 	if !ok {
@@ -308,6 +316,112 @@ func TestMaybeLogTransferCompleteLogsForMixedEntries(t *testing.T) {
 	if strings.Contains(logged, "files=3") {
 		t.Fatalf("expected file count to exclude metadata entries, got %q", logged)
 	}
+}
+
+// lockFreeLogWriter fails the test when a log line is written while the
+// transfer lock is held: a slow log destination must never stall SEND or ACK.
+type lockFreeLogWriter struct {
+	t *testing.T
+	m *managedTransfer
+}
+
+func (w lockFreeLogWriter) Write(p []byte) (int, error) {
+	if !w.m.mu.TryLock() {
+		w.t.Errorf("logged while holding the transfer lock: %q", p)
+		return len(p), nil
+	}
+	w.m.mu.Unlock()
+	return len(p), nil
+}
+
+// FuzzStoreStateCounts drives a transfer through arbitrary registrations,
+// state changes, acknowledgments, clips, and log checks. After every step the
+// running StateCounts must equal a recount of regular files by state, the
+// summary must match the full transfer minus its per-file slices, and no log
+// line may be written under the transfer lock.
+func FuzzStoreStateCounts(f *testing.F) {
+	f.Add([]byte{2, 0, 3, 1, 4, 0, 1, 5, 2, 2, 1, 9, 3, 0, 4, 0, 5, 0})
+	f.Add([]byte{0, 0, 1, 2, 3, 0, 0, 2, 2, 7, 2, 2, 1, 3, 0, 5, 0})
+	f.Add([]byte{3, 1, 0, 2, 2, 0, 0, 1, 1, 2, 2, 1, 0, 2, 2, 2, 0, 2, 5, 0})
+	f.Fuzz(func(t *testing.T, ops []byte) {
+		// Each op rechecks the whole transfer; past a few hundred ops an
+		// input adds runtime, not new states.
+		if len(ops) > 512 {
+			ops = ops[:512]
+		}
+		next := func() byte {
+			if len(ops) == 0 {
+				return 0
+			}
+			b := ops[0]
+			ops = ops[1:]
+			return b
+		}
+		s := newTestStore(t)
+		tr, err := s.NewTransfer("/r", int(next()%4), 0)
+		if err != nil {
+			t.Fatalf("NewTransfer: %v", err)
+		}
+		managed, _ := s.getManagedTransfer(tr.ID)
+		oldFlags, oldWriter := log.Flags(), log.Writer()
+		log.SetFlags(0)
+		log.SetOutput(lockFreeLogWriter{t: t, m: managed})
+		defer func() {
+			log.SetFlags(oldFlags)
+			log.SetOutput(oldWriter)
+		}()
+
+		entryTypes := []byte{0, encoding.EntryTypeFile, encoding.EntryTypeDir, encoding.EntryTypeSymlink}
+		for len(ops) > 0 {
+			op, fid := next()%6, uint64(next()%8)
+			switch op {
+			case 0:
+				s.RegisterTransferFileStates(tr.ID, []TransferFileStateUpdate{{
+					FileID:    fid,
+					EntryType: entryTypes[next()%4],
+					PathHash:  xxh3.Hash128([]byte(fmt.Sprintf("/r/%d", fid))),
+					FileSize:  int64(next() % 8),
+				}}, next()%4)
+			case 1:
+				s.SetTransferFileState(tr.ID, fid, next()%4)
+			case 2:
+				s.AcknowledgeTransferFile(tr.ID, fid, int64(next()%10)-1) // -1 marks Missing
+			case 3:
+				s.ClipTransfer(tr.ID)
+			case 4:
+				s.MaybeLogTransferProgress(tr.ID)
+			case 5:
+				complete := s.MaybeLogTransferComplete(tr.ID)
+				if sum, _ := s.GetTransferSummary(tr.ID); complete != sum.CompleteLogged {
+					t.Fatalf("MaybeLogTransferComplete=%v but CompleteLogged=%v", complete, sum.CompleteLogged)
+				}
+			}
+
+			full, ok := s.GetTransfer(tr.ID)
+			if !ok {
+				t.Fatal("transfer vanished")
+			}
+			sum, _ := s.GetTransferSummary(tr.ID)
+			var want [TransferStateMissing + 1]int
+			for i, st := range full.State {
+				if isRegularFileEntryType(full.EntryType[i]) {
+					want[st]++
+				}
+			}
+			if full.StateCounts != want {
+				t.Fatalf("StateCounts = %v, recount = %v", full.StateCounts, want)
+			}
+			if sum.State != nil || sum.EntryType != nil || sum.PathHash != nil ||
+				sum.FileSize != nil || sum.AckedSize != nil || sum.PageCache != nil {
+				t.Fatalf("summary carries per-file slices: %+v", sum)
+			}
+			full.State, full.EntryType, full.PathHash = nil, nil, nil
+			full.FileSize, full.AckedSize, full.PageCache = nil, nil, nil
+			if fmt.Sprintf("%+v", sum) != fmt.Sprintf("%+v", full) {
+				t.Fatalf("summary differs from transfer:\n sum=%+v\nfull=%+v", sum, full)
+			}
+		}
+	})
 }
 
 func TestMaybeLogTransferProgressUsesClientStyleFixedWidthLayout(t *testing.T) {
@@ -856,12 +970,11 @@ func TestStoreCloseWaitsForActiveReap(t *testing.T) {
 		t.Fatalf("transfer missing")
 	}
 
-	// Hold the per-transfer lock until the reaper holds the store lock and is
-	// blocked mid-pass. Close must then wait for that pass to finish.
+	// Hold the per-transfer lock until a reaper pass has started; it cannot
+	// finish without that lock. Close must then wait for the pass.
 	managed.mu.Lock()
 	deadline := time.Now().Add(time.Second)
-	for s.mu.TryLock() {
-		s.mu.Unlock()
+	for s.reapPasses.Load() == 0 {
 		if time.Now().After(deadline) {
 			managed.mu.Unlock()
 			s.Close()
@@ -894,8 +1007,8 @@ func TestStoreCloseWaitsForActiveReap(t *testing.T) {
 	s.Close() // idempotent
 }
 
-// An ACK can already hold a managed-transfer pointer when the reaper takes
-// the store lock. Either reaping wins and the ACK fails, or the ACK renews
+// An ACK can already hold a managed-transfer pointer when a reaper pass
+// starts. Either reaping wins and the ACK fails, or the ACK renews
 // the deadline and the transfer survives; a successful renewal cannot be lost.
 func TestStoreReapConcurrentACK(t *testing.T) {
 	s := newTestStoreWithOptions(t, WithTTL(time.Second))
@@ -908,10 +1021,9 @@ func TestStoreReapConcurrentACK(t *testing.T) {
 	managed.transfer.FileSize[0] = 10
 	managed.transfer.ExpiresAt = time.Now().Add(-time.Second)
 
-	// Block the reaper on this transfer, after it has taken the store lock.
+	// Block the reaper on this transfer once its pass has started.
 	deadline := time.Now().Add(5 * time.Second)
-	for s.mu.TryLock() {
-		s.mu.Unlock()
+	for s.reapPasses.Load() == 0 {
 		if time.Now().After(deadline) {
 			managed.mu.Unlock()
 			t.Fatal("reaper did not start")
@@ -924,7 +1036,7 @@ func TestStoreReapConcurrentACK(t *testing.T) {
 	go func() {
 		close(ackStarted)
 		// This is the apply step of an ACK that looked up the transfer
-		// before the reaper took the store lock.
+		// before the reaper's pass began.
 		managed.mu.Lock()
 		ackDone <- s.acknowledgeFileLocked(managed, 0, 1)
 		managed.mu.Unlock()

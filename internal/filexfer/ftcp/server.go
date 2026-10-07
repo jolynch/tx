@@ -114,7 +114,7 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 				if id == "" {
 					return filexfer.ProgressStatus{Source: "server"}
 				}
-				t, ok := deps.GetTransfer(id)
+				t, ok := deps.GetTransferSummary(id)
 				if !ok {
 					return filexfer.ProgressStatus{Source: "server", TxID: id}
 				}
@@ -201,13 +201,14 @@ type exitAfterDeps struct {
 	notified   sync.Map
 }
 
-func (d *exitAfterDeps) MaybeLogTransferComplete(txferID string) {
-	d.Deps.MaybeLogTransferComplete(txferID)
-	if t, ok := d.Deps.GetTransfer(txferID); ok && t.CompleteLogged {
-		if _, loaded := d.notified.LoadOrStore(txferID, struct{}{}); !loaded {
-			d.onComplete(txferID)
-		}
+func (d *exitAfterDeps) MaybeLogTransferComplete(txferID string) bool {
+	if !d.Deps.MaybeLogTransferComplete(txferID) {
+		return false
 	}
+	if _, loaded := d.notified.LoadOrStore(txferID, struct{}{}); !loaded {
+		d.onComplete(txferID)
+	}
+	return true
 }
 
 type connSession struct {

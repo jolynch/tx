@@ -39,30 +39,13 @@ func transferToStatus(id string, transfer Transfer) encoding.TransferStatus {
 	if transfer.TotalSize > 0 {
 		status.PercentBytes = float64(transfer.DoneSize) * 100.0 / float64(transfer.TotalSize)
 	}
-	for i, s := range transfer.State {
-		entryType := byte(0)
-		if i < len(transfer.EntryType) {
-			entryType = transfer.EntryType[i]
-		}
-		if !isStatusFileEntryType(entryType) {
-			continue
-		}
-		switch s {
-		case TransferStateStarted:
-			status.DownloadStatus.Started++
-		case TransferStateRunning:
-			status.DownloadStatus.Running++
-		case TransferStateDone:
-			status.DownloadStatus.Done++
-		case TransferStateMissing:
-			status.DownloadStatus.Missing++
-		}
+	status.DownloadStatus = encoding.DownloadStatus{
+		Started: transfer.StateCounts[TransferStateStarted],
+		Running: transfer.StateCounts[TransferStateRunning],
+		Done:    transfer.StateCounts[TransferStateDone],
+		Missing: transfer.StateCounts[TransferStateMissing],
 	}
 	return status
-}
-
-func isStatusFileEntryType(entryType byte) bool {
-	return entryType == 0 || entryType == encoding.EntryTypeFile
 }
 
 func handleSTATUS(_ context.Context, req Request, out io.Writer, deps Deps) error {
@@ -92,7 +75,7 @@ func handleSTATUS(_ context.Context, req Request, out io.Writer, deps Deps) erro
 		return writeOKLine(out, "")
 	}
 
-	transfer, ok := deps.GetTransfer(parsed.TransferID)
+	transfer, ok := deps.GetTransferSummary(parsed.TransferID)
 	if !ok {
 		return protocolErr{code: "NOT_FOUND", message: "transfer not found"}
 	}

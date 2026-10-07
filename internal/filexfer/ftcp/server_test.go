@@ -625,12 +625,12 @@ type panicDeps struct {
 }
 
 // Panic once so a later request can prove the listener survived.
-func (d *panicDeps) GetTransfer(txferID string) (Transfer, bool) {
+func (d *panicDeps) GetTransferSummary(txferID string) (Transfer, bool) {
 	if d.fired.CompareAndSwap(false, true) {
 		close(d.panicked)
 		panic("injected panic from a handler")
 	}
-	return d.Deps.GetTransfer(txferID)
+	return d.Deps.GetTransferSummary(txferID)
 }
 
 func TestServePanicDropsOnlyItsConnection(t *testing.T) {

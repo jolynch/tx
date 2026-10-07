@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -152,5 +153,68 @@ func TestTargetWriterFIFOWaitsThenDrops(t *testing.T) {
 	}
 	if int(next["i"].(float64)) != dropped {
 		t.Fatalf("after dropping %d records the next is %v", dropped, next["i"])
+	}
+}
+
+// lockCheckWriter records each Write and fails the test if the writer's
+// emitter mutex is held during one: a slow target must never block emitters.
+type lockCheckWriter struct {
+	t      *testing.T
+	w      *TargetWriter
+	mu     sync.Mutex
+	writes int
+	buf    bytes.Buffer
+}
+
+func (c *lockCheckWriter) Write(p []byte) (int, error) {
+	if !c.w.mu.TryLock() {
+		c.t.Error("target written while holding the emitter mutex")
+	} else {
+		c.w.mu.Unlock()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writes++
+	return c.buf.Write(p)
+}
+
+func (c *lockCheckWriter) snapshot() (int, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writes, c.buf.String()
+}
+
+// Records are written outside the emitter mutex, one Write per flush, and a
+// half-full buffer flushes without waiting for the interval.
+func TestTargetWriterWritesOutsideEmitterLock(t *testing.T) {
+	s := NewSink()
+	out := &lockCheckWriter{t: t}
+	out.w = StartTargetWriter(s, Header{Side: "c"}, time.Hour, []Target{{Path: "-", Stdout: out}})
+	for i := range 100 {
+		s.Emit("window", "t1", F("off", i))
+	}
+	out.w.Stop()
+	writes, got := out.snapshot()
+	if writes != 1 || strings.Count(got, "\n") != 100 {
+		t.Fatalf("got %d records in %d writes, want 100 in 1", strings.Count(got, "\n"), writes)
+	}
+
+	s = NewSink()
+	out = &lockCheckWriter{t: t}
+	out.w = StartTargetWriter(s, Header{Side: "c"}, time.Hour, []Target{{Path: "-", Stdout: out}})
+	defer out.w.Stop()
+	pad := strings.Repeat("x", 1000)
+	for i := range TargetBufferLimit / 2 / 1000 {
+		s.Emit("window", "t1", F("i", i), F("pad", pad))
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if writes, _ := out.snapshot(); writes > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a half-full buffer was not flushed before the interval")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

@@ -105,19 +105,26 @@ func handleACKWithInput(ctx context.Context, req Request, in io.Reader, out io.W
 	if len(records) == 0 {
 		return protocolErr{code: "BAD_REQUEST", message: "ACK requires at least one item"}
 	}
-	for _, record := range records {
-		_, task := trace.NewTask(ctx, "ack")
-		ok := deps.AcknowledgeTransferFile(txferID, record.FileID, record.AckBytes)
-		if ok {
-			if record.AckBytes >= 0 {
-				deps.MaybeLogTransferProgress(txferID)
-			}
-			deps.MaybeLogTransferComplete(txferID)
+	// Apply the whole request under one store lock, then check progress and
+	// completion once: both take the transfer lock, so doing either per record
+	// serializes every concurrent SEND behind each ACKed file.
+	_, task := trace.NewTask(ctx, "ack")
+	entries := make([]AckEntry, len(records))
+	progressed := false
+	for i, record := range records {
+		entries[i] = AckEntry{TxferID: txferID, FileID: record.FileID, AckBytes: record.AckBytes}
+		progressed = progressed || record.AckBytes >= 0
+	}
+	ok := deps.AcknowledgeTransferFiles(entries)
+	if ok {
+		if progressed {
+			deps.MaybeLogTransferProgress(txferID)
 		}
-		task.End()
-		if !ok {
-			return protocolErr{code: "INTERNAL", message: "failed to acknowledge file progress"}
-		}
+		deps.MaybeLogTransferComplete(txferID)
+	}
+	task.End()
+	if !ok {
+		return protocolErr{code: "INTERNAL", message: "failed to acknowledge file progress"}
 	}
 	if scope := events.FromContext(ctx); scope.Sink.Enabled() {
 		var delta int64

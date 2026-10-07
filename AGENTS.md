@@ -227,9 +227,18 @@ command, file, window, and ACK events. A nil sink costs one nil check.
   sizes, and checksum; zstd/lz4 decoders are pooled.
 - `CompressionPolicy` selects zstd, lz4, or identity from read/write latency.
 
-`Store` is an RWMutex-protected transfer map with **no process-wide instance**:
-whoever runs a server owns one and closes it. Per-file state is
-`Started -> Running -> Done` (or `Missing` for 404). `NewStore` owns a reap
+`Store` is a `sync.Map` of transfers with **no process-wide instance**:
+whoever runs a server owns one and closes it. Each transfer has an RWMutex
+over its state and a separate mutex for window hashes. Per-file state is
+`Started -> Running -> Done` (or `Missing` for 404), and `StateCounts` keeps
+per-state totals current so status needs no scan.
+- **Hot paths are O(1) per file.** Per-request and per-file code uses
+  `GetTransferSummary` (scalars only), never `GetTransfer`, which copies every
+  per-file slice. ACK applies a whole request under one lock.
+- **No I/O under the transfer lock.** Format log lines under the lock and
+  write them after releasing it.
+
+`NewStore` owns a reap
 goroutine and **must be closed**. The TTL restarts only on forward progress
 (the manifest walk registers new entries or finishes, acknowledged bytes grow,
 a file is counted, a file state advances), never on reads or repeated

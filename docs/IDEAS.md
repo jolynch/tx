@@ -16,6 +16,12 @@ instead of widening the current change; remove an entry when it ships.
   order, so a run that keeps hitting its budget re-checks the start of the tree
   and never reaches the end. Walk the file list with the seeded coprime step
   as well, but only under a budget, so `--verify full` stays sequential.
+- **Fast transfers rebuild and log a limiter they never use.** The client's
+  10s probe reporter sends `obs-link-mbps` in every mode, so the server
+  rebuilds the gentle limiter and logs `txfer-probe ... limiter=`, but `SEND`
+  applies it only to gentle items. The probe also competes with the transfer,
+  so `observed_link` swings between 200 and 2800 Mbps. Skip the report, or at
+  least the log line, in fast mode.
 
 ## Performance
 
@@ -43,6 +49,10 @@ instead of widening the current change; remove an entry when it ships.
 - **`CXSUM` always computes xxh64.** `hashChecksumRange` hashes every range
   with both xxh128 and xxh64, doubling server hash CPU when only one was
   requested.
+- **Client CPU per small file.** `tx recv copy` spends 42 core-s/GiB on a
+  4–64 KiB dataset with 8 CPUs and about 100 with 24, against 12–25 on the
+  sender. Growth with idle cores suggests spinning; profile the per-file path
+  (create, hash, trailer parse, sync enqueue, ACK) and the scheduler.
 
 ## Testing
 
@@ -60,6 +70,11 @@ instead of widening the current change; remove an entry when it ships.
   reimplements AUTH, AEAD, `PROBE`, and `SYNC` framing instead of running
   `ftcp.Serve` against a fake `Deps`, so protocol changes must be mirrored by
   hand.
+
+- **tx-bench never runs the sender's default `--exit-after`.** The harness
+  always passes `--exit-after never`, so it skipped the `exitAfterDeps` path
+  that once cloned the whole transfer per ACKed file. Run with the default,
+  or add a small-file acceptance case with `--exit-after 60s`.
 
 ## Code health
 

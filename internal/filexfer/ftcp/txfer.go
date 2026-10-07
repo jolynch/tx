@@ -150,7 +150,7 @@ func handleTXFERWithCallback(ctx context.Context, req Request, out io.Writer, de
 	manifestMode := parsed.Mode
 	manifestLinkMbps := parsed.LinkMbps
 	manifestConcurrency := parsed.Concurrency
-	if stored, ok := deps.GetTransfer(transfer.ID); ok {
+	if stored, ok := deps.GetTransferSummary(transfer.ID); ok {
 		if strings.TrimSpace(stored.Mode) != "" {
 			manifestMode = strings.ToLower(strings.TrimSpace(stored.Mode))
 		}
