@@ -373,14 +373,34 @@ func TestServeKeepAliveIdleTimeout(t *testing.T) {
 }
 
 // FuzzServeZeroCopySEND checks the wire contract and ACK state through the real
-// server in both zero-copy and buffered modes. Sizes include pipe/frame edges;
-// generating the payload keeps multi-megabyte cases out of the corpus files.
+// server, with zero-copy disabled and with a fuzzed zero-copy minimum. Each
+// SEND carries the fuzzed file between two small ones, so one response mixes
+// buffered frames, zero-copy frames, and empty files, and the buffered
+// response must keep them in order across flushes. Sizes include pipe/frame
+// edges; generating the payload keeps multi-megabyte cases out of the corpus.
 func FuzzServeZeroCopySEND(f *testing.F) {
 	for _, size := range []uint32{0, 1, 4095, 4096, 4097, 65535, 65536, 65537, 4194303, 4194304, 4194305} {
-		f.Add(size, uint32(0), uint32(0), uint32(8191), byte(0))
+		f.Add(size, uint32(0), uint32(0), uint32(8191), byte(0), uint32(0), uint32(0), uint32(0))
 	}
-	f.Add(uint32(4194417), uint32(19), uint32(4194335), uint32(4096), byte(173))
-	f.Fuzz(func(t *testing.T, sizeRaw, offsetRaw, lengthRaw, chunkRaw uint32, content byte) {
+	f.Add(uint32(4194417), uint32(19), uint32(4194335), uint32(4096), byte(173), uint32(1), uint32(4097), uint32(65535))
+	f.Add(uint32(70000), uint32(0), uint32(0), uint32(65535), byte(7), uint32(4096), uint32(65537), uint32(65536))
+	f.Fuzz(func(t *testing.T, sizeRaw, offsetRaw, lengthRaw, chunkRaw uint32, content byte, extraARaw, extraBRaw, minRaw uint32) {
+		const maxExtraSize = 128 << 10
+		type sendFile struct {
+			path           string
+			data           []byte
+			offset, length int64
+			id             uint64
+		}
+		dir := t.TempDir()
+		newFile := func(name string, data []byte, offset, length int64) *sendFile {
+			t.Helper()
+			path := filepath.Join(dir, name)
+			if err := os.WriteFile(path, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return &sendFile{path: path, data: data, offset: offset, length: length}
+		}
 		data := zeroCopyPayload(int(sizeRaw % (2*uint32(defaultFileFrameLogicalSize) + 1)))
 		for i := range data {
 			data[i] ^= content
@@ -393,16 +413,28 @@ func FuzzServeZeroCopySEND(f *testing.F) {
 		if length > 0 && lengthRaw != 0 {
 			length = 1 + int64(lengthRaw)%length
 		}
-		want := data[offset : offset+length]
+		extra := func(name string, sizeRaw uint32) *sendFile {
+			b := zeroCopyPayload(int(sizeRaw % (maxExtraSize + 1)))
+			for i := range b {
+				b[i] ^= content + 1
+			}
+			return newFile(name, b, 0, int64(len(b)))
+		}
+		main := newFile("sample.bin", data, offset, length)
+		files := []*sendFile{extra("a.bin", extraARaw), main, extra("c.bin", extraBRaw)}
+		var totalSize int64
+		for _, file := range files {
+			totalSize += int64(len(file.data))
+		}
+		zeroCopyMin := 1 + int64(minRaw)%(2*defaultFileFrameLogicalSize)
 		// Bound syscall count for large files; small cases still allow one-byte reads.
-		readLimit := max(1+int(chunkRaw%65536), len(data)/4096)
-		path := writeTempSendFile(t, data)
-		info, err := os.Stat(path)
+		readLimit := max(1+int(chunkRaw%65536), int(totalSize/4096))
+		info, err := os.Stat(main.path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, buffered := range []bool{false, true} {
-			t.Run(fmt.Sprintf("buffered=%t", buffered), func(t *testing.T) {
+		for _, disableZeroCopy := range []bool{false, true} {
+			t.Run(fmt.Sprintf("disable-zero-copy=%t", disableZeroCopy), func(t *testing.T) {
 				deps := realDeps(t, "/")
 				ln, err := net.Listen("tcp", "127.0.0.1:0")
 				if err != nil {
@@ -410,7 +442,7 @@ func FuzzServeZeroCopySEND(f *testing.F) {
 				}
 				done := make(chan error, 1)
 				go func() {
-					done <- Serve(ln, ServerOptions{Deps: deps, DisableZeroCopy: buffered, zeroCopyMinFrameBytes: 1})
+					done <- Serve(ln, ServerOptions{Deps: deps, DisableZeroCopy: disableZeroCopy, zeroCopyMinFrameBytes: zeroCopyMin})
 				}()
 				t.Cleanup(func() {
 					_ = ln.Close()
@@ -460,7 +492,7 @@ func FuzzServeZeroCopySEND(f *testing.F) {
 					}
 					return raw
 				}
-				raw := exchange(fmt.Sprintf("TXFER %q mode=fast link-mbps=1000 concurrency=1 comp=none", filepath.Dir(path)))
+				raw := exchange(fmt.Sprintf("TXFER %q mode=fast link-mbps=1000 concurrency=1 comp=none", dir))
 				if !bytes.HasSuffix(raw, []byte("OK\r\n")) {
 					t.Fatalf("TXFER failed: %q", raw)
 				}
@@ -473,14 +505,28 @@ func FuzzServeZeroCopySEND(f *testing.F) {
 					t.Fatal(err)
 				}
 				entries, _ := parseSYNCResponseEntries(string(manifest), nil)
-				if len(entries) != 1 || entries[0].Size != int64(len(data)) {
+				if len(entries) != len(files) {
 					t.Fatalf("unexpected manifest: %s", manifest)
 				}
-				fid, tid := entries[0].ID, header.TransferID
-				raw = exchangeWithItems(
-					fmt.Sprintf("SEND %s mode=fast", tid),
-					fmt.Sprintf("fd=%d %q comp=none offset=%d size=%d", fid, path, offset, length),
-				)
+				for _, file := range files {
+					for _, entry := range entries {
+						if filepath.Base(entry.Path) == filepath.Base(file.path) {
+							if entry.Size != int64(len(file.data)) {
+								t.Fatalf("manifest size for %s: %d", entry.Path, entry.Size)
+							}
+							file.id = entry.ID
+						}
+					}
+					if file.id == 0 {
+						t.Fatalf("%s missing from manifest: %s", file.path, manifest)
+					}
+				}
+				tid := header.TransferID
+				items := make([]string, len(files))
+				for i, file := range files {
+					items[i] = fmt.Sprintf("fd=%d %q comp=none offset=%d size=%d", file.id, file.path, file.offset, file.length)
+				}
+				raw = exchangeWithItems(fmt.Sprintf("SEND %s mode=fast", tid), items...)
 				if !bytes.HasSuffix(raw, []byte("OK\r\n")) {
 					t.Fatal("SEND missing terminal OK")
 				}
@@ -488,43 +534,58 @@ func FuzzServeZeroCopySEND(f *testing.F) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if len(frames) != max(1, int((length+defaultFileFrameLogicalSize-1)/defaultFileFrameLogicalSize)) {
-					t.Fatalf("unexpected frame count: %d", len(frames))
-				}
-				hash := encoding.FormatXXH128HashToken(xxh3.Hash128(want))
-				cursor := offset
-				for i, frame := range frames {
-					h, tr := frame.Header, frame.Trailer
-					n := min(defaultFileFrameLogicalSize, offset+length-cursor)
-					if h.FileID != fid || tr.FileID != fid || h.Offset != cursor || h.Size != n || h.WireSize != n || h.Comp != "none" {
-						t.Fatalf("unexpected frame %d: %+v / %+v", i, h, tr)
+				hashes := make([]string, len(files))
+				for fi, file := range files {
+					want := file.data[file.offset : file.offset+file.length]
+					count := max(1, int((file.length+defaultFileFrameLogicalSize-1)/defaultFileFrameLogicalSize))
+					if len(frames) < count {
+						t.Fatalf("%s: %d frames left, want %d", file.path, len(frames), count)
 					}
-					if !bytes.Equal(frame.Logical, data[cursor:cursor+n]) {
-						t.Fatalf("frame %d changed source bytes", i)
+					hashes[fi] = encoding.FormatXXH128HashToken(xxh3.Hash128(want))
+					cursor := file.offset
+					for i, frame := range frames[:count] {
+						h, tr := frame.Header, frame.Trailer
+						n := min(defaultFileFrameLogicalSize, file.offset+file.length-cursor)
+						if h.FileID != file.id || tr.FileID != file.id || h.Offset != cursor || h.Size != n || h.WireSize != n || h.Comp != "none" {
+							t.Fatalf("%s: unexpected frame %d: %+v / %+v", file.path, i, h, tr)
+						}
+						if !bytes.Equal(frame.Logical, file.data[cursor:cursor+n]) {
+							t.Fatalf("%s: frame %d changed source bytes", file.path, i)
+						}
+						cursor += n
+						next, token := cursor, ""
+						if i == count-1 {
+							next, token = 0, hashes[fi]
+						}
+						if tr.Next == nil || *tr.Next != next || tr.FileHashToken != token {
+							t.Fatalf("%s: unexpected trailer %d: %+v", file.path, i, tr)
+						}
 					}
-					cursor += n
-					next, token := cursor, ""
-					if i == len(frames)-1 {
-						next, token = 0, hash
+					if file == main {
+						last := frames[count-1].Trailer
 						for _, field := range []string{
 							fmt.Sprintf("meta:size=%d", info.Size()),
 							fmt.Sprintf("meta:mtime_ns=%d", info.ModTime().UnixNano()),
 							"meta:mode=" + encoding.FormatManifestMode(info.Mode()),
 						} {
-							if !strings.Contains(tr.ChecksumPrefix, field) {
+							if !strings.Contains(last.ChecksumPrefix, field) {
 								t.Fatalf("terminal metadata missing %s", field)
 							}
 						}
 					}
-					if tr.Next == nil || *tr.Next != next || tr.FileHashToken != token {
-						t.Fatalf("unexpected trailer %d: %+v", i, tr)
+					if !deps.VerifyTransferFileWindowHash(tid, file.id, file.offset+file.length, hashes[fi]) {
+						t.Fatalf("%s: server did not store the window hash at its end offset", file.path)
 					}
+					frames = frames[count:]
 				}
-				if !deps.VerifyTransferFileWindowHash(tid, fid, offset+length, hash) {
-					t.Fatal("server did not store the window hash at its end offset")
+				if len(frames) != 0 {
+					t.Fatalf("%d unexpected trailing frames", len(frames))
 				}
-				ackItem := fmt.Sprintf("fd=%d %q ack-token=%d@1@", fid, path, offset+length)
-				bad := exchangeWithItems("ACK "+tid, ackItem+"xxh128:00000000000000000000000000000000")
+				ackItem := func(fi int) string {
+					file := files[fi]
+					return fmt.Sprintf("fd=%d %q ack-token=%d@1@", file.id, file.path, file.offset+file.length)
+				}
+				bad := exchangeWithItems("ACK "+tid, ackItem(1)+"xxh128:00000000000000000000000000000000")
 				if !bytes.HasPrefix(bad, []byte("ERR CONFLICT ")) {
 					t.Fatalf("bad ACK accepted: %q", bad)
 				}
@@ -532,7 +593,11 @@ func FuzzServeZeroCopySEND(f *testing.F) {
 				if before.DoneSize != 0 {
 					t.Fatal("bad ACK advanced progress")
 				}
-				if got := string(exchangeWithItems("ACK "+tid, ackItem+hash)); got != "OK\r\n" {
+				acks := make([]string, len(files))
+				for fi := range files {
+					acks[fi] = ackItem(fi) + hashes[fi]
+				}
+				if got := string(exchangeWithItems("ACK "+tid, acks...)); got != "OK\r\n" {
 					t.Fatalf("valid ACK rejected: %q", got)
 				}
 				var status encoding.TransferStatus
@@ -543,8 +608,12 @@ func FuzzServeZeroCopySEND(f *testing.F) {
 				if err := json.Unmarshal(raw[3:], &status); err != nil {
 					t.Fatal(err)
 				}
-				if status.DoneSize != offset+length || status.TotalSize != int64(len(data)) {
-					t.Fatalf("unexpected progress: %+v", status)
+				var acked int64
+				for _, file := range files {
+					acked += file.offset + file.length
+				}
+				if status.DoneSize != acked || status.TotalSize != totalSize {
+					t.Fatalf("unexpected progress: %+v, want done %d of %d", status, acked, totalSize)
 				}
 			})
 		}

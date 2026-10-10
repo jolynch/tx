@@ -1,6 +1,7 @@
 package ftcp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -34,6 +35,11 @@ const defaultZeroCopyMinFrameBytes int64 = 1 << 20
 
 // zeroCopyOff, as a zeroCopyMinBytes value, sends every frame buffered.
 const zeroCopyOff int64 = 0
+
+// sendOutputBufferBytes sizes the buffer one SEND response writes its frames
+// through, so a small file's header, payload, and trailer, and many small
+// files together, share one write syscall.
+const sendOutputBufferBytes = 64 << 10
 const defaultCompressedFrameBufferBytes = 4 * 1024 * 1024
 const defaultMaxLinuxPipeSizeBytes int64 = 1 * 1024 * 1024
 const maxCompressedFrameBufferPoolBytes = 32 * 1024 * 1024
@@ -232,29 +238,86 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 		return protocolErr{code: "BAD_REQUEST", message: "SEND requires at least one item"}
 	}
 
+	// Fast requests write through one buffer, which must reach the client
+	// before the ERR line the caller writes, and before its OK. Gentle
+	// requests stay unbuffered, so their rate limiters pace the socket writes
+	// themselves rather than writes into a buffer.
+	resp := unbufferedSendOutput(out)
+	if header.Mode != loadStrategyGentle {
+		resp = newBufferedSendOutput(out)
+		defer resp.release()
+	}
 	transfer, hasTransfer := deps.GetTransferSummary(header.TransferID)
 	for _, record := range records {
 		item := record.item(header.Mode)
-		itemOut := out
+		itemOut := resp
 		if item.Mode == loadStrategyGentle {
 			if hasTransfer && transfer.DeadlineMS > 0 {
 				if err := checkTransferDeadline(deps, header.TransferID, transfer); err != nil {
 					return err
 				}
 			}
+			limited := out
 			gentleLimiter := deps.GetTransferGentleLimiter(header.TransferID, transfer.LinkMbps, gentleBWPct, gentleLimiterBurstBytes(limiter))
 			if gentleLimiter != nil {
-				itemOut = gentleLimiter.WrapRateLimitedWriter(itemOut, ctx)
+				limited = gentleLimiter.WrapRateLimitedWriter(limited, ctx)
 			}
 			if limiter != nil {
-				itemOut = limiter.WrapRateLimitedWriter(itemOut, ctx)
+				limited = limiter.WrapRateLimitedWriter(limited, ctx)
 			}
+			itemOut = unbufferedSendOutput(limited)
 		}
 		if err := streamSendItem(ctx, itemOut, deps, header.TransferID, item, zeroCopyMinBytes); err != nil {
+			_ = resp.Flush()
 			return err
 		}
 	}
-	return nil
+	return resp.Flush()
+}
+
+// sendOutput is where one SEND item writes its frames. Frames go to w, which
+// is a buffer shared by the whole response or, unbuffered, the response
+// writer itself. A zero-copy frame splices its payload straight to conn, so
+// it flushes the buffer first and writes its header and trailer to conn too;
+// nothing can then reach the socket ahead of bytes buffered before it.
+type sendOutput struct {
+	w    io.Writer
+	buf  *bufio.Writer // nil when unbuffered
+	conn *net.TCPConn  // the response as a raw socket, or nil (AEAD, limiters)
+}
+
+var sendOutputBufferPool = sync.Pool{
+	New: func() any { return bufio.NewWriterSize(nil, sendOutputBufferBytes) },
+}
+
+// newBufferedSendOutput takes a pooled buffer; release returns it.
+func newBufferedSendOutput(out io.Writer) *sendOutput {
+	buf := sendOutputBufferPool.Get().(*bufio.Writer)
+	buf.Reset(out)
+	return &sendOutput{w: buf, buf: buf, conn: extractTCPConn(out)}
+}
+
+func unbufferedSendOutput(out io.Writer) *sendOutput {
+	return &sendOutput{w: out, conn: extractTCPConn(out)}
+}
+
+// Flush writes any buffered frames to the response.
+func (o *sendOutput) Flush() error {
+	if o.buf == nil {
+		return nil
+	}
+	return o.buf.Flush()
+}
+
+// release returns a buffered output's buffer to the pool, discarding
+// anything not flushed. The output must not be used afterwards.
+func (o *sendOutput) release() {
+	if o.buf == nil {
+		return
+	}
+	o.buf.Reset(nil)
+	sendOutputBufferPool.Put(o.buf)
+	o.w, o.buf = nil, nil
 }
 
 const deadlineGracePeriod = 30 * time.Second
@@ -287,7 +350,7 @@ func checkTransferDeadline(deps Deps, txferID string, transfer Transfer) error {
 
 // streamSendItem sends one item as frames. Frames of at least zeroCopyMinBytes
 // use the zero-copy path when the output allows it; zeroCopyOff disables it.
-func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID string, item sendItem, zeroCopyMinBytes int64) error {
+func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID string, item sendItem, zeroCopyMinBytes int64) error {
 	ctx, windowTask := trace.NewTask(ctx, "send-window")
 	defer windowTask.End()
 	scope := events.FromContext(ctx)
@@ -324,7 +387,7 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 		if item.Offset != 0 || item.Size != 0 {
 			return protocolErr{code: "BAD_REQUEST", message: "directory SEND must request offset=0 size=0"}
 		}
-		return streamSendMetadataOnly(ctx, out, deps, txferID, item, fileRef, fileInfo)
+		return streamSendMetadataOnly(ctx, out.w, deps, txferID, item, fileRef, fileInfo)
 	}
 	if entryType != encoding.EntryTypeFile {
 		return protocolErr{code: "BAD_REQUEST", message: "SEND metadata-only supports directories only for non-file entries"}
@@ -393,12 +456,12 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 			IsTerminal:   true,
 			TerminalMD:   &md,
 			WindowHasher: windowHasher,
-			Output:       out,
+			Output:       out.w,
 		}
-		if err := writeFrameHeader(out, zeroArgs, 0, nil); err != nil {
+		if err := writeFrameHeader(out.w, zeroArgs, 0, nil); err != nil {
 			return err
 		}
-		windowHashToken, err := writeFrameTrailer(out, zeroArgs, nil)
+		windowHashToken, err := writeFrameTrailer(out.w, zeroArgs, nil)
 		if err != nil {
 			return err
 		}
@@ -446,8 +509,8 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 			IsTerminal:    isTerminal,
 			TerminalMD:    terminalMD,
 			WindowHasher:  windowHasher,
-			Output:        out,
-			OutputTCPConn: extractTCPConn(out),
+			Output:        out.w,
+			OutputTCPConn: out.conn,
 			PipeSizeBytes: pipeSizeBytes,
 			DirectIO:      usedDirectOpen,
 		}
@@ -466,6 +529,12 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 		var stats frameStreamStats
 		sendPath := sendPathBuffered
 		if zeroCopyMinBytes > 0 && frameSize >= zeroCopyMinBytes && canZeroCopy(frameArgs) {
+			// The splice bypasses out.w, so flush it and send this frame's
+			// header and trailer to the socket as well, in order.
+			if err := out.Flush(); err != nil {
+				return err
+			}
+			frameArgs.Output = out.conn
 			sendPath = sendPathSendfile
 			stats, err = streamFramePayloadZeroCopy(fd, &frameOffset, frameArgs)
 		} else {
@@ -526,6 +595,10 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 		}
 
 		if adaptive {
+			// WriteLatency times writes into the response buffer, much as
+			// unbuffered writes timed the kernel socket buffer, not the wire.
+			// When the buffer fills, the flush is charged to the frame that
+			// forced it, which is the backpressure signal the policy wants.
 			decision := compressPolicy.Decide(currentMode, policy.CompressionMetrics{
 				LogicalSize:    stats.LogicalSize,
 				WireSize:       stats.WireSize,
