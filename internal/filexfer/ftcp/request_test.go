@@ -654,7 +654,7 @@ func TestRequestValidationPrecedesResponse(t *testing.T) {
 			}
 			deps := &mockDeps{}
 			if verb == "SEND" {
-				err = handleSENDWithOptions(context.Background(), req, &wire, &out, deps, nil, true, 100)
+				err = handleSENDWithOptions(context.Background(), req, &wire, &out, deps, nil, zeroCopyOff, 100)
 			} else {
 				err = handleCXSUMWithInput(context.Background(), req, &wire, &out, deps)
 			}

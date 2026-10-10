@@ -409,7 +409,9 @@ func FuzzServeZeroCopySEND(f *testing.F) {
 					t.Fatal(err)
 				}
 				done := make(chan error, 1)
-				go func() { done <- Serve(ln, ServerOptions{Deps: deps, DisableZeroCopy: buffered}) }()
+				go func() {
+					done <- Serve(ln, ServerOptions{Deps: deps, DisableZeroCopy: buffered, zeroCopyMinFrameBytes: 1})
+				}()
 				t.Cleanup(func() {
 					_ = ln.Close()
 					if err := <-done; err != nil {

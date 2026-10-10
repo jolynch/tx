@@ -55,10 +55,31 @@ instead of widening the current change; remove an entry when it ships.
   `TXFER` manifest's header fields (root, mode, link, concurrency) before the
   `SYNC` result replaces it. Skip the `TXFER` when `LOCAL_DST` exists, except
   under `--skip-fetch`, and reuse the first probe.
-- **Client CPU per small file.** `tx recv copy` spends 42 core-s/GiB on a
-  4–64 KiB dataset with 8 CPUs and about 100 with 24, against 12–25 on the
-  sender. Growth with idle cores suggests spinning; profile the per-file path
-  (create, hash, trailer parse, sync enqueue, ACK) and the scheduler.
+- **Per-file cost of small files.** `tx-bench local --profile small` on
+  tmpfs, pinned to 4 cores, copies 4–64 KiB files at about 5.5 client and 4
+  sender core-s/GiB, against under 1 for 16 MiB files. The in-memory
+  `make bench-throughput` puts tx's own share at 11–15x the CPU of 16 MiB
+  files for the same bytes (4 KiB files); the goal is 1x. CPU profiles of the
+  tx-bench run show what is left:
+  - Sender: socket writes are about 23% of CPU, because every frame goes out
+    as three writes (header, payload, trailer). Assemble buffered frames
+    into one write, or buffer each SEND's output and flush it once.
+  - Receiver: creating output files is about 22% (`MkdirAll` 5% of it), and
+    applying trailer metadata (chmod, chown, utimes) about 16%. Create files
+    with their final mode, skip chown when the owner already matches, and
+    remember directories already created.
+  - Receiver: zstd-compressing each ACK body is about 5%; small ACK bodies
+    may not need compression.
+  - Batches are cut by bytes only, so 100 MiB of 10 KiB files becomes about
+    13 batches of 800 files. A batch splits into groups using only the SEND
+    slots free when it starts, so late batches can stream all their files on
+    one connection while freed slots sit idle. Cap files per batch so there
+    are more batches than slots.
+  - CPU per GiB grows with available cores even though the work does not.
+    In `make bench-throughput`, 4 KiB files cost 9.7 core-s/GiB with
+    `THROUGHPUT_CPUS=2` and 62 with 24 (16 MiB files: 1.0 and 4.8). That
+    suggests spinning or contention that scales with concurrency; profile
+    an unpinned run for scheduler and lock time.
 
 ## Testing
 

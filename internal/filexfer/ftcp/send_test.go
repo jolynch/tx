@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/zeebo/xxh3"
 	"golang.org/x/sys/unix"
@@ -111,7 +112,7 @@ func TestStreamSendItemRoundTripCompressionModes(t *testing.T) {
 			deps := &mockDeps{filePath: tmp}
 			var out bytes.Buffer
 
-			err := streamSendItem(context.Background(), &out, deps, "tx1", sendItem{FileID: 7, Offset: 0, Size: 0, Comp: comp, Path: tmp}, false)
+			err := streamSendItem(context.Background(), &out, deps, "tx1", sendItem{FileID: 7, Offset: 0, Size: 0, Comp: comp, Path: tmp}, defaultZeroCopyMinFrameBytes)
 			if err != nil {
 				t.Fatalf("streamSendItem failed: %v", err)
 			}
@@ -155,7 +156,7 @@ func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
 
 	var rawOut bytes.Buffer
 	slowOut := delayedWriter{w: &rawOut, delay: 25 * time.Millisecond}
-	err := streamSendItem(context.Background(), &slowOut, deps, "tx-adapt", sendItem{FileID: 9, Offset: 0, Size: 0, Comp: "adapt", Path: tmp}, false)
+	err := streamSendItem(context.Background(), &slowOut, deps, "tx-adapt", sendItem{FileID: 9, Offset: 0, Size: 0, Comp: "adapt", Path: tmp}, defaultZeroCopyMinFrameBytes)
 	if err != nil {
 		t.Fatalf("streamSendItem failed: %v", err)
 	}
@@ -198,7 +199,7 @@ func TestStreamSendItemDirectoryMetadataOnly(t *testing.T) {
 	deps := &mockDeps{filePath: dir, entryType: encoding.EntryTypeDir}
 
 	var out bytes.Buffer
-	if err := streamSendItem(context.Background(), &out, deps, "tx-dir", sendItem{FileID: 11, Offset: 0, Size: 0, Comp: "adapt", Path: dir}, false); err != nil {
+	if err := streamSendItem(context.Background(), &out, deps, "tx-dir", sendItem{FileID: 11, Offset: 0, Size: 0, Comp: "adapt", Path: dir}, defaultZeroCopyMinFrameBytes); err != nil {
 		t.Fatalf("streamSendItem directory failed: %v", err)
 	}
 
@@ -346,7 +347,7 @@ func TestHandleSENDBasic(t *testing.T) {
 	}
 	body := framedItemBody(t, `fd=1 `+strconv.Quote(tmp))
 	var out bytes.Buffer
-	if err := handleSENDWithOptions(context.Background(), req, body, &out, deps, nil, false, 25); err != nil {
+	if err := handleSENDWithOptions(context.Background(), req, body, &out, deps, nil, defaultZeroCopyMinFrameBytes, 25); err != nil {
 		t.Fatalf("handleSENDWithOptions failed: %v", err)
 	}
 	frames, err := decodeFrameStream(out.Bytes())
@@ -550,6 +551,67 @@ func TestStreamFramePayloadZeroCopyShortSourceDoesNotFinalizeHash(t *testing.T) 
 	}
 }
 
+// TestStreamSendItemZeroCopyMinFrameBytes checks that frames below the
+// zero-copy minimum take the buffered path and frames at or above it take
+// tee/splice.
+func TestStreamSendItemZeroCopyMinFrameBytes(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("tee/splice zero-copy is Linux-only")
+	}
+	path := writeTempSendFile(t, zeroCopyPayload(64<<10))
+	for _, tc := range []struct {
+		name    string
+		minimum int64
+		want    string
+	}{
+		{"default", defaultZeroCopyMinFrameBytes, sendPathBuffered},
+		{"at-minimum", 64 << 10, sendPathSendfile},
+		{"off", zeroCopyOff, sendPathBuffered},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, client := newTCPPair(t)
+			defer client.Close()
+			drained := make(chan struct{})
+			go func() {
+				defer close(drained)
+				_, _ = io.Copy(io.Discard, client)
+			}()
+			sink := events.NewSink()
+			var mu sync.Mutex
+			var paths []string
+			sink.Subscribe(func(e events.Event) {
+				if e.Name != "window" {
+					return
+				}
+				for _, f := range e.Fields {
+					if f.Key == "send_path" {
+						mu.Lock()
+						paths = append(paths, f.Val.(string))
+						mu.Unlock()
+					}
+				}
+			})
+			ctx := events.WithScope(context.Background(), events.Scope{Sink: sink, Conn: 1})
+			err := streamSendItem(ctx, server, &mockDeps{filePath: path}, "tx1", sendItem{
+				FileID: 1,
+				Comp:   "none",
+				Path:   path,
+				Mode:   loadStrategyFast,
+			}, tc.minimum)
+			_ = server.Close()
+			<-drained
+			if err != nil {
+				t.Fatalf("streamSendItem: %v", err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(paths) != 1 || paths[0] != tc.want {
+				t.Fatalf("send paths = %v, want [%s]", paths, tc.want)
+			}
+		})
+	}
+}
+
 func TestStreamSendItemZeroCopyDisconnectDoesNotRecordHash(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("tee/splice zero-copy is Linux-only")
@@ -582,7 +644,7 @@ func TestStreamSendItemZeroCopyDisconnectDoesNotRecordHash(t *testing.T) {
 			Comp:   "none",
 			Path:   path,
 			Mode:   loadStrategyFast,
-		}, false)
+		}, defaultZeroCopyMinFrameBytes)
 	}()
 	select {
 	case err := <-closed:
@@ -651,7 +713,7 @@ func TestWaitSocketWritableRejectsNonWritableEvents(t *testing.T) {
 	}
 }
 
-func newTCPPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+func newTCPPair(t testing.TB) (*net.TCPConn, *net.TCPConn) {
 	t.Helper()
 	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
