@@ -111,6 +111,9 @@ func TestHandleACKTouchesTransferOncePerRequest(t *testing.T) {
 	if mock.getTransferCalls != 0 {
 		t.Fatalf("ACK cloned the transfer %d times", mock.getTransferCalls)
 	}
+	if mock.refBatches != 1 || mock.verifyBatches != 1 {
+		t.Fatalf("ACK resolved files in %d calls and checked hashes in %d, want one each", mock.refBatches, mock.verifyBatches)
+	}
 }
 
 // A later invalid acknowledgment must leave real store state untouched.
@@ -279,7 +282,7 @@ func TestHandleACKCompletesTransferWithEmptyFile(t *testing.T) {
 	if !strings.Contains(logs.String(), "txfer-complete: tid="+txferID) {
 		t.Fatalf("expected txfer-complete log, got %q", logs.String())
 	}
-	if deps.VerifyTransferFileWindowHash(txferID, emptyID, 0, emptyHash) {
+	if deps.VerifyTransferFileWindowHashes(txferID, []WindowHash{{FileID: emptyID, EndBytes: 0, HashToken: emptyHash}})[0] {
 		t.Fatalf("empty file's (fid, 0) window hash survived its ACK")
 	}
 }

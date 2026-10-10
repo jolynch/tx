@@ -82,6 +82,8 @@ type ackRequestRecord struct {
 	FileID     uint64
 	AckBytes   int64
 	DeltaBytes int64
+	Path       string
+	HashToken  string
 }
 
 // Validate every acknowledgment before applying any. This does not lock the
@@ -96,14 +98,20 @@ func handleACKWithInput(ctx context.Context, req Request, in io.Reader, out io.W
 		if err != nil {
 			return ackRequestRecord{}, err
 		}
-		ackBytes, err := validateACKItem(item, deps)
-		return ackRequestRecord{FileID: item.FileID, AckBytes: ackBytes, DeltaBytes: item.DeltaBytes}, err
+		ackBytes, _, hashToken, provided, err := parseAckToken(item.AckToken)
+		if err != nil || !provided {
+			return ackRequestRecord{}, protocolErr{code: "BAD_REQUEST", message: "invalid ack token"}
+		}
+		return ackRequestRecord{FileID: item.FileID, AckBytes: ackBytes, DeltaBytes: item.DeltaBytes, Path: item.Path, HashToken: hashToken}, nil
 	})
 	if err != nil {
 		return err
 	}
 	if len(records) == 0 {
 		return protocolErr{code: "BAD_REQUEST", message: "ACK requires at least one item"}
+	}
+	if err := validateACKRecords(txferID, records, deps); err != nil {
+		return err
 	}
 	// Apply the whole request under one store lock, then check progress and
 	// completion once: both take the transfer lock, so doing either per record
@@ -136,32 +144,42 @@ func handleACKWithInput(ctx context.Context, req Request, in io.Reader, out io.W
 	return writeOKLine(out, "")
 }
 
-// validateACKItem checks one item against the store without mutating it,
-// returning the ack byte count the apply pass will use.
-func validateACKItem(item ackItem, deps Deps) (int64, error) {
-	ackBytes, _, ackHashToken, ackProvided, err := parseAckToken(item.AckToken)
-	if err != nil || !ackProvided {
-		return 0, protocolErr{code: "BAD_REQUEST", message: "invalid ack token"}
+// validateACKRecords checks every record against the store without mutating
+// it, with one store call to resolve the files and one to check the hashes:
+// the transfer lock is shared by every connection, so per-record calls would
+// serialize them. Parsing has already rejected any malformed item; of the
+// store checks, it reports the first failing record's error, in order.
+func validateACKRecords(txferID string, records []ackRequestRecord, deps Deps) error {
+	lookups := make([]FileLookup, len(records))
+	for i, r := range records {
+		lookups[i] = FileLookup{FileID: r.FileID, Path: r.Path}
 	}
-
-	fileRef, err := deps.GetFileRef(item.TransferID, item.FileID, item.Path)
-	if err != nil {
-		return 0, mapLookupError(err)
-	}
-
-	ackTarget := min(ackBytes, fileRef.FileSize)
-	if ackTarget < 0 {
-		ackTarget = 0
-	}
-	if ackBytes >= 0 {
-		if ackHashToken == "" {
-			return 0, protocolErr{code: "BAD_REQUEST", message: "missing window ack hash token"}
-		}
-		if !deps.VerifyTransferFileWindowHash(item.TransferID, item.FileID, ackTarget, ackHashToken) {
-			return 0, protocolErr{code: "CONFLICT", message: "window ack hash token mismatch"}
+	refs, errs := deps.GetFileRefs(txferID, lookups)
+	hashes := make([]WindowHash, 0, len(records))
+	for i, r := range records {
+		if errs[i] == nil && r.AckBytes >= 0 && r.HashToken != "" {
+			end := max(min(r.AckBytes, refs[i].FileSize), 0)
+			hashes = append(hashes, WindowHash{FileID: r.FileID, EndBytes: end, HashToken: r.HashToken})
 		}
 	}
-	return ackBytes, nil
+	verified := deps.VerifyTransferFileWindowHashes(txferID, hashes)
+	next := 0
+	for i, r := range records {
+		if errs[i] != nil {
+			return mapLookupError(errs[i])
+		}
+		if r.AckBytes < 0 {
+			continue
+		}
+		if r.HashToken == "" {
+			return protocolErr{code: "BAD_REQUEST", message: "missing window ack hash token"}
+		}
+		if !verified[next] {
+			return protocolErr{code: "CONFLICT", message: "window ack hash token mismatch"}
+		}
+		next++
+	}
+	return nil
 }
 
 func parseAckToken(raw string) (ackBytes int64, ackTS int64, ackHashToken string, provided bool, err error) {

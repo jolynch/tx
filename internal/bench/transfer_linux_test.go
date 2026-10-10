@@ -40,23 +40,20 @@ import (
 // file open, create, and metadata syscalls are left out, which makes the
 // per-file cost of tx itself (protocol, scheduling, store, hashing) visible.
 
-// memDeps serves file content from src instead of opening paths. GetFileRef
-// still runs, so the store's per-file lookup is part of the measurement.
+// memDeps serves file content from src instead of opening paths. File
+// lookups still go through the store, so its per-file work is part of the
+// measurement.
 type memDeps struct {
 	ftcp.Deps
 	src *os.File
 }
 
-func (d memDeps) GetFile(txferID string, fileID uint64, fullPath string) (*os.File, ftcp.FileRef, error) {
-	ref, err := d.GetFileRef(txferID, fileID, fullPath)
-	if err != nil {
-		return nil, ftcp.FileRef{}, err
-	}
+func (d memDeps) OpenFileRef(ref ftcp.FileRef) (*os.File, error) {
 	fd, err := unix.Dup(int(d.src.Fd()))
 	if err != nil {
-		return nil, ftcp.FileRef{}, err
+		return nil, err
 	}
-	return os.NewFile(uintptr(fd), fullPath), ref, nil
+	return os.NewFile(uintptr(fd), ref.Path), nil
 }
 
 // memTransferConfig is one in-memory copy: files of fileSize adding up to

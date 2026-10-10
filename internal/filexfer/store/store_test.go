@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -1304,5 +1305,74 @@ func TestSetTransferFilesState(t *testing.T) {
 	}
 	if got, _ := s.GetTransfer(tr.ID); !got.ExpiresAt.Equal(expired) {
 		t.Fatal("a batch that advanced nothing refreshed the TTL")
+	}
+}
+
+// TestGetFileRefsAndVerifyWindowHashes checks the batched lookups: one call
+// answers every item, each with its own result or error, in order.
+func TestGetFileRefsAndVerifyWindowHashes(t *testing.T) {
+	s := newTestStore(t)
+	tr, err := s.NewTransfer("/r", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.RegisterTransferFileStates(tr.ID, []TransferFileStateUpdate{
+		{FileID: 0, EntryType: encoding.EntryTypeDir, PathHash: xxh3.Hash128([]byte("/r"))},
+		{FileID: 1, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/r/a")), FileSize: 7},
+		{FileID: 2, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/r/b")), FileSize: 9},
+	}, TransferStateStarted)
+
+	cases := []struct {
+		name     string
+		lookup   FileLookup
+		wantCode int // 0 for success
+		wantMsg  string
+		wantRef  FileRef
+	}{
+		{"file", FileLookup{FileID: 1, Path: "/r/a"}, 0, "",
+			FileRef{TransferID: tr.ID, FileID: 1, Path: "/r/a", Directory: "/r", FileSize: 7, EntryType: encoding.EntryTypeFile}},
+		{"cleaned path", FileLookup{FileID: 2, Path: "/r/b/"}, 0, "",
+			FileRef{TransferID: tr.ID, FileID: 2, Path: "/r/b", Directory: "/r", FileSize: 9, EntryType: encoding.EntryTypeFile}},
+		{"root", FileLookup{FileID: 0, Path: "/r"}, 0, "",
+			FileRef{TransferID: tr.ID, FileID: 0, Path: "/r", Directory: "/r", EntryType: encoding.EntryTypeDir}},
+		{"root elsewhere", FileLookup{FileID: 0, Path: "/r/a"}, http.StatusForbidden, "root metadata path must equal transfer root", FileRef{}},
+		{"out of range", FileLookup{FileID: 9, Path: "/r/z"}, http.StatusNotFound, "file id out of range", FileRef{}},
+		{"relative", FileLookup{FileID: 2, Path: "r/b"}, http.StatusBadRequest, "path must be absolute", FileRef{}},
+		{"digest mismatch", FileLookup{FileID: 2, Path: "/r/a"}, http.StatusForbidden, "file path digest mismatch", FileRef{}},
+		{"outside root", FileLookup{FileID: 2, Path: "/x/b"}, http.StatusForbidden, "path must be within transfer root", FileRef{}},
+	}
+	lookups := make([]FileLookup, len(cases))
+	for i, c := range cases {
+		lookups[i] = c.lookup
+	}
+	refs, errs := s.GetFileRefs(tr.ID, lookups)
+	for i, c := range cases {
+		var lookupErr *FileLookupError
+		switch {
+		case c.wantCode == 0 && (errs[i] != nil || refs[i] != c.wantRef):
+			t.Errorf("%s: got (%+v, %v), want %+v", c.name, refs[i], errs[i], c.wantRef)
+		case c.wantCode != 0 && (!errors.As(errs[i], &lookupErr) || lookupErr.Code != c.wantCode || lookupErr.Msg != c.wantMsg):
+			t.Errorf("%s: got error %v, want %d %q", c.name, errs[i], c.wantCode, c.wantMsg)
+		}
+	}
+	// Without the transfer, a relative path still reports itself first.
+	_, errs = s.GetFileRefs("missing", []FileLookup{{FileID: 1, Path: "rel"}, {FileID: 1, Path: "/r/a"}})
+	if fmt.Sprint(errs) != "[path must be absolute transfer not found]" {
+		t.Fatalf("missing transfer: %v", errs)
+	}
+
+	hash := encoding.FormatXXH128HashToken(xxh3.Hash128([]byte("x")))
+	other := encoding.FormatXXH128HashToken(xxh3.Hash128([]byte("y")))
+	if !s.SetTransferFileWindowHashes(tr.ID, []WindowHash{{FileID: 1, EndBytes: 7, HashToken: hash}}) {
+		t.Fatal("SetTransferFileWindowHashes failed")
+	}
+	got := s.VerifyTransferFileWindowHashes(tr.ID, []WindowHash{
+		{FileID: 1, EndBytes: 7, HashToken: hash},  // match
+		{FileID: 1, EndBytes: 7, HashToken: other}, // wrong hash
+		{FileID: 1, EndBytes: 3, HashToken: hash},  // no hash for that range
+		{FileID: 1, EndBytes: -1, HashToken: hash}, // negative range
+	})
+	if fmt.Sprint(got) != "[true false false false]" {
+		t.Fatalf("verify results %v, want [true false false false]", got)
 	}
 }

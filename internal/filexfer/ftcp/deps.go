@@ -16,6 +16,7 @@ type FileLookupError = store.FileLookupError
 type TransferObservedLinkUpdate = store.TransferObservedLinkUpdate
 type AckEntry = store.AckEntry
 type WindowHash = store.WindowHash
+type FileLookup = store.FileLookup
 
 const (
 	TransferStateStarted = store.TransferStateStarted
