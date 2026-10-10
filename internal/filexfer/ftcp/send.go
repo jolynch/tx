@@ -238,17 +238,25 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 		return protocolErr{code: "BAD_REQUEST", message: "SEND requires at least one item"}
 	}
 
-	// Store updates take the transfer lock, which every connection of the
+	// Store calls take the transfer lock, which every connection of the
 	// transfer shares, so take it once per request rather than once per file:
-	// mark all items Running up front, and record their window hashes, and
-	// directories as Done, in one call each before the OK or ERR line. The
-	// client ACKs only after reading the whole response, so no ACK can arrive
-	// before its hash is recorded.
-	fileIDs := make([]uint64, len(records))
+	// resolve every item and mark the resolved ones Running up front, then
+	// record window hashes, and directories as Done, in one call each before
+	// the OK or ERR line. The client ACKs only after reading the whole
+	// response, so no ACK can arrive before its hash is recorded. A lookup
+	// error is reported when its item's turn comes.
+	lookups := make([]FileLookup, len(records))
 	for i, record := range records {
-		fileIDs[i] = record.FileID
+		lookups[i] = FileLookup{FileID: record.FileID, Path: record.Path}
 	}
-	_ = deps.SetTransferFilesState(header.TransferID, fileIDs, TransferStateRunning)
+	refs, refErrs := deps.GetFileRefs(header.TransferID, lookups)
+	running := make([]uint64, 0, len(records))
+	for i, record := range records {
+		if refErrs[i] == nil {
+			running = append(running, record.FileID)
+		}
+	}
+	_ = deps.SetTransferFilesState(header.TransferID, running, TransferStateRunning)
 	hashes := make([]WindowHash, 0, len(records))
 	var done []uint64
 	recordHashes := func() error {
@@ -271,7 +279,7 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 		defer resp.release()
 	}
 	transfer, hasTransfer := deps.GetTransferSummary(header.TransferID)
-	for _, record := range records {
+	for i, record := range records {
 		item := record.item(header.Mode)
 		itemOut := resp
 		if item.Mode == loadStrategyGentle {
@@ -291,7 +299,11 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 			}
 			itemOut = unbufferedSendOutput(limited)
 		}
-		sent, err := streamSendItem(ctx, itemOut, deps, header.TransferID, item, zeroCopyMinBytes)
+		var sent sentItem
+		err := mapLookupError(refErrs[i])
+		if err == nil {
+			sent, err = streamSendItem(ctx, itemOut, deps, header.TransferID, item, refs[i], zeroCopyMinBytes)
+		}
 		if sent.hash.HashToken != "" {
 			hashes = append(hashes, sent.hash)
 		}
@@ -393,12 +405,12 @@ type sentItem struct {
 
 // streamSendItem sends one item as frames. Frames of at least zeroCopyMinBytes
 // use the zero-copy path when the output allows it; zeroCopyOff disables it.
-func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID string, item sendItem, zeroCopyMinBytes int64) (sentItem, error) {
+func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID string, item sendItem, fileRef FileRef, zeroCopyMinBytes int64) (sentItem, error) {
 	ctx, windowTask := trace.NewTask(ctx, "send-window")
 	defer windowTask.End()
 	scope := events.FromContext(ctx)
 	itemStart := time.Now()
-	fd, fileRef, usedDirectOpen, err := openSendFile(deps, txferID, item)
+	fd, usedDirectOpen, err := openSendFile(deps, item, fileRef)
 	if err != nil {
 		return sentItem{}, mapLookupError(err)
 	}
@@ -589,7 +601,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 				}
 				_ = fd.Close()
 				fd = nil
-				fd, fileRef, err = deps.GetFile(txferID, item.FileID, item.Path)
+				fd, err = deps.OpenFileRef(fileRef)
 				if err != nil {
 					return sentItem{}, mapLookupError(err)
 				}
@@ -665,21 +677,16 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 	return sentItem{hash: recorded}, nil
 }
 
-func openSendFile(deps Deps, txferID string, item sendItem) (*os.File, FileRef, bool, error) {
-	if item.Mode != loadStrategyGentle {
-		fd, fileRef, err := deps.GetFile(txferID, item.FileID, item.Path)
-		return fd, fileRef, false, err
+// openSendFile opens an item's resolved file, with direct I/O in gentle mode
+// when the filesystem allows it, and reports whether it did.
+func openSendFile(deps Deps, item sendItem, fileRef FileRef) (*os.File, bool, error) {
+	if item.Mode == loadStrategyGentle {
+		if fd, err := os.OpenFile(fileRef.Path, os.O_RDONLY|unix.O_DIRECT, 0); err == nil {
+			return fd, true, nil
+		}
 	}
-	fileRef, err := deps.GetFileRef(txferID, item.FileID, item.Path)
-	if err != nil {
-		return nil, FileRef{}, false, err
-	}
-	fd, err := os.OpenFile(fileRef.Path, os.O_RDONLY|unix.O_DIRECT, 0)
-	if err != nil {
-		fd, fileRef, err = deps.GetFile(txferID, item.FileID, item.Path)
-		return fd, fileRef, false, err
-	}
-	return fd, fileRef, true, nil
+	fd, err := deps.OpenFileRef(fileRef)
+	return fd, false, err
 }
 
 func isDirectIOReadError(err error) bool {

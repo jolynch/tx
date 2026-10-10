@@ -637,65 +637,102 @@ func (s *Store) GetTransferSummary(txferID string) (Transfer, bool) {
 }
 
 func (s *Store) GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {
-	fullPath := filepath.Clean(fullPathRaw)
-	if !filepath.IsAbs(fullPath) {
-		return FileRef{}, &FileLookupError{Code: http.StatusBadRequest, Msg: "path must be absolute"}
-	}
+	refs, errs := s.GetFileRefs(txferID, []FileLookup{{FileID: fileID, Path: fullPathRaw}})
+	return refs[0], errs[0]
+}
 
+// FileLookup names one file of a transfer by ID and the path a request gave.
+type FileLookup struct {
+	FileID uint64
+	Path   string
+}
+
+// GetFileRefs resolves each lookup as GetFileRef does, under one acquisition
+// of the transfer's read lock, so a request resolves all its files at once
+// rather than contending for the lock once per file. refs[i] and errs[i]
+// answer lookups[i].
+func (s *Store) GetFileRefs(txferID string, lookups []FileLookup) (refs []FileRef, errs []error) {
+	refs = make([]FileRef, len(lookups))
+	errs = make([]error, len(lookups))
+	// A relative path is rejected before the transfer is even looked up.
+	paths := make([]string, len(lookups))
+	for i, l := range lookups {
+		paths[i] = filepath.Clean(l.Path)
+		if !filepath.IsAbs(paths[i]) {
+			errs[i] = &FileLookupError{Code: http.StatusBadRequest, Msg: "path must be absolute"}
+		}
+	}
+	fail := func(err error) ([]FileRef, []error) {
+		for i := range errs {
+			if errs[i] == nil {
+				errs[i] = err
+			}
+		}
+		return refs, errs
+	}
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
-		return FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "transfer not found"}
+		return fail(&FileLookupError{Code: http.StatusNotFound, Msg: "transfer not found"})
 	}
 
+	// Copy what each lookup needs under the lock; check paths after it.
+	type entry struct {
+		digest    xxh3.Uint128
+		size      int64
+		entryType byte
+		inRange   bool
+	}
+	entries := make([]entry, len(lookups))
 	managed.mu.RLock()
 	if managed.deleted {
 		managed.mu.RUnlock()
-		return FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "transfer not found"}
+		return fail(&FileLookupError{Code: http.StatusNotFound, Msg: "transfer not found"})
 	}
 	directory := managed.transfer.Directory
-	if fileID == intencoding.RootFileID {
-		managed.mu.RUnlock()
-		if fullPath != filepath.Clean(directory) {
-			return FileRef{}, &FileLookupError{Code: http.StatusForbidden, Msg: "root metadata path must equal transfer root"}
+	for i, l := range lookups {
+		if l.FileID == intencoding.RootFileID || l.FileID >= uint64(len(managed.transfer.State)) {
+			continue
 		}
-		return FileRef{
-			TransferID: txferID,
-			FileID:     fileID,
-			Path:       fullPath,
-			Directory:  directory,
-			FileSize:   0,
-			EntryType:  intencoding.EntryTypeDir,
-		}, nil
-	}
-	if fileID >= uint64(len(managed.transfer.State)) {
-		managed.mu.RUnlock()
-		return FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "file id out of range"}
-	}
-	expectedDigest := managed.transfer.PathHash[fileID]
-	fileSize := managed.transfer.FileSize[fileID]
-	entryType := byte(intencoding.EntryTypeFile)
-	if fileID < uint64(len(managed.transfer.EntryType)) && managed.transfer.EntryType[fileID] != 0 {
-		entryType = managed.transfer.EntryType[fileID]
+		e := entry{
+			digest:    managed.transfer.PathHash[l.FileID],
+			size:      managed.transfer.FileSize[l.FileID],
+			entryType: byte(intencoding.EntryTypeFile),
+			inRange:   true,
+		}
+		if l.FileID < uint64(len(managed.transfer.EntryType)) && managed.transfer.EntryType[l.FileID] != 0 {
+			e.entryType = managed.transfer.EntryType[l.FileID]
+		}
+		entries[i] = e
 	}
 	managed.mu.RUnlock()
 
-	if !utils.PathWithinRoot(directory, fullPath) {
-		return FileRef{}, &FileLookupError{Code: http.StatusForbidden, Msg: "path must be within transfer root"}
+	for i, l := range lookups {
+		if errs[i] != nil {
+			continue
+		}
+		fullPath := paths[i]
+		ref := FileRef{TransferID: txferID, FileID: l.FileID, Path: fullPath, Directory: directory}
+		switch {
+		case l.FileID == intencoding.RootFileID:
+			if fullPath != filepath.Clean(directory) {
+				errs[i] = &FileLookupError{Code: http.StatusForbidden, Msg: "root metadata path must equal transfer root"}
+				continue
+			}
+			ref.EntryType = intencoding.EntryTypeDir
+			refs[i] = ref
+		case !entries[i].inRange:
+			errs[i] = &FileLookupError{Code: http.StatusNotFound, Msg: "file id out of range"}
+		case !utils.PathWithinRoot(directory, fullPath):
+			errs[i] = &FileLookupError{Code: http.StatusForbidden, Msg: "path must be within transfer root"}
+		case xxh3.Hash128([]byte(fullPath)) != entries[i].digest:
+			errs[i] = &FileLookupError{Code: http.StatusForbidden, Msg: "file path digest mismatch"}
+		default:
+			ref.FileSize = entries[i].size
+			ref.EntryType = entries[i].entryType
+			refs[i] = ref
+		}
 	}
-
-	computedDigest := xxh3.Hash128([]byte(fullPath))
-	if expectedDigest != computedDigest {
-		return FileRef{}, &FileLookupError{Code: http.StatusForbidden, Msg: "file path digest mismatch"}
-	}
-
-	return FileRef{
-		TransferID: txferID,
-		FileID:     fileID,
-		Path:       fullPath,
-		Directory:  directory,
-		FileSize:   fileSize,
-		EntryType:  entryType,
-	}, nil
+	return refs, errs
 }
 
 // ListTransfers returns a summary of every transfer: scalars only, as
@@ -1038,23 +1075,33 @@ func (s *Store) SetTransferFileWindowHashes(txferID string, hashes []WindowHash)
 }
 
 func (s *Store) VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, token string) bool {
-	managed, ok := s.getManagedTransfer(txferID)
-	if !ok {
-		return false
-	}
+	return s.VerifyTransferFileWindowHashes(txferID, []WindowHash{{FileID: fileID, EndBytes: endBytes, HashToken: token}})[0]
+}
 
+// VerifyTransferFileWindowHashes checks each hash as
+// VerifyTransferFileWindowHash does, under one acquisition of the transfer's
+// locks, so an ACK checks all its items at once. ok[i] answers hashes[i].
+func (s *Store) VerifyTransferFileWindowHashes(txferID string, hashes []WindowHash) []bool {
+	ok := make([]bool, len(hashes))
+	managed, found := s.getManagedTransfer(txferID)
+	if !found {
+		return ok
+	}
 	managed.mu.RLock()
 	defer managed.mu.RUnlock()
-	if managed.deleted || endBytes < 0 {
-		return false
+	if managed.deleted {
+		return ok
 	}
 	managed.hashMu.Lock()
-	state, ok := managed.windowHashes[windowHashKey{fileID: fileID, endBytes: endBytes}]
-	managed.hashMu.Unlock()
-	if !ok {
-		return false
+	defer managed.hashMu.Unlock()
+	for i, h := range hashes {
+		if h.EndBytes < 0 {
+			continue
+		}
+		state, stored := managed.windowHashes[windowHashKey{fileID: h.FileID, endBytes: h.EndBytes}]
+		ok[i] = stored && state.hashToken == normalizeHashToken(h.HashToken)
 	}
-	return state.hashToken == normalizeHashToken(token)
+	return ok
 }
 
 func (s *Store) NewTransfer(directory string, numFiles int, totalSize int64, opts ...TransferOption) (Transfer, error) {
@@ -1137,14 +1184,23 @@ func (s *Store) GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.
 	if err != nil {
 		return nil, FileRef{}, err
 	}
+	fd, err := s.OpenFileRef(ref)
+	if err != nil {
+		return nil, FileRef{}, err
+	}
+	return fd, ref, nil
+}
+
+// OpenFileRef opens a file that GetFileRef or GetFileRefs resolved.
+func (s *Store) OpenFileRef(ref FileRef) (*os.File, error) {
 	fd, err := os.Open(ref.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "file not found"}
+			return nil, &FileLookupError{Code: http.StatusNotFound, Msg: "file not found"}
 		}
-		return nil, FileRef{}, &FileLookupError{Code: http.StatusInternalServerError, Msg: "failed to open file"}
+		return nil, &FileLookupError{Code: http.StatusInternalServerError, Msg: "failed to open file"}
 	}
-	return fd, ref, nil
+	return fd, nil
 }
 
 func (s *Store) AcknowledgeTransferFile(txferID string, fileID uint64, ackBytes int64) bool {

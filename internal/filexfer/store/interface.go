@@ -28,12 +28,13 @@ type Interface interface {
 	ReportTransferObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool)
 	GetTransferLimiterBps(txferID string) int64
 	GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error)
-	GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error)
+	GetFileRefs(txferID string, lookups []FileLookup) ([]FileRef, []error)
+	OpenFileRef(ref FileRef) (*os.File, error)
 
 	// Per-file progress.
 	SetTransferFilesState(txferID string, fileIDs []uint64, state uint8) bool
 	SetTransferFileWindowHashes(txferID string, hashes []WindowHash) bool
-	VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool
+	VerifyTransferFileWindowHashes(txferID string, hashes []WindowHash) []bool
 	AcknowledgeTransferFiles(entries []AckEntry) bool
 	SetTransferPageCache(txferID string, fileID uint64, blob []byte) bool
 

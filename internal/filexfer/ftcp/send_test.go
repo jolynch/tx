@@ -112,7 +112,7 @@ func TestStreamSendItemRoundTripCompressionModes(t *testing.T) {
 			deps := &mockDeps{filePath: tmp}
 			var out bytes.Buffer
 
-			sent, err := streamSendItem(context.Background(), unbufferedSendOutput(&out), deps, "tx1", sendItem{FileID: 7, Offset: 0, Size: 0, Comp: comp, Path: tmp}, defaultZeroCopyMinFrameBytes)
+			sent, err := streamSendItem(context.Background(), unbufferedSendOutput(&out), deps, "tx1", sendItem{FileID: 7, Offset: 0, Size: 0, Comp: comp, Path: tmp}, mustFileRef(t, deps, 7, tmp), defaultZeroCopyMinFrameBytes)
 			if err != nil {
 				t.Fatalf("streamSendItem failed: %v", err)
 			}
@@ -155,7 +155,7 @@ func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
 
 	var rawOut bytes.Buffer
 	slowOut := delayedWriter{w: &rawOut, delay: 25 * time.Millisecond}
-	_, err := streamSendItem(context.Background(), unbufferedSendOutput(&slowOut), deps, "tx-adapt", sendItem{FileID: 9, Offset: 0, Size: 0, Comp: "adapt", Path: tmp}, defaultZeroCopyMinFrameBytes)
+	_, err := streamSendItem(context.Background(), unbufferedSendOutput(&slowOut), deps, "tx-adapt", sendItem{FileID: 9, Offset: 0, Size: 0, Comp: "adapt", Path: tmp}, mustFileRef(t, deps, 9, tmp), defaultZeroCopyMinFrameBytes)
 	if err != nil {
 		t.Fatalf("streamSendItem failed: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestStreamSendItemDirectoryMetadataOnly(t *testing.T) {
 	deps := &mockDeps{filePath: dir, entryType: encoding.EntryTypeDir}
 
 	var out bytes.Buffer
-	sent, err := streamSendItem(context.Background(), unbufferedSendOutput(&out), deps, "tx-dir", sendItem{FileID: 11, Offset: 0, Size: 0, Comp: "adapt", Path: dir}, defaultZeroCopyMinFrameBytes)
+	sent, err := streamSendItem(context.Background(), unbufferedSendOutput(&out), deps, "tx-dir", sendItem{FileID: 11, Offset: 0, Size: 0, Comp: "adapt", Path: dir}, mustFileRef(t, deps, 11, dir), defaultZeroCopyMinFrameBytes)
 	if err != nil {
 		t.Fatalf("streamSendItem directory failed: %v", err)
 	}
@@ -317,6 +317,16 @@ func frameComps(raw []byte) ([]string, error) {
 	return comps, nil
 }
 
+// mustFileRef resolves a file as handleSENDWithOptions does before streaming.
+func mustFileRef(t *testing.T, deps Deps, fileID uint64, path string) FileRef {
+	t.Helper()
+	refs, errs := deps.GetFileRefs("tx1", []FileLookup{{FileID: fileID, Path: path}})
+	if errs[0] != nil {
+		t.Fatalf("GetFileRefs(%d, %s): %v", fileID, path, errs[0])
+	}
+	return refs[0]
+}
+
 func writeTempSendFile(t *testing.T, data []byte) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -407,9 +417,9 @@ func TestHandleSENDBuffersFastFrames(t *testing.T) {
 			}
 			// The store lock is shared by every connection of the transfer,
 			// so one request takes it once for states and once for hashes.
-			if deps.stateBatches != 1 || deps.setStateCalls != files || deps.windowBatches != 1 || deps.setWindowCalls != files {
-				t.Fatalf("store calls: %d state batches for %d files, %d hash batches for %d hashes; want 1 for %d each",
-					deps.stateBatches, deps.setStateCalls, deps.windowBatches, deps.setWindowCalls, files)
+			if deps.refBatches != 1 || deps.stateBatches != 1 || deps.setStateCalls != files || deps.windowBatches != 1 || deps.setWindowCalls != files {
+				t.Fatalf("store calls: %d lookup batches, %d state batches for %d files, %d hash batches for %d hashes; want 1 for %d each",
+					deps.refBatches, deps.stateBatches, deps.setStateCalls, deps.windowBatches, deps.setWindowCalls, files)
 			}
 			frames, err := decodeFrameStream(out.buf.Bytes())
 			if err != nil {
@@ -481,6 +491,10 @@ func TestHandleSENDFlushesBeforeError(t *testing.T) {
 	}
 	if deps.setWindowCalls != 1 || deps.windowHash != frames[0].Trailer.FileHashToken {
 		t.Fatalf("file 1's hash was not recorded before the error: %d hashes, last %q", deps.setWindowCalls, deps.windowHash)
+	}
+	// Only the items that resolved are marked Running.
+	if deps.setStateCalls != 2 {
+		t.Fatalf("%d items marked Running, want 2 (the missing file is not)", deps.setStateCalls)
 	}
 }
 
@@ -714,12 +728,13 @@ func TestStreamSendItemZeroCopyMinFrameBytes(t *testing.T) {
 				}
 			})
 			ctx := events.WithScope(context.Background(), events.Scope{Sink: sink, Conn: 1})
-			_, err := streamSendItem(ctx, unbufferedSendOutput(server), &mockDeps{filePath: path}, "tx1", sendItem{
+			deps := &mockDeps{filePath: path}
+			_, err := streamSendItem(ctx, unbufferedSendOutput(server), deps, "tx1", sendItem{
 				FileID: 1,
 				Comp:   "none",
 				Path:   path,
 				Mode:   loadStrategyFast,
-			}, tc.minimum)
+			}, mustFileRef(t, deps, 1, path), tc.minimum)
 			_ = server.Close()
 			<-drained
 			if err != nil {
@@ -764,13 +779,14 @@ func TestStreamSendItemZeroCopyDisconnectDoesNotRecordHash(t *testing.T) {
 		err  error
 	}
 	resCh := make(chan sendResult, 1)
+	ref := mustFileRef(t, deps, 1, path)
 	go func() {
 		sent, err := streamSendItem(context.Background(), unbufferedSendOutput(server), deps, "tx1", sendItem{
 			FileID: 1,
 			Comp:   "none",
 			Path:   path,
 			Mode:   loadStrategyFast,
-		}, defaultZeroCopyMinFrameBytes)
+		}, ref, defaultZeroCopyMinFrameBytes)
 		resCh <- sendResult{sent, err}
 	}()
 	select {

@@ -84,7 +84,8 @@ There is no separate item-count limit. The server verifies the complete framed
 body, counts nonblank lines to size record storage, then parses and validates
 each entry once. It retains compact ordered records, discards temporary maps,
 and releases the decoded body before processing those records. ACK records
-retain only file IDs and validated acknowledgment progress.
+retain file IDs, acknowledgment progress, and, until the store checks them in
+one pass, each item's path and hash token.
 
 Record storage can exceed the encoded payload size, especially for many short
 entries. Body and records coexist during validation; frame and decoder working

@@ -573,7 +573,7 @@ func FuzzServeZeroCopySEND(f *testing.F) {
 							}
 						}
 					}
-					if !deps.VerifyTransferFileWindowHash(tid, file.id, file.offset+file.length, hashes[fi]) {
+					if !deps.VerifyTransferFileWindowHashes(tid, []WindowHash{{FileID: file.id, EndBytes: file.offset + file.length, HashToken: hashes[fi]}})[0] {
 						t.Fatalf("%s: server did not store the window hash at its end offset", file.path)
 					}
 					frames = frames[count:]

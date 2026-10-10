@@ -69,17 +69,20 @@ instead of widening the current change; remove an entry when it ships.
     remember directories already created.
   - Receiver: zstd-compressing each ACK body is about 5%; small ACK bodies
     may not need compression.
-  - The transfer lock still limits scaling past about 8 CPUs. SEND and
-    ACK now take it once per request, but `GetFileRef` (per SEND item) and
-    `VerifyTransferFileWindowHash` (per ACK item) still take its read side
-    once per file, and at 24 CPUs each SEND carries only about 20 files.
-    Resolve file refs and verify ACK hashes in one call per request, or make
-    per-file state atomic so the per-file path takes no lock at all.
-  - Batches are cut by bytes only, so 100 MiB of 10 KiB files becomes about
-    13 batches of 800 files. A batch splits into groups using only the SEND
-    slots free when it starts, so late batches can stream all their files on
-    one connection while freed slots sit idle. Cap files per batch so there
-    are more batches than slots.
+  - The transfer lock still caps throughput past about 8 CPUs: 4 KiB
+    files peak near 640 MiB/s at 8 CPUs and fall to about 500 at 24. SEND
+    and ACK take it once per request, but at 24 CPUs each SEND carries
+    only about 20 files, so its exclusive side is still taken thousands of
+    times a second. In a block profile, `SetTransferFilesState` (SEND's
+    Running mark) is 45% of blocked time and `AcknowledgeTransferFiles`
+    17.5%, and each waits for readers to drain. Two fixes, best together:
+    - Make SENDs and ACKs larger. Batches are cut by bytes only and split
+      greedily into one group per free SEND slot. Cap files per batch so
+      there are a few times more batches than slots, and split a batch
+      only when it is larger than an even share.
+    - Take no exclusive lock per request: keep per-file state and
+      `StateCounts` in atomics, and the TTL as an atomic deadline, so the
+      transfer lock guards only registration and deletion.
   - CPU per GiB grows with available cores even though the work does not.
     In `make bench-throughput`, 4 KiB files cost 9.7 core-s/GiB with
     `THROUGHPUT_CPUS=2` and 62 with 24 (16 MiB files: 1.0 and 4.8). That

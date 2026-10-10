@@ -449,9 +449,9 @@ files should cost no more CPU per byte than large ones, and throughput should
 grow with CPUs. `TestTransferCostRatio` in `internal/bench` runs a real `ftcp`
 server and `tx.Client` in one process over loopback TCP, with no filesystem:
 
-- **Sender:** the store registers the files as `TXFER` would, but `GetFile`
-  returns a duplicate of one `memfd` the size of the largest file instead of
-  opening a path. Memory therefore does not grow with the file count or
+- **Sender:** the store registers the files as `TXFER` would, but
+  `OpenFileRef` returns a duplicate of one `memfd` the size of the largest
+  file instead of opening a path. Memory therefore does not grow with the file count or
   `THROUGHPUT_SIZE` (default `256MiB` per copy), apart from the manifest.
 - **Receiver:** `StartFromManifest` writes to `io.Discard`, so file creation
   and the CLI's metadata step are not measured. `tx-bench` covers those end

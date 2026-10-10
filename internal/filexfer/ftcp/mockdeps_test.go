@@ -69,6 +69,8 @@ type mockDeps struct {
 	setWindowCalls   int
 	stateBatches     int // SetTransferFilesState calls
 	windowBatches    int // SetTransferFileWindowHashes calls
+	refBatches       int // GetFileRefs calls
+	verifyBatches    int // VerifyTransferFileWindowHashes calls
 	reportTxferID    string
 	reportObserved   int64
 	reportBWPct      int
@@ -144,6 +146,25 @@ func (m *mockDeps) GetFile(txferID string, fileID uint64, fullPathRaw string) (*
 	return fd, m.fileRef(txferID, fileID, info.Size()), nil
 }
 
+// GetFileRefs resolves each lookup as GetFileRef does.
+func (m *mockDeps) GetFileRefs(txferID string, lookups []FileLookup) ([]FileRef, []error) {
+	m.refBatches++
+	refs := make([]FileRef, len(lookups))
+	errs := make([]error, len(lookups))
+	for i, l := range lookups {
+		refs[i], errs[i] = m.GetFileRef(txferID, l.FileID, l.Path)
+	}
+	return refs, errs
+}
+
+// OpenFileRef opens the served file, as GetFile does.
+func (m *mockDeps) OpenFileRef(ref FileRef) (*os.File, error) {
+	if m.filePath == "" {
+		return nil, nil
+	}
+	return os.Open(m.filePath)
+}
+
 func (m *mockDeps) GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {
 	if m.missingIDs[fileID] {
 		return FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "file not found"}
@@ -200,6 +221,15 @@ func (m *mockDeps) SetTransferFileWindowHashes(txferID string, hashes []WindowHa
 }
 
 func (m *mockDeps) VerifyTransferFileWindowHash(string, uint64, int64, string) bool { return true }
+
+func (m *mockDeps) VerifyTransferFileWindowHashes(_ string, hashes []WindowHash) []bool {
+	m.verifyBatches++
+	ok := make([]bool, len(hashes))
+	for i := range ok {
+		ok[i] = true
+	}
+	return ok
+}
 
 func (m *mockDeps) AcknowledgeTransferFiles(entries []AckEntry) bool {
 	for _, e := range entries {
