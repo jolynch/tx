@@ -25,8 +25,9 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
 
 - Iterate with unit tests (`go test ./that/pkg`, `make unit`), and run
   `make acceptance` when a change needs it; it is slower. Run the benchmark
-  targets (`make bench`, `make bench-acceptance`) only at the end, before
-  committing or merging: they saturate the machine's CPU, disk, and network.
+  targets (`make bench`, `make bench-acceptance`, `make bench-throughput`)
+  only at the end, before committing or merging: they saturate the machine's
+  CPU, disk, and network.
 - Ask before saturating the development machine. That includes benchmark
   targets, artificial load (`yes`, stress tools, busy loops), and long,
   parallel, or high-`-count` test and fuzz runs. Pass this rule on to any
@@ -114,6 +115,7 @@ make acceptance   # fuzz-short, then fuzz-long
 make bench        # Go microbenchmarks; pre-commit only (pegs the machine)
 make bench-acceptance        # tx-bench end to end on a 5GiB dataset (BENCH_SIZE)
 make bench-acceptance-dials  # dial budget of that run
+make bench-throughput        # in-memory copy; CPU count x file size cost grid
 
 go test ./...
 go test ./internal/filexfer/...
@@ -319,8 +321,11 @@ mirrors STATUS JSON.
   on a `BENCH_SIZE` dataset (default 5GiB, about 2.5x that in free disk). It
   is skipped unless `TX_BENCH_ACCEPTANCE_SIZE` is set and runs in its own CI
   job.
-- Benchmarks cover AEAD, codec pools, manifest prefix encoding, and store
-  operations under `internal/bench`. Benchmarks that must reach unexported
-  functions — request splitting and body parsing — live in their own package
-  instead, and every package carrying benchmarks is listed in the Makefile's
-  `bench` target, which is the single registry.
+- Benchmarks cover AEAD, codec pools, manifest prefix encoding, store
+  operations, and an in-memory client-server copy under `internal/bench`.
+  That copy also backs `TestTransferCostRatio` (`make bench-throughput`, its
+  own CI job), which is skipped unless `TX_BENCH_THROUGHPUT_SIZE` is set.
+  Benchmarks that must reach unexported functions — request splitting and
+  body parsing — live in their own package instead, and every package
+  carrying benchmarks is listed in the Makefile's `bench` target, which is
+  the single registry.

@@ -3898,3 +3898,61 @@ func TestEffectiveFrameReadBufferSizeClampsToLargestBucket(t *testing.T) {
 		}
 	}
 }
+
+// FuzzManifestEntryByID checks the indexed lookup against a linear scan,
+// including absent IDs and Entries being replaced, resized, or reordered after
+// the index was built.
+func FuzzManifestEntryByID(f *testing.F) {
+	f.Add([]byte{1, 2, 3}, []byte{1, 4, 2}, uint8(0))
+	f.Add([]byte{5, 5, 7}, []byte{5, 7, 9}, uint8(1))
+	f.Add([]byte{}, []byte{0}, uint8(2))
+	f.Fuzz(func(t *testing.T, ids []byte, lookups []byte, mutate uint8) {
+		// IDs are unique, as parseManifest enforces.
+		m := &Manifest{}
+		seen := make(map[uint64]bool)
+		for i, raw := range ids {
+			id := uint64(raw % 32)
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			m.Entries = append(m.Entries, ManifestEntry{ID: id, Path: strconv.Itoa(i)})
+		}
+		scan := func(id uint64) (ManifestEntry, bool) {
+			for _, e := range m.Entries {
+				if e.ID == id {
+					return e, true
+				}
+			}
+			return ManifestEntry{}, false
+		}
+		check := func(phase string) {
+			for _, raw := range lookups {
+				id := uint64(raw % 40)
+				got, gotOK := m.EntryByID(id)
+				want, wantOK := scan(id)
+				if gotOK != wantOK || got.Path != want.Path {
+					t.Fatalf("%s: EntryByID(%d) = (%q, %v), want (%q, %v)", phase, id, got.Path, gotOK, want.Path, wantOK)
+				}
+			}
+		}
+		check("initial")
+		switch mutate % 4 {
+		case 0: // grow, possibly reallocating
+			m.Entries = append(m.Entries, ManifestEntry{ID: 33, Path: "appended"})
+		case 1: // replace with a reversed copy
+			replaced := make([]ManifestEntry, len(m.Entries))
+			for i, e := range m.Entries {
+				replaced[len(replaced)-1-i] = e
+			}
+			m.Entries = replaced
+		case 2: // shrink
+			m.Entries = m.Entries[:len(m.Entries)/2]
+		case 3: // reorder in place: same backing array and length
+			for i, j := 0, len(m.Entries)-1; i < j; i, j = i+1, j-1 {
+				m.Entries[i], m.Entries[j] = m.Entries[j], m.Entries[i]
+			}
+		}
+		check("after mutation")
+	})
+}

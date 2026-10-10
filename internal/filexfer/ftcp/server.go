@@ -72,6 +72,23 @@ type ServerOptions struct {
 	ExitAfter              time.Duration             // 0 = disabled; exit this long after last transfer completes
 	KeepAliveTimeout       time.Duration             // idle window for kept-alive connections; 0 = keep-alive disabled (close after every verb)
 	Events                 *events.Sink              // nil disables the event timeline; also handed to the store Serve creates
+
+	// zeroCopyMinFrameBytes overrides defaultZeroCopyMinFrameBytes when > 0,
+	// so tests can drive small frames through the zero-copy path.
+	zeroCopyMinFrameBytes int64
+}
+
+// zeroCopyMinBytes is the smallest frame these options send zero-copy, or
+// zeroCopyOff.
+func (o ServerOptions) zeroCopyMinBytes() int64 {
+	switch {
+	case o.DisableZeroCopy:
+		return zeroCopyOff
+	case o.zeroCopyMinFrameBytes > 0:
+		return o.zeroCopyMinFrameBytes
+	default:
+		return defaultZeroCopyMinFrameBytes
+	}
 }
 
 type HandlerFunc func(context.Context, Request, io.Writer, Deps) error
@@ -224,7 +241,7 @@ type connSession struct {
 	socketWriteBufferBytes int
 	syncTimeout            time.Duration
 	maxSyncBodyBytes       int64
-	disableZeroCopy        bool
+	zeroCopyMinBytes       int64
 	targetIODepth          int
 	respOut                io.Writer
 	cmdBufReader           *bufio.Reader // reused per-command decrypt reader for encrypted kept-alive sessions
@@ -274,7 +291,7 @@ func handleConn(conn net.Conn, opts ServerOptions, deps Deps, onTransferCreated 
 		socketWriteBufferBytes: opts.SocketWriteBufferBytes,
 		syncTimeout:            opts.SyncTimeout,
 		maxSyncBodyBytes:       maxSyncBodyBytes,
-		disableZeroCopy:        opts.DisableZeroCopy,
+		zeroCopyMinBytes:       opts.zeroCopyMinBytes(),
 		targetIODepth:          opts.TargetIODepth,
 		respOut:                conn,
 		onTransferCreated:      onTransferCreated,
@@ -578,7 +595,7 @@ func (s *connSession) handleCommand(ctx context.Context, req Request, in io.Read
 	// SEND, ACK, and CXSUM carry their per-file item lists in a framed request
 	// body, so each needs the per-command reader alongside the response writer.
 	if req.Verb == VerbSEND {
-		return handleSENDWithOptions(ctx, req, in, out, s.deps, s.limiter, s.disableZeroCopy, s.gentleBWPct)
+		return handleSENDWithOptions(ctx, req, in, out, s.deps, s.limiter, s.zeroCopyMinBytes, s.gentleBWPct)
 	}
 	if req.Verb == VerbACK {
 		return handleACKWithInput(ctx, req, in, out, s.deps)

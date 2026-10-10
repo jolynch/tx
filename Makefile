@@ -1,4 +1,4 @@
-.PHONY: all acceptance fuzz-short fuzz-long vet build test unit bench bench-acceptance bench-acceptance-dials
+.PHONY: all acceptance fuzz-short fuzz-long vet build test unit bench bench-acceptance bench-acceptance-dials bench-throughput
 
 FUZZTIME_SHORT ?= 5s
 FUZZTIME_LONG ?= 30s
@@ -12,6 +12,10 @@ FUZZ := ./scripts/fuzz
 # bench-acceptance: dataset size and where its metrics land.
 BENCH_SIZE ?= 5GiB
 BENCH_OUT ?= bench/acceptance
+THROUGHPUT_SIZE ?= 64MiB
+# Comma-separated server CPU counts; empty covers 2, 4, 8, ... up to the host.
+THROUGHPUT_CPUS ?=
+THROUGHPUT_OUT ?= bench/throughput
 
 all: build test
 
@@ -46,6 +50,7 @@ fuzz-short:
 	$(FUZZ) -race ./internal/utils FuzzCommonPrefixLen $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) . FuzzSuggestBatchMaxBytes $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT) -parallel=1
 	$(FUZZ) -race . FuzzChecksumStreamReuse $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
+	$(FUZZ) -race . FuzzManifestEntryByID $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race ./internal/cmd/filexfercli FuzzVerifyCursor $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race ./internal/bench/dataset FuzzPlan $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race ./internal/bench/dataset FuzzSelectWarmBlocks $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
@@ -87,3 +92,13 @@ bench-acceptance:
 bench-acceptance-dials:
 	TX_BENCH_ACCEPTANCE_OUT=$(abspath $(BENCH_OUT)) \
 		go test -count=1 -run '^TestBenchAcceptanceDialBudget$$' -v ./internal/bench/harness
+
+# Copies THROUGHPUT_SIZE at file sizes from 4 KiB to 16 MiB through a real
+# server and client in one process, with no filesystem, once per server CPU
+# count up to the host's, and logs the size x CPU grid. Fails when small files
+# cost more than TX_BENCH_THROUGHPUT_MAX_RATIO times the CPU of 16 MiB files
+# for the same bytes, and writes THROUGHPUT_OUT/throughput.json.
+bench-throughput:
+	TX_BENCH_THROUGHPUT_SIZE=$(THROUGHPUT_SIZE) TX_BENCH_THROUGHPUT_CPUS=$(THROUGHPUT_CPUS) \
+		TX_BENCH_THROUGHPUT_OUT=$(abspath $(THROUGHPUT_OUT)) \
+		go test -count=1 -timeout 10m -run '^TestTransferCostRatio$$' -v ./internal/bench

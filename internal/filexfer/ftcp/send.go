@@ -26,6 +26,14 @@ import (
 )
 
 const defaultFileFrameLogicalSize int64 = 4 * 1024 * 1024
+
+// defaultZeroCopyMinFrameBytes is the smallest frame sent through tee/splice.
+// Each zero-copy frame pays for two pipes, a socket dup, and their closes, so
+// below about 1 MiB the buffered path is faster (BenchmarkSendFramePayload).
+const defaultZeroCopyMinFrameBytes int64 = 1 << 20
+
+// zeroCopyOff, as a zeroCopyMinBytes value, sends every frame buffered.
+const zeroCopyOff int64 = 0
 const defaultCompressedFrameBufferBytes = 4 * 1024 * 1024
 const defaultMaxLinuxPipeSizeBytes int64 = 1 * 1024 * 1024
 const maxCompressedFrameBufferPoolBytes = 32 * 1024 * 1024
@@ -207,7 +215,7 @@ func handleSEND(ctx context.Context, req Request, out io.Writer, deps Deps) erro
 // item. Reading first is required: responses are file data, and emitting any of
 // it before the request body is drained would deadlock against a client that is
 // still writing that body.
-func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out io.Writer, deps Deps, limiter *limit.Limiter, disableZeroCopy bool, gentleBWPct int) error {
+func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out io.Writer, deps Deps, limiter *limit.Limiter, zeroCopyMinBytes int64, gentleBWPct int) error {
 	header, err := parseSENDHeader(req)
 	if err != nil {
 		// Drain before replying so a client writing its body receives this error.
@@ -242,7 +250,7 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 				itemOut = limiter.WrapRateLimitedWriter(itemOut, ctx)
 			}
 		}
-		if err := streamSendItem(ctx, itemOut, deps, header.TransferID, item, disableZeroCopy); err != nil {
+		if err := streamSendItem(ctx, itemOut, deps, header.TransferID, item, zeroCopyMinBytes); err != nil {
 			return err
 		}
 	}
@@ -277,7 +285,9 @@ func checkTransferDeadline(deps Deps, txferID string, transfer Transfer) error {
 	return nil
 }
 
-func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID string, item sendItem, disableZeroCopy bool) error {
+// streamSendItem sends one item as frames. Frames of at least zeroCopyMinBytes
+// use the zero-copy path when the output allows it; zeroCopyOff disables it.
+func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID string, item sendItem, zeroCopyMinBytes int64) error {
 	ctx, windowTask := trace.NewTask(ctx, "send-window")
 	defer windowTask.End()
 	scope := events.FromContext(ctx)
@@ -455,7 +465,7 @@ func streamSendItem(ctx context.Context, out io.Writer, deps Deps, txferID strin
 		frameOffset := cursor
 		var stats frameStreamStats
 		sendPath := sendPathBuffered
-		if !disableZeroCopy && canZeroCopy(frameArgs) {
+		if zeroCopyMinBytes > 0 && frameSize >= zeroCopyMinBytes && canZeroCopy(frameArgs) {
 			sendPath = sendPathSendfile
 			stats, err = streamFramePayloadZeroCopy(fd, &frameOffset, frameArgs)
 		} else {

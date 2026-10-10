@@ -442,6 +442,64 @@ Sender rusage covers the whole run's server process. That includes Go
 runtime startup and the few small coordination fetches listed under
 [Sender](#sender); the report says so in a footnote.
 
+## Throughput Suite
+
+`make bench-throughput` measures how much more CPU tx spends to copy a set
+of bytes as many small files than as a few large ones. The goal is no
+difference: 10 files of 10 KiB should cost what one 100 KiB file costs.
+`TestTransferCostRatio` in `internal/bench` runs a real `ftcp` server and
+`tx.Client` in one process over loopback TCP, with no filesystem:
+
+- **Sender:** the store registers the files as `TXFER` would, but `GetFile`
+  returns a duplicate of one `memfd` the size of the largest file instead of
+  opening a path. Memory therefore does not grow with the file count or
+  `THROUGHPUT_SIZE` (default `64MiB` per copy); the heap stays near 100–200
+  MiB of client buffers.
+- **Receiver:** `StartFromManifest` writes to `io.Discard`, so file creation
+  and the CLI's metadata step are not measured. `tx-bench` covers those end
+  to end.
+- **Plan:** concurrency and batch size come from the same functions
+  `tx recv copy` uses, for a server with N CPUs (also applied as
+  `GOMAXPROCS`) on a fixed 10 Gb/s link, so the plan does not vary between
+  runs.
+
+The result is a grid: a row per CPU count N and a column per file size.
+`THROUGHPUT_CPUS` takes a comma-separated list of N; by default it covers
+2, 4, 8, and so on below the host's CPU count, then the count itself, so the
+last row is the whole machine. Counts above the host's CPUs are skipped.
+
+For each N, it copies `THROUGHPUT_SIZE` as 4 KiB, 16 KiB, 64 KiB, 1 MiB, and
+16 MiB files, one size after another in rounds, for at least three rounds
+and five seconds (`TX_BENCH_THROUGHPUT_MIN_WALL`). Interleaving the sizes keeps clock
+and load drift from landing on one of them, and each copy ends with a GC
+inside its own measurement. CPU is the process's user plus system time, so it
+covers both sides.
+
+Each size's **cost ratio** is its CPU per GiB divided by the 16 MiB files'
+CPU per GiB in the same row. Both sides of the ratio run on the same host,
+so it is far steadier than absolute CPU: with `GOMAXPROCS` from 2 to 24 on
+one host, 4 KiB CPU per GiB ranged from 9.7 to 62 core-s, while its ratio
+stayed between 9.5 and 15. It still varies between kinds of hosts, because
+per-file work (mostly syscalls) and per-byte work (copies and hashing) scale
+differently with CPU model and virtualization: a GitHub Actions runner (EPYC
+9V45, 4 CPUs) measured 17.8–21.8.
+
+The test fails when any ratio in the grid exceeds
+`TX_BENCH_THROUGHPUT_MAX_RATIO` (default 40). That is a regression bar for
+any CI host, not the goal. On the Ryzen host, the code before the indexed
+manifest lookup and the zero-copy size limit measured 2.5x its current ratio.
+Lower the default as the ratio improves; compare grids from the same host to
+judge a change.
+
+The test logs three grids (cost ratio, core-s per GiB, and MiB/s), each row
+with the plan tx made for that N, under a line naming the host's CPU model,
+kernel, and CPU count. With `TX_BENCH_THROUGHPUT_OUT` set (the Makefile uses
+`bench/throughput`), it also writes every row, with files/s, core-µs per
+file, and peak heap, to `throughput.json`; the `throughput` CI job uploads
+that file. A full grid on a 24-CPU host takes about 30 seconds. Without `TX_BENCH_THROUGHPUT_SIZE`, the test is skipped, so
+`go test ./...` stays fast. `BenchmarkTransferInMemory` runs the same copies
+under `make bench`; use `-cpu N` to plan for N CPUs.
+
 ## Failure Semantics
 
 | Condition                                                                 | Behavior |

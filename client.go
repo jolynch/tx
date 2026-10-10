@@ -351,6 +351,18 @@ type Manifest struct {
 	// computed". Uses atomic.Int64 so Size() is safe to call concurrently
 	// without a mutex.
 	allocatedBytes atomic.Int64
+
+	// byID indexes Entries by file ID for EntryByID. It is built on first use
+	// and rebuilt when Entries is replaced or resized.
+	byID atomic.Pointer[manifestIndex]
+}
+
+// manifestIndex maps file IDs to positions in the Entries slice it was built
+// from; first and n identify that slice.
+type manifestIndex struct {
+	first *ManifestEntry
+	n     int
+	pos   map[uint64]int
 }
 
 const manifestEntrySize = int64(unsafe.Sizeof(ManifestEntry{}))
@@ -972,13 +984,38 @@ func ManifestFingerprint(m *Manifest) string {
 	return fmt.Sprintf("%016x%016x", sum.Hi, sum.Lo)
 }
 
+// EntryByID returns the entry with the given file ID; IDs are unique, as
+// parseManifest enforces. Lookups are O(1) after the first, which builds an
+// index over Entries. Replacing, resizing, or reordering Entries is safe;
+// changing an entry's ID in place is not.
 func (m *Manifest) EntryByID(id uint64) (ManifestEntry, bool) {
-	if m == nil {
+	if m == nil || len(m.Entries) == 0 {
 		return ManifestEntry{}, false
 	}
-	for _, entry := range m.Entries {
-		if entry.ID == id {
-			return entry, true
+	idx := m.byID.Load()
+	if idx == nil || idx.n != len(m.Entries) || idx.first != &m.Entries[0] {
+		idx = &manifestIndex{
+			first: &m.Entries[0],
+			n:     len(m.Entries),
+			pos:   make(map[uint64]int, len(m.Entries)),
+		}
+		for i := range m.Entries {
+			idx.pos[m.Entries[i].ID] = i
+		}
+		m.byID.Store(idx)
+	}
+	i, ok := idx.pos[id]
+	if !ok {
+		return ManifestEntry{}, false
+	}
+	if m.Entries[i].ID == id {
+		return m.Entries[i], true
+	}
+	// An ID was rewritten in place; the index is stale, so scan.
+	m.byID.Store(nil)
+	for i := range m.Entries {
+		if m.Entries[i].ID == id {
+			return m.Entries[i], true
 		}
 	}
 	return ManifestEntry{}, false

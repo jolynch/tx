@@ -58,3 +58,22 @@ jobs:
           name: bench-acceptance
           path: bench/acceptance/
           if-no-files-found: ignore
+
+  throughput:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: "**/go.sum"
+      - name: Run throughput cost ratio
+        run: make bench-throughput
+      - name: Upload throughput metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-throughput
+          path: bench/throughput/
+          if-no-files-found: ignore

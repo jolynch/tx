@@ -201,13 +201,17 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		for _, e := range oldManifest.Entries {
 			oldByPath[e.Path] = e
 		}
-		var newFiles, staleFiles, unchangedFiles []tx.ManifestEntry
+		var newFiles, staleFiles []tx.ManifestEntry
+		var sameFiles int
 		var newBytes, staleBytes int64
-		for _, entry := range newManifest.Entries {
+		for i := range newManifest.Entries {
+			entry := newManifest.Entries[i]
 			if old, ok := oldByPath[entry.Path]; ok {
 				if manifestEntryMatches(old, entry) {
-					entry.Progress = tx.ManifestProgress{AckBytes: entry.Size, MetadataDone: true}
-					unchangedFiles = append(unchangedFiles, entry)
+					// The merged manifest below shares newManifest.Entries, so
+					// this carries the progress into it.
+					newManifest.Entries[i].Progress = tx.ManifestProgress{AckBytes: entry.Size, MetadataDone: true}
+					sameFiles++
 				} else {
 					staleFiles = append(staleFiles, entry)
 					staleBytes += entry.Size
@@ -220,7 +224,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		rmPaths := syncResp.RemovedPaths
 		newCount := encoding.HumanCount(uint64(len(newFiles)), 6)
 		staleCount := encoding.HumanCount(uint64(len(staleFiles)), 6)
-		unchangedCount := encoding.HumanCount(uint64(len(unchangedFiles)), 6)
+		unchangedCount := encoding.HumanCount(uint64(sameFiles), 6)
 		rmCount := encoding.HumanCount(uint64(len(rmPaths)), 6)
 
 		oldMem, _ := oldManifest.Size()
@@ -256,7 +260,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			}
 		}
 
-		// Build merged manifest with new entries, carry progress for unchanged.
+		// Build merged manifest; unchanged entries already carry their progress.
 		mergedManifest := &tx.Manifest{
 			TransferID:  newManifest.TransferID,
 			Root:        newManifest.Root,
@@ -264,14 +268,6 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			LinkMbps:    newManifest.LinkMbps,
 			Concurrency: newManifest.Concurrency,
 			Entries:     newManifest.Entries,
-		}
-		for _, uf := range unchangedFiles {
-			for i := range mergedManifest.Entries {
-				if mergedManifest.Entries[i].ID == uf.ID {
-					mergedManifest.Entries[i].Progress = uf.Progress
-					break
-				}
-			}
 		}
 
 		// Update server manifest with the latest server state for next round / future commands.

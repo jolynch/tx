@@ -236,7 +236,7 @@ func TestHandleACKCompletesTransferWithEmptyFile(t *testing.T) {
 		t.Fatalf("ParseRequest SEND: %v", err)
 	}
 	var sendOut bytes.Buffer
-	if err := handleSENDWithOptions(context.Background(), sendReq, framedItemBody(t, fmt.Sprintf("fd=%d %q", emptyID, emptyPath)), &sendOut, deps, nil, false, 25); err != nil {
+	if err := handleSENDWithOptions(context.Background(), sendReq, framedItemBody(t, fmt.Sprintf("fd=%d %q", emptyID, emptyPath)), &sendOut, deps, nil, defaultZeroCopyMinFrameBytes, 25); err != nil {
 		t.Fatalf("SEND: %v", err)
 	}
 	frames, err := decodeFrameStream(sendOut.Bytes())
