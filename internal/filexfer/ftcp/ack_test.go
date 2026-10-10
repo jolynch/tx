@@ -49,7 +49,7 @@ func TestHandleACKLogsCompleteAfterFinalProgress(t *testing.T) {
 	}
 
 	ackHash := "xxh128:0000000000000000000000000000000a"
-	if !deps.SetTransferFileWindowHash(txferID, entries[0].ID, entries[0].Size, ackHash) {
+	if !deps.SetTransferFileWindowHashes(txferID, []WindowHash{{FileID: entries[0].ID, EndBytes: entries[0].Size, HashToken: ackHash}}) {
 		t.Fatalf("SetTransferFileWindowHash returned false")
 	}
 
@@ -140,8 +140,8 @@ func TestHandleACKInvalidLateItemAppliesNothing(t *testing.T) {
 
 	hash := "xxh128:0000000000000000000000000000000a"
 	for _, e := range entries {
-		if !deps.SetTransferFileWindowHash(txferID, e.ID, e.Size, hash) {
-			t.Fatalf("SetTransferFileWindowHash(%d) returned false", e.ID)
+		if !deps.SetTransferFileWindowHashes(txferID, []WindowHash{{FileID: e.ID, EndBytes: e.Size, HashToken: hash}}) {
+			t.Fatalf("SetTransferFileWindowHashes(%d) returned false", e.ID)
 		}
 	}
 
@@ -255,8 +255,8 @@ func TestHandleACKCompletesTransferWithEmptyFile(t *testing.T) {
 		token := emptyHash
 		if e.ID != emptyID {
 			token = hash
-			if !deps.SetTransferFileWindowHash(txferID, e.ID, e.Size, hash) {
-				t.Fatalf("SetTransferFileWindowHash(%d) returned false", e.ID)
+			if !deps.SetTransferFileWindowHashes(txferID, []WindowHash{{FileID: e.ID, EndBytes: e.Size, HashToken: hash}}) {
+				t.Fatalf("SetTransferFileWindowHashes(%d) returned false", e.ID)
 			}
 		}
 		fmt.Fprintf(bw, "fd=%d %q ack-token=%d@1@%s\n", e.ID, filepath.Join(root, filepath.Base(e.Path)), e.Size, token)

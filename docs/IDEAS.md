@@ -69,6 +69,12 @@ instead of widening the current change; remove an entry when it ships.
     remember directories already created.
   - Receiver: zstd-compressing each ACK body is about 5%; small ACK bodies
     may not need compression.
+  - The transfer lock still limits scaling past about 8 CPUs. SEND and
+    ACK now take it once per request, but `GetFileRef` (per SEND item) and
+    `VerifyTransferFileWindowHash` (per ACK item) still take its read side
+    once per file, and at 24 CPUs each SEND carries only about 20 files.
+    Resolve file refs and verify ACK hashes in one call per request, or make
+    per-file state atomic so the per-file path takes no lock at all.
   - Batches are cut by bytes only, so 100 MiB of 10 KiB files becomes about
     13 batches of 800 files. A batch splits into groups using only the SEND
     slots free when it starts, so late batches can stream all their files on

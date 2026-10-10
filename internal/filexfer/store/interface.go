@@ -31,8 +31,8 @@ type Interface interface {
 	GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error)
 
 	// Per-file progress.
-	SetTransferFileState(txferID string, fileID uint64, state uint8) bool
-	SetTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool
+	SetTransferFilesState(txferID string, fileIDs []uint64, state uint8) bool
+	SetTransferFileWindowHashes(txferID string, hashes []WindowHash) bool
 	VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, hashToken string) bool
 	AcknowledgeTransferFiles(entries []AckEntry) bool
 	SetTransferPageCache(txferID string, fileID uint64, blob []byte) bool

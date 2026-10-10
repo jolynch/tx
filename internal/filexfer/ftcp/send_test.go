@@ -112,7 +112,7 @@ func TestStreamSendItemRoundTripCompressionModes(t *testing.T) {
 			deps := &mockDeps{filePath: tmp}
 			var out bytes.Buffer
 
-			err := streamSendItem(context.Background(), unbufferedSendOutput(&out), deps, "tx1", sendItem{FileID: 7, Offset: 0, Size: 0, Comp: comp, Path: tmp}, defaultZeroCopyMinFrameBytes)
+			sent, err := streamSendItem(context.Background(), unbufferedSendOutput(&out), deps, "tx1", sendItem{FileID: 7, Offset: 0, Size: 0, Comp: comp, Path: tmp}, defaultZeroCopyMinFrameBytes)
 			if err != nil {
 				t.Fatalf("streamSendItem failed: %v", err)
 			}
@@ -131,15 +131,14 @@ func TestStreamSendItemRoundTripCompressionModes(t *testing.T) {
 				t.Fatalf("decoded logical payload mismatch")
 			}
 
+			// The item returns its window hash for the SEND to record; it
+			// does not write the store itself.
 			expectedHash := encoding.FormatXXH128HashToken(xxh3.Hash128(data))
-			if deps.windowHash != expectedHash {
-				t.Fatalf("unexpected stored window hash: got=%q want=%q", deps.windowHash, expectedHash)
+			if sent.hash.FileID != 7 || sent.hash.HashToken != expectedHash || sent.hash.EndBytes != int64(len(data)) {
+				t.Fatalf("unexpected window hash: got %+v, want file 7 end %d hash %q", sent, len(data), expectedHash)
 			}
-			if deps.windowHashEnd != int64(len(data)) {
-				t.Fatalf("unexpected window hash end: got=%d want=%d", deps.windowHashEnd, len(data))
-			}
-			if deps.setWindowCalls != 1 {
-				t.Fatalf("expected one window hash set call, got %d", deps.setWindowCalls)
+			if deps.setWindowCalls != 0 {
+				t.Fatalf("expected no window hash set calls, got %d", deps.setWindowCalls)
 			}
 		})
 	}
@@ -156,7 +155,7 @@ func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
 
 	var rawOut bytes.Buffer
 	slowOut := delayedWriter{w: &rawOut, delay: 25 * time.Millisecond}
-	err := streamSendItem(context.Background(), unbufferedSendOutput(&slowOut), deps, "tx-adapt", sendItem{FileID: 9, Offset: 0, Size: 0, Comp: "adapt", Path: tmp}, defaultZeroCopyMinFrameBytes)
+	_, err := streamSendItem(context.Background(), unbufferedSendOutput(&slowOut), deps, "tx-adapt", sendItem{FileID: 9, Offset: 0, Size: 0, Comp: "adapt", Path: tmp}, defaultZeroCopyMinFrameBytes)
 	if err != nil {
 		t.Fatalf("streamSendItem failed: %v", err)
 	}
@@ -199,7 +198,8 @@ func TestStreamSendItemDirectoryMetadataOnly(t *testing.T) {
 	deps := &mockDeps{filePath: dir, entryType: encoding.EntryTypeDir}
 
 	var out bytes.Buffer
-	if err := streamSendItem(context.Background(), unbufferedSendOutput(&out), deps, "tx-dir", sendItem{FileID: 11, Offset: 0, Size: 0, Comp: "adapt", Path: dir}, defaultZeroCopyMinFrameBytes); err != nil {
+	sent, err := streamSendItem(context.Background(), unbufferedSendOutput(&out), deps, "tx-dir", sendItem{FileID: 11, Offset: 0, Size: 0, Comp: "adapt", Path: dir}, defaultZeroCopyMinFrameBytes)
+	if err != nil {
 		t.Fatalf("streamSendItem directory failed: %v", err)
 	}
 
@@ -229,8 +229,10 @@ func TestStreamSendItemDirectoryMetadataOnly(t *testing.T) {
 			t.Fatalf("metadata trailer missing %q in %q", token, raw)
 		}
 	}
-	if deps.windowHash != expectedHash || deps.windowHashEnd != 0 || deps.setWindowCalls != 1 {
-		t.Fatalf("unexpected stored metadata hash state hash=%q end=%d calls=%d", deps.windowHash, deps.windowHashEnd, deps.setWindowCalls)
+	// The directory's hash and Done state go back to the SEND, which records
+	// them with the rest of the request.
+	if !sent.done || sent.hash != (WindowHash{FileID: 11, EndBytes: 0, HashToken: expectedHash}) || deps.setWindowCalls != 0 || deps.setStateCalls != 0 {
+		t.Fatalf("unexpected directory result %+v, store calls hash=%d state=%d", sent, deps.setWindowCalls, deps.setStateCalls)
 	}
 }
 
@@ -399,8 +401,15 @@ func TestHandleSENDBuffersFastFrames(t *testing.T) {
 				t.Fatal(err)
 			}
 			var out countingWriter
-			if err := handleSENDWithOptions(context.Background(), req, framedItemBody(t, items...), &out, &mockDeps{filePath: tmp}, nil, defaultZeroCopyMinFrameBytes, 25); err != nil {
+			deps := &mockDeps{filePath: tmp}
+			if err := handleSENDWithOptions(context.Background(), req, framedItemBody(t, items...), &out, deps, nil, defaultZeroCopyMinFrameBytes, 25); err != nil {
 				t.Fatalf("handleSENDWithOptions: %v", err)
+			}
+			// The store lock is shared by every connection of the transfer,
+			// so one request takes it once for states and once for hashes.
+			if deps.stateBatches != 1 || deps.setStateCalls != files || deps.windowBatches != 1 || deps.setWindowCalls != files {
+				t.Fatalf("store calls: %d state batches for %d files, %d hash batches for %d hashes; want 1 for %d each",
+					deps.stateBatches, deps.setStateCalls, deps.windowBatches, deps.setWindowCalls, files)
 			}
 			frames, err := decodeFrameStream(out.buf.Bytes())
 			if err != nil {
@@ -421,6 +430,28 @@ func TestHandleSENDBuffersFastFrames(t *testing.T) {
 				t.Fatalf("%d writes, want at least %d: gentle frames must not be buffered", out.writes, 3*files)
 			}
 		})
+	}
+}
+
+// TestHandleSENDBatchesDirectoryState checks that directory items, which are
+// complete once sent, are marked Done with the rest of the request's state in
+// one store call, not one per directory.
+func TestHandleSENDBatchesDirectoryState(t *testing.T) {
+	dir := t.TempDir()
+	req, err := ParseRequest([]byte("SEND tx1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := framedItemBody(t, "fd=1 "+strconv.Quote(dir), "fd=2 "+strconv.Quote(dir), "fd=3 "+strconv.Quote(dir))
+	var out bytes.Buffer
+	deps := &mockDeps{filePath: dir, entryType: encoding.EntryTypeDir}
+	if err := handleSENDWithOptions(context.Background(), req, body, &out, deps, nil, defaultZeroCopyMinFrameBytes, 25); err != nil {
+		t.Fatalf("handleSENDWithOptions: %v", err)
+	}
+	// One batch marks all three Running, one marks them Done.
+	if deps.stateBatches != 2 || deps.setStateCalls != 6 || deps.windowBatches != 1 || deps.setWindowCalls != 3 {
+		t.Fatalf("store calls: %d state batches for %d states, %d hash batches for %d hashes; want 2 for 6 and 1 for 3",
+			deps.stateBatches, deps.setStateCalls, deps.windowBatches, deps.setWindowCalls)
 	}
 }
 
@@ -447,6 +478,9 @@ func TestHandleSENDFlushesBeforeError(t *testing.T) {
 	}
 	if len(frames) != 1 || frames[0].Header.FileID != 1 || !bytes.Equal(frames[0].Logical, data) {
 		t.Fatalf("want only file 1's complete frame before the error, got %d frames", len(frames))
+	}
+	if deps.setWindowCalls != 1 || deps.windowHash != frames[0].Trailer.FileHashToken {
+		t.Fatalf("file 1's hash was not recorded before the error: %d hashes, last %q", deps.setWindowCalls, deps.windowHash)
 	}
 }
 
@@ -680,7 +714,7 @@ func TestStreamSendItemZeroCopyMinFrameBytes(t *testing.T) {
 				}
 			})
 			ctx := events.WithScope(context.Background(), events.Scope{Sink: sink, Conn: 1})
-			err := streamSendItem(ctx, unbufferedSendOutput(server), &mockDeps{filePath: path}, "tx1", sendItem{
+			_, err := streamSendItem(ctx, unbufferedSendOutput(server), &mockDeps{filePath: path}, "tx1", sendItem{
 				FileID: 1,
 				Comp:   "none",
 				Path:   path,
@@ -725,14 +759,19 @@ func TestStreamSendItemZeroCopyDisconnectDoesNotRecordHash(t *testing.T) {
 		closed <- client.Close()
 	}()
 
-	errCh := make(chan error, 1)
+	type sendResult struct {
+		sent sentItem
+		err  error
+	}
+	resCh := make(chan sendResult, 1)
 	go func() {
-		errCh <- streamSendItem(context.Background(), unbufferedSendOutput(server), deps, "tx1", sendItem{
+		sent, err := streamSendItem(context.Background(), unbufferedSendOutput(server), deps, "tx1", sendItem{
 			FileID: 1,
 			Comp:   "none",
 			Path:   path,
 			Mode:   loadStrategyFast,
 		}, defaultZeroCopyMinFrameBytes)
+		resCh <- sendResult{sent, err}
 	}()
 	select {
 	case err := <-closed:
@@ -743,9 +782,12 @@ func TestStreamSendItemZeroCopyDisconnectDoesNotRecordHash(t *testing.T) {
 		t.Fatal("receiver did not read and disconnect")
 	}
 	select {
-	case err := <-errCh:
-		if err == nil {
+	case res := <-resCh:
+		if res.err == nil {
 			t.Fatal("zero-copy SEND unexpectedly succeeded after receiver disconnect")
+		}
+		if res.sent.hash.HashToken != "" {
+			t.Fatalf("failed SEND returned a terminal hash: %+v", res.sent)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("zero-copy SEND did not terminate after receiver disconnect")

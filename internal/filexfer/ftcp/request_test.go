@@ -568,7 +568,7 @@ func TestHandleACKTruncatedAppliesNothing(t *testing.T) {
 		t.Fatalf("expected one entry, got %d", len(entries))
 	}
 	hash := "xxh128:0000000000000000000000000000000a"
-	if !deps.SetTransferFileWindowHash(txferID, entries[0].ID, entries[0].Size, hash) {
+	if !deps.SetTransferFileWindowHashes(txferID, []WindowHash{{FileID: entries[0].ID, EndBytes: entries[0].Size, HashToken: hash}}) {
 		t.Fatal("SetTransferFileWindowHash returned false")
 	}
 

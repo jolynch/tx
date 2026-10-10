@@ -373,7 +373,7 @@ func FuzzStoreStateCounts(f *testing.F) {
 
 		entryTypes := []byte{0, encoding.EntryTypeFile, encoding.EntryTypeDir, encoding.EntryTypeSymlink}
 		for len(ops) > 0 {
-			op, fid := next()%6, uint64(next()%8)
+			op, fid := next()%7, uint64(next()%8)
 			switch op {
 			case 0:
 				s.RegisterTransferFileStates(tr.ID, []TransferFileStateUpdate{{
@@ -395,6 +395,9 @@ func FuzzStoreStateCounts(f *testing.F) {
 				if sum, _ := s.GetTransferSummary(tr.ID); complete != sum.CompleteLogged {
 					t.Fatalf("MaybeLogTransferComplete=%v but CompleteLogged=%v", complete, sum.CompleteLogged)
 				}
+			case 6:
+				ids := []uint64{fid, uint64(next() % 8), uint64(next() % 8)}
+				s.SetTransferFilesState(tr.ID, ids, next()%4)
 			}
 
 			full, ok := s.GetTransfer(tr.ID)
@@ -1250,4 +1253,56 @@ func TestAcknowledgeZeroByteFileCompletesTransfer(t *testing.T) {
 	assertDone("repeated missing ack", 3)
 	s.AcknowledgeTransferFile(transfer.ID, 3, -1)
 	assertDone("missing ack for directory", 3)
+}
+
+// TestSetTransferFilesState checks the batched state change: in-range files
+// advance under one lock, out-of-range IDs report false without blocking the
+// rest, a file already at or past the state is left alone, and the TTL
+// refreshes only when something advanced.
+func TestSetTransferFilesState(t *testing.T) {
+	s := newTestStore(t)
+	tr, err := s.NewTransfer("/r", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updates := make([]TransferFileStateUpdate, 0, 4)
+	for fid := uint64(0); fid < 4; fid++ {
+		updates = append(updates, TransferFileStateUpdate{
+			FileID:    fid,
+			EntryType: encoding.EntryTypeFile,
+			PathHash:  xxh3.Hash128([]byte(fmt.Sprintf("/r/%d", fid))),
+			FileSize:  1,
+		})
+	}
+	s.RegisterTransferFileStates(tr.ID, updates, TransferStateStarted)
+	s.SetTransferFileState(tr.ID, 3, TransferStateDone)
+	managed, _ := s.getManagedTransfer(tr.ID)
+	expired := time.Now().Add(-time.Second)
+	managed.mu.Lock()
+	managed.transfer.ExpiresAt = expired
+	managed.mu.Unlock()
+
+	if s.SetTransferFilesState(tr.ID, []uint64{1, 2, 3, 99}, TransferStateRunning) {
+		t.Fatal("an out-of-range file ID reported success")
+	}
+	got, _ := s.GetTransfer(tr.ID)
+	want := []uint8{TransferStateStarted, TransferStateRunning, TransferStateRunning, TransferStateDone}
+	for fid, st := range want {
+		if got.State[fid] != st {
+			t.Fatalf("file %d state %d, want %d", fid, got.State[fid], st)
+		}
+	}
+	if !got.ExpiresAt.After(expired) {
+		t.Fatal("advancing files did not refresh the TTL")
+	}
+
+	managed.mu.Lock()
+	managed.transfer.ExpiresAt = expired
+	managed.mu.Unlock()
+	if !s.SetTransferFilesState(tr.ID, []uint64{1, 3}, TransferStateRunning) {
+		t.Fatal("re-marking files already at or past Running failed")
+	}
+	if got, _ := s.GetTransfer(tr.ID); !got.ExpiresAt.Equal(expired) {
+		t.Fatal("a batch that advanced nothing refreshed the TTL")
+	}
 }
