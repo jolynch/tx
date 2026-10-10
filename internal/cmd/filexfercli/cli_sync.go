@@ -329,6 +329,18 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		if cfg.concurrencyExplicit {
 			effectiveConcurrency = cfg.concurrency
 		}
+		if len(pendingWork.files) > 0 {
+			printTransferPlan(stderr, fmt.Sprintf("%s-plan[%d]", logPrefix, round), transferPlanInput{
+				Probe:               probeResult,
+				LinkMbps:            probeResult.LinkMbps,
+				LoadStrategy:        loadStrategy,
+				Manifest:            mergedManifest,
+				Concurrency:         effectiveConcurrency,
+				ConcurrencyExplicit: cfg.concurrencyExplicit,
+				BatchPlan:           batchPlan,
+				WindowBytes:         client.FileRequestWindowBytes,
+			})
+		}
 
 		progressUpdates := make(chan tx.DownloadProgressUpdate, 1024)
 		entryByID := manifestEntriesByID(mergedManifest)
@@ -433,7 +445,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			ObservedLinkMbps: mergedManifest.LinkMbps,
 			StatusTotalBytes: totalAllBytes,
 			StatusTotalFiles: totalAllFiles,
-			StatusPolling:    false,
+			StatusPolling:    true,
 		})
 		if err != nil {
 			stopProgress()
