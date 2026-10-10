@@ -49,6 +49,12 @@ instead of widening the current change; remove an entry when it ships.
 - **`CXSUM` always computes xxh64.** `hashChecksumRange` hashes every range
   with both xxh128 and xxh64, doubling server hash CPU when only one was
   requested.
+- **Copy into an existing destination walks the source twice.** `runCopyCLI`
+  runs `runTransfer` (`PROBE` + full `TXFER` walk) before `runSync`, which
+  probes again and sends `SYNC`, a second walk. `runSync` uses only the
+  `TXFER` manifest's header fields (root, mode, link, concurrency) before the
+  `SYNC` result replaces it. Skip the `TXFER` when `LOCAL_DST` exists, except
+  under `--skip-fetch`, and reuse the first probe.
 - **Client CPU per small file.** `tx recv copy` spends 42 core-s/GiB on a
   4–64 KiB dataset with 8 CPUs and about 100 with 24, against 12–25 on the
   sender. Growth with idle cores suggests spinning; profile the per-file path

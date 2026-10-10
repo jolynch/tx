@@ -83,6 +83,68 @@ func formatStartBatchProbeLine(linkMiBPerSec int64, suggestedConcurrency int, pl
 	)
 }
 
+// transferPlanInput is what printTransferPlan reports: the probe, the manifest
+// being fetched, and the concurrency and batch plan derived from them.
+type transferPlanInput struct {
+	Probe tx.ProbeResponse
+	// LinkMbps is the raw link estimate, before any gentle-mode cap.
+	LinkMbps            int64
+	LoadStrategy        string
+	Manifest            *tx.Manifest
+	Concurrency         int
+	ConcurrencyExplicit bool
+	BatchPlan           tx.BatchSizePlan
+	WindowBytes         int64
+}
+
+// printTransferPlan writes the multi-line plan block that precedes a file
+// download, headed by label (for example "start-plan" or "sync-plan").
+func printTransferPlan(w io.Writer, label string, in transferPlanInput) {
+	probe := in.Probe
+	gentleCPUPct := tx.NormalizeGentleCPUPct(probe.GentleCPUPct)
+	gentleBWPct := tx.NormalizeGentleBWPct(probe.GentleBWPct)
+	effectiveLinkMbps := effectiveModeLinkMbps(in.LoadStrategy, in.LinkMbps, gentleBWPct)
+	linkMiBPerSec := in.LinkMbps * 1_000_000 / 8 / (1 << 20)
+	effectiveLinkMiBPerSec := effectiveLinkMbps * 1_000_000 / 8 / (1 << 20)
+	plan := in.BatchPlan
+
+	fmt.Fprintf(w, "%s:\n", label)
+	if in.Manifest != nil {
+		manifestMem, manifestDisk := in.Manifest.Size()
+		fmt.Fprintf(w, "  manifest: %d files indexed in [mem=%s, serialized=%s]\n",
+			len(in.Manifest.Entries),
+			encoding.HumanBytesFixedWidth(manifestMem, 4),
+			encoding.HumanBytesFixedWidth(manifestDisk, 4))
+	}
+	if in.LoadStrategy == tx.LoadStrategyGentle {
+		fmt.Fprintf(w, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s), %d%% gentle-cpu, %d%% gentle-bw\n",
+			probe.ServerCPU, probe.ServerIODepth, in.LinkMbps, linkMiBPerSec, gentleCPUPct, gentleBWPct)
+		fmt.Fprintf(w, "  mode: [%s] → concurrency = %d cpu * %d%% = %d, bw-limit = %d MiB/s * %d%% = %d MiB/s\n",
+			in.LoadStrategy, probe.ServerCPU, gentleCPUPct, probe.SuggestedConcurrency, linkMiBPerSec, gentleBWPct, effectiveLinkMiBPerSec)
+	} else {
+		fmt.Fprintf(w, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s)\n",
+			probe.ServerCPU, probe.ServerIODepth, in.LinkMbps, linkMiBPerSec)
+		fmt.Fprintf(w, "  mode: [%s] → concurrency = %d cpu * %d io-depth = %d, bw-limit = none\n",
+			in.LoadStrategy, probe.ServerCPU, probe.ServerIODepth, probe.SuggestedConcurrency)
+	}
+	if in.ConcurrencyExplicit {
+		fmt.Fprintf(w, "  concurrency: %d (override from --concurrency, server suggested %d)\n",
+			in.Concurrency, probe.SuggestedConcurrency)
+	} else {
+		fmt.Fprintf(w, "  concurrency: %d\n", in.Concurrency)
+	}
+	fmt.Fprintf(w, "  conn-pool: %d data, %d control\n", probe.WarmConnectionPoolSize, probe.WarmConnectionPoolSize)
+	fmt.Fprintf(w, "    window: %d\n", plan.EffectiveWinConc)
+	fmt.Fprintf(w, "    batch-per-window: %d\n", plan.PerFileWorkers)
+	fmt.Fprintf(w, "  batch: %s (from %s)\n",
+		encoding.HumanBytes(plan.BatchMaxBytes),
+		formatStartBatchCause(plan))
+	fmt.Fprintln(w, formatStartBatchWindowLine(in.WindowBytes, plan))
+	if bwProbeLine := formatStartBatchProbeLine(effectiveLinkMiBPerSec, probe.SuggestedConcurrency, plan); bwProbeLine != "" {
+		fmt.Fprintln(w, bwProbeLine)
+	}
+}
+
 func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Writer) int {
 	cf := cliflags.New("start")
 	cf.SetOutput(stderr)
@@ -380,16 +442,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 			miniProbe = probe
 		}
 		rawLinkMbps := max(manifest.LinkMbps, miniProbe.LinkMbps)
-		gentleCPUPct := tx.NormalizeGentleCPUPct(miniProbe.GentleCPUPct)
-		gentleBWPct := tx.NormalizeGentleBWPct(miniProbe.GentleBWPct)
-		effectiveLinkMbps := effectiveModeLinkMbps(loadStrategy, rawLinkMbps, gentleBWPct)
-		batchSize := tx.SuggestBatchMaxBytes(
-			miniProbe.SuggestedConcurrency,
-			client.WindowConcurrency,
-			client.FileRequestWindowBytes,
-			miniProbe.ServerSendBufBytes,
-			effectiveLinkMbps,
-		)
+		effectiveLinkMbps := effectiveModeLinkMbps(loadStrategy, rawLinkMbps, tx.NormalizeGentleBWPct(miniProbe.GentleBWPct))
 		batchPlan := tx.ExplainBatchMaxBytes(
 			miniProbe.SuggestedConcurrency,
 			client.WindowConcurrency,
@@ -397,41 +450,17 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 			miniProbe.ServerSendBufBytes,
 			effectiveLinkMbps,
 		)
-		linkMiBPerSec := rawLinkMbps * 1_000_000 / 8 / (1 << 20)
-		effectiveLinkMiBPerSec := effectiveLinkMbps * 1_000_000 / 8 / (1 << 20)
-		fmt.Fprintf(stderr, "start-plan:\n")
-		manifestMem, manifestDisk := manifest.Size()
-		fmt.Fprintf(stderr, "  manifest: %d files indexed in [mem=%s, serialized=%s]\n",
-			len(manifest.Entries),
-			encoding.HumanBytesFixedWidth(manifestMem, 4),
-			encoding.HumanBytesFixedWidth(manifestDisk, 4))
-		if loadStrategy == tx.LoadStrategyGentle {
-			fmt.Fprintf(stderr, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s), %d%% gentle-cpu, %d%% gentle-bw\n",
-				miniProbe.ServerCPU, miniProbe.ServerIODepth, rawLinkMbps, linkMiBPerSec, gentleCPUPct, gentleBWPct)
-			fmt.Fprintf(stderr, "  mode: [%s] → concurrency = %d cpu * %d%% = %d, bw-limit = %d MiB/s * %d%% = %d MiB/s\n",
-				loadStrategy, miniProbe.ServerCPU, gentleCPUPct, miniProbe.SuggestedConcurrency, linkMiBPerSec, gentleBWPct, effectiveLinkMiBPerSec)
-		} else {
-			fmt.Fprintf(stderr, "  server: %d cpu, %d io-depth, %d Mbps (%d MiB/s)\n",
-				miniProbe.ServerCPU, miniProbe.ServerIODepth, rawLinkMbps, linkMiBPerSec)
-			fmt.Fprintf(stderr, "  mode: [%s] → concurrency = %d cpu * %d io-depth = %d, bw-limit = none\n",
-				loadStrategy, miniProbe.ServerCPU, miniProbe.ServerIODepth, miniProbe.SuggestedConcurrency)
-		}
-		if cfg.concurrencyExplicit {
-			fmt.Fprintf(stderr, "  concurrency: %d (override from --concurrency, server suggested %d)\n",
-				effectiveConcurrency, miniProbe.SuggestedConcurrency)
-		} else {
-			fmt.Fprintf(stderr, "  concurrency: %d\n", effectiveConcurrency)
-		}
-		fmt.Fprintf(stderr, "  conn-pool: %d data, %d control\n", miniProbe.WarmConnectionPoolSize, miniProbe.WarmConnectionPoolSize)
-		fmt.Fprintf(stderr, "    window: %d\n", batchPlan.EffectiveWinConc)
-		fmt.Fprintf(stderr, "    batch-per-window: %d\n", batchPlan.PerFileWorkers)
-		fmt.Fprintf(stderr, "  batch: %s (from %s)\n",
-			encoding.HumanBytes(batchPlan.BatchMaxBytes),
-			formatStartBatchCause(batchPlan))
-		fmt.Fprintln(stderr, formatStartBatchWindowLine(client.FileRequestWindowBytes, batchPlan))
-		if bwProbeLine := formatStartBatchProbeLine(effectiveLinkMiBPerSec, miniProbe.SuggestedConcurrency, batchPlan); bwProbeLine != "" {
-			fmt.Fprintln(stderr, bwProbeLine)
-		}
+		batchSize := batchPlan.BatchMaxBytes
+		printTransferPlan(stderr, "start-plan", transferPlanInput{
+			Probe:               miniProbe,
+			LinkMbps:            rawLinkMbps,
+			LoadStrategy:        loadStrategy,
+			Manifest:            manifest,
+			Concurrency:         effectiveConcurrency,
+			ConcurrencyExplicit: cfg.concurrencyExplicit,
+			BatchPlan:           batchPlan,
+			WindowBytes:         client.FileRequestWindowBytes,
+		})
 		outputWriter := func(entry tx.ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
 			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
 			w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, syncWorker)

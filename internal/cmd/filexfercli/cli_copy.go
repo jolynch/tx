@@ -424,7 +424,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 			noSync:              cfg.skipFsync,
 			fsyncInterval:       fsyncInterval,
 			skipWrite:           cfg.skipWrite,
-			verbosity:           verbosityFromFlags(false, cfg.verbose),
+			verbosity:           copyVerbosity,
 			yes:                 cfg.yes,
 			probeBytes:          probeBytes,
 			traceFile:           cfg.traceFile,
@@ -652,7 +652,7 @@ func runEndOfCopyConvergence(
 		noSync:              cfg.skipFsync,
 		fsyncInterval:       fsyncInterval,
 		skipWrite:           cfg.skipWrite,
-		verbosity:           verbosityFromFlags(false, cfg.verbose),
+		verbosity:           verbosityFromFlags(cfg.progress, cfg.verbose),
 		yes:                 true, // never prompt — convergence is automatic
 		probeBytes:          probeBytes,
 		traceFile:           cfg.traceFile,

@@ -2660,9 +2660,17 @@ func TestRunCLICopySyncPath(t *testing.T) {
 	manifestRaw := buildTestManifestRaw("txcopy-sync", []string{entry})
 	meta := &tx.FileTrailerMetadata{Size: int64(len(payload)), MtimeNS: 100, Mode: "0644"}
 	withSyncPromptTestInput(t, "", false)
+	// SEND waits for the first STATUS so the progress poller always gets to
+	// print before the download finishes.
+	statusServed := make(chan struct{})
+	var statusOnce sync.Once
 
 	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
+		case intftcp.VerbSTATUS:
+			defer statusOnce.Do(func() { close(statusServed) })
+			_, err := io.WriteString(out, `OK {"transfer_id":"txcopy-sync","directory":"/remote","num_files":1,"total_size":5,"done":0,"done_size":0,"percent_files":0.0,"percent_bytes":0.0,"download_status":{"started":1,"running":0,"done":0,"missing":0}}`+"\r\n")
+			return err
 		case intftcp.VerbPROBE:
 			return writeCLIProbeResponse(req, out)
 		case intftcp.VerbTXFER:
@@ -2677,6 +2685,11 @@ func TestRunCLICopySyncPath(t *testing.T) {
 			}
 			return writeSyncResponse(out, "txcopy-sync", []string{entry}, nil)
 		case intftcp.VerbSEND:
+			select {
+			case <-statusServed:
+			case <-time.After(5 * time.Second):
+				return errors.New("SEND arrived without a STATUS poll")
+			}
 			_, err := io.WriteString(out, buildCLIFrameWithMetadata(1, payload, 0, meta))
 			return err
 		case intftcp.VerbACK:
@@ -2703,6 +2716,11 @@ func TestRunCLICopySyncPath(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(tmp, ".tx", "dst")); !os.IsNotExist(err) {
 		t.Fatalf("expected copy to remove state dir, stat err=%v", err)
+	}
+	for _, want := range []string{"sync-plan[0]:\n", "  concurrency: ", "txfer-progress:["} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("expected %q in sync output, got:\n%s", want, stderr.String())
+		}
 	}
 }
 
