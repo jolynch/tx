@@ -238,6 +238,29 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 		return protocolErr{code: "BAD_REQUEST", message: "SEND requires at least one item"}
 	}
 
+	// Store updates take the transfer lock, which every connection of the
+	// transfer shares, so take it once per request rather than once per file:
+	// mark all items Running up front, and record their window hashes, and
+	// directories as Done, in one call each before the OK or ERR line. The
+	// client ACKs only after reading the whole response, so no ACK can arrive
+	// before its hash is recorded.
+	fileIDs := make([]uint64, len(records))
+	for i, record := range records {
+		fileIDs[i] = record.FileID
+	}
+	_ = deps.SetTransferFilesState(header.TransferID, fileIDs, TransferStateRunning)
+	hashes := make([]WindowHash, 0, len(records))
+	var done []uint64
+	recordHashes := func() error {
+		if len(done) > 0 {
+			_ = deps.SetTransferFilesState(header.TransferID, done, TransferStateDone)
+		}
+		if len(hashes) > 0 && !deps.SetTransferFileWindowHashes(header.TransferID, hashes) {
+			return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
+		}
+		return nil
+	}
+
 	// Fast requests write through one buffer, which must reach the client
 	// before the ERR line the caller writes, and before its OK. Gentle
 	// requests stay unbuffered, so their rate limiters pace the socket writes
@@ -254,6 +277,7 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 		if item.Mode == loadStrategyGentle {
 			if hasTransfer && transfer.DeadlineMS > 0 {
 				if err := checkTransferDeadline(deps, header.TransferID, transfer); err != nil {
+					_ = recordHashes()
 					return err
 				}
 			}
@@ -267,10 +291,22 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 			}
 			itemOut = unbufferedSendOutput(limited)
 		}
-		if err := streamSendItem(ctx, itemOut, deps, header.TransferID, item, zeroCopyMinBytes); err != nil {
+		sent, err := streamSendItem(ctx, itemOut, deps, header.TransferID, item, zeroCopyMinBytes)
+		if sent.hash.HashToken != "" {
+			hashes = append(hashes, sent.hash)
+		}
+		if sent.done {
+			done = append(done, item.FileID)
+		}
+		if err != nil {
+			_ = recordHashes()
 			_ = resp.Flush()
 			return err
 		}
+	}
+	if err := recordHashes(); err != nil {
+		_ = resp.Flush()
+		return err
 	}
 	return resp.Flush()
 }
@@ -348,16 +384,23 @@ func checkTransferDeadline(deps Deps, txferID string, transfer Transfer) error {
 	return nil
 }
 
+// sentItem is what a sent item leaves for its SEND to record: the window
+// hash, and for a directory, which is complete once sent, that it is Done.
+type sentItem struct {
+	hash WindowHash
+	done bool
+}
+
 // streamSendItem sends one item as frames. Frames of at least zeroCopyMinBytes
 // use the zero-copy path when the output allows it; zeroCopyOff disables it.
-func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID string, item sendItem, zeroCopyMinBytes int64) error {
+func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID string, item sendItem, zeroCopyMinBytes int64) (sentItem, error) {
 	ctx, windowTask := trace.NewTask(ctx, "send-window")
 	defer windowTask.End()
 	scope := events.FromContext(ctx)
 	itemStart := time.Now()
 	fd, fileRef, usedDirectOpen, err := openSendFile(deps, txferID, item)
 	if err != nil {
-		return mapLookupError(err)
+		return sentItem{}, mapLookupError(err)
 	}
 	if scope.Sink.Enabled() {
 		scope.Sink.Emit("file_open", txferID,
@@ -370,11 +413,9 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 		}
 	}()
 
-	_ = deps.SetTransferFileState(txferID, item.FileID, TransferStateRunning)
-
 	fileInfo, err := fd.Stat()
 	if err != nil {
-		return protocolErr{code: "INTERNAL", message: "failed to stat file"}
+		return sentItem{}, protocolErr{code: "INTERNAL", message: "failed to stat file"}
 	}
 	entryType := fileRef.EntryType
 	if entryType == 0 {
@@ -382,22 +423,23 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 	}
 	if fileInfo.IsDir() {
 		if entryType != encoding.EntryTypeDir {
-			return protocolErr{code: "BAD_REQUEST", message: "SEND path is a directory but manifest entry is not"}
+			return sentItem{}, protocolErr{code: "BAD_REQUEST", message: "SEND path is a directory but manifest entry is not"}
 		}
 		if item.Offset != 0 || item.Size != 0 {
-			return protocolErr{code: "BAD_REQUEST", message: "directory SEND must request offset=0 size=0"}
+			return sentItem{}, protocolErr{code: "BAD_REQUEST", message: "directory SEND must request offset=0 size=0"}
 		}
-		return streamSendMetadataOnly(ctx, out.w, deps, txferID, item, fileRef, fileInfo)
+		hash, err := streamSendMetadataOnly(ctx, out.w, item, fileRef, fileInfo)
+		return sentItem{hash: hash, done: err == nil}, err
 	}
 	if entryType != encoding.EntryTypeFile {
-		return protocolErr{code: "BAD_REQUEST", message: "SEND metadata-only supports directories only for non-file entries"}
+		return sentItem{}, protocolErr{code: "BAD_REQUEST", message: "SEND metadata-only supports directories only for non-file entries"}
 	}
 	windowLen := fileInfo.Size()
 	if windowLen < 0 {
-		return protocolErr{code: "INTERNAL", message: "invalid file size"}
+		return sentItem{}, protocolErr{code: "INTERNAL", message: "invalid file size"}
 	}
 	if item.Offset > windowLen {
-		return protocolErr{code: "RANGE", message: "offset out of range"}
+		return sentItem{}, protocolErr{code: "RANGE", message: "offset out of range"}
 	}
 	windowLen -= item.Offset
 	if item.Size > 0 && item.Size < windowLen {
@@ -430,7 +472,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 	firstFrameLogical := min(windowLen, defaultFileFrameLogicalSize)
 	maxWSizeHint, err := maxFrameWireHint(item.Comp, firstFrameLogical)
 	if err != nil {
-		return protocolErr{code: "INTERNAL", message: "failed to compute max frame size hint"}
+		return sentItem{}, protocolErr{code: "INTERNAL", message: "failed to compute max frame size hint"}
 	}
 	pipeSizeBytes := desiredPipeSizeBytes(windowLen, firstFrameLogical)
 	firstFrame := true
@@ -459,23 +501,22 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 			Output:       out.w,
 		}
 		if err := writeFrameHeader(out.w, zeroArgs, 0, nil); err != nil {
-			return err
+			return sentItem{}, err
 		}
 		windowHashToken, err := writeFrameTrailer(out.w, zeroArgs, nil)
 		if err != nil {
-			return err
+			return sentItem{}, err
 		}
-		if !deps.SetTransferFileWindowHash(txferID, item.FileID, 0, windowHashToken) {
-			return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
-		}
+		recorded := WindowHash{FileID: item.FileID, EndBytes: 0, HashToken: windowHashToken}
 		if scope.Sink.Enabled() {
 			scope.Sink.Emit("file_done", txferID, events.F("conn", scope.Conn), events.F("file", item.FileID), events.Dur("dur", time.Since(itemStart)))
 		}
 		// The file stays Running until its ACK, which is where every
 		// regular file, empty or not, is marked Done and counted.
-		return nil
+		return sentItem{hash: recorded}, nil
 	}
 
+	var recorded WindowHash
 	for remaining := windowLen; remaining > 0; {
 		frameSize := min(remaining, defaultFileFrameLogicalSize)
 		nextOffset := cursor + frameSize
@@ -532,7 +573,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 			// The splice bypasses out.w, so flush it and send this frame's
 			// header and trailer to the socket as well, in order.
 			if err := out.Flush(); err != nil {
-				return err
+				return sentItem{}, err
 			}
 			frameArgs.Output = out.conn
 			sendPath = sendPathSendfile
@@ -544,18 +585,18 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 			if usedDirectOpen && isDirectIOReadError(err) {
 				if frameOffset != cursor {
 					_ = fd.Close()
-					return err
+					return sentItem{}, err
 				}
 				_ = fd.Close()
 				fd = nil
 				fd, fileRef, err = deps.GetFile(txferID, item.FileID, item.Path)
 				if err != nil {
-					return mapLookupError(err)
+					return sentItem{}, mapLookupError(err)
 				}
 				usedDirectOpen = false
 				remaining = item.Offset + windowLen - cursor
 				if remaining < 0 {
-					return protocolErr{code: "INTERNAL", message: "invalid resume offset after direct I/O retry"}
+					return sentItem{}, protocolErr{code: "INTERNAL", message: "invalid resume offset after direct I/O retry"}
 				}
 				if cursor == item.Offset {
 					if item.Mode == loadStrategyFast {
@@ -572,7 +613,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 				}
 				continue
 			}
-			return err
+			return sentItem{}, err
 		}
 
 		if scope.Sink.Enabled() {
@@ -587,11 +628,9 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 
 		if isTerminal {
 			if stats.WindowHashToken == "" {
-				return protocolErr{code: "INTERNAL", message: "failed to finalize window hash"}
+				return sentItem{}, protocolErr{code: "INTERNAL", message: "failed to finalize window hash"}
 			}
-			if !deps.SetTransferFileWindowHash(txferID, item.FileID, cursor, stats.WindowHashToken) {
-				return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
-			}
+			recorded = WindowHash{FileID: item.FileID, EndBytes: cursor, HashToken: stats.WindowHashToken}
 		}
 
 		if adaptive {
@@ -623,7 +662,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 		}
 	}
 
-	return nil
+	return sentItem{hash: recorded}, nil
 }
 
 func openSendFile(deps Deps, txferID string, item sendItem) (*os.File, FileRef, bool, error) {
@@ -682,7 +721,7 @@ func initialCompressionMode(comp string) policy.CompressionMode {
 	}
 }
 
-func streamSendMetadataOnly(ctx context.Context, out io.Writer, deps Deps, txferID string, item sendItem, fileRef FileRef, fileInfo os.FileInfo) error {
+func streamSendMetadataOnly(ctx context.Context, out io.Writer, item sendItem, fileRef FileRef, fileInfo os.FileInfo) (WindowHash, error) {
 	md := encoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
 	md.Size = 0
 	windowHasher := xxh3.New128()
@@ -701,17 +740,13 @@ func streamSendMetadataOnly(ctx context.Context, out io.Writer, deps Deps, txfer
 		Output:       out,
 	}
 	if err := writeFrameHeader(out, args, 0, nil); err != nil {
-		return err
+		return WindowHash{}, err
 	}
 	windowHashToken, err := writeFrameTrailer(out, args, nil)
 	if err != nil {
-		return err
+		return WindowHash{}, err
 	}
-	if !deps.SetTransferFileWindowHash(txferID, item.FileID, 0, windowHashToken) {
-		return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
-	}
-	_ = deps.SetTransferFileState(txferID, item.FileID, TransferStateDone)
-	return nil
+	return WindowHash{FileID: item.FileID, EndBytes: 0, HashToken: windowHashToken}, nil
 }
 
 func maxFrameWireHint(comp string, logicalSize int64) (int64, error) {

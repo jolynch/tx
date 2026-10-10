@@ -737,6 +737,15 @@ func (s *Store) SetTransferPageCache(txferID string, fileID uint64, blob []byte)
 }
 
 func (s *Store) SetTransferFileState(txferID string, fileID uint64, state uint8) bool {
+	return s.SetTransferFilesState(txferID, []uint64{fileID}, state)
+}
+
+// SetTransferFilesState advances each listed file to state under one
+// acquisition of the transfer lock, so a SEND marks all its items Running at
+// once rather than contending for the lock once per file. A file already at
+// or past state is left alone. It refreshes the TTL once if any file advanced,
+// and reports false if any file ID is out of range.
+func (s *Store) SetTransferFilesState(txferID string, fileIDs []uint64, state uint8) bool {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
@@ -747,16 +756,24 @@ func (s *Store) SetTransferFileState(txferID string, fileID uint64, state uint8)
 	if managed.deleted {
 		return false
 	}
-	if fileID >= uint64(len(managed.transfer.State)) {
-		return false
+	ok = true
+	advanced := false
+	for _, fileID := range fileIDs {
+		if fileID >= uint64(len(managed.transfer.State)) {
+			ok = false
+			continue
+		}
+		idx := int(fileID)
+		if !shouldAdvanceState(managed.transfer.State[idx], state) || managed.transfer.State[idx] == state {
+			continue
+		}
+		managed.transfer.setState(idx, state)
+		advanced = true
 	}
-	idx := int(fileID)
-	if !shouldAdvanceState(managed.transfer.State[idx], state) || managed.transfer.State[idx] == state {
-		return true
+	if advanced {
+		s.touchLocked(managed, time.Now())
 	}
-	managed.transfer.setState(idx, state)
-	s.touchLocked(managed, time.Now())
-	return true
+	return ok
 }
 
 func (s *Store) AcknowledgeTransferFiles(entries []AckEntry) bool {
@@ -979,30 +996,45 @@ func normalizeHashToken(raw string) string {
 }
 
 func (s *Store) SetTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, token string) bool {
+	return s.SetTransferFileWindowHashes(txferID, []WindowHash{{FileID: fileID, EndBytes: endBytes, HashToken: token}})
+}
+
+// WindowHash is the hash of one file's bytes up to EndBytes, as a SEND
+// streamed them, kept so an ACK for that range can be validated.
+type WindowHash struct {
+	FileID    uint64
+	EndBytes  int64
+	HashToken string
+}
+
+// SetTransferFileWindowHashes records window hashes under one acquisition of
+// the transfer's locks, so a SEND records all its files at once. It skips any
+// hash that is malformed or names an out-of-range file, and then reports false.
+func (s *Store) SetTransferFileWindowHashes(txferID string, hashes []WindowHash) bool {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
 	}
-
-	if !validHashToken(token) {
-		return false
-	}
-	state := windowHashState{
-		hashToken: normalizeHashToken(token),
-		expiresAt: time.Now().Add(s.ttl),
-	}
+	expiresAt := time.Now().Add(s.ttl)
 	managed.mu.RLock()
 	defer managed.mu.RUnlock()
 	if managed.deleted {
 		return false
 	}
-	if fileID >= uint64(len(managed.transfer.State)) || endBytes < 0 {
-		return false
-	}
+	ok = true
 	managed.hashMu.Lock()
-	managed.windowHashes[windowHashKey{fileID: fileID, endBytes: endBytes}] = state
-	managed.hashMu.Unlock()
-	return true
+	defer managed.hashMu.Unlock()
+	for _, h := range hashes {
+		if !validHashToken(h.HashToken) || h.FileID >= uint64(len(managed.transfer.State)) || h.EndBytes < 0 {
+			ok = false
+			continue
+		}
+		managed.windowHashes[windowHashKey{fileID: h.FileID, endBytes: h.EndBytes}] = windowHashState{
+			hashToken: normalizeHashToken(h.HashToken),
+			expiresAt: expiresAt,
+		}
+	}
+	return ok
 }
 
 func (s *Store) VerifyTransferFileWindowHash(txferID string, fileID uint64, endBytes int64, token string) bool {

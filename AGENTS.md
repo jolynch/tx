@@ -218,10 +218,13 @@ command, file, window, and ACK events. A nil sink costs one nil check.
 
 - `TXFER` emits a directory or single-file manifest, then `ClipTransfer` seals
   the file count.
-- `SEND` reads its item list from the framed request body, validates files
-  through `Deps`, streams adaptively compressed FX/1 windows (sendfile when
-  possible), and records window hashes for ACK checks. `ACK` and `CXSUM` read
-  the same bounded body shape through the shared iterator.
+- `SEND` reads its item list from the framed request body, marks every item
+  Running, validates files through `Deps`, streams adaptively compressed FX/1
+  windows through a 64 KiB response buffer (sendfile for frames of at least
+  1 MiB), and records the window hashes for ACK checks before its OK or ERR
+  line.
+  `ACK` and `CXSUM` read the same bounded body shape through the shared
+  iterator.
 - `STATUS <tid>` returns one JSON status; bare `STATUS` returns a framed body of
   one JSON object per line. Completed transfers remain listed until TTL expiry,
   which counts from the transfer's last forward progress.
@@ -236,7 +239,13 @@ over its state and a separate mutex for window hashes. Per-file state is
 per-state totals current so status needs no scan.
 - **Hot paths are O(1) per file.** Per-request and per-file code uses
   `GetTransferSummary` (scalars only), never `GetTransfer`, which copies every
-  per-file slice. ACK applies a whole request under one lock.
+  per-file slice.
+- **Take the transfer lock once per request, not once per file.** Every
+  connection of a transfer shares its lock, so per-file acquisitions
+  serialize the whole copy. SEND marks its items Running and its directories
+  Done (`SetTransferFilesState`) and records their window hashes
+  (`SetTransferFileWindowHashes`) in one call each, and ACK applies a whole
+  request under one lock.
 - **No I/O under the transfer lock.** Format log lines under the lock and
   write them after releasing it.
 

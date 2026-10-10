@@ -67,6 +67,8 @@ type mockDeps struct {
 	windowHash       string
 	setStateCalls    int
 	setWindowCalls   int
+	stateBatches     int // SetTransferFilesState calls
+	windowBatches    int // SetTransferFileWindowHashes calls
 	reportTxferID    string
 	reportObserved   int64
 	reportBWPct      int
@@ -176,6 +178,24 @@ func (m *mockDeps) SetTransferFileWindowHash(_ string, _ uint64, endBytes int64,
 	m.setWindowCalls++
 	m.windowHashEnd = endBytes
 	m.windowHash = hashToken
+	return true
+}
+
+// SetTransferFilesState counts each file as one state change, as
+// SetTransferFileState does.
+func (m *mockDeps) SetTransferFilesState(_ string, fileIDs []uint64, _ uint8) bool {
+	m.stateBatches++
+	m.setStateCalls += len(fileIDs)
+	return true
+}
+
+// SetTransferFileWindowHashes records each hash as SetTransferFileWindowHash
+// does, so windowHash holds the last one.
+func (m *mockDeps) SetTransferFileWindowHashes(txferID string, hashes []WindowHash) bool {
+	m.windowBatches++
+	for _, h := range hashes {
+		m.SetTransferFileWindowHash(txferID, h.FileID, h.EndBytes, h.HashToken)
+	}
 	return true
 }
 
