@@ -115,7 +115,7 @@ make acceptance   # fuzz-short, then fuzz-long
 make bench        # Go microbenchmarks; pre-commit only (pegs the machine)
 make bench-acceptance        # tx-bench end to end on a 5GiB dataset (BENCH_SIZE)
 make bench-acceptance-dials  # dial budget of that run
-make bench-throughput        # in-memory copy; CPU count x file size cost grid
+make bench-throughput        # in-memory copy; CPU count x file size grids, plain and AES
 
 go test ./...
 go test ./internal/filexfer/...

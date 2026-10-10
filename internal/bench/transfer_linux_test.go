@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"filippo.io/age"
 	"github.com/zeebo/xxh3"
 	"golang.org/x/sys/unix"
 
@@ -59,22 +60,30 @@ func (d memDeps) GetFile(txferID string, fileID uint64, fullPath string) (*os.Fi
 }
 
 // memTransferConfig is one in-memory copy: files of fileSize adding up to
-// totalBytes.
+// totalBytes, over a session encrypted with encrypt ("none", "aes", or
+// "chacha20").
 type memTransferConfig struct {
 	fileSize   int64
 	totalBytes int64
+	encrypt    string
 }
 
 func (c memTransferConfig) files() int {
 	return int(max(1, c.totalBytes/c.fileSize))
 }
 
-// memTransferResult is what a set of copies cost.
+func (c memTransferConfig) encrypted() bool {
+	return c.encrypt != "" && c.encrypt != "none"
+}
+
+// memTransferResult is what a set of copies cost. wall and cpuNS cover only
+// the data phase; setup is the untimed per-copy registration.
 type memTransferResult struct {
 	copies  int
 	files   int64
 	bytes   int64
 	wall    time.Duration
+	setup   time.Duration
 	cpuNS   int64 // user plus system, both sides
 	maxHeap uint64
 }
@@ -91,7 +100,9 @@ func (r memTransferResult) filesPerSec() float64 {
 	return float64(r.files) / r.wall.Seconds()
 }
 
-// memTransferEnv is a server and a client sharing one process.
+// memTransferEnv is a server and a client sharing one process. entries and
+// updates describe the files once; each copy replays them into a new
+// transfer.
 type memTransferEnv struct {
 	store   *store.Store
 	client  *tx.Client
@@ -99,6 +110,8 @@ type memTransferEnv struct {
 	conc    int
 	plan    tx.BatchSizePlan
 	sendBuf int64 // server socket write buffer, which sets the batch floor
+	entries []tx.ManifestEntry
+	updates []store.TransferFileStateUpdate
 	close   func()
 }
 
@@ -106,9 +119,11 @@ type memTransferEnv struct {
 // no meaningful link, and a measured one would vary the plan between runs.
 const memTransferLinkMbps = 10_000
 
-// startMemTransfer starts the server and client. It plans concurrency and
-// batch size as tx recv copy does, for a server with GOMAXPROCS CPUs on a
-// memTransferLinkMbps link.
+const memTransferRoot = "/tx-bench"
+
+// startMemTransfer starts the server and client and describes the files. It
+// plans concurrency and batch size as tx recv copy does, for a server with
+// GOMAXPROCS CPUs on a memTransferLinkMbps link.
 func startMemTransfer(tb testing.TB, cfg memTransferConfig) *memTransferEnv {
 	tb.Helper()
 	fd, err := unix.MemfdCreate("tx-bench-transfer", 0)
@@ -124,6 +139,26 @@ func startMemTransfer(tb testing.TB, cfg memTransferConfig) *memTransferEnv {
 		tb.Fatal(err)
 	}
 
+	// Keys as tx send tree and tx recv copy --encrypt set them up: a server
+	// identity, and an ephemeral client identity sent in AUTH.
+	serverOpts := ftcp.ServerOptions{}
+	var clientOpts []tx.ClientOption
+	if cfg.encrypted() {
+		serverID, err := age.GenerateX25519Identity()
+		if err != nil {
+			tb.Fatal(err)
+		}
+		clientID, err := age.GenerateX25519Identity()
+		if err != nil {
+			tb.Fatal(err)
+		}
+		serverOpts.ServerIdentity = serverID
+		clientOpts = append(clientOpts,
+			tx.WithClientAgePublicKey(clientID.Recipient().String()),
+			tx.WithClientAgeIdentity(clientID.String()),
+			tx.WithEncryptMode(cfg.encrypt))
+	}
+
 	logOut := log.Writer()
 	log.SetOutput(io.Discard) // the server logs every transfer's progress
 	st := store.NewStore()
@@ -131,20 +166,47 @@ func startMemTransfer(tb testing.TB, cfg memTransferConfig) *memTransferEnv {
 	if err != nil {
 		tb.Fatal(err)
 	}
+	serverOpts.Deps = memDeps{Deps: ftcp.NewRuntimeDeps(st), src: src}
 	served := make(chan error, 1)
 	go func() {
-		served <- ftcp.Serve(ln, ftcp.ServerOptions{Deps: memDeps{Deps: ftcp.NewRuntimeDeps(st), src: src}})
+		served <- ftcp.Serve(ln, serverOpts)
 	}()
 
-	client := tx.NewClient(ln.Addr().String())
+	client := tx.NewClient(ln.Addr().String(), clientOpts...)
 	probe, err := client.ProbeLink(context.Background(), tx.ProbeRequest{ProbeBytes: 1})
 	if err != nil {
 		tb.Fatalf("probe: %v", err)
 	}
 	conc := tx.LocalSuggestedConcurrency(runtime.GOMAXPROCS(0), probe.ServerIODepth)
 	client.Close()
-	client = tx.NewClient(ln.Addr().String(), tx.WithConcurrency(conc))
+	client = tx.NewClient(ln.Addr().String(), append(clientOpts, tx.WithConcurrency(conc))...)
 	plan := tx.ExplainBatchMaxBytes(conc, client.WindowConcurrency, client.FileRequestWindowBytes, probe.ServerSendBufBytes, memTransferLinkMbps)
+
+	n := cfg.files()
+	entries := make([]tx.ManifestEntry, 0, n)
+	updates := make([]store.TransferFileStateUpdate, 0, n+1)
+	updates = append(updates, store.TransferFileStateUpdate{
+		FileID:    encoding.RootFileID,
+		EntryType: encoding.EntryTypeDir,
+		PathHash:  xxh3.Hash128([]byte(memTransferRoot)),
+	})
+	for i := 1; i <= n; i++ {
+		rel := fmt.Sprintf("d%03d/f%07d", i%256, i)
+		updates = append(updates, store.TransferFileStateUpdate{
+			FileID:    uint64(i),
+			EntryType: encoding.EntryTypeFile,
+			PathHash:  xxh3.Hash128([]byte(path.Join(memTransferRoot, rel))),
+			FileSize:  cfg.fileSize,
+		})
+		entries = append(entries, tx.ManifestEntry{
+			ID:    uint64(i),
+			Type:  encoding.EntryTypeFile,
+			Path:  rel,
+			Size:  cfg.fileSize,
+			Mtime: 1,
+			Mode:  0o644,
+		})
+	}
 
 	return &memTransferEnv{
 		store:   st,
@@ -153,6 +215,8 @@ func startMemTransfer(tb testing.TB, cfg memTransferConfig) *memTransferEnv {
 		conc:    conc,
 		plan:    plan,
 		sendBuf: probe.ServerSendBufBytes,
+		entries: entries,
+		updates: updates,
 		close: func() {
 			client.Close()
 			_ = ln.Close()
@@ -164,53 +228,34 @@ func startMemTransfer(tb testing.TB, cfg memTransferConfig) *memTransferEnv {
 	}
 }
 
-const memTransferRoot = "/tx-bench"
-
-// copyOnce registers a fresh transfer of cfg.files() files with the store,
-// as TXFER would, and downloads all of it.
-func (e *memTransferEnv) copyOnce(tb testing.TB) {
+// register creates a fresh transfer of the env's files in the store, as TXFER
+// would, and returns its manifest. It is setup, kept out of the timed copy.
+func (e *memTransferEnv) register(tb testing.TB) *tx.Manifest {
 	tb.Helper()
-	n := e.cfg.files()
 	tr, err := e.store.NewTransfer(memTransferRoot, 0, 0, store.WithRequestPath(memTransferRoot))
 	if err != nil {
 		tb.Fatal(err)
 	}
 	updates := make(chan store.TransferFileStateUpdate, 1024)
 	done := e.store.RegisterTransferFileState(tr.ID, updates, store.TransferStateStarted)
-	manifest := &tx.Manifest{
-		TransferID:  tr.ID,
-		Root:        memTransferRoot,
-		Mode:        tx.LoadStrategyFast,
-		Concurrency: e.conc,
-		Entries:     make([]tx.ManifestEntry, 0, n),
-	}
-	updates <- store.TransferFileStateUpdate{
-		FileID:    encoding.RootFileID,
-		EntryType: encoding.EntryTypeDir,
-		PathHash:  xxh3.Hash128([]byte(memTransferRoot)),
-	}
-	for i := 1; i <= n; i++ {
-		rel := fmt.Sprintf("d%03d/f%07d", i%256, i)
-		updates <- store.TransferFileStateUpdate{
-			FileID:    uint64(i),
-			EntryType: encoding.EntryTypeFile,
-			PathHash:  xxh3.Hash128([]byte(path.Join(memTransferRoot, rel))),
-			FileSize:  e.cfg.fileSize,
-		}
-		manifest.Entries = append(manifest.Entries, tx.ManifestEntry{
-			ID:    uint64(i),
-			Type:  encoding.EntryTypeFile,
-			Path:  rel,
-			Size:  e.cfg.fileSize,
-			Mtime: 1,
-			Mode:  0o644,
-		})
+	for _, u := range e.updates {
+		updates <- u
 	}
 	close(updates)
 	<-done
 	e.store.ClipTransfer(tr.ID)
-	defer e.store.DeleteTransfer(tr.ID)
+	return &tx.Manifest{
+		TransferID:  tr.ID,
+		Root:        memTransferRoot,
+		Mode:        tx.LoadStrategyFast,
+		Concurrency: e.conc,
+		Entries:     e.entries,
+	}
+}
 
+// download copies every file of a registered transfer.
+func (e *memTransferEnv) download(tb testing.TB, manifest *tx.Manifest) {
+	tb.Helper()
 	resp, err := e.client.StartFromManifest(context.Background(), tx.StartFromManifestRequest{
 		Manifest:           manifest,
 		OutputWriter:       discardOutput,
@@ -221,9 +266,17 @@ func (e *memTransferEnv) copyOnce(tb testing.TB) {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	if len(resp.Errors) > 0 || resp.Downloaded != n {
+	if n := len(manifest.Entries); len(resp.Errors) > 0 || resp.Downloaded != n {
 		tb.Fatalf("downloaded %d of %d files; first error: %v", resp.Downloaded, n, firstErr(resp.Errors))
 	}
+}
+
+// copyOnce registers and downloads one transfer, then removes it.
+func (e *memTransferEnv) copyOnce(tb testing.TB) {
+	tb.Helper()
+	manifest := e.register(tb)
+	defer e.store.DeleteTransfer(manifest.TransferID)
+	e.download(tb, manifest)
 }
 
 func discardOutput(tx.ManifestEntry, int64) (io.WriteCloser, func() error, error) {
@@ -262,45 +315,82 @@ var memTransferSizes = []struct {
 	{"16MiB", 16 << 20},
 }
 
-// BenchmarkTransferInMemory copies 64 MiB per op at each file size. Run it
-// with -cpu to plan for that many server CPUs. core-s/GiB covers both sides.
+// BenchmarkTransferInMemory copies 256 MiB per op at each file size,
+// unencrypted. Run it with -cpu to plan for that many server CPUs. core-s/GiB
+// covers both sides and excludes the untimed per-copy registration.
 func BenchmarkTransferInMemory(b *testing.B) {
 	for _, sz := range memTransferSizes {
 		b.Run(sz.name, func(b *testing.B) {
-			cfg := memTransferConfig{fileSize: sz.size, totalBytes: 64 << 20}
+			cfg := memTransferConfig{fileSize: sz.size, totalBytes: 256 << 20}
 			env := startMemTransfer(b, cfg)
 			defer env.close()
 			env.copyOnce(b) // warm the connection pools
 			b.SetBytes(int64(cfg.files()) * cfg.fileSize)
-			cpu0 := processCPUNS()
+			var cpuNS int64
 			b.ResetTimer()
 			for b.Loop() {
-				env.copyOnce(b)
+				b.StopTimer()
+				manifest := env.register(b)
+				b.StartTimer()
+				cpu0 := processCPUNS()
+				env.download(b, manifest)
+				cpuNS += processCPUNS() - cpu0
+				b.StopTimer()
+				env.store.DeleteTransfer(manifest.TransferID)
+				b.StartTimer()
 			}
 			b.StopTimer()
 			gib := float64(b.N) * float64(cfg.files()) * float64(cfg.fileSize) / (1 << 30)
-			b.ReportMetric(float64(processCPUNS()-cpu0)/1e9/gib, "core-s/GiB")
+			b.ReportMetric(float64(cpuNS)/1e9/gib, "core-s/GiB")
 			b.ReportMetric(float64(b.N)*float64(cfg.files())/b.Elapsed().Seconds(), "files/s")
 		})
 	}
 }
 
-// TestTransferCostRatio compares what tx spends to copy the same bytes as
-// small files and as 16 MiB files, for each server CPU count in
-// TX_BENCH_THROUGHPUT_CPUS. Each size's cost ratio is its CPU per GiB over the
-// 16 MiB files' CPU per GiB at the same CPU count, measured in the same run, so
-// it holds across machines of different speed. The goal is 1.0 everywhere:
-// many small files cost no more than one large file. The test fails when any
-// ratio exceeds TX_BENCH_THROUGHPUT_MAX_RATIO, a bar against regressions
-// rather than the goal. It is skipped unless TX_BENCH_THROUGHPUT_SIZE is set
-// (make bench-throughput).
+// TestTransferCostRatio measures copies of the same bytes as files from 4 KiB
+// to 16 MiB, for each server CPU count in TX_BENCH_THROUGHPUT_CPUS and each
+// session encryption in TX_BENCH_THROUGHPUT_ENCRYPT. It reports two goals:
+//
+//   - Cost ratio: a size's CPU per GiB over the 16 MiB files' CPU per GiB in
+//     the same row. 1.0 means many small files cost no more than one large
+//     file. Measured within one run, it is steadier across hosts than
+//     absolute CPU.
+//   - Speedup: a size's rate over its rate in the mode's first row. Linear
+//     scaling with cores is CPUs divided by the first row's CPUs.
+//
+// The test fails when any cost ratio exceeds TX_BENCH_THROUGHPUT_MAX_RATIO, a
+// bar against regressions rather than the goal. It is skipped unless
+// TX_BENCH_THROUGHPUT_SIZE is set (make bench-throughput).
 const (
 	envTPSize     = "TX_BENCH_THROUGHPUT_SIZE"
 	envTPCPUs     = "TX_BENCH_THROUGHPUT_CPUS"
+	envTPEncrypt  = "TX_BENCH_THROUGHPUT_ENCRYPT"
 	envTPMaxRatio = "TX_BENCH_THROUGHPUT_MAX_RATIO"
 	envTPMinWall  = "TX_BENCH_THROUGHPUT_MIN_WALL"
 	envTPOut      = "TX_BENCH_THROUGHPUT_OUT"
 )
+
+// throughputEncryptModes returns the session encryptions to measure:
+// TX_BENCH_THROUGHPUT_ENCRYPT as a comma-separated list of none, aes, and
+// chacha20, or just none.
+func throughputEncryptModes(t *testing.T) []string {
+	t.Helper()
+	raw := os.Getenv(envTPEncrypt)
+	if raw == "" {
+		return []string{"none"}
+	}
+	var modes []string
+	for field := range strings.SplitSeq(raw, ",") {
+		mode := strings.ToLower(strings.TrimSpace(field))
+		switch mode {
+		case "none", "aes", "chacha20":
+			modes = append(modes, mode)
+		default:
+			t.Fatalf("%s=%q: modes are none, aes, and chacha20", envTPEncrypt, raw)
+		}
+	}
+	return modes
+}
 
 // throughputCPUCounts returns the server CPU counts the grid covers: by
 // default, powers of two from 2 up to the host's CPU count, then the count
@@ -350,6 +440,7 @@ func TestTransferCostRatio(t *testing.T) {
 		t.Fatalf("%s=%q: %v", envTPSize, sizeRaw, err)
 	}
 	cpuCounts := throughputCPUCounts(t)
+	modes := throughputEncryptModes(t)
 	maxRatio := envFloat(t, envTPMaxRatio, defaultTPMaxRatio)
 	minWall := 5 * time.Second
 	if raw := os.Getenv(envTPMinWall); raw != "" {
@@ -362,17 +453,26 @@ func TestTransferCostRatio(t *testing.T) {
 	rep := newThroughputReport(total, maxRatio)
 	t.Logf("host: %s, kernel %s, %d CPUs, %s; %s per copy, ratio bar %.1f",
 		rep.Host.CPUModel, rep.Host.Kernel, rep.Host.NumCPU, rep.Host.GoVersion, encoding.HumanBytes(total), maxRatio)
-	for _, cpus := range cpuCounts {
-		runtime.GOMAXPROCS(cpus)
-		rep.Rows = append(rep.Rows, measureThroughputRow(t, cpus, total, minWall))
+	for _, mode := range modes {
+		first := len(rep.Rows)
+		for _, cpus := range cpuCounts {
+			runtime.GOMAXPROCS(cpus)
+			rep.Rows = append(rep.Rows, measureThroughputRow(t, cpus, total, minWall, mode))
+		}
+		base := rep.Rows[first]
+		for i := first; i < len(rep.Rows); i++ {
+			for j := range rep.Rows[i].Sizes {
+				rep.Rows[i].Sizes[j].Speedup = rep.Rows[i].Sizes[j].MiBPerSec / base.Sizes[j].MiBPerSec
+			}
+		}
+		logThroughputGrids(t, mode, rep.Rows[first:])
 	}
-	logThroughputGrids(t, rep)
 
 	worst, at := 0.0, ""
 	for _, row := range rep.Rows {
 		for _, sz := range row.Sizes {
 			if sz.CostRatio > worst {
-				worst, at = sz.CostRatio, fmt.Sprintf("%s files at %d CPUs", encoding.HumanBytes(sz.FileSize), row.CPUs)
+				worst, at = sz.CostRatio, fmt.Sprintf("%s files at %d CPUs, encrypt=%s", encoding.HumanBytes(sz.FileSize), row.CPUs, row.Encrypt)
 			}
 		}
 	}
@@ -387,15 +487,16 @@ func TestTransferCostRatio(t *testing.T) {
 
 // measureThroughputRow measures every size with GOMAXPROCS already set to
 // cpus, so the server and client plan for that many CPUs.
-func measureThroughputRow(t *testing.T, cpus int, total int64, minWall time.Duration) throughputRow {
+func measureThroughputRow(t *testing.T, cpus int, total int64, minWall time.Duration, encrypt string) throughputRow {
 	t.Helper()
 	envs := make([]*memTransferEnv, len(memTransferSizes))
 	for i, sz := range memTransferSizes {
-		envs[i] = startMemTransfer(t, memTransferConfig{fileSize: sz.size, totalBytes: total})
+		envs[i] = startMemTransfer(t, memTransferConfig{fileSize: sz.size, totalBytes: total, encrypt: encrypt})
 		envs[i].copyOnce(t) // warm the connection pools
 	}
 	results := measureInterleaved(t, envs, 3, minWall)
 	row := throughputRow{
+		Encrypt:      encrypt,
 		CPUs:         cpus,
 		Concurrency:  envs[0].conc,
 		BatchBytes:   envs[0].plan.BatchMaxBytes,
@@ -416,6 +517,7 @@ func measureThroughputRow(t *testing.T, cpus int, total int64, minWall time.Dura
 			CoreSecPerGiB: r.coreSecPerGiB(),
 			CoreUSPerFile: float64(r.cpuNS) / 1e3 / float64(r.files),
 			CostRatio:     r.coreSecPerGiB() / ref,
+			SetupMS:       float64(r.setup.Microseconds()) / 1e3 / float64(r.copies),
 			HeapBytes:     r.maxHeap,
 		})
 	}
@@ -424,8 +526,9 @@ func measureThroughputRow(t *testing.T, cpus int, total int64, minWall time.Dura
 
 // measureInterleaved copies every size once per round until both minRounds
 // and minWall are reached. Interleaving keeps machine drift (clock speed,
-// background load) from landing on one size. Each copy ends with a GC inside
-// its own measurement, so no copy pays for another's garbage.
+// background load) from landing on one size. Registration is setup, timed
+// apart. Each copy ends with a GC that counts toward its CPU but not its wall
+// time, so no copy pays for another's garbage and the rate is the data phase.
 func measureInterleaved(tb testing.TB, envs []*memTransferEnv, minRounds int, minWall time.Duration) []memTransferResult {
 	tb.Helper()
 	results := make([]memTransferResult, len(envs))
@@ -434,13 +537,17 @@ func measureInterleaved(tb testing.TB, envs []*memTransferEnv, minRounds int, mi
 	start := time.Now()
 	for round := 0; round < minRounds || time.Since(start) < minWall; round++ {
 		for i, env := range envs {
+			r := &results[i]
+			setup0 := time.Now()
+			manifest := env.register(tb)
+			r.setup += time.Since(setup0)
 			cpu0, wall0 := processCPUNS(), time.Now()
-			env.copyOnce(tb)
+			env.download(tb, manifest)
+			r.wall += time.Since(wall0)
 			runtime.ReadMemStats(&ms)
 			runtime.GC()
-			r := &results[i]
-			r.wall += time.Since(wall0)
 			r.cpuNS += processCPUNS() - cpu0
+			env.store.DeleteTransfer(manifest.TransferID)
 			r.copies++
 			r.files += int64(env.cfg.files())
 			r.bytes += int64(env.cfg.files()) * env.cfg.fileSize
@@ -450,26 +557,27 @@ func measureInterleaved(tb testing.TB, envs []*memTransferEnv, minRounds int, mi
 	return results
 }
 
-// logThroughputGrids logs one grid per metric: a row per CPU count, a column
-// per file size.
-func logThroughputGrids(t *testing.T, rep throughputReport) {
+// logThroughputGrids logs one grid per metric for one encryption mode: a row
+// per CPU count, a column per file size.
+func logThroughputGrids(t *testing.T, mode string, rows []throughputRow) {
 	t.Helper()
 	grids := []struct {
 		title string
 		cell  func(throughputSize) string
 	}{
 		{"cost ratio vs " + memTransferReference.name + " files (goal 1.00)", func(s throughputSize) string { return fmt.Sprintf("%.2f", s.CostRatio) }},
+		{fmt.Sprintf("speedup vs %d CPUs (linear = CPUs/%d)", rows[0].CPUs, rows[0].CPUs), func(s throughputSize) string { return fmt.Sprintf("%.2f", s.Speedup) }},
 		{"CPU, core-s/GiB", func(s throughputSize) string { return fmt.Sprintf("%.2f", s.CoreSecPerGiB) }},
 		{"rate, MiB/s", func(s throughputSize) string { return fmt.Sprintf("%.0f", s.MiBPerSec) }},
 	}
 	for _, g := range grids {
 		var b strings.Builder
-		fmt.Fprintf(&b, "\n%s\n%6s", g.title, "CPUs")
+		fmt.Fprintf(&b, "\nencrypt=%s: %s\n%6s", mode, g.title, "CPUs")
 		for _, sz := range memTransferSizes {
 			fmt.Fprintf(&b, " %8s", sz.name)
 		}
 		fmt.Fprintf(&b, " %18s", "plan")
-		for _, row := range rep.Rows {
+		for _, row := range rows {
 			fmt.Fprintf(&b, "\n%6d", row.CPUs)
 			for _, sz := range row.Sizes {
 				fmt.Fprintf(&b, " %8s", g.cell(sz))
@@ -497,8 +605,10 @@ type throughputReport struct {
 	Pass       bool            `json:"pass"`
 }
 
-// throughputRow is one CPU count: the plan tx made for it and every size.
+// throughputRow is one CPU count and encryption mode: the plan tx made for it
+// and every size.
 type throughputRow struct {
+	Encrypt      string           `json:"encrypt"`
 	CPUs         int              `json:"cpus"`
 	Concurrency  int              `json:"concurrency"`
 	BatchBytes   int64            `json:"batch_bytes"`
@@ -515,6 +625,8 @@ type throughputSize struct {
 	CoreSecPerGiB float64 `json:"core_sec_per_gib"`
 	CoreUSPerFile float64 `json:"core_us_per_file"`
 	CostRatio     float64 `json:"cost_ratio"`
+	Speedup       float64 `json:"speedup"`  // rate over the mode's first row
+	SetupMS       float64 `json:"setup_ms"` // untimed registration per copy
 	HeapBytes     uint64  `json:"heap_bytes"`
 }
 

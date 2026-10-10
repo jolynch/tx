@@ -12,10 +12,12 @@ FUZZ := ./scripts/fuzz
 # bench-acceptance: dataset size and where its metrics land.
 BENCH_SIZE ?= 5GiB
 BENCH_OUT ?= bench/acceptance
-THROUGHPUT_SIZE ?= 64MiB
+THROUGHPUT_SIZE ?= 256MiB
 # Comma-separated server CPU counts; empty covers 2, 4, 8, ... up to the host.
 THROUGHPUT_CPUS ?=
 THROUGHPUT_OUT ?= bench/throughput
+# Session encryption modes to measure: none, aes, chacha20.
+THROUGHPUT_ENCRYPT ?= none,aes
 
 all: build test
 
@@ -95,10 +97,12 @@ bench-acceptance-dials:
 
 # Copies THROUGHPUT_SIZE at file sizes from 4 KiB to 16 MiB through a real
 # server and client in one process, with no filesystem, once per server CPU
-# count up to the host's, and logs the size x CPU grid. Fails when small files
-# cost more than TX_BENCH_THROUGHPUT_MAX_RATIO times the CPU of 16 MiB files
-# for the same bytes, and writes THROUGHPUT_OUT/throughput.json.
+# count up to the host's and per THROUGHPUT_ENCRYPT mode, and logs the size x
+# CPU grids: cost ratio, speedup, CPU, and rate. Fails when small files cost
+# more than TX_BENCH_THROUGHPUT_MAX_RATIO times the CPU of 16 MiB files for the
+# same bytes, and writes THROUGHPUT_OUT/throughput.json.
 bench-throughput:
 	TX_BENCH_THROUGHPUT_SIZE=$(THROUGHPUT_SIZE) TX_BENCH_THROUGHPUT_CPUS=$(THROUGHPUT_CPUS) \
+		TX_BENCH_THROUGHPUT_ENCRYPT=$(THROUGHPUT_ENCRYPT) \
 		TX_BENCH_THROUGHPUT_OUT=$(abspath $(THROUGHPUT_OUT)) \
 		go test -count=1 -timeout 10m -run '^TestTransferCostRatio$$' -v ./internal/bench
