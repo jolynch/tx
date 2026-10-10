@@ -95,10 +95,16 @@ Fast mode's core choices:
   enough parallel work to saturate the link.
 - **Server reads:** `posix_fadvise(SEQUENTIAL)` plus asynchronous
   `readahead(2)` for the next frame when the window is large enough.
-- **Zero-copy:** when the frame is uncompressed, the connection is a raw TCP
-  socket, and the read is not direct I/O, Linux can use `splice`/`tee` to move
-  bytes from the page cache to the socket without copying file payloads through
-  userspace.
+- **Zero-copy:** when the frame is at least 1 MiB and uncompressed, the
+  connection is a raw TCP socket, and the read is not direct I/O, Linux can use
+  `splice`/`tee` to move bytes from the page cache to the socket without
+  copying file payloads through userspace. Below 1 MiB, setting up the pipes
+  costs more than the copy it saves.
+- **Buffered responses:** other frames go through a 64 KiB buffer per `SEND`
+  response, so a small file's header, payload, and trailer, and many small
+  files together, share one write syscall. A zero-copy frame flushes the
+  buffer first. Gentle-mode items stay unbuffered so their rate limiters pace
+  the socket writes.
 - **Compression:** adaptive compression can upgrade when the network is the
   bottleneck and downgrade when CPU or poor ratio makes compression expensive.
 

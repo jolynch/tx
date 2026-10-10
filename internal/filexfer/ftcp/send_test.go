@@ -112,7 +112,7 @@ func TestStreamSendItemRoundTripCompressionModes(t *testing.T) {
 			deps := &mockDeps{filePath: tmp}
 			var out bytes.Buffer
 
-			err := streamSendItem(context.Background(), &out, deps, "tx1", sendItem{FileID: 7, Offset: 0, Size: 0, Comp: comp, Path: tmp}, defaultZeroCopyMinFrameBytes)
+			err := streamSendItem(context.Background(), unbufferedSendOutput(&out), deps, "tx1", sendItem{FileID: 7, Offset: 0, Size: 0, Comp: comp, Path: tmp}, defaultZeroCopyMinFrameBytes)
 			if err != nil {
 				t.Fatalf("streamSendItem failed: %v", err)
 			}
@@ -156,7 +156,7 @@ func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
 
 	var rawOut bytes.Buffer
 	slowOut := delayedWriter{w: &rawOut, delay: 25 * time.Millisecond}
-	err := streamSendItem(context.Background(), &slowOut, deps, "tx-adapt", sendItem{FileID: 9, Offset: 0, Size: 0, Comp: "adapt", Path: tmp}, defaultZeroCopyMinFrameBytes)
+	err := streamSendItem(context.Background(), unbufferedSendOutput(&slowOut), deps, "tx-adapt", sendItem{FileID: 9, Offset: 0, Size: 0, Comp: "adapt", Path: tmp}, defaultZeroCopyMinFrameBytes)
 	if err != nil {
 		t.Fatalf("streamSendItem failed: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestStreamSendItemDirectoryMetadataOnly(t *testing.T) {
 	deps := &mockDeps{filePath: dir, entryType: encoding.EntryTypeDir}
 
 	var out bytes.Buffer
-	if err := streamSendItem(context.Background(), &out, deps, "tx-dir", sendItem{FileID: 11, Offset: 0, Size: 0, Comp: "adapt", Path: dir}, defaultZeroCopyMinFrameBytes); err != nil {
+	if err := streamSendItem(context.Background(), unbufferedSendOutput(&out), deps, "tx-dir", sendItem{FileID: 11, Offset: 0, Size: 0, Comp: "adapt", Path: dir}, defaultZeroCopyMinFrameBytes); err != nil {
 		t.Fatalf("streamSendItem directory failed: %v", err)
 	}
 
@@ -359,6 +359,94 @@ func TestHandleSENDBasic(t *testing.T) {
 	}
 	if !bytes.Equal(frames[0].Logical, data) {
 		t.Fatalf("unexpected logical bytes")
+	}
+}
+
+// countingWriter counts Write calls, standing in for write syscalls. It keeps
+// its buffer in a field rather than embedding it, so io.WriteString cannot
+// reach bytes.Buffer.WriteString around the count.
+type countingWriter struct {
+	buf    bytes.Buffer
+	writes int
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.writes++
+	return w.buf.Write(p)
+}
+
+// TestHandleSENDBuffersFastFrames checks that fast-mode SEND coalesces small
+// frames into about one write per buffer, while gentle mode leaves each frame
+// unbuffered under its rate limiters.
+func TestHandleSENDBuffersFastFrames(t *testing.T) {
+	const files = 1000
+	data := zeroCopyPayload(4 << 10)
+	tmp := writeTempSendFile(t, data)
+	items := make([]string, files)
+	for i := range items {
+		items[i] = fmt.Sprintf("fd=%d %s", i+1, strconv.Quote(tmp))
+	}
+	for _, tc := range []struct {
+		mode     string
+		buffered bool
+	}{
+		{loadStrategyFast, true},
+		{loadStrategyGentle, false},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			req, err := ParseRequest([]byte("SEND tx1 mode=" + tc.mode))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out countingWriter
+			if err := handleSENDWithOptions(context.Background(), req, framedItemBody(t, items...), &out, &mockDeps{filePath: tmp}, nil, defaultZeroCopyMinFrameBytes, 25); err != nil {
+				t.Fatalf("handleSENDWithOptions: %v", err)
+			}
+			frames, err := decodeFrameStream(out.buf.Bytes())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(frames) != files {
+				t.Fatalf("decoded %d frames, want %d", len(frames), files)
+			}
+			for i, frame := range frames {
+				if frame.Header.FileID != uint64(i+1) || !bytes.Equal(frame.Logical, data) {
+					t.Fatalf("frame %d: file %d, %d bytes", i, frame.Header.FileID, len(frame.Logical))
+				}
+			}
+			if limit := out.buf.Len()/sendOutputBufferBytes + 2; tc.buffered && out.writes > limit {
+				t.Fatalf("%d writes for %d bytes, want at most %d", out.writes, out.buf.Len(), limit)
+			}
+			if !tc.buffered && out.writes < 3*files {
+				t.Fatalf("%d writes, want at least %d: gentle frames must not be buffered", out.writes, 3*files)
+			}
+		})
+	}
+}
+
+// TestHandleSENDFlushesBeforeError checks that frames buffered before a
+// failing item reach the response before the handler returns its error, so
+// the client reads them ahead of the ERR line.
+func TestHandleSENDFlushesBeforeError(t *testing.T) {
+	data := []byte("first file")
+	tmp := writeTempSendFile(t, data)
+	req, err := ParseRequest([]byte("SEND tx1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := framedItemBody(t, "fd=1 "+strconv.Quote(tmp), "fd=2 "+strconv.Quote(tmp), "fd=3 "+strconv.Quote(tmp))
+	var out bytes.Buffer
+	deps := &mockDeps{filePath: tmp, missingIDs: map[uint64]bool{2: true}}
+	err = handleSENDWithOptions(context.Background(), req, body, &out, deps, nil, defaultZeroCopyMinFrameBytes, 25)
+	if err == nil {
+		t.Fatal("SEND with a missing file succeeded")
+	}
+	frames, decodeErr := decodeFrameStream(out.Bytes())
+	if decodeErr != nil {
+		t.Fatalf("decode %q: %v", out.Bytes(), decodeErr)
+	}
+	if len(frames) != 1 || frames[0].Header.FileID != 1 || !bytes.Equal(frames[0].Logical, data) {
+		t.Fatalf("want only file 1's complete frame before the error, got %d frames", len(frames))
 	}
 }
 
@@ -592,7 +680,7 @@ func TestStreamSendItemZeroCopyMinFrameBytes(t *testing.T) {
 				}
 			})
 			ctx := events.WithScope(context.Background(), events.Scope{Sink: sink, Conn: 1})
-			err := streamSendItem(ctx, server, &mockDeps{filePath: path}, "tx1", sendItem{
+			err := streamSendItem(ctx, unbufferedSendOutput(server), &mockDeps{filePath: path}, "tx1", sendItem{
 				FileID: 1,
 				Comp:   "none",
 				Path:   path,
@@ -639,7 +727,7 @@ func TestStreamSendItemZeroCopyDisconnectDoesNotRecordHash(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- streamSendItem(context.Background(), server, deps, "tx1", sendItem{
+		errCh <- streamSendItem(context.Background(), unbufferedSendOutput(server), deps, "tx1", sendItem{
 			FileID: 1,
 			Comp:   "none",
 			Path:   path,

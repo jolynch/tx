@@ -3,6 +3,7 @@ package ftcp
 import (
 	"bytes"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -39,7 +40,8 @@ func realDeps(t *testing.T, root string) Deps {
 // and server_test.go.
 type mockDeps struct {
 	// Inputs.
-	filePath   string // GetFile/GetFileRef serve this file when non-empty
+	filePath   string          // GetFile/GetFileRef serve this file when non-empty
+	missingIDs map[uint64]bool // GetFile/GetFileRef report these file IDs as not found
 	entryType  byte
 	transfer   Transfer // returned by GetTransfer and GetTransferSummary when transferOK
 	transferOK bool
@@ -122,6 +124,9 @@ func (m *mockDeps) ReportTransferObservedLink(txferID string, observedLinkMbps i
 func (m *mockDeps) GetTransferLimiterBps(string) int64 { return 0 }
 
 func (m *mockDeps) GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error) {
+	if m.missingIDs[fileID] {
+		return nil, FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "file not found"}
+	}
 	if m.filePath == "" {
 		return nil, FileRef{}, nil
 	}
@@ -138,6 +143,9 @@ func (m *mockDeps) GetFile(txferID string, fileID uint64, fullPathRaw string) (*
 }
 
 func (m *mockDeps) GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {
+	if m.missingIDs[fileID] {
+		return FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "file not found"}
+	}
 	if m.filePath == "" {
 		return FileRef{}, nil
 	}

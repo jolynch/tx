@@ -58,12 +58,11 @@ instead of widening the current change; remove an entry when it ships.
 - **Per-file cost of small files.** `tx-bench local --profile small` on
   tmpfs, pinned to 4 cores, copies 4–64 KiB files at about 5.5 client and 4
   sender core-s/GiB, against under 1 for 16 MiB files. The in-memory
-  `make bench-throughput` puts tx's own share at 11–15x the CPU of 16 MiB
-  files for the same bytes (4 KiB files); the goal is 1x. CPU profiles of the
-  tx-bench run show what is left:
-  - Sender: socket writes are about 23% of CPU, because every frame goes out
-    as three writes (header, payload, trailer). Assemble buffered frames
-    into one write, or buffer each SEND's output and flush it once.
+  `make bench-throughput` puts tx's own share at 5–9.5x the CPU of 16 MiB
+  files for the same bytes (4 KiB files); the goal is 1x. In its profile, ACK
+  handling is about 12% of CPU (client and server together) and client
+  trailer parsing about 5%. CPU profiles of the tx-bench run show what is
+  left:
   - Receiver: creating output files is about 22% (`MkdirAll` 5% of it), and
     applying trailer metadata (chmod, chown, utimes) about 16%. Create files
     with their final mode, skip chown when the owner already matches, and

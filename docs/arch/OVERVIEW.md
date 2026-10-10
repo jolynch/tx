@@ -197,9 +197,11 @@ blocking: a slow file on one connection does not stall transfers on the others.
 On the server side, each fast-mode `SEND` handler uses `fadvise(SEQUENTIAL)` and
 background `readahead(2)` to prefetch the next frame into the page cache while
 the current frame is being written to the socket. When encryption and
-compression are off and the output is a raw TCP socket, the server uses a
-zero-copy `splice`/`tee` path that moves file data from the page cache to the
-NIC without copying through userspace.
+compression are off, the output is a raw TCP socket, and the frame is at least
+1 MiB, the server uses a zero-copy `splice`/`tee` path that moves file data
+from the page cache to the NIC without copying through userspace. Smaller
+frames go through a 64 KiB buffer per response, so many small files share one
+write syscall.
 
 The net effect is that disk reads, compression, network writes, and disk writes
 on the receiver all overlap — keeping SSD, CPU, and NIC busy simultaneously.
