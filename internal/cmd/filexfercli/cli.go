@@ -20,9 +20,7 @@ import (
 
 	"sync/atomic"
 
-	"filippo.io/age"
 	"github.com/jolynch/tx"
-	"github.com/jolynch/tx/internal/aead"
 	"github.com/jolynch/tx/internal/cliflags"
 	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/filexfer"
@@ -398,55 +396,6 @@ State is stored in <local-dst>/../.tx/ (manifest, progress, staging).
 Default status server address: %s
 Run 'tx recv <command> --help' for command-specific options.
 `, defaultFileListener)
-}
-
-func resolveEncryptionOptions(mode string) (pubKey string, identity string, encMode string, err error) {
-	return resolveEncryptionOptionsWithKeys(mode, "")
-}
-
-// resolveEncryptionOptionsWithKeys resolves the client age identity. If
-// keysDir is empty, an ephemeral identity is generated per call (legacy
-// behavior). If keysDir is set, a persistent identity is loaded from
-// keysDir/key (generated and persisted if absent), so pubkey-based server
-// allowlists can match a stable client identity.
-func resolveEncryptionOptionsWithKeys(mode, keysDir string) (pubKey string, identity string, encMode string, err error) {
-	mode = strings.ToLower(strings.TrimSpace(mode))
-	switch mode {
-	case "", "none":
-		return "", "", "", nil
-	case "auto", "aes", "chacha20":
-	default:
-		return "", "", "", fmt.Errorf("unsupported --encrypt value %q (supported: none, auto, aes, chacha20)", mode)
-	}
-	if keysDir == "" {
-		id, genErr := age.GenerateX25519Identity()
-		if genErr != nil {
-			return "", "", "", fmt.Errorf("generate age identity: %w", genErr)
-		}
-		return id.Recipient().String(), id.String(), mode, nil
-	}
-	id, _, err := aead.LoadOrGenerateAgeIdentity(keysDir, false)
-	if err != nil {
-		return "", "", "", fmt.Errorf("load keys from %s: %w", keysDir, err)
-	}
-	return id.Recipient().String(), id.String(), mode, nil
-}
-
-// validateAuthTokens enforces: every token is a valid opaque string, and the
-// combination requires encryption.
-func validateAuthTokens(tokens []string, encMode string) error {
-	if len(tokens) == 0 {
-		return nil
-	}
-	if encMode == "" || encMode == "none" {
-		return fmt.Errorf("--auth-token requires --encrypt (auth tokens only travel inside the encrypted AUTH blob)")
-	}
-	for _, t := range tokens {
-		if vErr := aead.ValidateAuthToken(t); vErr != nil {
-			return fmt.Errorf("--auth-token %q: %w", t, vErr)
-		}
-	}
-	return nil
 }
 
 func resolveLoadStrategy(raw string) (string, error) {

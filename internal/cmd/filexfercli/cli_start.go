@@ -23,10 +23,7 @@ import (
 
 type startArgs struct {
 	targetDir           string
-	agePublicKey        string
-	ageIdentity         string
-	encMode             string
-	authTokens          []string
+	auth                clientAuth
 	verbosity           int
 	concurrency         int
 	concurrencyExplicit bool
@@ -152,9 +149,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 		fmt.Fprintln(stderr, "usage: tx recv start [flags] <target-dir>")
 		cf.PrintDefaults(stderr)
 	}
-	var encryptMode string
-	var keysDir string
-	var authTokens []string
+	var authFlags clientAuthFlags
 	var concurrency int
 	var ackEveryRaw string
 	var compressRaw string
@@ -167,9 +162,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	var progressFilePaths []string
 	var progressFormats []string
 	var progressIntervalRaw string
-	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
-	cf.StringVar(&keysDir, "k", "keys", "", "Persistent age keys directory (default: ephemeral)")
-	cf.StringSliceVar(&authTokens, "t", "auth-token", "Client auth token presented in encrypted AUTH blob; repeatable")
+	authFlags.register(cf)
 	cf.BoolVar(&progress, "", "progress", true, "Show transfer progress every 2s")
 	cf.BoolVar(&verbose, "v", "verbose", false, "Per-file progress output")
 	cf.StringSliceVar(&progressFilePaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
@@ -255,12 +248,8 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 			return 2
 		}
 	}
-	agePublicKey, ageIdentity, resolvedEncMode, err := resolveEncryptionOptionsWithKeys(encryptMode, keysDir)
+	auth, err := resolveClientAuth(authFlags)
 	if err != nil {
-		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
-		return 2
-	}
-	if err := validateAuthTokens(authTokens, resolvedEncMode); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
@@ -271,10 +260,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	}
 	return runStart(serverURL, startArgs{
 		targetDir:           cf.Arg(0),
-		agePublicKey:        agePublicKey,
-		ageIdentity:         ageIdentity,
-		encMode:             resolvedEncMode,
-		authTokens:          authTokens,
+		auth:                auth,
 		verbosity:           verbosity,
 		concurrency:         concurrency,
 		concurrencyExplicit: concurrencyExplicit,
@@ -382,7 +368,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 			stopProgress()
 		}
 	}()
-	client, closeClient := phaseClient(cfg.client, serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()), tx.WithConcurrency(effectiveConcurrency))
+	client, closeClient := phaseClient(cfg.client, serverURL, append(cfg.auth.options(), tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()), tx.WithConcurrency(effectiveConcurrency))...)
 	defer closeClient()
 	// A shared client was built before the manifest's mode was known; a
 	// resumed transfer keeps the mode it started with.

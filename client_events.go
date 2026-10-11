@@ -40,7 +40,10 @@ type syncDialKey struct{}
 // rawConn unwraps the pool's session wrapper so a connection keeps one id.
 func rawConn(conn net.Conn) net.Conn {
 	if sc, ok := conn.(*sessionTCPConn); ok {
-		return sc.Conn
+		conn = sc.Conn
+	}
+	if nc, ok := conn.(*noiseConn); ok {
+		conn = nc.Conn
 	}
 	return conn
 }

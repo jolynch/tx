@@ -40,28 +40,14 @@ func TestParseRequestSENDRejectsInlineItems(t *testing.T) {
 	}
 }
 
-func TestParseRequestAUTHChaCha20(t *testing.T) {
-	req, err := ParseRequest([]byte(`AUTH chacha20 abc123`))
-	if err != nil {
-		t.Fatalf("ParseRequest err: %v", err)
-	}
-	if req.Verb != VerbAUTH {
-		t.Fatalf("verb=%v", req.Verb)
-	}
-	if len(req.Params) != 1 {
-		t.Fatalf("params len=%d", len(req.Params))
-	}
-	if got := req.Params[0]["protocol"]; got != "chacha20" {
-		t.Fatalf("unexpected protocol: %q", got)
-	}
-	if got := req.Params[0]["blob"]; got != "abc123" {
-		t.Fatalf("unexpected blob: %q", got)
-	}
-}
-
-func TestParseRequestAUTHRejectsUnexpectedArguments(t *testing.T) {
-	if _, err := ParseRequest([]byte(`AUTH aes abc123 mode=chacha20`)); err == nil {
-		t.Fatal("expected error")
+func TestParseRequestAUTHIgnoresArguments(t *testing.T) {
+	// AUTH is handled before parsing on a connection's first line; anywhere
+	// else the handler rejects it whatever its arguments.
+	for _, line := range []string{"AUTH", "AUTH key", "AUTH chacha20 abc123", "auth noise-v1 x"} {
+		req, err := ParseRequest([]byte(line))
+		if err != nil || req.Verb != VerbAUTH {
+			t.Fatalf("ParseRequest(%q) = (%v, %v)", line, req.Verb, err)
+		}
 	}
 }
 

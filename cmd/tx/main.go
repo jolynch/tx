@@ -91,7 +91,7 @@ func loadOrGenerateServerKey(dir string, isDefault bool) (*age.X25519Identity, e
 		return nil, err
 	}
 	if ephemeral {
-		log.Printf("Keys directory not found, using ephemeral in-memory key")
+		log.Printf("Keys directory %s is missing or not writable; using an ephemeral server key that changes on restart", dir)
 	}
 	return identity, nil
 }
@@ -180,6 +180,9 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 		keysDirFlag       string
 		requireAuth       bool
 		authTokenVals     []string
+		authTokenFiles    []string
+		clientRecipients  []string
+		clientRecipFiles  []string
 		targetIODepth     int
 		disableZeroCopy   bool
 		traceFile         string
@@ -198,8 +201,11 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 	cf.StringVar(&gentleCPURaw, "", "gentle-cpu", gentleCPUDefault, "Percent of server CPUs advertised for gentle concurrency")
 	cf.StringVar(&gentleBWRaw, "", "gentle-bw", gentleBWDefault, "Percent of observed link bandwidth used for gentle limiting")
 	cf.StringVar(&keysDirFlag, "k", "keys", keysDir, "Age keys directory")
-	cf.BoolVar(&requireAuth, "", "require-auth", false, "Require AUTH before commands")
-	cf.StringSliceVar(&authTokenVals, "", "require-auth-token", "Allowlisted auth token (opaque string >8 bytes, repeatable); implies --require-auth")
+	cf.BoolVar(&requireAuth, "", "require-auth", false, "Require AUTH before commands; with no allowlist, accept any client that proves its own age private key")
+	cf.StringSliceVar(&authTokenVals, "", "require-auth-token", "Allowlisted secret token; repeatable; implies --require-auth. Prefer --require-auth-token-file: values here are visible in the process list")
+	cf.StringSliceVar(&authTokenFiles, "", "require-auth-token-file", "File holding one allowlisted secret token; repeatable; implies --require-auth")
+	cf.StringSliceVar(&clientRecipients, "", "require-client-recipient", "Allowlisted client age recipient (public key); the client must prove its private key; repeatable; implies --require-auth")
+	cf.StringSliceVar(&clientRecipFiles, "", "require-client-recipient-file", "File holding one allowlisted client age recipient; repeatable; implies --require-auth")
 	cf.IntVar(&targetIODepth, "", "target-io-depth", 4, "Target IO depth per CPU advertised in PROBE")
 	cf.BoolVar(&disableZeroCopy, "", "disable-zero-copy", false, "Force buffered send path (for benchmarking)")
 	cf.StringVar(&exitAfterRaw, "", "exit-after", "60s", "Exit duration after transfer completes; 'never' to run forever (e.g. 5s, 1m)")
@@ -286,24 +292,39 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 		log.Fatalf("Invalid --progress-interval: %v", err)
 	}
 
-	for _, tok := range authTokenVals {
-		if vErr := aead.ValidateAuthToken(tok); vErr != nil {
-			log.Fatalf("Invalid --require-auth-token: %v", vErr)
+	for _, path := range authTokenFiles {
+		entry, readErr := cliflags.ReadCredentialFile(path)
+		if readErr != nil {
+			log.Fatalf("Invalid --require-auth-token-file: %v", readErr)
+		}
+		authTokenVals = append(authTokenVals, entry)
+	}
+	for _, path := range clientRecipFiles {
+		entry, readErr := cliflags.ReadCredentialFile(path)
+		if readErr != nil {
+			log.Fatalf("Invalid --require-client-recipient-file: %v", readErr)
+		}
+		clientRecipients = append(clientRecipients, entry)
+	}
+	for i, tok := range authTokenVals {
+		if lower := strings.ToLower(tok); strings.HasPrefix(lower, "age1") || strings.HasPrefix(lower, "age-secret-key-") {
+			log.Fatalf("Invalid --require-auth-token: token %d is an age key; allow client age recipients with --require-client-recipient", i+1)
 		}
 	}
-	if len(authTokenVals) > 0 && !requireAuth {
+	tokenList, err := aead.NewAllowlist(authTokenVals, nil)
+	if err != nil {
+		log.Fatalf("Invalid --require-auth-token: %v", err)
+	}
+	recipientList, err := aead.NewAllowlist(nil, clientRecipients)
+	if err != nil {
+		log.Fatalf("Invalid --require-client-recipient: %v", err)
+	}
+	switch {
+	case !tokenList.Empty() || !recipientList.Empty():
 		requireAuth = true
-	}
-	if requireAuth && len(authTokenVals) == 0 {
-		gen, tokErr := aead.NewAuthToken()
-		if tokErr != nil {
-			log.Fatalf("Generate auth token: %v", tokErr)
-		}
-		log.Printf("generated auth token: %s", gen)
-		authTokenVals = append(authTokenVals, gen)
-	}
-	if len(authTokenVals) > 0 {
-		log.Printf("auth required (%d identities/tokens allowlisted)", len(authTokenVals))
+		log.Printf("auth required (%d tokens, %d client recipients allowlisted)", tokenList.Len(), recipientList.Len())
+	case requireAuth:
+		log.Printf("auth required: any client that proves its own age private key")
 	}
 	progressTargets, err := cliflags.ResolveProgressTargets(progressPaths, progressFormats)
 	if err != nil {
@@ -335,7 +356,7 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 	if err != nil {
 		log.Fatalf("Key setup failed: %v", err)
 	}
-	log.Printf("Public key %s", serverKey.Recipient().String())
+	log.Printf("Server recipient (clients may pass it to --require-server-recipient): %s", serverKey.Recipient().String())
 
 	fsFileRate = rate
 	fsFileBurst = burst
@@ -420,21 +441,22 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 
 	log.Printf("File transfer listener at %s (root=%s)", listenAddr, chroot)
 	if serveErr := serve(fileLn, ftcp.ServerOptions{
-		RequireAuth:            requireAuth,
-		AllowedAuthTokens:      authTokenVals,
-		ServerIdentity:         serverKey,
-		Limiter:                fileStreamLimiter,
-		GentleCPUPct:           gentleCPUPct,
-		GentleBWPct:            gentleBWPct,
-		SocketWriteBufferBytes: socketWriteBufBytes,
-		RootDir:                chroot,
-		ProgressTargets:        progressTargets,
-		ProgressInterval:       progressInterval,
-		DisableZeroCopy:        disableZeroCopy,
-		TargetIODepth:          targetIODepth,
-		ExitAfter:              exitAfter,
-		KeepAliveTimeout:       idleTimeout,
-		Events:                 sink,
+		RequireAuth:             requireAuth,
+		AllowedAuthTokens:       authTokenVals,
+		AllowedClientRecipients: clientRecipients,
+		ServerIdentity:          serverKey,
+		Limiter:                 fileStreamLimiter,
+		GentleCPUPct:            gentleCPUPct,
+		GentleBWPct:             gentleBWPct,
+		SocketWriteBufferBytes:  socketWriteBufBytes,
+		RootDir:                 chroot,
+		ProgressTargets:         progressTargets,
+		ProgressInterval:        progressInterval,
+		DisableZeroCopy:         disableZeroCopy,
+		TargetIODepth:           targetIODepth,
+		ExitAfter:               exitAfter,
+		KeepAliveTimeout:        idleTimeout,
+		Events:                  sink,
 	}); serveErr != nil {
 		log.Fatalf("File transfer listener stopped: %v", serveErr)
 	}

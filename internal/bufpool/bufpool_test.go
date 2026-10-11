@@ -18,7 +18,9 @@ func TestBucketSizeLadder(t *testing.T) {
 		{4 * kiB, 4 * kiB},
 		{4*kiB + 1, 16 * kiB},
 		{64 * kiB, 64 * kiB},
-		{64*kiB + 1, 256 * kiB},
+		{64*kiB + 1, 128 * kiB},
+		{128 * kiB, 128 * kiB},
+		{128*kiB + 1, 256 * kiB},
 		{4 * miB, 4 * miB},
 		{4*miB + 1, 8 * miB},
 		{64 * miB, 64 * miB},
@@ -42,6 +44,32 @@ func TestAcquireReturnsRequestedLengthFromBucketCapacity(t *testing.T) {
 	}
 	if cap(buf) != 16*kiB {
 		t.Errorf("cap = %d, want the 16 KiB bucket", cap(buf))
+	}
+}
+
+// Get and Put are the per-record path's pool: once warm they allocate
+// nothing, and Get hands back a bucket-length buffer.
+func TestGetPutDoNotAllocate(t *testing.T) {
+	p, err := Get(100 * kiB)
+	if err != nil || len(*p) != 128*kiB {
+		t.Fatalf("Get(100KiB) = (%d bytes, %v), want the 128 KiB bucket", len(*p), err)
+	}
+	Put(p)
+	if raceEnabled {
+		t.Skip("the race detector makes sync.Pool drop buffers at random")
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		p, _ := Get(128 * kiB)
+		Put(p)
+	})
+	if allocs != 0 {
+		t.Fatalf("Get/Put allocated %.1f times", allocs)
+	}
+	if _, err := Get(0); err == nil {
+		t.Fatal("Get(0) succeeded")
+	}
+	if _, err := Get(MaxBucket + 1); err == nil {
+		t.Fatal("Get above MaxBucket succeeded")
 	}
 }
 

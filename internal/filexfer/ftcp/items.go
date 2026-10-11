@@ -71,7 +71,7 @@ func readRequestItemBody(in io.Reader, verb string) (*bufpool.Growing, error) {
 	if err != nil {
 		return nil, err
 	}
-	framed := encoding.NewFramedBodyReader(in, encoding.FramedBodyReaderOpts{
+	framed := encoding.NewFramedBodyReader(requestBodySource(in), encoding.FramedBodyReaderOpts{
 		MaxLogicalBytes: encoding.MaxRequestBytes,
 	})
 	// ReadFrom returns only on verified terminal-frame completion: a stream
@@ -81,6 +81,11 @@ func readRequestItemBody(in io.Reader, verb string) (*bufpool.Growing, error) {
 	if _, err := body.ReadFrom(framed); err != nil {
 		body.Release()
 		return nil, protocolErr{code: "BAD_REQUEST", message: "invalid " + verb + " request body: " + err.Error()}
+	}
+	// The request must end here, before any item is applied.
+	if err := completeRequest(in); err != nil {
+		body.Release()
+		return nil, err
 	}
 	return body, nil
 }
@@ -211,7 +216,7 @@ func drainItemBody(in io.Reader) {
 	if in == nil {
 		return
 	}
-	_, _ = io.Copy(io.Discard, encoding.NewFramedBodyReader(in, encoding.FramedBodyReaderOpts{
+	_, _ = io.Copy(io.Discard, encoding.NewFramedBodyReader(requestBodySource(in), encoding.FramedBodyReaderOpts{
 		MaxLogicalBytes: encoding.MaxRequestBytes,
 	}))
 }

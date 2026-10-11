@@ -130,9 +130,16 @@ func TestHandleConnInitialHeartbeatDoesNotCountAsActivity(t *testing.T) {
 	defer clientConn.Close()
 
 	activityCount := make(chan struct{}, 1)
+	opts := ServerOptions{KeepAliveTimeout: time.Second}
+	auth, err := newAuthPolicy(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
 	go handleConn(
 		serverConn,
-		ServerOptions{KeepAliveTimeout: time.Second},
+		opts,
+		auth,
+		nil,
 		realDeps(t, "/"),
 		nil,
 		func() { activityCount <- struct{}{} },

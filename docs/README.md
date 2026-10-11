@@ -20,6 +20,7 @@ The docs are organized into four top-level sections:
 ## FTCP
 
 - [Overview](./ftcp/OVERVIEW.md)
+- [FTCP authentication specification](./ftcp/AUTH.md)
 - [Manifest Format (FM/1)](./ftcp/MANIFEST.md)
 - [Frame Format (FX/1)](./ftcp/FRAMING.md)
 

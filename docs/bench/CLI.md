@@ -346,11 +346,11 @@ whose flags differ. For `local`, `--` goes to `tx recv copy` and repeatable
 |------|----------------|----------------|------|
 | Defaults | `--exit-after never` | `--verify none` | Placed before `TX_ARGS`, so yours win (Go flags keep the last value) |
 | Managed | `--listen`, `--exit-with stdin`, `--stats`, `--trace`, `CHROOT`; `-p`/`-f` only with `--trace` | `--stats`, `--trace`, `REMOTE_SRC`, `LOCAL_DST`; `-p`/`-f` only with `--trace` | Set by `tx-bench`; passing one in `TX_ARGS` is a usage error naming the `tx-bench` option to use instead (`-l`, `--trace`, `--go-trace`, …). Without `--trace`, your own `-p`/`-f` progress targets pass through. |
-| Read, then passed through | `--require-auth-token` | `--skip-write`, `--encrypt`, `-k`, `-t` | `--skip-write` turns off the `DST` check. `--encrypt`, `-k`, and `-t` are also given to the `tx recv get` fetches of sender state. A user-supplied `--require-auth-token` turns `--auth` off and is not echoed into the printed `recv-copy` command. |
+| Read, then passed through | `--require-auth-token[-file]`, `--require-client-recipient[-file]` | `--skip-write`, `--encrypt`, `-k`, `-t`, `--auth-token-file`, `--require-server-recipient[-file]` | `--skip-write` turns off the `DST` check. The client auth flags are also given to the `tx recv get` fetches of sender state. A user-supplied server allowlist flag turns `--auth` off and is not echoed into the printed `recv-copy` command. |
 
 `tx-bench` recognizes these flags in every form Go's `flag` package accepts:
-`-x v`, `--x v`, `-x=v`, and `--x=v`. Repeatable tx flags (`-t`,
-`--require-auth-token`, and `-p`/`-f` when not managed) append rather than
+`-x v`, `--x v`, `-x=v`, and `--x=v`. Repeatable tx flags (`-t`, the server
+allowlist flags, and `-p`/`-f` when not managed) append rather than
 replace, which is why the managed ones are rejected rather than overridden.
 
 Everything else is opaque to `tx-bench`. It is recorded verbatim as

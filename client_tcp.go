@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,8 +18,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"filippo.io/age"
-	"github.com/jolynch/tx/internal/aead"
 	"github.com/jolynch/tx/internal/events"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	ftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
@@ -34,15 +31,6 @@ const maxTCPLineBytes = 4 * 1024 * 1024
 // maxResponseBodyBytes caps server-supplied framed responses at the same size
 // as the server's SYNC manifest limit.
 const maxResponseBodyBytes int64 = 1 << 30
-
-type tcpAuthState struct {
-	publicKey      string // client's age public key
-	identity       string // client's age identity (private key)
-	parsedIdentity age.Identity
-	serverKey      string // server's age public key (discovered via AUTH key)
-	hasAuth        bool
-	encMode        string // resolved cipher: "aes" or "chacha20"
-}
 
 type probeResponse struct {
 	ServerCPU           int
@@ -69,6 +57,24 @@ type managedTCPConnCloser struct {
 
 	reusable atomic.Bool
 	closed   atomic.Bool
+	// stopWatch, set by watch, ends the cancellation watch and reports
+	// whether cancellation closed the connection.
+	stopWatch func() bool
+}
+
+// watch closes the connection if ctx is cancelled before Close, unblocking
+// any read or write on it; Close then releases rather than recycles it.
+func (c *managedTCPConnCloser) watch(ctx context.Context) {
+	c.stopWatch = watchManagedTCPConnContext(ctx, c.conn)
+}
+
+// cancelErr reports err as the context's cancellation when the watch closed
+// the connection under it.
+func cancelErr(ctx context.Context, err error) error {
+	if err != nil && ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", context.Cause(ctx), err)
+	}
+	return err
 }
 
 func (c *managedTCPConnCloser) markReusable() {
@@ -95,6 +101,9 @@ func (c *managedTCPConnCloser) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
+	if c.stopWatch != nil && c.stopWatch() {
+		return c.client.releaseManagedTCPConn(c.conn, c.pool)
+	}
 	if c.reusable.Load() {
 		return c.client.recycleManagedTCPConn(c.conn, c.pool)
 	}
@@ -114,6 +123,7 @@ type checksumStream struct {
 	trailer bool   // the next line is the current frame's trailer
 	status  bool   // a status line ended the response
 	ok      bool   // that status line was OK
+	ended   bool   // an authenticated response's END was checked
 	err     error  // sticky read error
 
 	fileID uint64 // file id of the current frame, for the trailer check
@@ -184,6 +194,10 @@ func (s *checksumStream) Read(p []byte) (int, error) {
 			s.err = s.wrapReadErr(err)
 			return n, s.err
 		case s.status:
+			// An authenticated response reaches EOF only at its END.
+			if err := s.finish(); err != nil {
+				return 0, err
+			}
 			return 0, io.EOF
 		}
 		line, err := utils.ReadLineLimit(s.br, maxTCPLineBytes)
@@ -198,6 +212,18 @@ func (s *checksumStream) Read(p []byte) (int, error) {
 			s.err = err
 		}
 	}
+}
+
+// finish checks, once, that an authenticated OK response ended at its END.
+func (s *checksumStream) finish() error {
+	if !s.ok || s.ended || noiseSessionOf(s.closer.conn) == nil {
+		return nil
+	}
+	s.ended = true
+	if err := finishResponse(s.closer.conn, s.br); err != nil {
+		s.err = s.wrapReadErr(err)
+	}
+	return s.err
 }
 
 // wrapReadErr names an expired response deadline.
@@ -225,14 +251,31 @@ func (s *checksumStream) Close() error {
 		return nil
 	}
 	s.once.Do(func() {
+		// An authenticated response must end at its END even when the caller
+		// consumed the status line without another Read; the check runs
+		// before the cancellation watch stops, under the response deadline,
+		// or responseEndTimeout when there is none.
+		deadlineSet := s.timeout > 0
+		if s.ok && len(s.pending) == 0 && !s.ended && s.err == nil && noiseSessionOf(s.closer.conn) != nil {
+			if !deadlineSet {
+				_ = s.closer.conn.SetReadDeadline(time.Now().Add(responseEndTimeout))
+				deadlineSet = true
+			}
+			_ = s.finish()
+		}
 		cancelled := s.stopWatch()
-		if s.ok && len(s.pending) == 0 && s.br.Buffered() == 0 && !cancelled {
+		if s.ok && len(s.pending) == 0 && s.br.Buffered() == 0 && s.err == nil && !cancelled {
 			// A pooled connection must not carry the response deadline.
-			if s.timeout == 0 || s.closer.conn.SetReadDeadline(time.Time{}) == nil {
+			if !deadlineSet || s.closer.conn.SetReadDeadline(time.Time{}) == nil {
 				s.closer.markReusable()
 			}
 		}
 		s.closeErr = s.closer.Close()
+		// A read error, such as a malformed trailer or a missing END, is
+		// reported again here so a caller checking only Close sees it.
+		if s.err != nil {
+			s.closeErr = s.err
+		}
 		if s.end != nil {
 			s.end()
 		}
@@ -266,6 +309,9 @@ func (c *Client) probeKeepAliveSessionConn(conn net.Conn, state tcpAuthState) (b
 	if _, err := readTCPStatus(c.metrics(), br); err != nil {
 		return false, 0, err
 	}
+	if err := finishResponse(conn, br); err != nil {
+		return false, 0, err
+	}
 	rttMillis := time.Since(start).Milliseconds()
 	if resp.KeepAliveMS > 0 {
 		c.keepAliveMS.Store(resp.KeepAliveMS)
@@ -289,7 +335,8 @@ func newManagedTCPReadCloser(reader io.Reader, closer *managedTCPConnCloser) io.
 // function reports whether that happened, so a caller never recycles a
 // connection the context closed.
 func watchManagedTCPConnContext(ctx context.Context, conn net.Conn) func() bool {
-	if ctx == nil || conn == nil {
+	if ctx == nil || conn == nil || ctx.Done() == nil {
+		// A context that can never be cancelled needs no watch.
 		return func() bool { return false }
 	}
 	done := make(chan struct{})
@@ -432,153 +479,6 @@ func writeTCPLine(w io.Writer, line string) error {
 	return err
 }
 
-func (c *Client) resolveTCPAuthState(ctx context.Context) (tcpAuthState, error) {
-	encMode := strings.ToLower(strings.TrimSpace(c.EncryptMode))
-	if encMode == "" || encMode == "none" {
-		return tcpAuthState{}, nil
-	}
-	if encMode != "auto" && encMode != "aes" && encMode != "chacha20" {
-		return tcpAuthState{}, fmt.Errorf("unsupported encrypt mode: %s", encMode)
-	}
-
-	// Generate ephemeral client identity if not provided.
-	requestPub := strings.TrimSpace(c.ClientAgePublicKey)
-	requestIdentity := strings.TrimSpace(c.ClientAgeIdentity)
-	if requestPub == "" || requestIdentity == "" {
-		identity, err := age.GenerateX25519Identity()
-		if err != nil {
-			return tcpAuthState{}, fmt.Errorf("generate age identity: %w", err)
-		}
-		requestPub = identity.Recipient().String()
-		requestIdentity = identity.String()
-	}
-
-	parsed, err := parseAgeIdentity(requestIdentity)
-	if err != nil {
-		return tcpAuthState{}, err
-	}
-
-	// Discover the server's public key and recommended cipher via AUTH key.
-	recommendedCipher, serverKey, err := c.discoverServerKey(ctx)
-	if err != nil {
-		return tcpAuthState{}, fmt.Errorf("discover server key: %w", err)
-	}
-
-	// Resolve "auto" to the server's recommended cipher.
-	if encMode == "auto" {
-		encMode = recommendedCipher
-	}
-
-	return tcpAuthState{
-		publicKey:      requestPub,
-		identity:       requestIdentity,
-		parsedIdentity: parsed,
-		serverKey:      serverKey,
-		hasAuth:        true,
-		encMode:        encMode,
-	}, nil
-}
-
-// discoverServerKey sends AUTH key on a fresh connection and reads back the
-// server's recommended cipher and public key from the OK response.
-// Response format: "OK <cipher> <pubkey>\r\n"
-func (c *Client) discoverServerKey(ctx context.Context) (recommendedCipher string, serverKey string, err error) {
-	conn, dialErr := c.dialTCP(ctx)
-	if dialErr != nil {
-		return "", "", fmt.Errorf("dial for key exchange: %w", dialErr)
-	}
-	defer conn.Close()
-	defer watchManagedTCPConnContext(ctx, conn)()
-	if err := writeTCPLine(conn, "AUTH key"); err != nil {
-		return "", "", err
-	}
-	br := bufio.NewReader(conn)
-	line, err := readTCPLine(br, maxTCPLineBytes)
-	if err != nil {
-		return "", "", fmt.Errorf("read key exchange response: %w", err)
-	}
-	msg, ok := parseOKStatusLine(line)
-	if !ok {
-		if lineErr := parseErrControlFrame(c.metrics(), line); lineErr != nil {
-			return "", "", lineErr
-		}
-		return "", "", fmt.Errorf("unexpected key exchange response: %s", line)
-	}
-	parts := strings.Fields(msg)
-	if len(parts) != 2 {
-		return "", "", fmt.Errorf("malformed AUTH key response: expected '<cipher> <pubkey>', got %q", msg)
-	}
-	cipher := parts[0]
-	key := parts[1]
-	if cipher != "aes" && cipher != "chacha20" {
-		return "", "", fmt.Errorf("unsupported server cipher: %s", cipher)
-	}
-	if _, err := age.ParseX25519Recipient(key); err != nil {
-		return "", "", fmt.Errorf("invalid server public key: %w", err)
-	}
-	return cipher, key, nil
-}
-
-func (c *Client) sendTCPAuth(conn net.Conn, state tcpAuthState) error {
-	if !state.hasAuth {
-		return nil
-	}
-	recipient, err := age.ParseX25519Recipient(state.serverKey)
-	if err != nil {
-		return fmt.Errorf("parse server key: %w", err)
-	}
-	// Encrypt the client's public key to the server using AEAD. If the
-	// client has auth tokens, append them space-delimited after the pubkey.
-	encrypted := c.acquireScratchBuffer(0)
-	defer c.releaseScratchBuffer(encrypted)
-	ew, encErr := aead.Encrypt(encrypted, recipient, aeadOptionsForMode(state.encMode))
-	if encErr != nil {
-		return encErr
-	}
-	plain := state.publicKey
-	for _, tok := range c.ClientAuthTokens {
-		plain += " " + tok
-	}
-	if _, err := ew.Write([]byte(plain)); err != nil {
-		return err
-	}
-	if err := ew.Close(); err != nil {
-		return err
-	}
-	encoded := base64.StdEncoding.EncodeToString(encrypted.Bytes())
-	return writeTCPLine(conn, "AUTH "+state.encMode+" "+encoded)
-}
-
-func aeadOptionsForMode(mode string) aead.Options {
-	switch mode {
-	case "aes":
-		return aead.Options{Algorithm: aead.AlgorithmAES}
-	case "chacha20":
-		return aead.Options{Algorithm: aead.AlgorithmChaCha20}
-	default:
-		return aead.Options{} // RecommendedCipher
-	}
-}
-
-// newTCPRequestWriter returns a writer for one outbound command plus a close
-// function that finalizes it. Encrypted sessions get a fresh AEAD stream per
-// command (each command self-delimiting on a kept-alive connection); plain
-// sessions write straight to the conn. Mirrors the server's newResponseWriter.
-func (c *Client) newTCPRequestWriter(conn net.Conn, state tcpAuthState) (io.Writer, func() error, error) {
-	if !state.hasAuth {
-		return conn, func() error { return nil }, nil
-	}
-	recipient, err := age.ParseX25519Recipient(state.serverKey)
-	if err != nil {
-		return nil, nil, err
-	}
-	ew, err := aead.Encrypt(conn, recipient, aeadOptionsForMode(state.encMode))
-	if err != nil {
-		return nil, nil, err
-	}
-	return ew, ew.Close, nil
-}
-
 func (c *Client) sendTCPCommand(conn net.Conn, state tcpAuthState, payload string) error {
 	w, closeRequest, err := c.newTCPRequestWriter(conn, state)
 	if err != nil {
@@ -589,57 +489,6 @@ func (c *Client) sendTCPCommand(conn net.Conn, state tcpAuthState, payload strin
 		return err
 	}
 	return closeRequest()
-}
-
-func (c *Client) responseReaderForTCP(conn net.Conn, state tcpAuthState) (io.Reader, error) {
-	if !state.hasAuth {
-		return conn, nil
-	}
-	identity := state.parsedIdentity
-	if identity == nil {
-		return nil, errors.New("missing identity for encrypted response")
-	}
-	decReader, err := aead.Decrypt(conn, identity)
-	if err != nil {
-		return nil, fmt.Errorf("decryption failed: %w", err)
-	}
-	return decReader, nil
-}
-
-func (c *Client) dialAndAuthWithState(ctx context.Context, state tcpAuthState) (net.Conn, error) {
-	conn, err := c.dialTCP(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("dial file listener: %w", err)
-	}
-	stopWatch := func() bool { return false }
-	if state.hasAuth {
-		stopWatch = watchManagedTCPConnContext(ctx, conn)
-	}
-	if err := c.sendTCPAuth(conn, state); err != nil {
-		stopWatch()
-		_ = conn.Close()
-		return nil, fmt.Errorf("send AUTH: %w", err)
-	}
-	if stopWatch() {
-		// The context closed conn while AUTH was in flight.
-		_ = conn.Close()
-		return nil, fmt.Errorf("send AUTH: %w", context.Cause(ctx))
-	}
-	return conn, nil
-}
-
-// dialAndAuth resolves auth state, dials a TCP connection, and sends the
-// AUTH handshake. The caller is responsible for closing the returned connection.
-func (c *Client) dialAndAuth(ctx context.Context) (net.Conn, tcpAuthState, error) {
-	state, err := c.resolveTCPAuthState(ctx)
-	if err != nil {
-		return nil, tcpAuthState{}, err
-	}
-	conn, err := c.dialAndAuthWithState(ctx, state)
-	if err != nil {
-		return nil, tcpAuthState{}, err
-	}
-	return conn, state, nil
 }
 
 // sendAndReadTCP sends a command on the connection and returns a buffered
@@ -749,13 +598,15 @@ func (c *Client) sendAndReadTCPWithBody(conn net.Conn, state tcpAuthState, cmd s
 	return bufio.NewReader(responseReader), nil
 }
 
-func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest) (GetManifestResponse, error) {
+func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest) (_ GetManifestResponse, err error) {
 	conn, state, pool, err := c.acquireManagedTCPConn(ctx, poolControl)
 	if err != nil {
 		return GetManifestResponse{}, err
 	}
 	closer := managedTCPConnCloser{client: c, conn: conn, pool: pool}
 	defer closer.Close()
+	closer.watch(ctx)
+	defer func() { err = cancelErr(ctx, err) }()
 
 	comp := request.Comp
 	if comp == "" {
@@ -816,6 +667,9 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 		}
 		return GetManifestResponse{}, fmt.Errorf("unexpected TXFER terminator: %q", statusLine)
 	}
+	if err := finishResponse(conn, br); err != nil {
+		return GetManifestResponse{}, fmt.Errorf("TXFER: %w", err)
+	}
 	closer.markReusable()
 	manifest, err := parseManifest(raw)
 	if err != nil {
@@ -824,7 +678,7 @@ func (c *Client) getManifestTCP(ctx context.Context, request GetManifestRequest)
 	return GetManifestResponse{Manifest: manifest}, nil
 }
 
-func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestRequest) (SyncManifestResponse, error) {
+func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestRequest) (_ SyncManifestResponse, err error) {
 	limit := c.currentRequestLimits().maxSync
 	// Marshal and preflight before dialing. SYNC is never split — the server
 	// indexes the prior manifest as a whole — so a manifest above the limit can
@@ -845,6 +699,8 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 	}
 	closer := managedTCPConnCloser{client: c, conn: conn, pool: pool}
 	defer closer.Close()
+	closer.watch(ctx)
+	defer func() { err = cancelErr(ctx, err) }()
 
 	comp := request.Comp
 	if comp == "" {
@@ -951,6 +807,9 @@ func (c *Client) syncManifestTCP(ctx context.Context, request SyncManifestReques
 		}
 		return SyncManifestResponse{}, fmt.Errorf("unexpected SYNC terminator: %q", statusLine)
 	}
+	if err := finishResponse(conn, br); err != nil {
+		return SyncManifestResponse{}, fmt.Errorf("SYNC: %w", err)
+	}
 	closer.markReusable()
 
 	manifest, parseErr := parseManifest(manifestBuf.Bytes())
@@ -1001,6 +860,10 @@ func (c *Client) fetchFileBatchBodyTCP(
 	// Pointer guard: ownership passes to the returned ReadCloser on success,
 	// so it must outlive this call.
 	closer := &managedTCPConnCloser{client: c, conn: conn, pool: pool}
+	// Cancelling ctx closes the connection, ending any read the stream is
+	// blocked in, including the wait for an authenticated END; Close then
+	// releases the connection rather than recycling it.
+	closer.watch(ctx)
 	c.emitReqStart(ctx, "SEND", txferID, conn, body.body)
 	cmd := "SEND " + txferID + " mode=" + normalizeLoadStrategy(c.LoadStrategy)
 	br, err := c.sendAndReadTCPWithBody(conn, state, cmd, body.body)
@@ -1117,6 +980,9 @@ func (c *Client) probeTCP(ctx context.Context, req ProbeRequest, probeBytes int6
 	}
 	if _, err := readTCPStatus(c.metrics(), br); err != nil {
 		return probeResponse{}, fmt.Errorf("read PROBE status: %w", err)
+	}
+	if err := finishResponse(conn, br); err != nil {
+		return probeResponse{}, fmt.Errorf("PROBE: %w", err)
 	}
 	probeResp.CTS1 = capture.FirstTS()
 	if probeResp.CTS1 == 0 {
@@ -1270,7 +1136,7 @@ func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands [
 	return AcknowledgeFileProgressResponse{}, err
 }
 
-func (c *Client) acknowledgeFileProgressGroupTCP(ctx context.Context, commands []acknowledgeFileProgressCommand, body encodedRequest) (AcknowledgeFileProgressResponse, error) {
+func (c *Client) acknowledgeFileProgressGroupTCP(ctx context.Context, commands []acknowledgeFileProgressCommand, body encodedRequest) (_ AcknowledgeFileProgressResponse, err error) {
 	if len(commands) == 0 {
 		return AcknowledgeFileProgressResponse{}, errors.New("missing ack requests")
 	}
@@ -1292,6 +1158,8 @@ func (c *Client) acknowledgeFileProgressGroupTCP(ctx context.Context, commands [
 	}
 	closer := managedTCPConnCloser{client: c, conn: conn, pool: pool}
 	defer closer.Close()
+	closer.watch(ctx)
+	defer func() { err = cancelErr(ctx, err) }()
 
 	rt := c.beginReq("ACK", txferID)
 	if rt != nil {
@@ -1323,16 +1191,21 @@ func (c *Client) ackOnConn(conn net.Conn, state tcpAuthState, txferID string, bo
 	if _, err := readTCPStatus(c.metrics(), br); err != nil {
 		return AcknowledgeFileProgressResponse{}, fmt.Errorf("read ACK response: %w", err)
 	}
+	if err := finishResponse(conn, br); err != nil {
+		return AcknowledgeFileProgressResponse{}, fmt.Errorf("ACK: %w", err)
+	}
 	return AcknowledgeFileProgressResponse{}, nil
 }
 
-func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (GetStatusResponse, error) {
+func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (_ GetStatusResponse, err error) {
 	conn, state, pool, err := c.acquireManagedTCPConn(ctx, poolControl)
 	if err != nil {
 		return GetStatusResponse{}, err
 	}
 	closer := managedTCPConnCloser{client: c, conn: conn, pool: pool}
 	defer closer.Close()
+	closer.watch(ctx)
+	defer func() { err = cancelErr(ctx, err) }()
 
 	br, err := c.sendAndReadTCP(conn, state, "STATUS "+request.TransferID)
 	if err != nil {
@@ -1341,6 +1214,9 @@ func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (Ge
 	message, err := readTCPStatus(c.metrics(), br)
 	if err != nil {
 		return GetStatusResponse{}, fmt.Errorf("read STATUS response: %w", err)
+	}
+	if err := finishResponse(conn, br); err != nil {
+		return GetStatusResponse{}, fmt.Errorf("STATUS: %w", err)
 	}
 	closer.markReusable()
 	if strings.TrimSpace(message) == "" {
@@ -1353,13 +1229,15 @@ func (c *Client) getStatusTCP(ctx context.Context, request GetStatusRequest) (Ge
 	return GetStatusResponse{Status: &status}, nil
 }
 
-func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesRequest) (ListStatusesResponse, error) {
+func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesRequest) (_ ListStatusesResponse, err error) {
 	conn, state, pool, err := c.acquireManagedTCPConn(ctx, poolControl)
 	if err != nil {
 		return ListStatusesResponse{}, err
 	}
 	closer := managedTCPConnCloser{client: c, conn: conn, pool: pool}
 	defer closer.Close()
+	closer.watch(ctx)
+	defer func() { err = cancelErr(ctx, err) }()
 
 	br, err := c.sendAndReadTCP(conn, state, "STATUS")
 	if err != nil {
@@ -1398,6 +1276,9 @@ func (c *Client) listStatusesTCP(ctx context.Context, request ListStatusesReques
 			return ListStatusesResponse{}, ctrlErr
 		}
 		return ListStatusesResponse{}, fmt.Errorf("unexpected STATUS terminator: %q", statusLine)
+	}
+	if err := finishResponse(conn, br); err != nil {
+		return ListStatusesResponse{}, fmt.Errorf("STATUS list: %w", err)
 	}
 	closer.markReusable()
 	return ListStatusesResponse{Statuses: statuses}, nil

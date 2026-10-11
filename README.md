@@ -68,37 +68,65 @@ much as you can in a 30s budget.
 ### With encryption
 
 ```bash
-# Server — keys are generated automatically on first run
-tx send tree --listen 0.0.0.0:3453 -k /var/lib/tx/keys /srv/data
+# Server — require encryption and proof of the client's private key
+tx send tree --require-auth --listen 0.0.0.0:3453 /srv/data
 
-# Client — ephemeral keys by default, auto-negotiates optimal cipher
+# Client — generates an in-memory key
 tx recv copy --encrypt auto tx://10.0.0.1:3453/srv/data /var/lib/data
 ```
 
-### With authorization
+This accepts any client with a key pair. For a long-running server with a known
+age public key, the client can also authenticate the server with
+`--require-server-recipient age1...`. Obtain that key through a trusted channel.
+Each connection runs one Noise handshake, then encrypts every command and
+response. Pooled connections reuse the session.
 
-Shared-secret tokens restrict who can download from the server.
-Generate a token securely and share it out-of-band via invoking the
-command. Treat these tokens as short lived session credentials, not
-long lived keys (for long lived just use an `age` public key as
-the token).
+### With a token from the environment
+
+Allowlist entries imply `--require-auth` and restrict which clients can connect.
 
 ```bash
-# Generate a token
-TOKEN=$(head -c 16 /dev/random | xxd -p)
-echo "$TOKEN"  # share this with authorized clients
+# The token is secret: don't log it! Share it with the client out of band.
+export TX_AUTH_TOKEN=$(openssl rand -hex 32)
 
-# Server — only clients presenting this token are allowed
-tx send tree --listen 0.0.0.0:3453 -k /var/lib/tx/keys \
-  --require-auth-token "$TOKEN" /srv/data
+# Server
+tx send tree --require-auth-token "$TX_AUTH_TOKEN" --listen 0.0.0.0:3453 /srv/data
 
-# Client — present the token inside the encrypted AUTH blob
-tx recv copy --encrypt auto -t "$TOKEN" \
-  tx://10.0.0.1:3453/srv/data /var/lib/data
+# Client — reads TX_AUTH_TOKEN automatically; no key files needed
+tx recv copy tx://10.0.0.1:3453/srv/data /var/lib/data
 ```
 
-Tokens are sent inside the encrypted AUTH blob, so they are never visible on
-the wire. The server validates them with constant-time comparison.
+### With a token file
+
+```bash
+# Generate a secret token; copy the file to the client securely
+umask 077
+openssl rand -hex 32 > client.token
+
+# Server
+tx send tree --require-auth-token-file client.token --listen 0.0.0.0:3453 /srv/data
+
+# Client
+tx recv copy --auth-token-file client.token tx://10.0.0.1:3453/srv/data /var/lib/data
+```
+
+Tokens never cross the wire: each side proves it holds the token inside the
+handshake. Use one token per client so each can be revoked alone.
+
+### With a generated age key
+
+```bash
+# Client — generate a private key and share only its public recipient
+mkdir -p client-keys
+age-keygen -o client-keys/key
+age-keygen -y client-keys/key
+
+# Server — allow the recipient printed above
+tx send tree --require-client-recipient age1... --listen 0.0.0.0:3453 /srv/data
+
+# Client — proves it holds the corresponding private key
+tx recv copy --keys ./client-keys tx://10.0.0.1:3453/srv/data /var/lib/data
+```
 
 ## Full CLI reference
 

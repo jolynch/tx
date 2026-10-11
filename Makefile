@@ -48,6 +48,7 @@ acceptance:
 # Their corpus saturates well before 10s, so a longer budget buys nothing.
 fuzz-short:
 	$(FUZZ) -race ./internal/aead FuzzRoundTrip $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
+	$(FUZZ) -race ./internal/aead FuzzParsePreface $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race ./internal/sampler FuzzGeneratorSlots $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race ./internal/utils FuzzCommonPrefixLen $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) . FuzzSuggestBatchMaxBytes $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT) -parallel=1
@@ -61,6 +62,7 @@ fuzz-short:
 # coverage past 10s, so CI gives them a larger budget to keep exploring.
 fuzz-long:
 	$(FUZZ) -race . FuzzTCPConnPool $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/aead FuzzReadRecords $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/encoding FuzzManifestEntryRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/ftcp FuzzFramedItemRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/ftcp FuzzFramedBodyHeader $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
@@ -80,7 +82,7 @@ fuzz-long:
 # between hosts are tx-bench's job (docs/bench).
 bench: build
 	@mkdir -p bench/results
-	go test -bench=. -run=^$$ -benchmem ./internal/bench . ./internal/filexfer/ftcp | tee bench/results/latest.txt
+	go test -bench=. -run=^$$ -benchmem ./internal/bench ./internal/aead . ./internal/filexfer/ftcp | tee bench/results/latest.txt
 
 # Runs tx-bench remote send-tree and recv-copy as separate processes on a
 # BENCH_SIZE dataset and checks correctness, liveness and shutdown, and

@@ -28,36 +28,9 @@ func ParseRequest(payload []byte) (Request, error) {
 	req := Request{Verb: verb}
 	switch verb {
 	case VerbAUTH:
-		if c.eof() {
-			return Request{}, protocolErr{code: "BAD_AUTH", message: "missing auth protocol (key, aes, chacha20)"}
-		}
-		protocol, protoErr := c.readToken()
-		if protoErr != nil {
-			return Request{}, protocolErr{code: "BAD_AUTH", message: "invalid auth protocol"}
-		}
-		switch protocol {
-		case "key":
-			if !c.eof() {
-				return Request{}, protocolErr{code: "BAD_AUTH", message: "unexpected auth arguments after key"}
-			}
-			req.Params = append(req.Params, map[string]string{"protocol": "key"})
-			return req, nil
-		case "aes", "chacha20":
-			if c.eof() {
-				return Request{}, protocolErr{code: "BAD_AUTH", message: "missing auth blob"}
-			}
-			blob, readErr := c.readBlobValue()
-			if readErr != nil {
-				return Request{}, protocolErr{code: "BAD_AUTH", message: "invalid auth payload"}
-			}
-			if !c.eof() {
-				return Request{}, protocolErr{code: "BAD_AUTH", message: "unexpected auth arguments"}
-			}
-			req.Params = append(req.Params, map[string]string{"protocol": protocol, "blob": string(blob)})
-			return req, nil
-		default:
-			return Request{}, protocolErr{code: "BAD_AUTH", message: "unsupported auth protocol: " + protocol}
-		}
+		// AUTH is valid only as a connection's first line, which runAuth
+		// handles before parsing; elsewhere its arguments do not matter.
+		return req, nil
 	case VerbTXFER:
 		directory, readErr := c.readPathValue()
 		if readErr != nil {

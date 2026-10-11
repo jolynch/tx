@@ -34,14 +34,10 @@ func runStatusCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 	}
 	var txferID string
 	var listAll bool
-	var encryptMode string
-	var keysDir string
-	var authTokens []string
+	var authFlags clientAuthFlags
 	cf.StringVar(&txferID, "", "tid", "", "Transfer ID")
 	cf.BoolVar(&listAll, "", "all", false, "List all active transfers on REMOTE_HOST")
-	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
-	cf.StringVar(&keysDir, "k", "keys", "", "Persistent age keys directory (default: ephemeral)")
-	cf.StringSliceVar(&authTokens, "t", "auth-token", "Client auth token presented in encrypted AUTH blob; repeatable")
+	authFlags.register(cf)
 	if err := cf.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -57,17 +53,13 @@ func runStatusCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "status REMOTE_HOST must be a host:port address")
 		return 2
 	}
-	agePublicKey, ageIdentity, resolvedEncMode, err := resolveEncryptionOptionsWithKeys(encryptMode, keysDir)
+	auth, err := resolveClientAuth(authFlags)
 	if err != nil {
-		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
-		return 2
-	}
-	if err := validateAuthTokens(authTokens, resolvedEncMode); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
 
-	client := tx.NewClient(remoteHost, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(resolvedEncMode), tx.WithClientAuthTokens(authTokens...))
+	client := tx.NewClient(remoteHost, auth.options()...)
 	defer client.Close()
 
 	if listAll {

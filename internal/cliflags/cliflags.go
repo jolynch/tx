@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 
@@ -238,4 +239,37 @@ func wrapHelpText(text string, width int) []string {
 	}
 	lines = append(lines, current)
 	return lines
+}
+
+// maxCredentialFileBytes bounds a credential file: one 4096-byte entry plus
+// an optional CRLF.
+const maxCredentialFileBytes = 4096 + 2
+
+// ReadCredentialFile reads one credential: a single entry, optionally
+// followed by one LF or CRLF. It rejects blank content, extra lines, and
+// surrounding whitespace, and never echoes the content in an error.
+func ReadCredentialFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("read credential file: %w", err)
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxCredentialFileBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read credential file %s: %w", path, err)
+	}
+	if len(raw) > maxCredentialFileBytes {
+		return "", fmt.Errorf("credential file %s is larger than one entry", path)
+	}
+	s := string(raw)
+	if t, ok := strings.CutSuffix(s, "\n"); ok {
+		s = strings.TrimSuffix(t, "\r")
+	}
+	if s == "" {
+		return "", fmt.Errorf("credential file %s is empty", path)
+	}
+	if strings.ContainsAny(s, "\r\n") || strings.TrimSpace(s) != s {
+		return "", fmt.Errorf("credential file %s must hold exactly one entry with no surrounding whitespace", path)
+	}
+	return s, nil
 }

@@ -272,9 +272,10 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 	// Fast requests write through one buffer, which must reach the client
 	// before the ERR line the caller writes, and before its OK. Gentle
 	// requests stay unbuffered, so their rate limiters pace the socket writes
-	// themselves rather than writes into a buffer.
+	// themselves rather than writes into a buffer. A transport that batches
+	// writes, an authenticated session, already buffers into whole records.
 	resp := unbufferedSendOutput(out)
-	if header.Mode != loadStrategyGentle {
+	if header.Mode != loadStrategyGentle && transportFlusher(out) == nil {
 		resp = newBufferedSendOutput(out)
 		defer resp.release()
 	}
@@ -298,6 +299,7 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 				limited = limiter.WrapRateLimitedWriter(limited, ctx)
 			}
 			itemOut = unbufferedSendOutput(limited)
+			itemOut.frameFlush = transportFlusher(out)
 		}
 		var sent sentItem
 		err := mapLookupError(refErrs[i])
@@ -332,6 +334,9 @@ type sendOutput struct {
 	w    io.Writer
 	buf  *bufio.Writer // nil when unbuffered
 	conn *net.TCPConn  // the response as a raw socket, or nil (AEAD, limiters)
+	// frameFlush, when set, sends a completed frame through a transport that
+	// batches writes; gentle responses use it so frames keep their pacing.
+	frameFlush func() error
 }
 
 var sendOutputBufferPool = sync.Pool{
@@ -634,6 +639,11 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 		cursor = stats.NextOffset
 		remaining -= frameSize
 		firstFrame = false
+		if out.frameFlush != nil {
+			if err := out.frameFlush(); err != nil {
+				return sentItem{}, err
+			}
+		}
 		if isTerminal && scope.Sink.Enabled() && cursor >= fileRef.FileSize {
 			scope.Sink.Emit("file_done", txferID, events.F("conn", scope.Conn), events.F("file", item.FileID), events.Dur("dur", time.Since(itemStart)))
 		}

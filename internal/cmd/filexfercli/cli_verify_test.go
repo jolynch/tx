@@ -109,7 +109,7 @@ func TestVerifyCopyDataSamplesBatchesChecksumRequests(t *testing.T) {
 				if serverID, err = age.GenerateX25519Identity(); err != nil {
 					t.Fatal(err)
 				}
-				cfg.encryptMode = "auto"
+				cfg.auth = clientAuth{encMode: "auto"}
 			}
 			// At 100% every slot is verified once.
 			var expected []sampler.Sample
@@ -799,11 +799,7 @@ func TestChecksumHashTimeout(t *testing.T) {
 					if serverID, err = age.GenerateX25519Identity(); err != nil {
 						t.Fatal(err)
 					}
-					pub, id, mode, err := resolveEncryptionOptionsWithKeys("auto", "")
-					if err != nil {
-						t.Fatal(err)
-					}
-					opts = append(opts, tx.WithClientAgePublicKey(pub), tx.WithClientAgeIdentity(id), tx.WithEncryptMode(mode))
+					opts = append(opts, tx.WithEncryptMode("auto"))
 				}
 				srv := newFTCPTestServerWithIdentity(t, serverID, func(req intftcp.Request, out io.Writer) error {
 					time.Sleep(tc.stall)

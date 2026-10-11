@@ -5,7 +5,8 @@ file transfers over plain TCP sockets.
 
 ## Scope
 
-- Transport: plain TCP stream.
+- Transport: a plain TCP stream, or the plaintext of an authenticated Noise
+  session (see [Inside an authenticated session](#inside-an-authenticated-session)).
 - This framing carries per-file transfer messages after a manifest has been
   exchanged out of band, and it also carries **request and response bodies** for
   the command protocol — any body whose size grows with the transfer. See
@@ -239,3 +240,34 @@ checksum token. Current implementation emits `file-hash=xxh128:<hex32>`.
 `max-wsize` is a first-frame hint only. Clients may use it to pre-size a reusable
 frame buffer, but they may cap allocation (current client default cap is `64 MiB`)
 and still stream larger frames in multiple reads.
+
+## Inside an authenticated session
+
+On an authenticated connection, FX/1 frames, FM/1 manifests, and status lines
+are unchanged; they are the plaintext of Noise records, each
+`uint16-BE length || kind || AEAD(payload)` (see [AUTH.md](./AUTH.md#records)).
+One response is nested like this:
+
+```
+Noise message (DATA records ... END record)
+  FX/1 header / payload / FXT/1 trailer   repeated; next=0 ends the framed body
+  OK or ERR status line                   ends the command's response grammar
+authenticated END                         ends the message
+```
+
+Each layer ends separately, and a reader checks them from the inside out:
+
+1. **Decoded FM termination**: a manifest body ends at its terminator line;
+   nothing may follow it in the decoded bytes.
+2. **Verified FX termination**: the framed body ends at the trailer whose
+   `next` is 0, after its hashes verify.
+3. **Terminal response status**: the command's `OK` or `ERR` line follows the
+   frames.
+4. **Authenticated END**: the message ends exactly after the status line. A
+   client recycles the connection only after reading `END` through its
+   outermost parser buffer, and an `END` without the terminal status is an
+   error.
+
+Record boundaries carry no meaning for the framing above: frames may span
+records, and a writer may flush a short record at a completed frame or
+progress point.

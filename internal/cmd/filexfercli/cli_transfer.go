@@ -19,10 +19,7 @@ import (
 type transferArgs struct {
 	sourceDir    string
 	targetDir    string
-	agePublicKey string
-	ageIdentity  string
-	encMode      string
-	authTokens   []string
+	auth         clientAuth
 	loadStrategy string
 	probeBytes   int64
 	verbosity    int
@@ -41,13 +38,13 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		cf.PrintDefaults(stderr)
 	}
 	var sourceDir string
-	var encryptMode string
+	var authFlags clientAuthFlags
 	var loadStrategyRaw string
 	var probeSizeRaw string
 	var verbose bool
 	var deadlineRaw string
 	cf.StringVar(&sourceDir, "s", "source-directory", "", "Absolute source directory to transfer")
-	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
+	authFlags.register(cf)
 	cf.StringVar(&loadStrategyRaw, "", "load-strategy", tx.LoadStrategyFast, "Server load strategy (fast|gentle)")
 	probeSizeRaw = encoding.HumanBytes(defaultCLIProbeBytes)
 	cf.StringVar(&probeSizeRaw, "", "probe-size", probeSizeRaw, "Probe payload size for transfer metadata; 1B, 4KiB, 8MiB")
@@ -81,9 +78,9 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		fmt.Fprintf(stderr, "invalid --load-strategy: %v\n", err)
 		return 2
 	}
-	agePublicKey, ageIdentity, resolvedEncMode, err := resolveEncryptionOptions(encryptMode)
+	auth, err := resolveClientAuth(authFlags)
 	if err != nil {
-		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
+		fmt.Fprintln(stderr, err)
 		return 2
 	}
 	var deadlineMS int64
@@ -102,9 +99,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 	return runTransfer(serverURL, transferArgs{
 		sourceDir:    sourceDir,
 		targetDir:    cf.Arg(0),
-		agePublicKey: agePublicKey,
-		ageIdentity:  ageIdentity,
-		encMode:      resolvedEncMode,
+		auth:         auth,
 		loadStrategy: loadStrategy,
 		probeBytes:   probeBytes,
 		verbosity:    verbosityFromFlags(false, verbose),
@@ -121,7 +116,7 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 
 	fmt.Fprintf(stderr, "transfer(addr=[%s], source=[%s])\n", serverURL, cfg.sourceDir)
 
-	client, closeClient := phaseClient(cfg.client, serverURL, tx.WithLoadStrategy(cfg.loadStrategy), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
+	client, closeClient := phaseClient(cfg.client, serverURL, append(cfg.auth.options(), tx.WithLoadStrategy(cfg.loadStrategy), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))...)
 	defer closeClient()
 	start := time.Now()
 	cfg.stats.Phase("probe")
@@ -280,14 +275,10 @@ func runResumeRefresh(serverURL string, cfg transferArgs, stderr io.Writer) int 
 
 	fmt.Fprintf(stderr, "resume(addr=[%s], source=[%s])\n", serverURL, cfg.sourceDir)
 
-	client, closeClient := phaseClient(cfg.client, serverURL,
+	client, closeClient := phaseClient(cfg.client, serverURL, append(cfg.auth.options(),
 		tx.WithLoadStrategy(cfg.loadStrategy),
-		tx.WithClientAgePublicKey(cfg.agePublicKey),
-		tx.WithClientAgeIdentity(cfg.ageIdentity),
-		tx.WithEncryptMode(cfg.encMode),
-		tx.WithClientAuthTokens(cfg.authTokens...),
 		tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()),
-	)
+	)...)
 	defer closeClient()
 
 	start := time.Now()

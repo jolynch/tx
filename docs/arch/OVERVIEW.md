@@ -38,8 +38,9 @@ From these measurements the client computes:
 - **Suggested concurrency** — `server_cpus × io_depth` in fast mode (default
   IO depth is 4), or a server-advertised percentage of CPUs in gentle mode.
   Clamped to `[2, 256]`.
-- **Suggested cipher** — resolved during the AUTH key exchange if encryption
-  is enabled. Hardware acceleration is preferred if present.
+- **Suggested cipher** — resolved from `AUTH key noise-v1` discovery if
+  encryption is enabled: AES-GCM only when both the client accelerates it and
+  the server recommends it, ChaCha20-Poly1305 otherwise.
 
 ### Connection pool
 
@@ -75,13 +76,14 @@ to `[2, 256]`. Both pools work the same way and differ only in growth:
 `tx recv copy` uses one client for all its phases (transfer, data, converge,
 and verification), so the pools warm once.
 
-Every pooled connection has already completed the AUTH handshake. When the
+Every pooled connection has already completed the Noise handshake and
+`FINISH` when the client encrypts. When the
 server grants keep-alive (negotiated on the discovery probe via
 `keep-alive=auto` / `keep-alive-ms`), pooled connections are long-lived
 sessions: each is upgraded with a zero-payload keep-alive PROBE when dialed, and
 a connection whose response was cleanly consumed returns to its pool instead of
-being closed. Reused connections skip the TCP and AUTH handshakes and keep their
-congestion window warm across batches. Two guardrails keep silently dead
+being closed. Reused connections skip the TCP and Noise handshakes, keep their
+session keys, and keep their congestion window warm across batches. Two guardrails keep silently dead
 connections out of the pools: once per quarter of the granted idle window, a
 background loop heartbeats each pooled connection idle for that long with a
 zero-payload PROBE round trip (a failed heartbeat closes the connection and
@@ -102,10 +104,11 @@ header's file ID, and lines are bounded like every other response. The
 client's `ChecksumBatchOptions.HashTimeout` sets one read deadline for the
 whole response: that long per started 4 MiB of hashing the request asks for
 in total, set before the request is sent. There is no per-read re-arming:
-the server buffers frames 64 KiB at a time, and an encrypted response
-arrives only when a 64 KiB AEAD chunk fills or the response ends, so
-progress shows in bursts. The wait for a pool connection does not count
-against it. A timed-out
+the server buffers frames, 64 KiB at a time in plaintext and in whole records
+on an authenticated connection, where it flushes finished checksums as a short
+record at a frame boundary at most every 250 ms, so progress arrives steadily
+rather than only when records fill. The wait for a pool connection does not
+count against it. A timed-out
 connection is closed, not pooled.
 
 ### Windowing and batching

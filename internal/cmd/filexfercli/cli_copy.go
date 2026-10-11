@@ -74,11 +74,11 @@ func parseCacheLoadFlag(raw string) (bool, time.Duration, error) {
 }
 
 type copyCLIConfig struct {
-	remoteSrc           string
-	localDst            string
-	encryptMode         string
-	keysDir             string
-	authTokens          []string
+	remoteSrc string
+	localDst  string
+	authFlags clientAuthFlags
+	// auth is resolved from authFlags once and shared by every phase.
+	auth                clientAuth
 	compressRaw         string
 	modeRaw             string
 	concurrency         int
@@ -177,9 +177,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 	cf.StringVar(&cfg.verifyRaw, "", "verify", "meta", "Integrity checks after copy: none|meta|N%data|full|<duration> (default meta)")
 	cf.StringVar(&cfg.cacheLoadRaw, "", "cache-load", cfg.cacheLoadRaw, "Mirror sender page cache after success: none|full|<duration> (default none)")
 	cf.StringVar(&cfg.modeRaw, "", "mode", tx.LoadStrategyFast, "Server read strategy: fast|gentle")
-	cf.StringVar(&cfg.encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
-	cf.StringVar(&cfg.keysDir, "k", "keys", "", "Persistent age keys directory (default: ephemeral)")
-	cf.StringSliceVar(&cfg.authTokens, "t", "auth-token", "Client auth token presented in encrypted AUTH blob; repeatable")
+	cfg.authFlags.register(cf)
 	cf.StringVar(&cfg.compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	cf.IntVar(&cfg.concurrency, "", "concurrency", 0, "Parallel download / verification workers and data connections (0=adapt from server)")
 	cf.BoolVar(&cfg.progress, "", "progress", true, "Show transfer progress every 2s")
@@ -270,15 +268,12 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 		return runLocalCopyCLI(src.LocalPath, cfg.localDst, cfg, stdout, stderr)
 	}
 	serverURL := src.HostPort
-	agePublicKey, ageIdentity, encMode, err := resolveEncryptionOptionsWithKeys(cfg.encryptMode, cfg.keysDir)
+	auth, err := resolveClientAuth(cfg.authFlags)
 	if err != nil {
-		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
-		return 2
-	}
-	if err := validateAuthTokens(cfg.authTokens, encMode); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
+	cfg.auth = auth
 	compress, err := resolveCompress(cfg.compressRaw)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --compress: %v\n", err)
@@ -343,7 +338,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 
 	// One client serves every phase, so its connection pools warm once, during
 	// the probe and manifest walk, rather than per phase.
-	cfg.client = tx.NewClient(serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(compress), tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()), tx.WithConcurrency(cfg.concurrency))
+	cfg.client = tx.NewClient(serverURL, append(auth.options(), tx.WithLoadStrategy(loadStrategy), tx.WithComp(compress), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()), tx.WithConcurrency(cfg.concurrency))...)
 	defer cfg.client.Close()
 
 	localExists := pathExists(cfg.localDst)
@@ -375,10 +370,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 	transferCfg := transferArgs{
 		sourceDir:    cfg.remoteSrc,
 		targetDir:    cfg.localDst,
-		agePublicKey: agePublicKey,
-		ageIdentity:  ageIdentity,
-		encMode:      encMode,
-		authTokens:   cfg.authTokens,
+		auth:         auth,
 		loadStrategy: loadStrategy,
 		probeBytes:   probeBytes,
 		verbosity:    0,
@@ -413,10 +405,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 		syncCfg := syncArgs{
 			sourceDir:           cfg.remoteSrc,
 			targetDir:           cfg.localDst,
-			agePublicKey:        agePublicKey,
-			ageIdentity:         ageIdentity,
-			encMode:             encMode,
-			authTokens:          cfg.authTokens,
+			auth:                auth,
 			concurrency:         cfg.concurrency,
 			concurrencyExplicit: cfg.concurrency > 0,
 			ackEvery:            ackEvery,
@@ -441,10 +430,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 	} else {
 		startCfg := startArgs{
 			targetDir:           cfg.localDst,
-			agePublicKey:        agePublicKey,
-			ageIdentity:         ageIdentity,
-			encMode:             encMode,
-			authTokens:          cfg.authTokens,
+			auth:                auth,
 			verbosity:           copyVerbosity,
 			concurrency:         cfg.concurrency,
 			concurrencyExplicit: cfg.concurrency > 0,
@@ -478,7 +464,7 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 	if needConverge {
 		if code := runEndOfCopyConvergence(
 			serverURL, cfg,
-			agePublicKey, ageIdentity, encMode,
+			auth,
 			ackEvery, compress, fsyncInterval, probeBytes,
 			progressTargets, progressInterval,
 			metadataFailures,
@@ -613,7 +599,7 @@ func clampCachePercent(pct float64) float64 {
 func runEndOfCopyConvergence(
 	serverURL string,
 	cfg copyCLIConfig,
-	agePublicKey, ageIdentity, encMode string,
+	auth clientAuth,
 	ackEvery int64,
 	compress string,
 	fsyncInterval int64,
@@ -641,10 +627,7 @@ func runEndOfCopyConvergence(
 	syncCfg := syncArgs{
 		sourceDir:           cfg.remoteSrc,
 		targetDir:           cfg.localDst,
-		agePublicKey:        agePublicKey,
-		ageIdentity:         ageIdentity,
-		encMode:             encMode,
-		authTokens:          cfg.authTokens,
+		auth:                auth,
 		concurrency:         cfg.concurrency,
 		concurrencyExplicit: cfg.concurrency > 0,
 		ackEvery:            ackEvery,
@@ -918,14 +901,10 @@ func verifyCopyRemoteMetadata(serverURL string, cfg copyCLIConfig, manifest *tx.
 	if manifest == nil {
 		return errors.New("missing manifest")
 	}
-	agePublicKey, ageIdentity, encMode, err := resolveEncryptionOptionsWithKeys(cfg.encryptMode, cfg.keysDir)
-	if err != nil {
-		return fmt.Errorf("invalid --encrypt: %w", err)
-	}
-	client, closeClient := phaseClient(cfg.client, serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
+	client, closeClient := phaseClient(cfg.client, serverURL, append(cfg.auth.options(), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))...)
 	defer closeClient()
 	probeCtx, cancel := context.WithTimeout(context.Background(), verifyChecksumRequestTimeout)
-	_, err = client.ProbeLink(probeCtx, tx.ProbeRequest{ProbeBytes: 1})
+	_, err := client.ProbeLink(probeCtx, tx.ProbeRequest{ProbeBytes: 1})
 	cancel()
 	if err != nil {
 		return fmt.Errorf("probe metadata request limits: %w", err)

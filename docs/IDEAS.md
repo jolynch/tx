@@ -8,9 +8,17 @@ instead of widening the current change; remove an entry when it ships.
 
 - **`tx recv get` drops flags for local sources.** The local branch in
   `cli_get.go` builds `localGetArgs` and silently discards `--compress`,
-  `--encrypt`, `--auth-token`, `--ack-every`, `--deadline`, and
-  `--concurrency`. Warn like `tx recv copy` does (`warnIgnoredLocalFlags`), or
+  `--encrypt`, `--auth-token`, `--auth-token-file`, `--keys`,
+  `--require-server-recipient`, `--require-server-recipient-file`,
+  `--ack-every`, `--deadline`, and `--concurrency`. Warn like `tx recv copy` does (`warnIgnoredLocalFlags`), or
   reject them.
+- **A long-lived client keeps a stale server key.** `resolveTCPAuthState`
+  discovers the server key once per client. After the server restarts with a
+  new key (the default when its keys directory is missing or read-only), every
+  handshake fails as `server rejected authentication` until the client is
+  recreated. On a refusal from a client that does not require the server's
+  recipient, re-discover once, and retry if the key changed. Pools copy the
+  auth state, so the key must be shared by pointer, as `tokenPref` is.
 - **A budgeted `--verify` always checks the same files first.** The seed
   spreads samples within each file, but `verifyCursor` takes files in manifest
   order, so a run that keeps hitting its budget re-checks the start of the tree
@@ -25,20 +33,10 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Performance
 
-- **Variable-size AEAD chunks for streaming responses.** The AEAD writer seals
-  only full 64 KiB chunks until the response ends, and the reader treats any
-  short chunk as the final one. An encrypted `CXSUM`, manifest, or `STATUS`
-  stream therefore shows no progress until 64 KiB fills, which is why `CXSUM`
-  uses one work-sized deadline instead of a per-frame idle timeout. Two
-  options:
-  - Pick a smaller chunk size for streaming responses. The size is already in
-    each stream's header, so this needs no format change.
-  - Add a `Flush` that seals a short non-final chunk. The final-chunk flag is
-    already authenticated, so truncation protection holds, but older readers
-    reject such a chunk, so the client must advertise support.
-- **One key per keep-alive session.** Every response starts a new AEAD stream
-  with a fresh X25519 key wrap, so pooled connections still pay a key exchange
-  per command.
+- **`bufpool.Acquire` allocates a release closure.** `Get`/`Put` are
+  allocation-free, but `Acquire` returns a new closure per call, and
+  `Release` boxes a pointer for a bare slice. Move the per-frame callers
+  (`send.go`, `cxsum.go`, the client's frame buffers) to `Get`/`Put`.
 - **Probes bypass the pools.** `probeTCP` dials directly, and a fast-mode
   throughput probe opens one connection per server CPU, in both the transfer
   and converge phases of `tx recv copy`. Probe over pooled connections, or
@@ -89,6 +87,31 @@ instead of widening the current change; remove an entry when it ships.
     suggests spinning or contention that scales with concurrency; profile
     an unpinned run for scheduler and lock time.
 
+## Security
+
+- **Credentials carry no scope.** Any allowlisted token or age key can list
+  and read every transfer the server holds. Bind a transfer to the credential
+  that created it, or allow per-credential roots, if operators need isolation.
+- **Per-source connection limits.** `MaxUnauthenticatedConns` bounds sockets
+  that have not finished a handshake, but one host can still fill it, and an
+  any-key server spends X25519 work on every opening. A per-address cap or
+  rate limit would stop a single host from filling the global cap.
+- **Rate-limit the legacy AUTH log line.** Any unauthenticated peer can make
+  the server log `legacy AUTH from <addr>` once per connection; the admission
+  cap bounds concurrent connections, not their rate. Log once per address per
+  interval, or count and summarize.
+- **Check credential file permissions.** The server key file and token files
+  load even when group or others can read them. Warn, as ssh does, when a
+  private key or token file has group or other permission bits set.
+- **Record the proven client key.** In token mode and on any-key servers the
+  server accepts any key it can verify and records nothing about it. Logging
+  the credential ID or a key fingerprint in connection events would give
+  operators a stable identity to audit.
+- **Rediscover a changed server key.** A client caches the discovered server
+  key, so after a server with an ephemeral key restarts, every new connection
+  fails until the client restarts. Rediscovering once after a refusal before
+  message 2, unless the key is pinned, would recover without weakening pins.
+
 ## Testing
 
 - **Fault injection.** Inject disk faults (short reads, `EIO`, `ENOSPC`),
@@ -102,7 +125,7 @@ instead of widening the current change; remove an entry when it ships.
   `TOO_SLOW`), `isDirectIOReadError`, and `EnqueueCacheRestoreBatch` have no
   coverage, and `internal/cliflags` and `internal/metrics` have no tests.
 - **CLI tests reimplement the server.** `serveFTCPConn` in `cli_test.go`
-  reimplements AUTH, AEAD, `PROBE`, and `SYNC` framing instead of running
+  reimplements AUTH handling, `PROBE`, and `SYNC` framing instead of running
   `ftcp.Serve` against a fake `Deps`, so protocol changes must be mirrored by
   hand.
 

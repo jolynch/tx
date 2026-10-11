@@ -36,9 +36,7 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 		fmt.Fprintln(stderr)
 		cf.PrintDefaults(stderr)
 	}
-	var encryptMode string
-	var keysDir string
-	var authTokens []string
+	var authFlags clientAuthFlags
 	var compressRaw string
 	var ackEveryRaw string
 	var skipWrite bool
@@ -56,9 +54,7 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 	var cacheLoadEnabled bool
 	var cacheLoadBudget time.Duration
 	var statsPath string
-	cf.StringVar(&encryptMode, "", "encrypt", "", "Encryption algorithm: none|auto|aes|chacha20 (default: none)")
-	cf.StringVar(&keysDir, "k", "keys", "", "Persistent age keys directory (default: ephemeral)")
-	cf.StringSliceVar(&authTokens, "t", "auth-token", "Client auth token presented in encrypted AUTH blob; repeatable")
+	authFlags.register(cf)
 	cf.StringVar(&compressRaw, "", "compress", "", "Compression algorithm: adapt|none|lz4|zstd (default: adapt)")
 	cf.IntVar(&concurrency, "", "concurrency", 0, "Parallel download workers and data connections (0=auto)")
 	cf.BoolVar(&skipWrite, "", "skip-write", false, "Do not write the file; fetch to discard instead")
@@ -157,15 +153,6 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 			return 2
 		}
 	}
-	agePublicKey, ageIdentity, resolvedEncMode, err := resolveEncryptionOptionsWithKeys(encryptMode, keysDir)
-	if err != nil {
-		fmt.Fprintf(stderr, "invalid --encrypt: %v\n", err)
-		return 2
-	}
-	if err := validateAuthTokens(authTokens, resolvedEncMode); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 2
-	}
 	compress, err := resolveCompress(compressRaw)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --compress: %v\n", err)
@@ -202,12 +189,18 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 		}, stdout, stderr)
 	}
 
+	// Remote only: a local copy never reads TX_AUTH_TOKEN or loads keys.
+	auth, err := resolveClientAuth(authFlags)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 	effectiveConcurrency := tx.DefaultClientConcurrency()
 	if concurrency > 0 {
 		effectiveConcurrency = concurrency
 	}
 
-	client := tx.NewClient(serverURL, tx.WithLoadStrategy(tx.LoadStrategyFast), tx.WithComp(compress), tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(resolvedEncMode), tx.WithClientAuthTokens(authTokens...), tx.WithClientMetrics(stats.ClientMetrics()), tx.WithEventSink(stats.EventSink()), tx.WithConcurrency(concurrency))
+	client := tx.NewClient(serverURL, append(auth.options(), tx.WithLoadStrategy(tx.LoadStrategyFast), tx.WithComp(compress), tx.WithClientMetrics(stats.ClientMetrics()), tx.WithEventSink(stats.EventSink()), tx.WithConcurrency(concurrency))...)
 	defer client.Close()
 
 	// Fetch manifest for the single file (skip full probe).

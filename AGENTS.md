@@ -12,6 +12,8 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
 - [Verification](docs/arch/VERIFICATION.md): metadata/data integrity, sampling,
   ACK validation, and failure semantics.
 - [FTCP protocol](docs/ftcp/OVERVIEW.md): transport, AUTH, commands, and responses.
+- [FTCP authentication specification](docs/ftcp/AUTH.md): server key discovery,
+  the Noise handshake, admission, and the encrypted record layer.
 - [FM/1 manifests](docs/ftcp/MANIFEST.md) and
   [FX/1 frames](docs/ftcp/FRAMING.md): exact wire formats and parsing rules.
 - [CLI reference](docs/pub/CLI.md): commands, flags, workflows, and `.tx/` state.
@@ -79,6 +81,28 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
 - Never commit. Leave finished work staged (`git add`) for review; the
   maintainer writes the commit. Do not amend, squash, or rewrite existing
   commits unless asked.
+- Avoid allocating on hot paths: per record, frame, file, item, or command.
+  Prefer fixed-size buffers held in a long-lived struct, or reuse from an
+  existing pool, to a fresh `make` or `new` per call:
+  - `internal/bufpool`: size-bucketed byte buffers (4 KiB to 64 MiB, with
+    64 KiB, 128 KiB, and 256 KiB the common I/O sizes). `Get`/`Put` pool a
+    `*[]byte` and allocate nothing, so per-record and per-message paths use
+    them; `Acquire` returns a release closure, fine per request. `Growing`
+    sizes a buffer by bytes actually received.
+  - `internal/aead`: takes its record buffers from `bufpool` (`Get`/`Put`)
+    and clears any plaintext in them before `Put`.
+  - `internal/filexfer/encoding/codec.go`: pooled zstd encoders and decoders
+    and lz4 readers.
+  - `internal/filexfer/ftcp/send.go`: `sendOutputBufferPool` and
+    `compressedFrameBufferPool`.
+  - `Client`: `acquireLineReader` and `acquireScratchBuffer`.
+
+  Reuse `bufpool` before adding a pool; a new one stores pointers
+  (`*[]byte`), not slices, so `Put` does not allocate. Watch for hidden
+  allocations: closures that capture variables, method
+  values, and values converted to interfaces escape to the heap. Lock in a
+  zero-allocation path with a test, as `TestRecordPathDoesNotAllocate` does,
+  or with `b.ReportAllocs()` in its benchmark.
 - Prefer option structs or functional options to long positional argument
   lists, especially repeated types.
 - Keep unrelated constants out of `iota` blocks to avoid shifting values.
@@ -148,7 +172,12 @@ go run ./cmd/tx-bench local -s 256MiB -n 1
 - `internal/bufpool`: size-bucketed reusable byte buffers for per-request I/O,
   plus `Growing`, whose buffer tracks bytes actually received rather than a
   size a peer declared.
-- `internal/{aead,pagecache,fsync,sampler,utils,metrics}`: encryption/auth,
+- `internal/aead`: the Noise handshake and record layer (`Session`,
+  `MessageWriter`, `MessageReader`, `FinishMessage`), credentials and the
+  typed allowlist, and age key decoding. flynn/noise runs only the handshake
+  and stays inside the package; the record layer owns its AEAD, nonce counter,
+  and REKEY, and allocates nothing per record.
+- `internal/{pagecache,fsync,sampler,utils,metrics}`:
   cache restore, fsync batching, sampling, network/string helpers, and metrics.
 - `internal/events`: the nil-safe event `Sink`, its JSON-lines encoding, and
   the `events` progress-target writer. `internal/txstats` writes `--stats`.
@@ -193,8 +222,21 @@ PROBE -> TXFER (FM/1 manifest) -> SEND (FX/1 frames) -> ACK -> STATUS
 - Paths/blobs are quoted or length-prefixed (`<len>:<bytes>`), and may not
   contain `\n` or `\r` — readers split on `\n` before consulting the length
   prefix, so encoders reject line breaks rather than emit an ambiguous stream.
-- Optional first-command `AUTH` age-encrypts request/response data and carries
-  bearer tokens inside the encrypted blob.
+- Optional first-line `AUTH`: `AUTH key noise-v1` discovers the server's age key
+  (the bare legacy `AUTH key` gets an upgrade message);
+  `AUTH noise-v1 <token|age> <cipher> <tag>` starts a Noise `IK` (age) or
+  `IKpsk0` (token) handshake, so the server proves its key and the client its
+  own key, and token mode also proves the token. The client's first record is
+  `FINISH`, and nothing is dispatched before it verifies. After that, each
+  command and response is one Noise message ending in an authenticated `END`
+  record, under one pair of cipher states for the connection's life. Every
+  server accepts AUTH; `RequireAuth` rejects plaintext, and allowlisted tokens
+  (`AllowedAuthTokens`) or client recipients (`AllowedClientRecipients`)
+  restrict who may authenticate.
+- Request and response completion is checked through the outermost parser
+  buffer: a request must reach its `END` before it changes state
+  (`completeRequest`), and a response before its connection is recycled
+  (`finishResponse`).
 - Connections are normally single-command. `PROBE keep-alive=auto` can grant
   `keep-alive-ms`; the client then pools sessions, heartbeats at one quarter of
   the window, checks pooled connections before reuse, and evicts dead ones.
@@ -277,8 +319,13 @@ response reader until its synchronous consumer returns. Direct `GetChecksum`
 remains a single request. Encoded request bodies carry their captured maximum;
 SEND checks that budget before acquiring a connection.
 
-Client age keys apply automatically. `WithClientAuthTokens` sends bearer tokens
-inside AUTH; `WithContextDialer` supplies custom connections. `client_pool.go`
+`client_auth.go` resolves credentials once per client (`resolveTCPAuthState`),
+discovers the server key once, and authenticates each dial
+(`dialAndAuthWithState`): token candidates in order with the last success
+first, `ERR BUSY` retried with backoff, at most 16 handshakes in flight. The
+session belongs to the connection (`noiseConn`). Without an identity the
+client generates one in-memory key pair. `WithContextDialer` supplies custom
+connections. `client_pool.go`
 keeps two TCP pools that never share connections, one for SEND/CXSUM and one
 for ACK/STATUS/TXFER/SYNC. Both open the concurrency (`WithConcurrency`, else
 the probe's suggestion) up front, lend the most recently used idle connection,
