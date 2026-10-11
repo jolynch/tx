@@ -3,7 +3,7 @@
 This document defines the strict manifest format emitted by `TXFER` and consumed by `tx recv copy` and `tx recv get`.
 
 When requesting a manifest via `TXFER`, clients may first issue `AUTH`.
-If `AUTH` provides a client recipient, the manifest stream is age-encrypted for that recipient.
+On an authenticated connection the manifest stream travels inside the response's encrypted Noise records (see [AUTH](AUTH.md)); its framing is unchanged.
 
 The FM/1 byte stream is identical regardless of the TXFER wire compression
 (`comp=none` or `comp=zstd`). The TXFER response wraps it in a sequence of

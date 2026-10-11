@@ -22,10 +22,7 @@ import (
 type syncArgs struct {
 	sourceDir           string
 	targetDir           string
-	agePublicKey        string
-	ageIdentity         string
-	encMode             string
-	authTokens          []string
+	auth                clientAuth
 	concurrency         int
 	concurrencyExplicit bool
 	ackEvery            int64
@@ -162,7 +159,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		}
 
 		// Probe link bandwidth.
-		client, closeClient := phaseClient(cfg.client, serverURL, tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientAgePublicKey(cfg.agePublicKey), tx.WithClientAgeIdentity(cfg.ageIdentity), tx.WithEncryptMode(cfg.encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()), tx.WithConcurrency(cfg.concurrency))
+		client, closeClient := phaseClient(cfg.client, serverURL, append(cfg.auth.options(), tx.WithLoadStrategy(loadStrategy), tx.WithComp(cfg.compress), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()), tx.WithConcurrency(cfg.concurrency))...)
 		defer closeClient()
 		probeResult, err := client.ProbeLink(context.Background(), tx.ProbeRequest{
 			ProbeBytes:   cfg.probeBytes,

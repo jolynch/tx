@@ -63,6 +63,16 @@ type memTransferConfig struct {
 	fileSize   int64
 	totalBytes int64
 	encrypt    string
+	// keepAlive grants keep-alive, so pooled connections carry many
+	// commands; without it every command dials and authenticates afresh.
+	keepAlive bool
+}
+
+// parseThroughputMode splits a grid mode such as "aes+ka" into its cipher
+// and whether the server grants keep-alive.
+func parseThroughputMode(mode string) (string, bool) {
+	cipher, ka := strings.CutSuffix(mode, "+ka")
+	return cipher, ka
 }
 
 func (c memTransferConfig) files() int {
@@ -136,9 +146,12 @@ func startMemTransfer(tb testing.TB, cfg memTransferConfig) *memTransferEnv {
 		tb.Fatal(err)
 	}
 
-	// Keys as tx send tree and tx recv copy --encrypt set them up: a server
-	// identity, and an ephemeral client identity sent in AUTH.
+	// Keys as tx send tree and tx recv copy --keys set them up: a server
+	// identity, and a client identity proven in the Noise handshake.
 	serverOpts := ftcp.ServerOptions{}
+	if cfg.keepAlive {
+		serverOpts.KeepAliveTimeout = time.Minute
+	}
 	var clientOpts []tx.ClientOption
 	if cfg.encrypted() {
 		serverID, err := age.GenerateX25519Identity()
@@ -379,11 +392,11 @@ func throughputEncryptModes(t *testing.T) []string {
 	var modes []string
 	for field := range strings.SplitSeq(raw, ",") {
 		mode := strings.ToLower(strings.TrimSpace(field))
-		switch mode {
+		switch cipher, _ := parseThroughputMode(mode); cipher {
 		case "none", "aes", "chacha20":
 			modes = append(modes, mode)
 		default:
-			t.Fatalf("%s=%q: modes are none, aes, and chacha20", envTPEncrypt, raw)
+			t.Fatalf("%s=%q: modes are none, aes, and chacha20, each optionally with +ka for keep-alive", envTPEncrypt, raw)
 		}
 	}
 	return modes
@@ -488,7 +501,8 @@ func measureThroughputRow(t *testing.T, cpus int, total int64, minWall time.Dura
 	t.Helper()
 	envs := make([]*memTransferEnv, len(memTransferSizes))
 	for i, sz := range memTransferSizes {
-		envs[i] = startMemTransfer(t, memTransferConfig{fileSize: sz.size, totalBytes: total, encrypt: encrypt})
+		cipher, keepAlive := parseThroughputMode(encrypt)
+		envs[i] = startMemTransfer(t, memTransferConfig{fileSize: sz.size, totalBytes: total, encrypt: cipher, keepAlive: keepAlive})
 		envs[i].copyOnce(t) // warm the connection pools
 	}
 	results := measureInterleaved(t, envs, 3, minWall)

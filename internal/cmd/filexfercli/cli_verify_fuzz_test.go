@@ -277,11 +277,7 @@ func verifyFuzzManifest(t *testing.T, source string, encrypt bool) (string, []tx
 	addr, path, _ := strings.Cut(rest, "/")
 	opts := []tx.ClientOption{}
 	if encrypt {
-		pub, id, mode, err := resolveEncryptionOptionsWithKeys("auto", "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		opts = append(opts, tx.WithClientAgePublicKey(pub), tx.WithClientAgeIdentity(id), tx.WithEncryptMode(mode))
+		opts = append(opts, tx.WithEncryptMode("auto"))
 	}
 	client := tx.NewClient(addr, opts...)
 	defer client.Close()

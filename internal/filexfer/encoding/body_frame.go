@@ -168,6 +168,14 @@ func (w *FramedBodyWriter) flushChunk(n int, terminal bool) error {
 	}
 	w.offset += int64(len(chunk))
 	w.lastFlush = time.Now()
+	// A completed non-terminal frame is a deliberate progress point: let a
+	// transport that batches writes (an authenticated session) send it now.
+	// The terminal frame needs no flush; the response ends right after it.
+	if !terminal {
+		if f, ok := w.dst.(interface{ Flush() error }); ok {
+			return f.Flush()
+		}
+	}
 	return nil
 }
 

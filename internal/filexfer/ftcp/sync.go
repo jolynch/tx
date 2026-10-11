@@ -3,6 +3,7 @@ package ftcp
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -134,12 +135,21 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	// Read the framed old-manifest body from the input stream and parse it.
 	// The body is capped because the index built from it has to be held whole:
 	// the walk below consults it for every path on disk.
-	oldManifestReader := encoding.NewFramedBodyReader(in, encoding.FramedBodyReaderOpts{
+	oldManifestReader := encoding.NewFramedBodyReader(requestBodySource(in), encoding.FramedBodyReaderOpts{
 		MaxLogicalBytes: maxBodyBytes,
 	})
-	pathIndex, parseErr := readOldManifest(oldManifestReader)
+	// One decoded buffer serves the parser and the end check, so bytes after
+	// the manifest's terminator cannot hide in a second read-ahead buffer.
+	manifest := bufio.NewReader(oldManifestReader)
+	pathIndex, parseErr := readOldManifest(manifest)
+	if parseErr == nil {
+		parseErr = expectDecodedEnd(manifest)
+	}
 	if parseErr != nil {
 		return protocolErr{code: "BAD_REQUEST", message: fmt.Sprintf("invalid old manifest: %s", parseErr)}
+	}
+	if err := completeRequest(in); err != nil {
+		return err
 	}
 
 	// Create transfer and set hints (same pattern as TXFER).
@@ -412,10 +422,24 @@ func probeAndEncodePageCache(fullPath string) []byte {
 	return blob
 }
 
-// readOldManifest reads FM/1 manifest lines from in until a blank line.
+// expectDecodedEnd checks that nothing follows the manifest's terminator and
+// that the framed body reached its verified terminal frame.
+func expectDecodedEnd(br *bufio.Reader) error {
+	if br.Buffered() > 0 {
+		return errors.New("bytes after the manifest terminator")
+	}
+	if _, err := br.ReadByte(); err != io.EOF {
+		if err == nil {
+			return errors.New("bytes after the manifest terminator")
+		}
+		return err
+	}
+	return nil
+}
+
+// readOldManifest reads FM/1 manifest lines from br until a blank line.
 // Returns a map keyed by xxh3-128 path hash — no path strings are retained.
-func readOldManifest(in io.Reader) (map[xxh3.Uint128]*oldEntry, error) {
-	br := bufio.NewReader(in)
+func readOldManifest(br *bufio.Reader) (map[xxh3.Uint128]*oldEntry, error) {
 	pathIndex := make(map[xxh3.Uint128]*oldEntry)
 	prevPath := ""
 	prevMtime := ""

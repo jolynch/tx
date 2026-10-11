@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jolynch/tx/internal/events"
 	intftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	"github.com/jolynch/tx/internal/filexfer/store"
 )
@@ -420,6 +421,10 @@ func TestClientCloseStopsTCPPoolAndAllowsDirectDialLater(t *testing.T) {
 	if client.tcpPool(poolData) != nil || client.tcpPool(poolControl) != nil {
 		t.Fatal("expected pools to be cleared after Close")
 	}
+	// A probe after (or racing) Close never starts pools nothing would stop.
+	if n := client.ensureTCPPools(tcpAuthState{}, 2); n != 0 || client.tcpPool(poolData) != nil {
+		t.Fatalf("ensureTCPPools after Close = %d, pools started again", n)
+	}
 
 	dialer.SetSuccessLimit(5)
 	if _, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"}); err == nil {
@@ -620,6 +625,55 @@ func TestHeartbeatReturnsHealthyConnectionsBeforeSlowProbe(t *testing.T) {
 	}
 	if got := len(pool.slots); got != 2 {
 		t.Fatalf("pool holds %d slots, want 2", got)
+	}
+}
+
+// stop waits for the pool's heartbeat loop, aborting a probe stuck on a
+// silent peer instead of waiting out its timeout, so nothing the pool logs
+// lands after stop returns.
+func TestPoolStopWaitsForHeartbeat(t *testing.T) {
+	sink := NewClientEventSink()
+	var stopped atomic.Bool
+	var late atomic.Int64
+	sink.Subscribe(func(events.Event) {
+		if stopped.Load() {
+			late.Add(1)
+		}
+	})
+	c := NewClient("pipe", WithEventSink(sink))
+	pool := newTCPConnPool(tcpAuthState{}, tcpPoolOptions{size: 1, limit: 1}, 5000)
+	conn, peer := net.Pipe()
+	t.Cleanup(func() { _ = peer.Close() })
+	probed := make(chan struct{})
+	go func() {
+		// Read the heartbeat PROBE and never answer it.
+		_, _ = bufio.NewReader(peer).ReadString('\n')
+		close(probed)
+		_, _ = io.Copy(io.Discard, peer)
+	}()
+	pool.takeSlot()
+	pool.enqueue(&sessionTCPConn{Conn: conn, lastActive: time.Now().Add(-time.Second)})
+	// The loop ticks every interval; a short grant makes the first tick
+	// come quickly.
+	pool.sessionMS.Store(40)
+	pool.startHeartbeats(c)
+	select {
+	case <-probed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("heartbeat never probed the idle session")
+	}
+	start := time.Now()
+	pool.stop()
+	stopped.Store(true)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("stop took %v; it waited out the probe", elapsed)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := late.Load(); n != 0 {
+		t.Fatalf("%d events after stop returned", n)
+	}
+	if got := len(pool.slots); got != 0 {
+		t.Fatalf("pool holds %d slots after stop, want 0", got)
 	}
 }
 

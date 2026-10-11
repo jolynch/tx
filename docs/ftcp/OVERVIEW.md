@@ -2,6 +2,10 @@
 
 This document defines the TCP file-transfer command protocol implemented by tx.
 
+The [FTCP authentication specification](AUTH.md) is the authoritative wire
+reference for `AUTH`: server key discovery, the Noise handshake, `FINISH`, and
+the encrypted record layer. This document summarizes it under [AUTH](#auth).
+
 ## Transport
 
 - Listener: `tx send tree --listen` (default `127.0.0.1:3453`)
@@ -150,17 +154,21 @@ allocator without ever exceeding a limit.
 
 1. Client connects.
 2. Client sends either:
-   - command line (`TXFER|SYNC|SEND|ACK|CXSUM|STATUS|PROBE`), or
-   - `AUTH` first, then exactly one command line.
-3. Server writes response.
-4. Server closes connection.
+   - a plaintext command line (`TXFER|SYNC|SEND|ACK|CXSUM|STATUS|PROBE`), or
+   - an `AUTH noise-v1` preface and handshake, then commands as encrypted
+     Noise messages.
+3. Server writes the response: plaintext, or one encrypted message ending in
+   an authenticated `END` record.
+4. Server closes the connection unless PROBE granted keep-alive.
 
-With `--require-auth` (or `--require-auth-token`), the first line must be `AUTH`.
+With `--require-auth`, or any allowlist entry (`--require-auth-token[-file]`
+or `--require-client-recipient[-file]`), plaintext commands are rejected with
+`ERR NOT_AUTHORIZED missing AUTH`.
 
 ## Keep-Alive
 
-One TCP connection per command pays a fresh handshake (and AUTH, when
-encrypted) per batch and restarts TCP slow-start every time. A client may
+One TCP connection per command pays a fresh TCP handshake (and a Noise
+handshake, when encrypted) per batch and restarts TCP slow-start every time. A client may
 instead request connection reuse via PROBE:
 
 - **Request**: any `PROBE` may carry `keep-alive=auto`.
@@ -169,9 +177,10 @@ instead request connection reuse via PROBE:
   ignore the request key and old clients ignore the grant token, so the
   exchange is backward compatible in both directions.
 - After the grant, the server keeps the connection open after each
-  successful command and reads the next command from it. Encrypted (`AUTH`)
-  sessions carry each command and each response in its own self-delimiting
-  AEAD stream.
+  successful command and reads the next command from it. Authenticated
+  sessions keep one pair of Noise cipher states for the connection's life;
+  each command and each response is one message ending in an authenticated
+  `END` record, and pooled commands perform no further key exchange.
 - Any handler error still writes `ERR ...` and closes the connection.
 
 Two guardrails keep silently dead connections from lingering:
@@ -185,7 +194,10 @@ Two guardrails keep silently dead connections from lingering:
    EOF before reusing a pooled connection.
 2. **Server idle reaping**: the server closes a kept-alive connection that
    receives no bytes for the keep-alive window (`--idle-timeout`, default
-   60s; `0` disables keep-alive entirely). Every completed command —
+   60s; `0` disables keep-alive entirely). Authenticated connections always
+   run under this deadline, 60s when keep-alive is disabled: it bounds the
+   first command after `FINISH`, the time between commands, and the time
+   between records of a request. Every completed command —
    heartbeats included — extends the connection by a fresh window, but
    heartbeats do not count as activity for `--exit-after`, so a lingering
    idle client cannot block server shutdown.
@@ -203,68 +215,32 @@ For this line protocol, token bytes cannot span command newlines.
 
 ## AUTH
 
-### Request
+`AUTH` is only valid as a connection's first line. Every server answers it;
+the server flags decide whether it is required and which credentials it
+accepts:
 
-Three forms:
+| Server configuration | Plaintext clients | AUTH clients |
+| --- | --- | --- |
+| No flags | Accepted | Age mode with any client key, after proof of its private key |
+| `--require-auth` | Rejected | Age mode with any client key, after proof of its private key |
+| Allowlist entries (`--require-auth-token[-file]`, `--require-client-recipient[-file]`) | Rejected | Token mode with an allowed token, or age mode with an allowed recipient's private key |
 
-- `AUTH key` — key exchange: server returns its recommended cipher and age public key.
-- `AUTH aes <blob>` — encrypted session setup using AES-GCM.
-- `AUTH chacha20 <blob>` — encrypted session setup using ChaCha20-Poly1305.
+The [FTCP authentication specification](./AUTH.md) defines the protocol. In
+brief:
 
-`<blob>` is a single token containing standard base64 of the AEAD-encrypted
-payload (base64 keeps the line-oriented protocol free of raw newline bytes).
-Bare, quoted (`"..."`), and length-prefixed (`<len>:<bytes>`) token forms are
-all accepted; the current client sends a bare base64 token.
-
-### Key Exchange Flow
-
-1. Client sends `AUTH key\r\n`.
-2. Server responds `OK <recommended-cipher> <server-age-public-key>\r\n` and closes the connection.
-3. Client opens a new connection and sends either `AUTH aes <blob>\r\n` or `AUTH chacha20 <blob>\r\n`.
-
-If the client requested `auto`, it first resolves `auto` to the server's
-recommended cipher from step 2 and then uses that resolved value in the second
-connection.
-
-### Encrypted Connection Flow
-
-After `AUTH aes <blob>` or `AUTH chacha20 <blob>`:
-
-- Server treats the first AUTH token (`aes` or `chacha20`) as the session
-  cipher.
-- Server base64-decodes `<blob>`, then decrypts it using its identity and the
-  selected AEAD algorithm to recover the client's identity material.
-- Decrypted plaintext is a space-delimited sequence:
-
-  ```
-  <client_age_public_key> [<token1> <token2> ...]
-  ```
-
-  The first field is the client's age X25519 recipient; remaining fields are
-  zero or more opaque identity tokens. A token is any printable string with
-  length > 8 bytes, no ASCII spaces, and no newlines (arbitrary encoding —
-  hex, base64, bech32, an `age1…` recipient, a UUID, etc.).
-- Authorization check (whenever AUTH is required; `--require-auth` without
-  `--require-auth-token` allowlists a generated token):
-  - Build the presented set `{client_age_public_key} ∪ {token1, token2, ...}`.
-  - At least one presented value must exactly match an allowlisted token
-    configured on the server. The client's age public key counts as an
-    identity token, so an operator may allowlist the `age1…` string directly
-    without a shared secret.
-  - Comparison is constant-time (`crypto/subtle.ConstantTimeCompare`).
-- If AUTH is not required, the allowlist is empty and any decryptable client is
-  accepted (any tokens presented are ignored).
-- If valid:
-  - subsequent command bytes from the client must be encrypted to the server's
-    public key using that same AEAD algorithm.
-  - subsequent response bytes are encrypted to the client's public key using
-    that same AEAD algorithm.
-- If invalid: `ERR NOT_AUTHORIZED authorization failed`.
-
-### Unencrypted Connection Flow
-
-When no encryption is desired, the client omits AUTH entirely and sends the
-command directly.
+- **Discovery:** `AUTH key noise-v1\r\n` on its own connection returns
+  `OK <aes|chacha20> <server-age-recipient>\r\n`. The bare legacy `AUTH key`
+  gets `ERR UNSUPPORTED_AUTH client predates noise-v1; upgrade tx`.
+- **Handshake:** `AUTH noise-v1 <token|age> <aes|chacha20> <credential-tag>\r\n`
+  is followed at once by Noise message 1 (`IK`, or `IKpsk0` in token mode).
+  The server answers with message 2 or one plaintext `ERR` diagnostic. The
+  client's first record is an empty `FINISH`, and the server dispatches
+  nothing before it verifies it.
+- **Records:** every command and response is then one message of records
+  ending in an authenticated `END`, each
+  `uint16-BE length || kind || AEAD(payload, ad = length || kind)`.
+- **Admission:** at most `MaxUnauthenticatedConns` (default 1024) connections
+  may be unauthenticated at once; any more get `ERR BUSY`.
 
 ## TXFER
 

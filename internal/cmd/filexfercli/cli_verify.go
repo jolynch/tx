@@ -379,10 +379,6 @@ func hashItems(ctx context.Context, items []verifyItem, src bool) ([]string, err
 
 func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Manifest, stderr io.Writer) (verifyDataResult, error) {
 	opts := cfg.verifyOptions()
-	agePublicKey, ageIdentity, encMode, err := resolveEncryptionOptionsWithKeys(cfg.encryptMode, cfg.keysDir)
-	if err != nil {
-		return verifyDataResult{seed: opts.seed}, fmt.Errorf("invalid --encrypt: %w", err)
-	}
 	files, totals := newVerifyFiles(manifest.Root, manifest.Entries, opts, func(entry tx.ManifestEntry) (string, string) {
 		return filepath.Clean(filepath.Join(manifest.Root, filepath.FromSlash(entry.Path))),
 			filepath.Join(cfg.localDst, filepath.FromSlash(entry.Path))
@@ -390,10 +386,10 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 	if len(files) == 0 {
 		return totals, nil
 	}
-	client, closeClient := phaseClient(cfg.client, serverURL, tx.WithClientAgePublicKey(agePublicKey), tx.WithClientAgeIdentity(ageIdentity), tx.WithEncryptMode(encMode), tx.WithClientAuthTokens(cfg.authTokens...), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))
+	client, closeClient := phaseClient(cfg.client, serverURL, append(cfg.auth.options(), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))...)
 	defer closeClient()
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), verifyChecksumRequestTimeout)
-	_, err = client.ProbeLink(probeCtx, tx.ProbeRequest{ProbeBytes: 1})
+	_, err := client.ProbeLink(probeCtx, tx.ProbeRequest{ProbeBytes: 1})
 	probeCancel()
 	if err != nil {
 		return totals, fmt.Errorf("probe checksum request limits: %w", err)

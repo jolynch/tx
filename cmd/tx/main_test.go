@@ -3,10 +3,12 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"filippo.io/age"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -82,11 +84,10 @@ func TestRunSendTreeRequireAuth(t *testing.T) {
 	called := false
 	serve := func(listener net.Listener, opts ftcp.ServerOptions) error {
 		called = true
-		if !opts.RequireAuth || len(opts.AllowedAuthTokens) != 1 {
+		// Bare --require-auth generates no token: it requires AUTH and
+		// accepts any client that proves its own private key.
+		if !opts.RequireAuth || len(opts.AllowedAuthTokens) != 0 {
 			t.Fatalf("server auth options: required=%v tokens=%d", opts.RequireAuth, len(opts.AllowedAuthTokens))
-		}
-		if err := aead.ValidateAuthToken(opts.AllowedAuthTokens[0]); err != nil {
-			t.Fatalf("invalid generated token: %v", err)
 		}
 		if opts.ServerIdentity == nil || opts.RootDir != root {
 			t.Fatalf("server identity/root: identity=%v root=%q", opts.ServerIdentity, opts.RootDir)
@@ -126,6 +127,47 @@ func TestRunSendTreeRequireAuth(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("server was not called")
+	}
+}
+
+func TestRunSendTreeAllowlistFiles(t *testing.T) {
+	root := t.TempDir()
+	token := strings.Repeat("f", 64)
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileID, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "client.token")
+	if err := os.WriteFile(tokenFile, []byte(token+"\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recipientFile := filepath.Join(dir, "client.age")
+	if err := os.WriteFile(recipientFile, []byte(fileID.Recipient().String()+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	serve := func(_ net.Listener, opts ftcp.ServerOptions) error {
+		called = true
+		wantRecipients := []string{id.Recipient().String(), fileID.Recipient().String()}
+		if !opts.RequireAuth || !slices.Equal(opts.AllowedAuthTokens, []string{token}) ||
+			!slices.Equal(opts.AllowedClientRecipients, wantRecipients) {
+			t.Fatalf("allowlist = tokens %d, recipients %v, required=%v",
+				len(opts.AllowedAuthTokens), opts.AllowedClientRecipients, opts.RequireAuth)
+		}
+		if _, err := aead.NewAllowlist(opts.AllowedAuthTokens, opts.AllowedClientRecipients); err != nil {
+			t.Fatal(err)
+		}
+		return nil
+	}
+	args := []string{"--listen", "127.0.0.1:0", "--require-client-recipient", id.Recipient().String(),
+		"--require-client-recipient-file", recipientFile, "--require-auth-token-file", tokenFile, root}
+	if got := runSendTree(args, io.Discard, serve); got != 0 || !called {
+		t.Fatalf("runSendTree = %d, called=%v", got, called)
 	}
 }
 

@@ -4,12 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"net"
 	"os"
 	"path/filepath"
@@ -2369,90 +2369,142 @@ func TestManifestSizeScales(t *testing.T) {
 	}
 }
 
-func TestSendTCPAuthIncludesClientAuthTokens(t *testing.T) {
-	serverID, err := age.GenerateX25519Identity()
+// dialCounter wraps a dialer to count dials and closes.
+type dialCounter struct {
+	dials, closes atomic.Int64
+}
+
+type countedConn struct {
+	net.Conn
+	d *dialCounter
+}
+
+func (c *countedConn) Close() error {
+	c.d.closes.Add(1)
+	return c.Conn.Close()
+}
+
+func (d *dialCounter) dial(ctx context.Context, addr string) (net.Conn, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if err != nil {
-		t.Fatalf("generate server id: %v", err)
+		return nil, err
 	}
+	d.dials.Add(1)
+	return &countedConn{Conn: conn, d: d}, nil
+}
+
+func TestClientOrderedTokens(t *testing.T) {
+	wrong := strings.Repeat("w", 40)
+	right := strings.Repeat("r", 40)
+	addr := startRealKeepAliveServer(t, intftcp.ServerOptions{AllowedAuthTokens: []string{right}, KeepAliveTimeout: 5 * time.Second})
+	var d dialCounter
+	c := NewClient(addr, WithClientAuthTokens(wrong, right), WithContextDialer(d.dial))
+	defer c.Close()
+	ctx := context.Background()
+	if _, err := c.GetStatus(ctx, GetStatusRequest{TransferID: "missing"}); err == nil || !strings.Contains(err.Error(), "NOT_FOUND") {
+		t.Fatalf("first request = %v, want an authenticated NOT_FOUND", err)
+	}
+	// Discovery, the rejected first token, and the accepted second.
+	if got := d.dials.Load(); got != 3 {
+		t.Fatalf("first request dialed %d times, want 3", got)
+	}
+	// Later dials start with the token that succeeded.
+	if _, err := c.GetStatus(ctx, GetStatusRequest{TransferID: "missing"}); err == nil || !strings.Contains(err.Error(), "NOT_FOUND") {
+		t.Fatalf("second request = %v", err)
+	}
+	if got := d.dials.Load(); got != 4 {
+		t.Fatalf("second request dialed %d times in total, want 4", got)
+	}
+
+	// No candidate succeeds: a secret-free authentication error.
+	c2 := NewClient(addr, WithClientAuthTokens(wrong))
+	defer c2.Close()
+	_, err := c2.GetStatus(ctx, GetStatusRequest{TransferID: "missing"})
+	if err == nil || strings.Contains(err.Error(), wrong) {
+		t.Fatalf("rejected tokens = %v", err)
+	}
+	// An invalid later candidate fails before any dial.
+	var d3 dialCounter
+	c3 := NewClient(addr, WithClientAuthTokens(right, "short"), WithContextDialer(d3.dial))
+	defer c3.Close()
+	if _, err := c3.GetStatus(ctx, GetStatusRequest{TransferID: "missing"}); err == nil || d3.dials.Load() != 0 {
+		t.Fatalf("invalid candidate = %v after %d dials", err, d3.dials.Load())
+	}
+}
+
+func TestClientEncryptedModesAgainstServerPolicies(t *testing.T) {
+	token := strings.Repeat("t", 48)
 	clientID, err := age.GenerateX25519Identity()
 	if err != nil {
-		t.Fatalf("generate client id: %v", err)
+		t.Fatal(err)
 	}
+	other, _ := age.GenerateX25519Identity()
+	for _, tc := range []struct {
+		name   string
+		server intftcp.ServerOptions
+		opts   []ClientOption
+		ok     bool
+	}{
+		{"open server, plaintext", intftcp.ServerOptions{}, nil, true},
+		{"open server, in-memory key", intftcp.ServerOptions{}, []ClientOption{WithEncryptMode("auto")}, true},
+		{"require-auth, plaintext", intftcp.ServerOptions{RequireAuth: true}, nil, false},
+		{"require-auth, in-memory key", intftcp.ServerOptions{RequireAuth: true}, []ClientOption{WithEncryptMode("chacha20")}, true},
+		{"token allowlist, token", intftcp.ServerOptions{AllowedAuthTokens: []string{token}}, []ClientOption{WithClientAuthTokens(token)}, true},
+		{"token allowlist, any key", intftcp.ServerOptions{AllowedAuthTokens: []string{token}}, []ClientOption{WithEncryptMode("aes")}, false},
+		{"age allowlist, listed", intftcp.ServerOptions{AllowedClientRecipients: []string{clientID.Recipient().String()}},
+			[]ClientOption{WithClientAgeIdentity(clientID.String())}, true},
+		{"age allowlist, unlisted", intftcp.ServerOptions{AllowedClientRecipients: []string{clientID.Recipient().String()}},
+			[]ClientOption{WithClientAgeIdentity(other.String())}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := startRealKeepAliveServer(t, tc.server)
+			c := NewClient(addr, tc.opts...)
+			defer c.Close()
+			_, err := c.ListStatuses(context.Background(), ListStatusesRequest{})
+			if (err == nil) != tc.ok {
+				t.Fatalf("ListStatuses = %v, want ok=%t", err, tc.ok)
+			}
+		})
+	}
+}
 
-	c := NewClient("ignored:0", WithClientAuthTokens("tok-alpha-12345", "tok-beta-67890"))
-	parsed, err := parseAgeIdentity(clientID.String())
-	if err != nil {
-		t.Fatalf("parse client id: %v", err)
-	}
-	state := tcpAuthState{
-		publicKey:      clientID.Recipient().String(),
-		identity:       clientID.String(),
-		parsedIdentity: parsed,
-		serverKey:      serverID.Recipient().String(),
-		hasAuth:        true,
-		encMode:        "aes",
-	}
-
-	serverConn, clientConn := net.Pipe()
-	errCh := make(chan error, 1)
-	lineCh := make(chan string, 1)
-	go func() {
-		defer serverConn.Close()
-		br := bufio.NewReader(serverConn)
-		line, rerr := readCompatLine(br)
-		if rerr != nil {
-			errCh <- rerr
-			return
+func TestClientRejectsInvalidCredentialConfig(t *testing.T) {
+	id, _ := age.GenerateX25519Identity()
+	other, _ := age.GenerateX25519Identity()
+	token := strings.Repeat("t", 40)
+	for name, opts := range map[string][]ClientOption{
+		"none with a token":     {WithClientAuthTokens(token), WithEncryptMode("none")},
+		"recipient only":        {WithClientAgePublicKey(id.Recipient().String())},
+		"mismatched pair":       {WithClientAgeIdentity(id.String()), WithClientAgePublicKey(other.Recipient().String())},
+		"recipient as token":    {WithClientAuthTokens(id.Recipient().String())},
+		"pin without crypto":    {WithRequiredServerRecipient(id.Recipient().String())},
+		"unknown encrypt":       {WithEncryptMode("des")},
+		"token with whitespace": {WithClientAuthTokens(" " + token)},
+	} {
+		var d dialCounter
+		c := NewClient("127.0.0.1:1", append(opts, WithContextDialer(d.dial))...)
+		if _, err := c.resolveTCPAuthState(context.Background()); err == nil {
+			t.Errorf("%s: accepted", name)
 		}
-		lineCh <- line
-	}()
+		if d.dials.Load() != 0 {
+			t.Errorf("%s: dialed before rejecting", name)
+		}
+	}
+}
 
-	if err := c.sendTCPAuth(clientConn, state); err != nil {
-		t.Fatalf("sendTCPAuth: %v", err)
+func TestClientServerKeyPin(t *testing.T) {
+	id, _ := age.GenerateX25519Identity()
+	other, _ := age.GenerateX25519Identity()
+	addr := startRealKeepAliveServer(t, intftcp.ServerOptions{ServerIdentity: id})
+	ok := NewClient(addr, WithEncryptMode("auto"), WithRequiredServerRecipient(id.Recipient().String()))
+	defer ok.Close()
+	if _, err := ok.ListStatuses(context.Background(), ListStatusesRequest{}); err != nil {
+		t.Fatalf("matching pin: %v", err)
 	}
-	_ = clientConn.Close()
-
-	var line string
-	select {
-	case line = <-lineCh:
-	case rerr := <-errCh:
-		t.Fatalf("read AUTH line: %v", rerr)
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout reading AUTH line")
-	}
-
-	req, err := intftcp.ParseRequest([]byte(line))
-	if err != nil {
-		t.Fatalf("parse AUTH request: %v", err)
-	}
-	if req.Verb != intftcp.VerbAUTH {
-		t.Fatalf("expected AUTH verb, got %v", req.Verb)
-	}
-	if req.Params[0]["protocol"] != "aes" {
-		t.Fatalf("expected aes protocol, got %q", req.Params[0]["protocol"])
-	}
-	blob := req.Params[0]["blob"]
-	raw, berr := base64.StdEncoding.DecodeString(strings.TrimSpace(blob))
-	if berr != nil {
-		t.Fatalf("base64 decode: %v", berr)
-	}
-	dec, derr := aead.DecryptWithOptions(bytes.NewReader(raw), serverID, aead.Options{Algorithm: aead.AlgorithmAES})
-	if derr != nil {
-		t.Fatalf("decrypt init: %v", derr)
-	}
-	plain, perr := io.ReadAll(dec)
-	if perr != nil {
-		t.Fatalf("decrypt: %v", perr)
-	}
-	fields := strings.Fields(string(plain))
-	if len(fields) != 3 {
-		t.Fatalf("expected 3 fields (<pubkey> <tok1> <tok2>), got %d: %q", len(fields), fields)
-	}
-	if fields[0] != clientID.Recipient().String() {
-		t.Fatalf("fields[0]: want client pubkey %q, got %q", clientID.Recipient().String(), fields[0])
-	}
-	if fields[1] != "tok-alpha-12345" || fields[2] != "tok-beta-67890" {
-		t.Fatalf("unexpected token fields: %q %q", fields[1], fields[2])
+	bad := NewClient(addr, WithEncryptMode("auto"), WithRequiredServerRecipient(other.Recipient().String()))
+	defer bad.Close()
+	if _, err := bad.ListStatuses(context.Background(), ListStatusesRequest{}); err == nil {
+		t.Fatal("mismatched pin accepted")
 	}
 }
 
@@ -3237,64 +3289,34 @@ func TestClientKeepAliveEncryptedSessionReuse(t *testing.T) {
 }
 
 func TestClientKeepAliveAuthWatcherStopsBeforeReuse(t *testing.T) {
-	// Keep the AUTH watcher pending while the first request completes, then
-	// schedule it after another request has borrowed that request's session.
+	// Each request cancels its context right after it returns; the session
+	// it used must go back to the pool and be reused, not closed.
 	previous := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(previous)
-	server, err := age.GenerateX25519Identity()
+	id, err := age.GenerateX25519Identity()
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, err := age.GenerateX25519Identity()
+	addr := startRealKeepAliveServer(t, intftcp.ServerOptions{ServerIdentity: id, KeepAliveTimeout: 5 * time.Second})
+	var d dialCounter
+	c := NewClient(addr, WithEncryptMode("aes"), WithContextDialer(d.dial))
+	defer c.Close()
+	state, err := c.resolveTCPAuthState(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	state := tcpAuthState{
-		publicKey: client.Recipient().String(), identity: client.String(), parsedIdentity: client,
-		serverKey: server.Recipient().String(), hasAuth: true, encMode: "aes",
+	c.controlPool = newTCPConnPool(state, tcpPoolOptions{size: 1}, 5000)
+	for i := range 50 {
+		ctx, cancel := context.WithCancel(context.Background())
+		if _, err := c.ListStatuses(ctx, ListStatusesRequest{}); err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		cancel()
+		runtime.Gosched()
 	}
-	var response bytes.Buffer
-	for _, line := range []string{
-		"PROBE cpu=1 cts0=1 sts0=1 sts1=1 probe-bytes=0 keep-alive-ms=5000\r\nOK\r\n",
-		"OK {\"transfer_id\":\"first\"}\r\n",
-		"OK {\"transfer_id\":\"second\"}\r\n",
-	} {
-		writer, err := aead.Encrypt(&response, client.Recipient(), aead.Options{Algorithm: aead.AlgorithmAES})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := io.WriteString(writer, line); err != nil {
-			t.Fatal(err)
-		}
-		if err := writer.Close(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for i := range 100 {
-		func() {
-			conn, peer := net.Pipe()
-			defer peer.Close()
-			counted := &closeCountConn{Conn: conn, response: bytes.NewReader(response.Bytes())}
-			c := NewClient("memory", WithContextDialer(func(context.Context, string) (net.Conn, error) {
-				return counted, nil
-			}))
-			c.controlPool = newTCPConnPool(state, tcpPoolOptions{size: 1}, 5000)
-			defer c.Close()
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			first, err := c.GetStatus(ctx, GetStatusRequest{TransferID: "first"})
-			if err != nil || first.Status == nil || first.Status.TransferID != "first" {
-				t.Fatalf("iteration %d: first request = %+v, %v", i, first, err)
-			}
-			counted.beforeWrite = func() { cancel(); runtime.Gosched() }
-			second, err := c.GetStatus(context.Background(), GetStatusRequest{TransferID: "second"})
-			if err != nil || second.Status == nil || second.Status.TransferID != "second" {
-				t.Fatalf("iteration %d: second request = %+v, %v after first request cancellation", i, second, err)
-			}
-			if counted.closes.Load() != 0 || c.MetricSnapshot().DialCount != 1 {
-				t.Fatalf("iteration %d: session was closed or replaced instead of reused", i)
-			}
-		}()
+	// One discovery connection and one session, reused for every request.
+	if d.dials.Load() != 2 || d.closes.Load() != 1 {
+		t.Fatalf("dials = %d, closes = %d; want 2 and 1", d.dials.Load(), d.closes.Load())
 	}
 }
 
@@ -3955,4 +3977,363 @@ func FuzzManifestEntryByID(f *testing.F) {
 		}
 		check("after mutation")
 	})
+}
+
+// Heartbeats probe idle encrypted sessions while borrowers use the same
+// pool; under -race this checks that no session state is shared between
+// them and that heartbeat failures do not occur.
+func TestEncryptedHeartbeatsWithConcurrentBorrowers(t *testing.T) {
+	addr := startRealKeepAliveServer(t, intftcp.ServerOptions{RequireAuth: true, KeepAliveTimeout: 400 * time.Millisecond})
+	c := NewClient(addr, WithEncryptMode("chacha20"), WithConcurrency(4))
+	defer c.Close()
+	ctx := context.Background()
+	if _, err := c.ProbeLink(ctx, ProbeRequest{ProbeBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			deadline := time.Now().Add(time.Second)
+			for time.Now().Before(deadline) {
+				if _, err := c.ListStatuses(ctx, ListStatusesRequest{}); err != nil {
+					errs <- err
+					return
+				}
+				time.Sleep(time.Duration(rand.IntN(30)) * time.Millisecond)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	snap := c.MetricSnapshot()
+	if snap.HeartbeatCount == 0 || snap.HeartbeatFailureCount != 0 {
+		t.Fatalf("heartbeats = %d, failures = %d", snap.HeartbeatCount, snap.HeartbeatFailureCount)
+	}
+}
+
+// An encrypted download without keep-alive closes every connection instead
+// of recycling it; closing an authenticated connection must not fail the
+// verified download, including split windows of one large file.
+func TestEncryptedSplitDownloadWithoutKeepAlive(t *testing.T) {
+	root := t.TempDir()
+	data := bytes.Repeat([]byte("0123456789abcdef"), 1<<16) // 1 MiB
+	if err := os.WriteFile(filepath.Join(root, "big.bin"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := store.NewStore()
+	t.Cleanup(st.Close)
+	addr := startRealKeepAliveServer(t, intftcp.ServerOptions{
+		Deps: intftcp.NewRuntimeDeps(st, intftcp.WithRoot(root)), RequireAuth: true,
+	})
+	client := NewClient(addr, WithEncryptMode("aes"), WithFileRequestWindowBytes(1<<20))
+	defer client.Close()
+	ctx := context.Background()
+	manifest, err := client.GetManifest(ctx, GetManifestRequest{Directory: "/", Mode: "fast", LinkMbps: 100, Concurrency: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id uint64
+	for _, e := range manifest.Manifest.Entries {
+		if e.Type == intencoding.EntryTypeFile {
+			id = e.ID
+		}
+	}
+	dest := filepath.Join(t.TempDir(), "big.bin")
+	if err := os.WriteFile(dest, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.GetFiles(ctx, GetFilesRequest{
+		Manifest:      manifest.Manifest,
+		FileIDs:       []uint64{id},
+		BatchMaxBytes: 256 << 10,
+		OutputWriter: func(_ ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
+			fd, err := os.OpenFile(dest, os.O_RDWR, 0o644)
+			if err != nil {
+				return nil, nil, err
+			}
+			if _, err := fd.Seek(offset, io.SeekStart); err != nil {
+				_ = fd.Close()
+				return nil, nil, err
+			}
+			return fd, func() error { return nil }, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("GetFiles: %v", err)
+	}
+	got, _ := os.ReadFile(dest)
+	if !bytes.Equal(got, data) {
+		t.Fatalf("downloaded %d bytes differ from the source", len(got))
+	}
+}
+
+// noiseScriptServer authenticates any client key, reads one request to its
+// END, and lets respond write the raw response on the session.
+func noiseScriptServer(t *testing.T, respond func(w *aead.MessageWriter)) string {
+	t.Helper()
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kp, err := aead.KeyPairFromIdentity(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+				br := bufio.NewReader(conn)
+				line, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				if line == "AUTH key "+aead.PrefaceVersion+"\r\n" {
+					_, _ = io.WriteString(conn, "OK chacha20 "+id.Recipient().String()+"\r\n")
+					return
+				}
+				sess, _, err := aead.ServerHandshake(conn, br, []byte(line), aead.ServerConfig{Static: kp, AnyKey: true})
+				if err != nil {
+					return
+				}
+				defer sess.Close()
+				mr, err := sess.Reader()
+				if err != nil {
+					return
+				}
+				if _, err := io.Copy(io.Discard, mr); err != nil {
+					return
+				}
+				respond(sess.Writer(false))
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// An authenticated SEND or CXSUM response succeeds only at its END after the
+// terminal OK: a stream that loses END, carries bytes after OK, or lacks OK
+// fails from Read, and from Close when the caller stopped reading early.
+func TestEncryptedStreamsRequireTerminalOKAndEnd(t *testing.T) {
+	const frame = "FX/1 5 offset=0 size=3 wsize=3 comp=none ts=1\n" + "abc" + "FXT/1 5 status=ok ts=1 next=0\n"
+	type ending int
+	const (
+		withEnd ending = iota
+		withoutEnd
+		trailingBytes
+	)
+	respond := func(body string, end ending) func(w *aead.MessageWriter) {
+		return func(w *aead.MessageWriter) {
+			_, _ = io.WriteString(w, body)
+			switch end {
+			case withEnd:
+				_ = w.End()
+			case withoutEnd:
+				_ = w.Flush()
+			case trailingBytes:
+				_, _ = io.WriteString(w, "X")
+				_ = w.End()
+			}
+		}
+	}
+	cases := []struct {
+		name    string
+		body    string
+		end     ending
+		wantErr bool
+	}{
+		{"complete", frame + "OK\r\n", withEnd, false},
+		{"OK without END", frame + "OK\r\n", withoutEnd, true},
+		{"bytes after OK", frame + "OK\r\n", trailingBytes, true},
+		{"END without OK", frame, withEnd, true},
+		{"partial status line", frame + "O", withEnd, true},
+		{"ERR then OK", frame + "ERR INTERNAL boom\r\nOK\r\n", withEnd, true},
+	}
+	ctx := context.Background()
+	open := map[string]func(c *Client) (io.ReadCloser, error){
+		"SEND": func(c *Client) (io.ReadCloser, error) {
+			body, err := c.fetchFileBatchTCP(ctx, "tx1", []FetchFileTarget{{FileID: 5, FullPath: "/tmp/a"}})
+			if err != nil {
+				return nil, err
+			}
+			stream, _, err := c.newFileStream(body, "", 3)
+			if err != nil {
+				_ = body.Close()
+			}
+			return stream, err
+		},
+		"CXSUM": func(c *Client) (io.ReadCloser, error) {
+			resp, err := c.GetChecksum(ctx, GetChecksumRequest{TransferID: "tx1", Targets: []ChecksumTarget{{FileID: 5, FullPath: "/tmp/a", Size: 3}}})
+			return resp.Reader, err
+		},
+	}
+	for verb, openStream := range open {
+		for _, tc := range cases {
+			// The CXSUM stream passes its status line through to the caller,
+			// so "END without OK" is a caller-visible short response there.
+			if verb == "CXSUM" && (tc.name == "END without OK" || tc.name == "ERR then OK") {
+				continue
+			}
+			for _, readAll := range []bool{true, false} {
+				name := fmt.Sprintf("%s/%s/readAll=%v", verb, tc.name, readAll)
+				t.Run(name, func(t *testing.T) {
+					c := NewClient(noiseScriptServer(t, respond(tc.body, tc.end)), WithEncryptMode("chacha20"))
+					defer c.Close()
+					stream, err := openStream(c)
+					if err != nil {
+						t.Fatalf("open: %v", err)
+					}
+					var readErr error
+					if readAll {
+						_, readErr = io.ReadAll(stream)
+					} else {
+						_, readErr = io.ReadFull(stream, make([]byte, 3))
+					}
+					closeErr := stream.Close()
+					if readAll && (readErr != nil) != tc.wantErr {
+						t.Fatalf("Read err = %v, want error %v", readErr, tc.wantErr)
+					}
+					if !readAll && readErr != nil {
+						t.Fatalf("first bytes: %v", readErr)
+					}
+					// SEND's Close drains to the terminal status; CXSUM's
+					// releases a stream abandoned before its status line
+					// without claiming success.
+					// SEND's Close reports any failure, whether or not the
+					// caller already saw it from Read.
+					if verb == "SEND" && (closeErr != nil) != tc.wantErr {
+						t.Fatalf("Close err = %v, want error %v", closeErr, tc.wantErr)
+					}
+					// A failed response never returns its connection to a pool.
+					if tc.wantErr && c.MetricSnapshot().ConnectionReuseCount != 0 {
+						t.Fatal("a failed response's connection was recycled")
+					}
+				})
+			}
+		}
+	}
+
+	// A malformed trailer fails the CXSUM Read and is reported again by
+	// Close.
+	bad := "FX/1 5 offset=0 size=3 wsize=3 comp=none ts=1\n" + "abc" + "FXT/1 6 status=ok ts=1 next=0\n" + "OK\r\n"
+	c := NewClient(noiseScriptServer(t, respond(bad, withEnd)), WithEncryptMode("chacha20"))
+	defer c.Close()
+	stream, err := open["CXSUM"](c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(stream); err == nil {
+		t.Fatal("malformed trailer read cleanly")
+	}
+	if err := stream.Close(); err == nil {
+		t.Fatal("Close dropped the malformed-trailer error")
+	}
+}
+
+// A control command returns promptly when its context is cancelled while
+// the server withholds the response's END, and the connection is not
+// recycled.
+func TestControlCommandHonorsCancellation(t *testing.T) {
+	stall := make(chan struct{})
+	t.Cleanup(func() { close(stall) })
+	addr := noiseScriptServer(t, func(w *aead.MessageWriter) {
+		_, _ = io.WriteString(w, `OK {"transfer_id":"tx1"}`+"\r\n")
+		_ = w.Flush()
+		<-stall
+	})
+	c := NewClient(addr, WithEncryptMode("chacha20"))
+	defer c.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	start := time.Now()
+	_, err := c.GetStatus(ctx, GetStatusRequest{TransferID: "tx1"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetStatus err = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("GetStatus returned %v after cancellation", elapsed)
+	}
+	if got := c.MetricSnapshot().ConnectionReuseCount; got != 0 {
+		t.Fatalf("cancelled connection was recycled %d times", got)
+	}
+}
+
+// Cancelling a SEND's context ends a read blocked waiting for the
+// authenticated END after the terminal OK.
+func TestSENDHonorsCancellation(t *testing.T) {
+	const frame = "FX/1 5 offset=0 size=3 wsize=3 comp=none ts=1\n" + "abc" + "FXT/1 5 status=ok ts=1 next=0\n"
+	stall := make(chan struct{})
+	t.Cleanup(func() { close(stall) })
+	addr := noiseScriptServer(t, func(w *aead.MessageWriter) {
+		_, _ = io.WriteString(w, frame+"OK\r\n")
+		_ = w.Flush()
+		<-stall
+	})
+	c := NewClient(addr, WithEncryptMode("chacha20"))
+	defer c.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	body, err := c.fetchFileBatchTCP(ctx, "tx1", []FetchFileTarget{{FileID: 5, FullPath: "/tmp/a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, _, err := c.newFileStream(body, "", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.AfterFunc(100*time.Millisecond, cancel)
+	start := time.Now()
+	if _, err := io.ReadAll(stream); err == nil {
+		t.Fatal("stream read completed without END")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("read returned %v after cancellation", elapsed)
+	}
+	_ = stream.Close()
+	if got := c.MetricSnapshot().ConnectionReuseCount; got != 0 {
+		t.Fatalf("cancelled connection was recycled %d times", got)
+	}
+}
+
+// A BUSY retry that cannot get its handshake slot back gives up at the
+// authentication deadline, even when the caller's context has none.
+func TestRetryBusyReacquireHonorsDeadline(t *testing.T) {
+	slots := make(chan struct{}, 1)
+	slot := &handshakeSlot{slots: slots}
+	if err := slot.reacquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Another handshake takes the slot as soon as the retry releases it.
+	taken := make(chan struct{})
+	go func() {
+		slots <- struct{}{}
+		close(taken)
+	}()
+	t.Cleanup(func() { <-taken; <-slots })
+	start := time.Now()
+	err := retryBusy(context.Background(), start.Add(300*time.Millisecond), slot, func() error {
+		return aead.ErrServerBusy
+	})
+	if err == nil {
+		t.Fatal("retryBusy succeeded without a slot")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("retryBusy returned after %v, past its deadline", elapsed)
+	}
 }

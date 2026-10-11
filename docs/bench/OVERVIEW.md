@@ -461,9 +461,12 @@ server and `tx.Client` in one process over loopback TCP, with no filesystem:
   `GOMAXPROCS`) on a fixed 10 Gb/s link, so the plan does not vary between
   runs.
 - **Encryption:** `THROUGHPUT_ENCRYPT` (default `none,aes`; `chacha20` is
-  also accepted) lists the session encryptions to measure. An encrypted mode
+  also accepted) lists the session encryptions to measure. Without keep-alive,
+  every command dials and authenticates afresh; append `+ka` to a mode (for
+  example `aes+ka`) to grant keep-alive so pooled connections reuse their
+  sessions. An encrypted mode
   sets up keys as `tx send tree` and `tx recv copy --encrypt` do: a server
-  identity, and an ephemeral client identity sent in `AUTH`.
+  identity, and a client identity that authenticates in the Noise handshake.
 
 The result is a set of grids per encryption mode: a row per CPU count N and
 a column per file size. `THROUGHPUT_CPUS` takes a comma-separated list of N;

@@ -316,6 +316,13 @@ func TestParsePassThrough(t *testing.T) {
 	}
 }
 
+func TestPassThroughFetchArgsCarryCredentialFiles(t *testing.T) {
+	pt := parsePassThrough([]string{"--auth-token-file", "/a.token", "--require-server-recipient-file", "/server.age", "--compress", "zstd"})
+	if got := pt.fetchArgs(); !slices.Equal(got, []string{"--auth-token-file=/a.token", "--require-server-recipient-file=/server.age"}) {
+		t.Fatalf("fetchArgs = %v", got)
+	}
+}
+
 func TestParseServerArg(t *testing.T) {
 	cases := map[string][2]string{
 		"10.0.4.17:3453":           {"10.0.4.17:3453", "/"},

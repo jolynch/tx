@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -101,107 +100,53 @@ func newFTCPTestServerWithIdentity(t *testing.T, serverID *age.X25519Identity, h
 
 func serveFTCPConn(conn net.Conn, serverID *age.X25519Identity, handler func(intftcp.Request, io.Writer) error) {
 	br := bufio.NewReader(conn)
-	firstLine, err := readFTCPLine(br)
+	rawFirst, err := br.ReadString('\n')
 	if err != nil {
 		return
 	}
-	req, err := intftcp.ParseRequest([]byte(firstLine))
-	if err != nil {
-		_, _ = io.WriteString(conn, "ERR BAD_REQUEST "+err.Error()+"\r\n")
-		return
-	}
+	firstLine := strings.TrimRight(rawFirst, "\r\n")
 
 	out := io.Writer(conn)
 	closeOut := func() error { return nil }
-	cmdReq := req
-	if req.Verb == intftcp.VerbAUTH {
-		if len(req.Params) == 0 {
-			_, _ = io.WriteString(conn, "ERR BAD_AUTH missing protocol\r\n")
+	if strings.HasPrefix(firstLine, "AUTH ") {
+		if serverID == nil {
+			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED no server identity\r\n")
 			return
 		}
-		protocol := req.Params[0]["protocol"]
-
-		if protocol == "key" {
-			// Key exchange: return recommended cipher and server public key.
-			if serverID == nil {
-				_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED no server identity\r\n")
-				return
-			}
+		if firstLine == "AUTH key "+aead.PrefaceVersion {
 			_, _ = io.WriteString(conn, "OK "+string(aead.RecommendedCipher())+" "+serverID.Recipient().String()+"\r\n")
 			return
 		}
-
-		// aes/chacha20: decode and decrypt the blob to get the client's public key.
-		blobRaw := req.Params[0]["blob"]
-		if blobRaw == "" || serverID == nil {
-			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
+		// One authenticated command per connection, from any client key.
+		kp, kpErr := aead.KeyPairFromIdentity(serverID)
+		if kpErr != nil {
 			return
 		}
-		opts := aead.Options{}
-		switch protocol {
-		case "aes":
-			opts.Algorithm = aead.AlgorithmAES
-		case "chacha20":
-			opts.Algorithm = aead.AlgorithmChaCha20
-		default:
-			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
+		sess, _, hsErr := aead.ServerHandshake(conn, br, []byte(rawFirst), aead.ServerConfig{Static: kp, AnyKey: true})
+		if hsErr != nil {
+			var diag *aead.DiagnosticError
+			if errors.As(hsErr, &diag) {
+				_, _ = io.WriteString(conn, diag.Line+"\r\n")
+			}
 			return
 		}
-		blobBytes, b64Err := base64.StdEncoding.DecodeString(strings.TrimSpace(blobRaw))
-		if b64Err != nil {
-			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED bad base64\r\n")
+		defer sess.Close()
+		mr, mrErr := sess.Reader()
+		if mrErr != nil {
 			return
 		}
-		dec, decErr := aead.DecryptWithOptions(bytes.NewReader(blobBytes), serverID, opts)
-		if decErr != nil {
-			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
+		br = bufio.NewReader(mr)
+		w := sess.Writer(false)
+		out, closeOut = w, w.End
+		if firstLine, err = readFTCPLine(br); err != nil {
 			return
 		}
-		plain, readErr := io.ReadAll(dec)
-		if readErr != nil {
-			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
-			return
-		}
-		fields := strings.Fields(string(plain))
-		if len(fields) == 0 {
-			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
-			return
-		}
-		recipient, parseErr := age.ParseX25519Recipient(fields[0])
-		if parseErr != nil {
-			_, _ = io.WriteString(conn, "ERR NOT_AUTHORIZED\r\n")
-			return
-		}
-
-		// Encrypt responses to client.
-		ew, encErr := aead.Encrypt(conn, recipient, opts)
-		if encErr != nil {
-			return
-		}
-		out = ew
-		closeOut = ew.Close
-
-		// Decrypt the command from client.
-		cmdReader, cmdDecErr := aead.DecryptWithOptions(br, serverID, opts)
-		if cmdDecErr != nil {
-			_, _ = io.WriteString(out, "ERR NOT_AUTHORIZED request decryption failed\r\n")
-			_ = closeOut()
-			return
-		}
-		br = bufio.NewReader(cmdReader)
-
-		cmdLine, cmdErr := readFTCPLine(br)
-		if cmdErr != nil {
-			_, _ = io.WriteString(out, "ERR BAD_REQUEST missing command\r\n")
-			_ = closeOut()
-			return
-		}
-		cmdReq, err = intftcp.ParseRequest([]byte(cmdLine))
-		if err != nil {
-			_, _ = io.WriteString(out, "ERR BAD_REQUEST "+err.Error()+"\r\n")
-			_ = closeOut()
-			return
-		}
+	}
+	cmdReq, err := intftcp.ParseRequest([]byte(firstLine))
+	if err != nil {
+		_, _ = io.WriteString(out, "ERR BAD_REQUEST "+err.Error()+"\r\n")
+		_ = closeOut()
+		return
 	}
 	if cmdReq.Verb == intftcp.VerbPROBE && len(cmdReq.Params) > 0 {
 		n, convErr := strconv.ParseInt(strings.TrimSpace(cmdReq.Params[0]["probe-bytes"]), 10, 64)
@@ -4339,5 +4284,84 @@ func TestRootErrorSkipsCancellations(t *testing.T) {
 	}
 	if got := rootError([]error{opCanceled}); got != opCanceled {
 		t.Fatalf("all-canceled rootError = %v", got)
+	}
+}
+
+func TestClientAuthFlagPrecedence(t *testing.T) {
+	tokenA := strings.Repeat("a", 40)
+	tokenB := strings.Repeat("b", 40)
+	envToken := strings.Repeat("e", 40)
+	dir := t.TempDir()
+	fileA := filepath.Join(dir, "a.token")
+	if err := os.WriteFile(fileA, []byte(tokenA+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badFile := filepath.Join(dir, "bad.token")
+	if err := os.WriteFile(badFile, []byte(tokenA+"\n"+tokenB+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keys := t.TempDir()
+	server, _ := age.GenerateX25519Identity()
+	serverFile := filepath.Join(dir, "server.age")
+	if err := os.WriteFile(serverFile, []byte(server.Recipient().String()+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := func(v string, set bool) func(string) (string, bool) {
+		return func(string) (string, bool) { return v, set }
+	}
+	for _, tc := range []struct {
+		name    string
+		flags   clientAuthFlags
+		env     func(string) (string, bool)
+		tokens  []string
+		encMode string
+		age     bool
+		server  string // the required server recipient
+		wantErr bool
+	}{
+		{name: "nothing is plaintext", env: env("", false), encMode: ""},
+		{name: "encrypt alone uses an in-memory key", flags: clientAuthFlags{encrypt: "aes"}, env: env("", false), encMode: "aes"},
+		{name: "tokens keep their order", flags: clientAuthFlags{tokens: []string{tokenB, tokenA}}, env: env(envToken, true), tokens: []string{tokenB, tokenA}, encMode: "auto"},
+		{name: "token file", flags: clientAuthFlags{tokenFiles: []string{fileA}}, env: env("", false), tokens: []string{tokenA}, encMode: "auto"},
+		{name: "environment token", env: env(envToken, true), tokens: []string{envToken}, encMode: "auto"},
+		{name: "--keys suppresses the environment", flags: clientAuthFlags{keysDir: keys}, env: env(envToken, true), age: true, encMode: "auto"},
+		{name: "--encrypt none suppresses the environment", flags: clientAuthFlags{encrypt: "none"}, env: env(envToken, true), encMode: ""},
+		{name: "token plus keys", flags: clientAuthFlags{tokens: []string{tokenA}, keysDir: keys}, env: env("", false), tokens: []string{tokenA}, age: true, encMode: "auto"},
+		{name: "server recipient", flags: clientAuthFlags{encrypt: "auto", serverRecipient: server.Recipient().String()}, env: env("", false), encMode: "auto", server: server.Recipient().String()},
+		{name: "server recipient file", flags: clientAuthFlags{encrypt: "auto", serverRecipientFile: serverFile}, env: env("", false), encMode: "auto", server: server.Recipient().String()},
+		{name: "token with server recipient", flags: clientAuthFlags{tokens: []string{tokenA}, serverRecipient: server.Recipient().String()}, env: env("", false), tokens: []string{tokenA}, encMode: "auto", server: server.Recipient().String()},
+		{name: "token and token file", flags: clientAuthFlags{tokens: []string{tokenA}, tokenFiles: []string{fileA}}, env: env("", false), wantErr: true},
+		{name: "none with a token", flags: clientAuthFlags{encrypt: "none", tokens: []string{tokenA}}, env: env("", false), wantErr: true},
+		{name: "empty environment", env: env("", true), wantErr: true},
+		{name: "short token", flags: clientAuthFlags{tokens: []string{"short"}}, env: env("", false), wantErr: true},
+		{name: "recipient as token", flags: clientAuthFlags{tokens: []string{server.Recipient().String()}}, env: env("", false), wantErr: true},
+		{name: "two-line token file", flags: clientAuthFlags{tokenFiles: []string{badFile}}, env: env("", false), wantErr: true},
+		{name: "server recipient implies encryption", flags: clientAuthFlags{serverRecipient: server.Recipient().String()}, env: env("", false), encMode: "auto", server: server.Recipient().String()},
+		{name: "server recipient with encrypt none", flags: clientAuthFlags{encrypt: "none", serverRecipient: server.Recipient().String()}, env: env("", false), wantErr: true},
+		{name: "server recipient and file", flags: clientAuthFlags{encrypt: "auto", serverRecipient: server.Recipient().String(), serverRecipientFile: serverFile}, env: env("", false), wantErr: true},
+		{name: "server private key as recipient", flags: clientAuthFlags{encrypt: "auto", serverRecipient: server.String()}, env: env("", false), wantErr: true},
+		{name: "bad encrypt", flags: clientAuthFlags{encrypt: "des"}, env: env("", false), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.flags.resolve(tc.env)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("resolve accepted %+v", tc.flags)
+				}
+				for _, secret := range []string{tokenA, tokenB, envToken} {
+					if strings.Contains(err.Error(), secret) {
+						t.Fatalf("error echoes a token: %v", err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if got.encMode != tc.encMode || strings.Join(got.tokens, ",") != strings.Join(tc.tokens, ",") || (got.ageIdentity != "") != tc.age ||
+				got.serverRecipient != tc.server {
+				t.Fatalf("resolve = %+v", got)
+			}
+		})
 	}
 }

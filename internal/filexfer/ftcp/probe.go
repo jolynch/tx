@@ -98,9 +98,13 @@ func handlePROBEWithInput(_ context.Context, req Request, in io.Reader, out io.W
 	gentleBWPct = limit.NormalizeGentleBWPct(gentleBWPct)
 	sts0 := time.Now().UnixMilli()
 	if parsed.ProbeBytes > 0 {
-		if err := drainProbePayload(in, parsed.ProbeBytes, &sts0); err != nil {
+		if err := drainProbePayload(requestBodySource(in), parsed.ProbeBytes, &sts0); err != nil {
 			return protocolErr{code: "BAD_REQUEST", message: "invalid PROBE payload"}
 		}
+	}
+	// The request must end with its payload, before the limiter changes.
+	if err := completeRequest(in); err != nil {
+		return err
 	}
 	if deps != nil && parsed.TransferID != "" && parsed.ObservedLinkMbps > 0 {
 		if update, ok := deps.ReportTransferObservedLink(parsed.TransferID, parsed.ObservedLinkMbps, gentleBWPct, gentleBurstBytes, 0.2); ok && update.NewRateBps != update.OldRateBps {

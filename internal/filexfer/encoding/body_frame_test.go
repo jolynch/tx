@@ -551,3 +551,33 @@ func TestFrameCeilingClampsIntoRange(t *testing.T) {
 	t.Logf("ceiling=%d (rmem_max=%d, floor=%d, cap=%d); a full chunk encodes to at most %d",
 		got, utils.MaxSocketReadBufferBytes(), minFrameCeilingBytes, maxFrameCeilingBytes, maxEncoded)
 }
+
+// flushCounter records Flush calls and the bytes written before each.
+type flushCounter struct {
+	bytes.Buffer
+	flushedAt []int
+}
+
+func (f *flushCounter) Flush() error {
+	f.flushedAt = append(f.flushedAt, f.Len())
+	return nil
+}
+
+func TestFramedBodyWriterFlushesCompletedFrames(t *testing.T) {
+	var dst flushCounter
+	w := NewFramedBodyWriter(&dst, "none", 1024, 0)
+	if _, err := w.Write(bytes.Repeat([]byte("x"), 2500)); err != nil {
+		t.Fatal(err)
+	}
+	// Two full frames are complete progress points; the rest is pending.
+	if len(dst.flushedAt) != 2 {
+		t.Fatalf("flushes after two frames = %d, want 2", len(dst.flushedAt))
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The terminal frame is not flushed: the response ends right after it.
+	if len(dst.flushedAt) != 2 {
+		t.Fatalf("flushes after Close = %d, want 2", len(dst.flushedAt))
+	}
+}

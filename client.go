@@ -22,6 +22,7 @@ import (
 	"unsafe"
 
 	"filippo.io/age"
+	"github.com/jolynch/tx/internal/aead"
 	"github.com/jolynch/tx/internal/bufpool"
 	"github.com/jolynch/tx/internal/events"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
@@ -63,6 +64,9 @@ func (f clientOptionFunc) apply(c *Client) {
 	f(c)
 }
 
+// WithContextDialer supplies the client's connections. The dialer must
+// return promptly once its context is cancelled: Close waits for the
+// connection pools' background dials to finish.
 func WithContextDialer(dialer func(context.Context, string) (net.Conn, error)) ClientOption {
 	return clientOptionFunc(func(c *Client) {
 		c.contextDialer = dialer
@@ -212,16 +216,21 @@ func WithClientMetrics(m *ClientMetricCounters) ClientOption {
 	})
 }
 
+// WithClientAuthTokens sets the token candidates, tried in order on the first
+// authentication; later dials start with the one that succeeded. Tokens are
+// kept byte for byte and validated before the first dial.
 func WithClientAuthTokens(tokens ...string) ClientOption {
 	return clientOptionFunc(func(c *Client) {
-		var out []string
-		for _, t := range tokens {
-			t = strings.TrimSpace(t)
-			if t != "" {
-				out = append(out, t)
-			}
-		}
-		c.ClientAuthTokens = out
+		c.ClientAuthTokens = append([]string(nil), tokens...)
+	})
+}
+
+// WithRequiredServerRecipient requires the server to prove the private key
+// of this age recipient (its public key): the client refuses a server whose
+// discovered key differs. It requires authenticated encryption.
+func WithRequiredServerRecipient(recipient string) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.RequiredServerRecipient = strings.TrimSpace(recipient)
 	})
 }
 
@@ -254,9 +263,12 @@ type Client struct {
 	Comp                    string // adapt|none|lz4|zstd; empty means server default (adapt)
 	ClientAgePublicKey      string
 	ClientAgeIdentity       string
-	EncryptMode             string   // "auto", "aes", or "chacha20" — selects post-AUTH stream cipher
-	ClientAuthTokens        []string // tokens presented in the encrypted AUTH blob
-	DisableKeepAlive        bool     // opt out of PROBE keep-alive connection reuse
+	EncryptMode             string   // "none", "auto", "aes", or "chacha20"; a credential defaults to auto
+	ClientAuthTokens        []string // token candidates, tried in order; each handshake proves one
+	// RequiredServerRecipient, when set, is the age recipient discovery
+	// must return and the server must prove.
+	RequiredServerRecipient string
+	DisableKeepAlive        bool // opt out of PROBE keep-alive connection reuse
 
 	// Context dialer allows clients to setup custom connections
 	// For example injecting TLS
@@ -265,6 +277,17 @@ type Client struct {
 	tcpPoolMu   sync.Mutex
 	dataPool    *tcpConnPool
 	controlPool *tcpConnPool
+	poolsClosed bool // Close ran: no pool starts again
+
+	// authMu guards authState, the transport configuration resolved once
+	// (including server key discovery) and shared by every pool, and
+	// localKey, the in-memory key pair generated when no identity is set.
+	authMu    sync.Mutex
+	authState *tcpAuthState
+	localKey  *aead.KeyPair
+	// hsSlots bounds this client's handshakes in flight.
+	hsOnce  sync.Once
+	hsSlots chan struct{}
 
 	// bufferPool caches reusable frame-read buffers keyed by bucketed size.
 
@@ -747,7 +770,8 @@ func NewClient(fileAddr string, opts ...ClientOption) *Client {
 }
 
 // Close releases any warmed TCP pool state owned by the client. It is safe to
-// call multiple times.
+// call multiple times. The client still works afterwards, dialing a
+// connection per command, but never starts pools again, so none outlives it.
 func (c *Client) Close() error {
 	if c == nil {
 		return nil
@@ -755,6 +779,7 @@ func (c *Client) Close() error {
 	c.tcpPoolMu.Lock()
 	data, control := c.dataPool, c.controlPool
 	c.dataPool, c.controlPool = nil, nil
+	c.poolsClosed = true
 	c.tcpPoolMu.Unlock()
 	data.stop()
 	control.stop()
@@ -1142,8 +1167,7 @@ func (c *Client) collectEntryMetadataGroup(
 	if _, ok := parseOKStatusLine(statusLine); !ok {
 		return fmt.Errorf("unexpected metadata terminal status: %s", strings.TrimSpace(statusLine))
 	}
-	markStreamReusable(stream)
-	return nil
+	return finishStreamResponse(stream, br)
 
 }
 
@@ -1630,7 +1654,9 @@ func (c *Client) downloadSubBatch(
 
 	statusLine, err := readTCPLine(br, maxTCPLineBytes)
 	if err != nil {
-		if !errors.Is(err, io.EOF) {
+		// An authenticated END without the terminal OK is an error; a
+		// plain connection that closed early is not reused.
+		if !errors.Is(err, io.EOF) || streamSession(stream) != nil {
 			return nil, nil, nil, fmt.Errorf("read batch terminal status: %w", err)
 		}
 	} else {
@@ -1640,7 +1666,9 @@ func (c *Client) downloadSubBatch(
 		if _, ok := parseOKStatusLine(statusLine); !ok {
 			return nil, nil, nil, fmt.Errorf("unexpected batch terminal response: %s", statusLine)
 		}
-		markStreamReusable(stream)
+		if err := finishStreamResponse(stream, br); err != nil {
+			return nil, nil, nil, err
+		}
 	}
 
 	return results, pendingAcks, ackProgresses, nil
@@ -3286,10 +3314,12 @@ type fileStream struct {
 	expectNextFrame bool
 
 	pendingErr error
+	err        error // the first failure; sticky
 	finished   bool
 	// sawTerminalOK is set only when the stream ended with a parsed terminal
-	// OK status line. A bare EOF (server closed without terminal status) also
-	// finishes the stream but must not recycle the connection.
+	// OK status line and, on an authenticated connection, its verified END.
+	// A bare EOF (server closed without terminal status) also finishes the
+	// stream but must not recycle the connection.
 	sawTerminalOK bool
 	closed        bool
 	pending       *FileFrameMeta
@@ -3462,7 +3492,26 @@ func (c *Client) newFileStreamTraced(respBody io.ReadCloser, ageIdentity string,
 	return stream, stream.meta, nil
 }
 
+// errStreamComplete is openNextFrame's report of a response that ended
+// cleanly: a verified terminal OK, or a plain connection's clean close. Only
+// it ends a stream with io.EOF; a wrapped or premature EOF is a failure.
+var errStreamComplete = errors.New("file stream complete")
+
+// Read returns frame payload, then io.EOF once the response ended cleanly.
+// The first failure is sticky: later reads return it and parse nothing more,
+// so a response cannot recover from an error, and Close reports it.
 func (s *fileStream) Read(p []byte) (int, error) {
+	if s.err != nil {
+		return 0, s.err
+	}
+	n, err := s.read(p)
+	if err != nil && err != io.EOF {
+		s.err = err
+	}
+	return n, err
+}
+
+func (s *fileStream) read(p []byte) (int, error) {
 	if s.pendingErr != nil {
 		err := s.pendingErr
 		s.pendingErr = nil
@@ -3475,7 +3524,7 @@ func (s *fileStream) Read(p []byte) (int, error) {
 	for {
 		if s.logical == nil {
 			if err := s.openNextFrame(); err != nil {
-				if errors.Is(err, io.EOF) {
+				if err == errStreamComplete {
 					s.finished = true
 					return 0, io.EOF
 				}
@@ -3511,13 +3560,12 @@ func (s *fileStream) Close() error {
 	}
 	s.closed = true
 
+	// Draining reaches the terminal OK and END, or the error that replaces
+	// them; a caller that stopped before EOF still learns of a response
+	// that did not end cleanly. Reaching OK marks the connection reusable.
+	var drainErr error
 	if !s.finished {
-		_, _ = io.Copy(io.Discard, s)
-	}
-	if s.sawTerminalOK {
-		// Stream consumed through the terminal OK line — the underlying
-		// connection is at a command boundary and safe to recycle.
-		markStreamReusable(s.respBody)
+		_, drainErr = io.Copy(io.Discard, s)
 	}
 	logicalErr := error(nil)
 	if s.logical != nil {
@@ -3530,6 +3578,9 @@ func (s *fileStream) Close() error {
 	bodyErr := s.respBody.Close()
 	if logicalErr != nil {
 		return logicalErr
+	}
+	if drainErr != nil {
+		return drainErr
 	}
 	if bodyErr != nil {
 		return bodyErr
@@ -3552,7 +3603,15 @@ func (s *fileStream) openNextFrame() error {
 				if s.expectNextFrame {
 					return errors.New("missing next frame after trailer next offset")
 				}
-				return io.EOF
+				if streamSession(s.respBody) != nil {
+					return errMissingOK
+				}
+				return errStreamComplete
+			}
+			if errors.Is(err, io.EOF) {
+				// A line cut short by the end of the response: never a
+				// clean completion.
+				err = io.ErrUnexpectedEOF
 			}
 			return fmt.Errorf("read frame header: %w", err)
 		}
@@ -3562,8 +3621,13 @@ func (s *fileStream) openNextFrame() error {
 				return err
 			}
 			if _, ok := parseOKStatusLine(trimmedHeader); ok {
+				// An authenticated response succeeds only at its END, so
+				// the stream reports EOF only once END is verified.
+				if err := finishStreamResponse(s.respBody, s.br); err != nil {
+					return err
+				}
 				s.sawTerminalOK = true
-				return io.EOF
+				return errStreamComplete
 			}
 			return errors.New("unexpected terminal status line")
 		}

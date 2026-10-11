@@ -154,14 +154,37 @@ func handleCXSUMWithInput(_ context.Context, req Request, in io.Reader, out io.W
 
 	// Buffer the small frames so each costs no write syscall. Flush before
 	// any return, so an ERR line written after an error follows the frames.
-	w := bufio.NewWriterSize(out, 64<<10)
+	// A transport that batches writes already buffers, so it gets no second
+	// buffer; it is flushed at most every cxsumProgressInterval, at a frame
+	// boundary, so checksums arrive as they finish without one record per
+	// frame.
+	flush := transportFlusher(out)
+	w := out
+	var bw *bufio.Writer
+	if flush == nil {
+		bw = bufio.NewWriterSize(out, 64<<10)
+		w = bw
+	}
+	flushBuffer := func() error {
+		if bw == nil {
+			return nil
+		}
+		return bw.Flush()
+	}
+	lastFlush := time.Now()
 	for _, record := range records {
 		if err := streamChecksumItem(w, deps, txferID, record.item(), buf); err != nil {
-			_ = w.Flush()
+			_ = flushBuffer()
 			return err
 		}
+		if flush != nil && time.Since(lastFlush) >= cxsumProgressInterval {
+			if err := flush(); err != nil {
+				return err
+			}
+			lastFlush = time.Now()
+		}
 	}
-	return w.Flush()
+	return flushBuffer()
 }
 
 func streamChecksumItem(out io.Writer, deps Deps, txferID string, item cxsumItem, buf []byte) error {

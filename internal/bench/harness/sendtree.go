@@ -194,9 +194,10 @@ func runSendTree(ctx context.Context, cfg sendTreeConfig) error {
 	}
 
 	var warnings []string
-	userTokens := pt.values("require-auth-token")
+	userAllowlist := pt.values("require-auth-token", "require-auth-token-file",
+		"require-client-recipient", "require-client-recipient-file")
 	s.auth = cfg.flags.auth == "on" || (cfg.flags.auth == "auto" && s.ds.Bench.In != nil)
-	if len(userTokens) > 0 {
+	if len(userAllowlist) > 0 {
 		s.auth = false // the user manages auth; their token is not echoed
 	}
 	if s.auth {
@@ -205,7 +206,7 @@ func runSendTree(ctx context.Context, cfg sendTreeConfig) error {
 		}
 	}
 	host, _, _ := net.SplitHostPort(cfg.flags.listen)
-	if !s.auth && len(userTokens) == 0 && !isLoopback(host) {
+	if !s.auth && len(userAllowlist) == 0 && !isLoopback(host) {
 		warnings = append(warnings, fmt.Sprintf("auth is off and %s listens on %s: %s is readable by anyone who can reach the port",
 			"tx send tree", cfg.flags.listen, s.chroot))
 	}

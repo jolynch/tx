@@ -17,6 +17,7 @@ var buckets = [...]int{
 	4 * kiB,
 	16 * kiB,
 	64 * kiB,
+	128 * kiB,
 	256 * kiB,
 	1 * miB,
 	2 * miB,
@@ -46,14 +47,54 @@ func BucketSize(n int64) int {
 	return MaxBucket
 }
 
+// poolFor returns the pool of size-byte buffers. It holds *[]byte, so Put
+// stores a pointer and allocates nothing.
 func poolFor(size int) *sync.Pool {
 	if existing, ok := pools.Load(size); ok {
 		return existing.(*sync.Pool)
 	}
 	sz := size
-	created := &sync.Pool{New: func() any { return make([]byte, sz) }}
+	created := &sync.Pool{New: func() any { b := make([]byte, sz); return &b }}
 	actual, _ := pools.LoadOrStore(size, created)
 	return actual.(*sync.Pool)
+}
+
+// Get returns a pooled buffer holding at least size bytes; the slice it
+// points to has its bucket's full length. Contents are not cleared. Get and
+// Put allocate nothing once the pool is warm, so per-record and per-message
+// paths use them; Put the same pointer back after the last use.
+func Get(size int) (*[]byte, error) {
+	if size <= 0 {
+		return nil, errors.New("bufpool: size must be > 0")
+	}
+	if size > MaxBucket {
+		return nil, fmt.Errorf("bufpool: size %d exceeds the largest bucket %d", size, MaxBucket)
+	}
+	bucket := BucketSize(int64(size))
+	p, ok := poolFor(bucket).Get().(*[]byte)
+	if !ok {
+		return nil, errors.New("bufpool: pool returned an unexpected type")
+	}
+	if cap(*p) < bucket {
+		// Defend against a short buffer returned by the pool.
+		*p = make([]byte, bucket)
+	}
+	*p = (*p)[:bucket]
+	return p, nil
+}
+
+// Put returns a buffer from Get for reuse. Buffers not sized to a bucket, or
+// larger than maxPooledBytes, are dropped rather than pooled.
+func Put(p *[]byte) {
+	if p == nil {
+		return
+	}
+	c := cap(*p)
+	if c == 0 || c > maxPooledBytes || BucketSize(int64(c)) != c {
+		return
+	}
+	*p = (*p)[:c]
+	poolFor(c).Put(p)
 }
 
 // Acquire returns a size-byte buffer and a release function. Contents are not
@@ -70,24 +111,18 @@ func Acquire(size int) ([]byte, func(), error) {
 		// buffer allocate it themselves.
 		return nil, nil, fmt.Errorf("bufpool: size %d exceeds the largest bucket %d", size, MaxBucket)
 	}
-	bucket := BucketSize(int64(size))
-	pool := poolFor(bucket)
-	buf, ok := pool.Get().([]byte)
-	if !ok {
-		return nil, nil, errors.New("bufpool: pool returned an unexpected type")
+	p, err := Get(size)
+	if err != nil {
+		return nil, nil, err
 	}
-	if cap(buf) < size {
-		// Defend against a short buffer returned by the pool.
-		buf = make([]byte, bucket)
-	}
-	buf = buf[:size]
+	buf := (*p)[:size]
 	released := false
 	return buf, func() {
 		if released {
 			return
 		}
 		released = true
-		Release(buf[:cap(buf)])
+		Put(p)
 	}, nil
 }
 
@@ -101,5 +136,6 @@ func Release(buf []byte) {
 	if BucketSize(int64(c)) != c {
 		return
 	}
-	poolFor(c).Put(buf[:c])
+	b := buf[:c]
+	poolFor(c).Put(&b)
 }

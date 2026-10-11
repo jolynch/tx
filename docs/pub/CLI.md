@@ -37,39 +37,60 @@ Offer a tree (directory) via a FTCP server.
             leave it, symlinks inside it are followed
 
 Options:
-      --listen string              Listen address (host:port) (default "127.0.0.1:3453")
-  -b, --bwlimit string             Response rate limit for gentle transfers only; fast
-                                   transfers do not respect it (e.g. 100MiB, 1000mbps)
-                                   (default "")
-      --bwlimit-burst string       Rate limit burst size (default "1MiB")
-      --gentle-cpu string          Percent of server CPUs advertised for gentle
-                                   concurrency (default "25%")
-      --gentle-bw string           Percent of observed link bandwidth used for gentle
-                                   limiting (default "25%")
-  -k, --keys string                Age keys directory (default "/var/lib/tx/keys")
-      --require-auth               Require AUTH before commands (default false)
-      --require-auth-token string  Allowlisted auth token (opaque string >8 bytes,
-                                   repeatable); implies --require-auth (default "")
-      --target-io-depth int        Target IO depth per CPU advertised in PROBE (default
-                                   4)
-      --disable-zero-copy          Force buffered send path (for benchmarking) (default
-                                   false)
-      --exit-after string          Exit duration after transfer completes; 'never' to
-                                   run forever (e.g. 5s, 1m) (default "60s")
-      --idle-timeout string        Close kept-alive connections idle for this duration;
-                                   0 disables keep-alive (e.g. 10s, 1m) (default "60s")
-      --trace string               Write runtime/trace output to this file (default "")
-  -p, --progress-path string       Progress output target; repeatable, use - for stdout
-                                   (default "")
-  -f, --progress-format string     Progress format: json|int|events; 1 applies to all
-                                   targets, or one per target (default json)
-      --progress-interval string   Progress write interval (e.g. 500ms, 10s) (default
-                                   "1s")
-      --stats string               Write JSON-lines transfer and process statistics to
-                                   this file (default "")
-      --exit-with string           Shut down cleanly, as on SIGTERM, when this ends:
-                                   none|stdin. stdin exits when stdin (a pipe or socket)
-                                   closes, tying tx to whoever holds it (default "none")
+      --listen string                         Listen address (host:port) (default
+                                              "127.0.0.1:3453")
+  -b, --bwlimit string                        Response rate limit for gentle transfers
+                                              only; fast transfers do not respect it
+                                              (e.g. 100MiB, 1000mbps) (default "")
+      --bwlimit-burst string                  Rate limit burst size (default "1MiB")
+      --gentle-cpu string                     Percent of server CPUs advertised for
+                                              gentle concurrency (default "25%")
+      --gentle-bw string                      Percent of observed link bandwidth used
+                                              for gentle limiting (default "25%")
+  -k, --keys string                           Age keys directory (default
+                                              "/var/lib/tx/keys")
+      --require-auth                          Require AUTH before commands; with no
+                                              allowlist, accept any client that proves
+                                              its own age private key (default false)
+      --require-auth-token string             Allowlisted secret token; repeatable;
+                                              implies --require-auth. Prefer
+                                              --require-auth-token-file: values here are
+                                              visible in the process list (default "")
+      --require-auth-token-file string        File holding one allowlisted secret token;
+                                              repeatable; implies --require-auth
+                                              (default "")
+      --require-client-recipient string       Allowlisted client age recipient (public
+                                              key); the client must prove its private
+                                              key; repeatable; implies --require-auth
+                                              (default "")
+      --require-client-recipient-file string  File holding one allowlisted client age
+                                              recipient; repeatable; implies
+                                              --require-auth (default "")
+      --target-io-depth int                   Target IO depth per CPU advertised in
+                                              PROBE (default 4)
+      --disable-zero-copy                     Force buffered send path (for
+                                              benchmarking) (default false)
+      --exit-after string                     Exit duration after transfer completes;
+                                              'never' to run forever (e.g. 5s, 1m)
+                                              (default "60s")
+      --idle-timeout string                   Close kept-alive connections idle for this
+                                              duration; 0 disables keep-alive (e.g. 10s,
+                                              1m) (default "60s")
+      --trace string                          Write runtime/trace output to this file
+                                              (default "")
+  -p, --progress-path string                  Progress output target; repeatable, use -
+                                              for stdout (default "")
+  -f, --progress-format string                Progress format: json|int|events; 1
+                                              applies to all targets, or one per target
+                                              (default json)
+      --progress-interval string              Progress write interval (e.g. 500ms, 10s)
+                                              (default "1s")
+      --stats string                          Write JSON-lines transfer and process
+                                              statistics to this file (default "")
+      --exit-with string                      Shut down cleanly, as on SIGTERM, when
+                                              this ends: none|stdin. stdin exits when
+                                              stdin (a pipe or socket) closes, tying tx
+                                              to whoever holds it (default "none")
 ```
 
 ### `tx recv`
@@ -113,46 +134,69 @@ Behavior:
   - --verify=MODE post-copy verification: none|meta|N%data|full|<dur>
 
 Options:
-      --clean                     Remove LOCAL_DST first, then force a clean transfer
-                                  (default false)
-      --skip-fetch                Fetch and persist remote manifest state only; do not
-                                  start or sync files (default false)
-      --skip-write                Do not mutate LOCAL_DST; fetch file bodies to discard
-                                  instead of writing them (default false)
-      --skip-fsync                Acknowledge writes without fdatasync (default false)
-      --fsync-interval string     Background fsync batch threshold; 0=inline fdatasync,
-                                  -1=syncfs-only at exit (default "512MiB")
-      --verify string             Integrity checks after copy:
-                                  none|meta|N%data|full|<duration> (default meta)
-      --cache-load string         Mirror sender page cache after success:
-                                  none|full|<duration> (default none)
-      --mode string               Server read strategy: fast|gentle (default "fast")
-      --encrypt string            Encryption algorithm: none|auto|aes|chacha20 (default:
-                                  none)
-  -k, --keys string               Persistent age keys directory (default: ephemeral)
-  -t, --auth-token string         Client auth token presented in encrypted AUTH blob;
-                                  repeatable (default "")
-      --compress string           Compression algorithm: adapt|none|lz4|zstd (default:
-                                  adapt)
-      --concurrency int           Parallel download / verification workers and data
-                                  connections (0=adapt from server) (default 0)
-      --progress                  Show transfer progress every 2s (default true)
-  -v, --verbose                   Per-file progress output (default false)
-  -p, --progress-path string      Progress output target; repeatable, use - for stdout
-                                  (default "")
-  -f, --progress-format string    Progress format: json|int|events; 1 applies to all
-                                  targets, or one per target (default json)
-      --progress-interval string  Progress write interval (e.g. 500ms, 10s) (default
-                                  "1s")
-  -y, --yes                       Skip confirmation prompt on sync paths (default false)
-  -a, --ack-every string          Bytes between progress acks; e.g. 1B, 4KiB, 8MiB
-                                  (default "128.00 MiB")
-      --probe-size string         Probe payload size; e.g. 1B, 4KiB, 8MiB (default "1.00
-                                  MiB")
-      --deadline string           Transfer deadline (e.g. 60s, 5m) (default "")
-      --trace string              Write runtime/trace output to this file (default "")
-      --stats string              Write a JSON statistics object for this run to this
-                                  file at exit (default "")
+      --clean                                 Remove LOCAL_DST first, then force a clean
+                                              transfer (default false)
+      --skip-fetch                            Fetch and persist remote manifest state
+                                              only; do not start or sync files (default
+                                              false)
+      --skip-write                            Do not mutate LOCAL_DST; fetch file bodies
+                                              to discard instead of writing them
+                                              (default false)
+      --skip-fsync                            Acknowledge writes without fdatasync
+                                              (default false)
+      --fsync-interval string                 Background fsync batch threshold; 0=inline
+                                              fdatasync, -1=syncfs-only at exit (default
+                                              "512MiB")
+      --verify string                         Integrity checks after copy:
+                                              none|meta|N%data|full|<duration> (default
+                                              meta)
+      --cache-load string                     Mirror sender page cache after success:
+                                              none|full|<duration> (default none)
+      --mode string                           Server read strategy: fast|gentle (default
+                                              "fast")
+      --encrypt string                        Encryption: none|auto|aes|chacha20
+                                              (default: none, or auto with a credential)
+  -k, --keys string                           Age keys directory holding this client's
+                                              identity; selects age authentication
+                                              without a token (default "")
+  -t, --auth-token string                     Auth token candidate, tried in order;
+                                              repeatable. Prefer --auth-token-file:
+                                              values here are visible in the process
+                                              list (default "")
+      --auth-token-file string                File holding one auth token candidate,
+                                              tried in order; repeatable (default "")
+      --require-server-recipient string       Server age recipient (public key) the
+                                              server must prove it holds; refuses any
+                                              other server (default "")
+      --require-server-recipient-file string  File holding the server age recipient the
+                                              server must prove it holds (default "")
+      --compress string                       Compression algorithm: adapt|none|lz4|zstd
+                                              (default: adapt)
+      --concurrency int                       Parallel download / verification workers
+                                              and data connections (0=adapt from server)
+                                              (default 0)
+      --progress                              Show transfer progress every 2s (default
+                                              true)
+  -v, --verbose                               Per-file progress output (default false)
+  -p, --progress-path string                  Progress output target; repeatable, use -
+                                              for stdout (default "")
+  -f, --progress-format string                Progress format: json|int|events; 1
+                                              applies to all targets, or one per target
+                                              (default json)
+      --progress-interval string              Progress write interval (e.g. 500ms, 10s)
+                                              (default "1s")
+  -y, --yes                                   Skip confirmation prompt on sync paths
+                                              (default false)
+  -a, --ack-every string                      Bytes between progress acks; e.g. 1B,
+                                              4KiB, 8MiB (default "128.00 MiB")
+      --probe-size string                     Probe payload size; e.g. 1B, 4KiB, 8MiB
+                                              (default "1.00 MiB")
+      --deadline string                       Transfer deadline (e.g. 60s, 5m) (default
+                                              "")
+      --trace string                          Write runtime/trace output to this file
+                                              (default "")
+      --stats string                          Write a JSON statistics object for this
+                                              run to this file at exit (default "")
 ```
 
 #### `tx recv get`
@@ -168,36 +212,54 @@ via copy_file_range. LOCAL_DST defaults to the file's basename in the current
 directory.
 
 Options:
-      --encrypt string            Encryption algorithm: none|auto|aes|chacha20 (default:
-                                  none)
-  -k, --keys string               Persistent age keys directory (default: ephemeral)
-  -t, --auth-token string         Client auth token presented in encrypted AUTH blob;
-                                  repeatable (default "")
-      --compress string           Compression algorithm: adapt|none|lz4|zstd (default:
-                                  adapt)
-      --concurrency int           Parallel download workers and data connections (0=auto)
-                                  (default 0)
-      --skip-write                Do not write the file; fetch to discard instead
-                                  (default false)
-      --skip-fsync                Acknowledge writes without fdatasync (default false)
-      --fsync-interval string     Background fsync batch threshold; 0=inline fdatasync,
-                                  -1=syncfs-only at exit (default "512MiB")
-      --progress                  Show transfer progress every 2s (default true)
-  -v, --verbose                   Per-file progress output (default false)
-  -p, --progress-path string      Progress output target; repeatable, use - for stdout
-                                  (default "")
-  -f, --progress-format string    Progress format: json|int|events; 1 applies to all
-                                  targets, or one per target (default json)
-      --progress-interval string  Progress write interval (e.g. 500ms, 10s) (default
-                                  "1s")
-      --cache-load string         Load downloaded file into page cache after success:
-                                  none|full|<duration> (default none)
-  -a, --ack-every string          Bytes between progress acks; e.g. 1B, 4KiB, 8MiB
-                                  (default "128.00 MiB")
-      --deadline string           Transfer deadline (e.g. 60s, 5m) (default "")
-      --trace string              Write runtime/trace output to this file (default "")
-      --stats string              Write a JSON statistics object for this run to this
-                                  file at exit (default "")
+      --encrypt string                        Encryption: none|auto|aes|chacha20
+                                              (default: none, or auto with a credential)
+  -k, --keys string                           Age keys directory holding this client's
+                                              identity; selects age authentication
+                                              without a token (default "")
+  -t, --auth-token string                     Auth token candidate, tried in order;
+                                              repeatable. Prefer --auth-token-file:
+                                              values here are visible in the process
+                                              list (default "")
+      --auth-token-file string                File holding one auth token candidate,
+                                              tried in order; repeatable (default "")
+      --require-server-recipient string       Server age recipient (public key) the
+                                              server must prove it holds; refuses any
+                                              other server (default "")
+      --require-server-recipient-file string  File holding the server age recipient the
+                                              server must prove it holds (default "")
+      --compress string                       Compression algorithm: adapt|none|lz4|zstd
+                                              (default: adapt)
+      --concurrency int                       Parallel download workers and data
+                                              connections (0=auto) (default 0)
+      --skip-write                            Do not write the file; fetch to discard
+                                              instead (default false)
+      --skip-fsync                            Acknowledge writes without fdatasync
+                                              (default false)
+      --fsync-interval string                 Background fsync batch threshold; 0=inline
+                                              fdatasync, -1=syncfs-only at exit (default
+                                              "512MiB")
+      --progress                              Show transfer progress every 2s (default
+                                              true)
+  -v, --verbose                               Per-file progress output (default false)
+  -p, --progress-path string                  Progress output target; repeatable, use -
+                                              for stdout (default "")
+  -f, --progress-format string                Progress format: json|int|events; 1
+                                              applies to all targets, or one per target
+                                              (default json)
+      --progress-interval string              Progress write interval (e.g. 500ms, 10s)
+                                              (default "1s")
+      --cache-load string                     Load downloaded file into page cache after
+                                              success: none|full|<duration> (default
+                                              none)
+  -a, --ack-every string                      Bytes between progress acks; e.g. 1B,
+                                              4KiB, 8MiB (default "128.00 MiB")
+      --deadline string                       Transfer deadline (e.g. 60s, 5m) (default
+                                              "")
+      --trace string                          Write runtime/trace output to this file
+                                              (default "")
+      --stats string                          Write a JSON statistics object for this
+                                              run to this file at exit (default "")
 ```
 
 #### `tx recv status`
@@ -215,12 +277,25 @@ Modes:
   status --all [host]    List all active transfers on the server
 
 Options:
-      --tid string         Transfer ID (default "")
-      --all                List all active transfers on REMOTE_HOST (default false)
-      --encrypt string     Encryption algorithm: none|auto|aes|chacha20 (default: none)
-  -k, --keys string        Persistent age keys directory (default: ephemeral)
-  -t, --auth-token string  Client auth token presented in encrypted AUTH blob;
-                           repeatable (default "")
+      --tid string                            Transfer ID (default "")
+      --all                                   List all active transfers on REMOTE_HOST
+                                              (default false)
+      --encrypt string                        Encryption: none|auto|aes|chacha20
+                                              (default: none, or auto with a credential)
+  -k, --keys string                           Age keys directory holding this client's
+                                              identity; selects age authentication
+                                              without a token (default "")
+  -t, --auth-token string                     Auth token candidate, tried in order;
+                                              repeatable. Prefer --auth-token-file:
+                                              values here are visible in the process
+                                              list (default "")
+      --auth-token-file string                File holding one auth token candidate,
+                                              tried in order; repeatable (default "")
+      --require-server-recipient string       Server age recipient (public key) the
+                                              server must prove it holds; refuses any
+                                              other server (default "")
+      --require-server-recipient-file string  File holding the server age recipient the
+                                              server must prove it holds (default "")
 ```
 
 ---
@@ -319,9 +394,116 @@ budget.
 tx send tree                                       # serve cwd on default addr
 tx send tree /srv/data                              # serve /srv/data
 tx send tree --listen 0.0.0.0:4000 /srv/data       # custom addr + chroot
-tx send tree --require-auth /srv/data               # auto-generate token
+tx send tree --require-auth /srv/data               # AUTH required; any client key
 tx send tree --bwlimit 100MiB /srv/data             # rate limit gentle transfers
 ```
+
+### Authentication and encryption
+
+Every server accepts encrypted (`AUTH`) clients; the server flags decide
+whether authentication is required and which credentials it accepts. See the
+[FTCP authentication specification](../ftcp/AUTH.md) for the wire format.
+
+| Server | Plaintext clients | Encrypted clients |
+| --- | --- | --- |
+| No flags | Accepted | Any client key, after proof of its private key |
+| `--require-auth` | Rejected | Any client key, after proof of its private key |
+| Allowlist entries (`--require-auth-token[-file]`, `--require-client-recipient[-file]`) | Rejected | An allowed token, or the private key for an allowed client recipient |
+
+The server allowlist has two typed lists, and any entry implies
+`--require-auth`:
+
+- `--require-auth-token` and `--require-auth-token-file` take secret tokens.
+  A token must be 16–4096 visible ASCII characters; generate one with
+  `openssl rand -hex 32`. A hand-chosen token needs at least 64 random bits
+  (16 random hex characters); with a short token, the client should require
+  the server recipient. A value beginning with `age1` or `AGE-SECRET-KEY-`
+  fails startup rather than becoming a token.
+- `--require-client-recipient` and `--require-client-recipient-file` take
+  client age recipients (public keys, `age1...`). The client must prove the
+  matching private key. A private key in this list fails startup.
+
+```bash
+# Any client may encrypt; plaintext still works.
+tx send tree /srv/data
+tx recv copy --encrypt auto tx://host:3453/srv/data ./data
+
+# Require AUTH from any client that proves its own key.
+tx send tree --require-auth /srv/data
+tx recv copy --encrypt auto tx://host:3453/srv/data ./data
+
+# Allow two token clients and one age client.
+tx send tree --require-auth-token-file ./a.token --require-auth-token-file ./b.token \
+  --require-client-recipient "$ALICE_AGE_RECIPIENT" /srv/data
+tx recv copy --auth-token-file ./a.token tx://host:3453/srv/data ./data
+tx recv copy --keys ./alice-keys tx://host:3453/srv/data ./data
+
+# Also require the server's own key, as printed at its startup.
+tx recv copy --auth-token-file ./a.token \
+  --require-server-recipient-file ./server.age tx://host:3453/srv/data ./data
+```
+
+Client credential precedence:
+
+- `--auth-token` or `--auth-token-file` (not both) give token candidates, tried
+  in order on a fresh connection each; later connections start with the one
+  that succeeded. To rotate, list the new token before the old one.
+- `--keys DIR` loads the age identity in `DIR/key`, creating one (mode 0600)
+  when the directory exists without it; a missing directory is an error. It
+  selects age authentication without a token, and supplies the key a token
+  client proves with one.
+- `TX_AUTH_TOKEN` supplies one token only when none of the above is given and
+  `--encrypt` is not `none`. Local copies never read it.
+- Without `--keys`, the client generates one in-memory key pair and uses it
+  whenever it encrypts. `--encrypt auto|aes|chacha20` alone encrypts with it.
+- A credential, or `--require-server-recipient`, defaults `--encrypt` to
+  `auto`; `--encrypt none` with either is an error.
+
+Direct values on the command line are visible in the process list; prefer
+token files. A credential file (`--auth-token-file`,
+`--require-auth-token-file`, and the recipient `-file` flags) holds exactly one
+entry, optionally followed by one LF or CRLF, with no other lines and no
+surrounding whitespace. Logs and errors never contain tokens or private keys.
+
+`--require-server-recipient age1...` (or `--require-server-recipient-file`)
+requires the server to prove the private key of that recipient, its public
+key. Without it, an active attacker can substitute its own key during
+discovery: against an any-key server this lets it read and alter the
+transfer. It combines with `--auth-token`: a token proves only that the
+server is one of the token's holders, so another holder could impersonate
+the server, and an attacker who substitutes its key could test guesses of a
+short token offline. Requiring the server recipient closes both. The server
+prints its recipient at startup. The key persists across restarts when the
+keys directory holds one or can store a new one. When the default directory
+is missing or not writable, the server uses an ephemeral key; any other
+missing or unwritable `--keys` directory fails startup.
+
+`auto` selects AES-GCM only when this machine accelerates AES and the server
+recommends it, and ChaCha20-Poly1305 otherwise; use `--encrypt chacha20` for a
+server without AES acceleration.
+
+Each new connection costs one handshake round trip; pooled connections reuse
+their session keys. With keep-alive off (server `--idle-timeout 0`), every
+command pays that round trip.
+
+Upgrading from earlier releases, which used an encrypted bearer-token blob:
+
+- Encrypted clients and servers must upgrade together. Earlier clients fail
+  at key discovery with `UNSUPPORTED_AUTH client predates noise-v1; upgrade
+  tx`, and the server logs `legacy AUTH from <addr>` for each attempt. New
+  clients fail against earlier servers, which reject the versioned discovery
+  line.
+- Earlier clients that do not encrypt keep working against a server without
+  auth flags.
+- Bare `--require-auth` no longer generates a token: it accepts any client
+  that proves its own key. A deployment that relied on the generated token
+  must allowlist it, or other entries, explicitly before upgrading.
+- `--require-auth-token` takes only secret tokens. Allow a client age
+  recipient with `--require-client-recipient`; an `age1...` value in
+  `--require-auth-token` now fails startup.
+- Tokens of 16 or more characters, including those earlier releases
+  generated (16 hex characters), still work. Shorter tokens must be
+  reissued.
 
 ### Transfer Strategies: `fast` and `gentle`
 

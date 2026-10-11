@@ -92,7 +92,7 @@ func runLocalCopyCLI(srcRoot, dstRoot string, cfg copyCLIConfig, stdout, stderr 
 		fmt.Fprintln(stderr, "--skip-fetch is not supported for local copies")
 		return 2
 	}
-	warnIgnoredLocalFlags(cfg.encryptMode, cfg.authTokens, stderr)
+	warnIgnoredLocalFlags(cfg.authFlags, stderr)
 
 	progressInterval, err := time.ParseDuration(cfg.progressIntervalRaw)
 	if err != nil {
@@ -1004,12 +1004,17 @@ func startLocalProgressTicker(doneBytes, doneFiles *atomic.Int64, totalBytes, to
 	}
 }
 
-func warnIgnoredLocalFlags(encryptMode string, authTokens []string, stderr io.Writer) {
-	if enc := strings.ToLower(strings.TrimSpace(encryptMode)); enc != "" && enc != "none" {
+// warnIgnoredLocalFlags notes authentication flags a local copy ignores. A
+// local copy never reads TX_AUTH_TOKEN.
+func warnIgnoredLocalFlags(f clientAuthFlags, stderr io.Writer) {
+	if enc := strings.ToLower(strings.TrimSpace(f.encrypt)); enc != "" && enc != "none" {
 		fmt.Fprintln(stderr, "note: --encrypt has no effect on local copies")
 	}
-	if len(authTokens) > 0 {
+	if len(f.tokens) > 0 || len(f.tokenFiles) > 0 {
 		fmt.Fprintln(stderr, "note: --auth-token has no effect on local copies")
+	}
+	if f.keysDir != "" || f.serverRecipient != "" || f.serverRecipientFile != "" {
+		fmt.Fprintln(stderr, "note: --keys and --require-server-recipient have no effect on local copies")
 	}
 }
 

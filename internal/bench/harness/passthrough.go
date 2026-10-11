@@ -136,12 +136,13 @@ func recvManaged(tracing bool) []managedFlag {
 }
 
 // fetchArgs are the TX_ARGS that also apply to the small tx recv get
-// fetches of sender state: --encrypt, -k, and -t.
+// fetches of sender state: encryption, credentials, and the server key pin.
 func (pt passThrough) fetchArgs() []string {
 	var out []string
 	for _, f := range pt.flags {
 		switch f.name {
-		case "encrypt", "k", "keys", "t", "auth-token":
+		case "encrypt", "k", "keys", "t", "auth-token", "auth-token-file",
+			"require-server-recipient", "require-server-recipient-file":
 			out = append(out, "--"+f.name+"="+f.value)
 		}
 	}

@@ -155,6 +155,12 @@ type tcpConnPool struct {
 	target  atomic.Int64
 	stopped atomic.Bool
 
+	// bg tracks the pool's background goroutines, fills and the heartbeat
+	// loop, so stop returns only after they have finished and nothing they
+	// log lands after it. bgMu orders goBackground's Add against stop.
+	bgMu sync.Mutex
+	bg   sync.WaitGroup
+
 	// hbSem bounds concurrent heartbeat probes; pool-lifetime so ticks don't
 	// reallocate it.
 	hbSem chan struct{}
@@ -352,12 +358,38 @@ func (p *tcpConnPool) takeStale(interval time.Duration) []*sessionTCPConn {
 	return stale
 }
 
+// stop closes the pool. Cancelling its context aborts in-flight dials and
+// heartbeat probes, and stop waits for its background goroutines before
+// closing the idle connections.
 func (p *tcpConnPool) stop() {
-	if p == nil || p.stopped.Swap(true) {
+	if p == nil {
+		return
+	}
+	p.bgMu.Lock()
+	stopped := p.stopped.Swap(true)
+	p.bgMu.Unlock()
+	if stopped {
 		return
 	}
 	p.cancel()
+	p.bg.Wait()
 	p.drain()
+}
+
+// goBackground runs f in a goroutine that stop waits for, and reports
+// whether it started one: a stopping pool starts nothing.
+func (p *tcpConnPool) goBackground(f func()) bool {
+	p.bgMu.Lock()
+	defer p.bgMu.Unlock()
+	if p.stopped.Load() {
+		return false
+	}
+	p.bg.Add(1)
+	go func() {
+		defer p.bg.Done()
+		f()
+	}()
+	return true
 }
 
 func (p *tcpConnPool) drain() {
@@ -499,7 +531,11 @@ func (p *tcpConnPool) triggerRefill(c *Client) {
 			p.refilling.Add(-1)
 			return
 		}
-		go c.fillTCPPoolConn(p)
+		if !p.goBackground(func() { c.fillTCPPoolConn(p) }) {
+			p.putSlot()
+			p.refilling.Add(-1)
+			return
+		}
 	}
 }
 
@@ -533,7 +569,7 @@ func (p *tcpConnPool) startHeartbeats(c *Client) {
 		return
 	}
 	interval := heartbeatIntervalForGrant(p.sessionMS.Load())
-	go func() {
+	p.goBackground(func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -544,7 +580,7 @@ func (p *tcpConnPool) startHeartbeats(c *Client) {
 				p.heartbeatIdleConns(c, interval)
 			}
 		}
-	}()
+	})
 }
 
 // heartbeatIdleConns runs once per interval. It first scales the pool down to
@@ -559,6 +595,9 @@ func (p *tcpConnPool) startHeartbeats(c *Client) {
 // releases its p.hbSem slot) before returning — so p.hbSem is fully drained
 // at the start of every tick, making pool-lifetime reuse safe.
 func (p *tcpConnPool) heartbeatIdleConns(c *Client, interval time.Duration) {
+	if p.ctx.Err() != nil {
+		return // stopping: stop drains the idle connections
+	}
 	borrowed := p.borrowed.Load()
 	peak := max(p.peak.Swap(borrowed), borrowed)
 	if p.used.Load() {
@@ -573,12 +612,24 @@ func (p *tcpConnPool) heartbeatIdleConns(c *Client, interval time.Duration) {
 	var failed atomic.Bool
 	var wg sync.WaitGroup
 	for _, sc := range stale {
+		if p.ctx.Err() != nil {
+			// Stopping: probing would only send a PROBE to discard.
+			_ = p.discard(c, sc, "stopped")
+			continue
+		}
 		wg.Add(1)
 		p.hbSem <- struct{}{}
 		go func(sc *sessionTCPConn) {
 			defer wg.Done()
 			defer func() { <-p.hbSem }()
+			// Stopping the pool closes a probe's connection, so stop never
+			// waits out a probe's timeout.
+			stopWatch := watchManagedTCPConnContext(p.ctx, sc)
 			_, rttMillis, err := c.probeKeepAliveSessionConn(sc, p.authState)
+			if stopWatch() {
+				_ = p.discard(c, sc, "stopped")
+				return
+			}
 			if err != nil {
 				failed.Store(true)
 				c.metrics().IncHeartbeatFailure()
@@ -611,6 +662,10 @@ func (c *Client) ensureTCPPools(state tcpAuthState, concurrency int) int {
 		return 0
 	}
 	c.tcpPoolMu.Lock()
+	if c.poolsClosed {
+		c.tcpPoolMu.Unlock()
+		return 0
+	}
 	if c.dataPool != nil {
 		size := c.dataPool.opts.limit
 		c.tcpPoolMu.Unlock()
@@ -707,6 +762,11 @@ func (c *Client) recycleManagedTCPConn(conn net.Conn, pool *tcpConnPool) error {
 // has a pending EOF/RST, and pending data means protocol desync. This closes
 // the borrow-time race where the server went away after the last heartbeat.
 func sessionConnAlive(sc *sessionTCPConn) bool {
+	// An authenticated session must be healthy and hold no read-ahead: an
+	// idle connection is at a message boundary with nothing pending.
+	if sess := noiseSessionOf(sc); sess != nil && (sess.Failed() || sess.Buffered() > 0) {
+		return false
+	}
 	syscallConn, ok := sc.Conn.(syscall.Conn)
 	if !ok {
 		// Cannot peek this transport (custom dialer); assume alive rather
