@@ -3,6 +3,7 @@ package ftcp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -181,10 +182,38 @@ func TestParseItemLineCXSUMMultipleItemsWithOptions(t *testing.T) {
 }
 
 func TestParseItemLineMalformedLenValue(t *testing.T) {
-	if _, err := readItemBody(framedItemBody(t, `fd=1 10:/tmp`), sendItemKeys, "SEND"); err == nil {
-		t.Fatal("expected error")
-	} else if pe, ok := err.(protocolErr); !ok || pe.code != "BAD_REQUEST" {
-		t.Fatalf("expected BAD_REQUEST protocolErr, got %v", err)
+	for _, length := range []string{"10", strconv.Itoa(int(^uint(0) >> 1)), "18446744073709551616"} {
+		t.Run(length, func(t *testing.T) {
+			if _, err := readItemBody(framedItemBody(t, "fd=1 "+length+":/tmp"), sendItemKeys, "SEND"); err == nil {
+				t.Fatal("expected error")
+			} else if pe, ok := err.(protocolErr); !ok || pe.code != "BAD_REQUEST" {
+				t.Fatalf("expected BAD_REQUEST protocolErr, got %v", err)
+			}
+		})
+	}
+}
+
+func TestReadLenValueBounds(t *testing.T) {
+	for _, tc := range []struct {
+		input, value, rest string
+		wantErr            error
+	}{
+		{input: "0: next", rest: " next"},
+		{input: " 3:a:b tail", value: "a:b", rest: " tail"},
+		{input: "1:x", value: "x"},
+		{input: "2:x", wantErr: io.ErrUnexpectedEOF},
+		{input: strconv.Itoa(int(^uint(0)>>1)) + ":x", wantErr: io.ErrUnexpectedEOF},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			c := newCursor([]byte(tc.input))
+			value, err := c.readLenValue()
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("readLenValue = %v, want %v", err, tc.wantErr)
+			}
+			if err == nil && (string(value) != tc.value || string(c.b[c.i:]) != tc.rest) {
+				t.Fatalf("value=%q rest=%q, want %q %q", value, c.b[c.i:], tc.value, tc.rest)
+			}
+		})
 	}
 }
 
@@ -715,8 +744,8 @@ func TestCompactRequestRecords(t *testing.T) {
 			if algo != "" {
 				line += " algo=" + algo
 			}
-			raw, err := parseItemLine([]byte(line), cxsumItemKeys, "CXSUM")
-			if err != nil {
+			raw := map[string]string{}
+			if err := parseItemLine(raw, []byte(line), cxsumItemKeys, "CXSUM"); err != nil {
 				t.Fatal(err)
 			}
 			want, err := parseCXSUMItem(raw)

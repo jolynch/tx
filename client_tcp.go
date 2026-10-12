@@ -154,7 +154,8 @@ func (s *checksumStream) accept(line []byte) error {
 	trimmed := strings.TrimRight(string(line), "\r\n")
 	switch {
 	case s.trailer:
-		if !strings.HasPrefix(trimmed+" ", "FXT/1 "+strconv.FormatUint(s.fileID, 10)+" ") {
+		version, rest := intencoding.NextFXToken(trimmed)
+		if id, _ := intencoding.NextFXToken(rest); version != "FXT/1" || id != strconv.FormatUint(s.fileID, 10) {
 			return fmt.Errorf("CXSUM frame trailer does not match file %d: %q", s.fileID, trimmed)
 		}
 		s.trailer = false
@@ -531,9 +532,12 @@ func (w *itemWriter) begin(fileID uint64, path string) {
 		w.buf.WriteByte('\n')
 	}
 	w.buf.WriteString("fd=")
-	w.buf.WriteString(strconv.FormatUint(fileID, 10))
+	w.buf.Write(strconv.AppendUint(w.buf.AvailableBuffer(), fileID, 10))
 	w.buf.WriteByte(' ')
-	w.buf.WriteString(makeLenToken(path))
+	// makeLenToken's <len>:<path>, appended in place.
+	w.buf.Write(strconv.AppendInt(w.buf.AvailableBuffer(), int64(len(path)), 10))
+	w.buf.WriteByte(':')
+	w.buf.WriteString(path)
 }
 
 func (w *itemWriter) field(key string, value string) {
@@ -547,7 +551,10 @@ func (w *itemWriter) field(key string, value string) {
 }
 
 func (w *itemWriter) fieldInt(key string, value int64) {
-	w.field(key, strconv.FormatInt(value, 10))
+	w.field(key, "")
+	if w.err == nil {
+		w.buf.Write(strconv.AppendInt(w.buf.AvailableBuffer(), value, 10))
+	}
 }
 
 func (w *itemWriter) bytes() ([]byte, error) {

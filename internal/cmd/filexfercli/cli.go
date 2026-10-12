@@ -1565,7 +1565,7 @@ func isChecksumOKLine(line string) bool {
 }
 
 func parseChecksumFrameHeader(line string) (checksumFrameHeader, error) {
-	fields := strings.Fields(line)
+	fields := encoding.FXFields(make([]string, 0, 16), line)
 	if len(fields) < 3 || fields[0] != "FX/1" {
 		return checksumFrameHeader{}, errors.New("invalid checksum frame header")
 	}
@@ -1601,7 +1601,7 @@ func parseChecksumFrameHeader(line string) (checksumFrameHeader, error) {
 }
 
 func parseChecksumFrameTrailer(line string) (checksumFrameTrailer, error) {
-	fields := strings.Fields(line)
+	fields := encoding.FXFields(make([]string, 0, 16), line)
 	if len(fields) < 3 || fields[0] != "FXT/1" {
 		return checksumFrameTrailer{}, errors.New("invalid checksum frame trailer")
 	}

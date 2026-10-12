@@ -22,6 +22,7 @@ import (
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/filexfer/policy"
+	"github.com/jolynch/tx/internal/utils"
 	"github.com/zeebo/xxh3"
 	"golang.org/x/sys/unix"
 )
@@ -111,6 +112,10 @@ type frameStreamArgs struct {
 	OutputTCPConn *net.TCPConn
 	PipeSizeBytes int
 	DirectIO      bool
+	// Timed reports whether anything reads the frame's latencies: window
+	// events, or the adaptive policy choosing the next frame's codec. A
+	// frame nothing reads skips its clock reads.
+	Timed bool
 }
 
 type frameStreamStats struct {
@@ -337,6 +342,9 @@ type sendOutput struct {
 	// frameFlush, when set, sends a completed frame through a transport that
 	// batches writes; gentle responses use it so frames keep their pacing.
 	frameFlush func() error
+	// hasher is reset and reused by each item, rather than allocating 1.2 KiB
+	// per file.
+	hasher xxh3.Hasher128
 }
 
 var sendOutputBufferPool = sync.Pool{
@@ -411,10 +419,13 @@ type sentItem struct {
 // streamSendItem sends one item as frames. Frames of at least zeroCopyMinBytes
 // use the zero-copy path when the output allows it; zeroCopyOff disables it.
 func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID string, item sendItem, fileRef FileRef, zeroCopyMinBytes int64) (sentItem, error) {
-	ctx, windowTask := trace.NewTask(ctx, "send-window")
+	ctx, windowTask := utils.NewTraceTask(ctx, "send-window")
 	defer windowTask.End()
 	scope := events.FromContext(ctx)
-	itemStart := time.Now()
+	var itemStart time.Time
+	if scope.Sink.Enabled() {
+		itemStart = time.Now()
+	}
 	fd, usedDirectOpen, err := openSendFile(deps, item, fileRef)
 	if err != nil {
 		return sentItem{}, mapLookupError(err)
@@ -445,7 +456,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 		if item.Offset != 0 || item.Size != 0 {
 			return sentItem{}, protocolErr{code: "BAD_REQUEST", message: "directory SEND must request offset=0 size=0"}
 		}
-		hash, err := streamSendMetadataOnly(ctx, out.w, item, fileRef, fileInfo)
+		hash, err := streamSendMetadataOnly(ctx, out, item, fileRef, fileInfo)
 		return sentItem{hash: hash, done: err == nil}, err
 	}
 	if entryType != encoding.EntryTypeFile {
@@ -497,7 +508,8 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 	adaptive := item.Comp == "adapt"
 	currentMode := initialCompressionMode(item.Comp)
 	compressPolicy := policy.NewCompressionPolicy()
-	windowHasher := xxh3.New128()
+	windowHasher := &out.hasher
+	windowHasher.Reset()
 
 	// Zero-byte files: emit one terminal frame with no payload so the client
 	// always receives a frame stream rather than a bare OK response.
@@ -571,6 +583,9 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 			OutputTCPConn: out.conn,
 			PipeSizeBytes: pipeSizeBytes,
 			DirectIO:      usedDirectOpen,
+			// The policy is per item, so a terminal frame's latencies would
+			// only choose a codec for a frame that never comes.
+			Timed: scope.Sink.Enabled() || (adaptive && !isTerminal),
 		}
 
 		if readaheadCh != nil && !isTerminal {
@@ -622,7 +637,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 					firstFrame = true
 					currentMode = initialCompressionMode(item.Comp)
 					compressPolicy = policy.NewCompressionPolicy()
-					windowHasher = xxh3.New128()
+					windowHasher.Reset()
 				} else {
 					if item.Mode == loadStrategyFast {
 						tryAdviseSequential(fd, cursor, remaining)
@@ -655,7 +670,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 			recorded = WindowHash{FileID: item.FileID, EndBytes: cursor, HashToken: stats.WindowHashToken}
 		}
 
-		if adaptive {
+		if adaptive && !isTerminal {
 			// WriteLatency times writes into the response buffer, much as
 			// unbuffered writes timed the kernel socket buffer, not the wire.
 			// When the buffer fills, the flush is charged to the frame that
@@ -738,10 +753,11 @@ func initialCompressionMode(comp string) policy.CompressionMode {
 	}
 }
 
-func streamSendMetadataOnly(ctx context.Context, out io.Writer, item sendItem, fileRef FileRef, fileInfo os.FileInfo) (WindowHash, error) {
+func streamSendMetadataOnly(ctx context.Context, out *sendOutput, item sendItem, fileRef FileRef, fileInfo os.FileInfo) (WindowHash, error) {
 	md := encoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
 	md.Size = 0
-	windowHasher := xxh3.New128()
+	windowHasher := &out.hasher
+	windowHasher.Reset()
 	args := frameStreamArgs{
 		Ctx:          ctx,
 		FileID:       item.FileID,
@@ -754,12 +770,12 @@ func streamSendMetadataOnly(ctx context.Context, out io.Writer, item sendItem, f
 		IsTerminal:   true,
 		TerminalMD:   &md,
 		WindowHasher: windowHasher,
-		Output:       out,
+		Output:       out.w,
 	}
-	if err := writeFrameHeader(out, args, 0, nil); err != nil {
+	if err := writeFrameHeader(out.w, args, 0, nil); err != nil {
 		return WindowHash{}, err
 	}
-	windowHashToken, err := writeFrameTrailer(out, args, nil)
+	windowHashToken, err := writeFrameTrailer(out.w, args, nil)
 	if err != nil {
 		return WindowHash{}, err
 	}
@@ -822,69 +838,92 @@ func growPipeBestEffort(pipeFD *os.File, sizeBytes int) {
 	_, _ = unix.FcntlInt(pipeFD.Fd(), unix.F_SETPIPE_SZ, sizeBytes)
 }
 
-func buildFrameHeaderLine(fileID uint64, offset int64, size int64, wireSize int64, comp string, maxWSizeHint *int64, ts int64) string {
+// frameLineBytes is the pooled buffer a frame header or trailer line is
+// formatted into. Lines are usually under 300 bytes; a longer one grows the
+// slice rather than failing.
+const frameLineBytes = 4 << 10
+
+func appendFrameHeaderLine(dst []byte, fileID uint64, offset int64, size int64, wireSize int64, comp string, maxWSizeHint *int64, ts int64) []byte {
+	dst = append(dst, "FX/1 "...)
+	dst = strconv.AppendUint(dst, fileID, 10)
+	dst = append(dst, " offset="...)
+	dst = strconv.AppendInt(dst, offset, 10)
+	dst = append(dst, " size="...)
+	dst = strconv.AppendInt(dst, size, 10)
+	dst = append(dst, " wsize="...)
+	dst = strconv.AppendInt(dst, wireSize, 10)
+	dst = append(dst, " comp="...)
+	dst = append(dst, comp...)
 	if maxWSizeHint != nil {
-		return "FX/1 " + strconv.FormatUint(fileID, 10) +
-			" offset=" + strconv.FormatInt(offset, 10) +
-			" size=" + strconv.FormatInt(size, 10) +
-			" wsize=" + strconv.FormatInt(wireSize, 10) +
-			" comp=" + comp +
-			" max-wsize=" + strconv.FormatInt(*maxWSizeHint, 10) +
-			" ts=" + strconv.FormatInt(ts, 10) + "\n"
+		dst = append(dst, " max-wsize="...)
+		dst = strconv.AppendInt(dst, *maxWSizeHint, 10)
 	}
-	return "FX/1 " + strconv.FormatUint(fileID, 10) +
-		" offset=" + strconv.FormatInt(offset, 10) +
-		" size=" + strconv.FormatInt(size, 10) +
-		" wsize=" + strconv.FormatInt(wireSize, 10) +
-		" comp=" + comp +
-		" ts=" + strconv.FormatInt(ts, 10) + "\n"
+	dst = append(dst, " ts="...)
+	dst = strconv.AppendInt(dst, ts, 10)
+	return append(dst, '\n')
 }
 
-func buildFrameTrailerLine(fileID uint64, ts int64, next int64, windowHashToken string, metadata *encoding.FileFrameMetadata) string {
-	var b strings.Builder
-	b.WriteString("FXT/1 ")
-	b.WriteString(strconv.FormatUint(fileID, 10))
-	b.WriteString(" status=ok ts=")
-	b.WriteString(strconv.FormatInt(ts, 10))
+func appendFrameTrailerLine(dst []byte, fileID uint64, ts int64, next int64, windowHashToken string, metadata *encoding.FileFrameMetadata) []byte {
+	dst = append(dst, "FXT/1 "...)
+	dst = strconv.AppendUint(dst, fileID, 10)
+	dst = append(dst, " status=ok ts="...)
+	dst = strconv.AppendInt(dst, ts, 10)
 	if windowHashToken != "" {
-		b.WriteString(" file-hash=")
-		b.WriteString(windowHashToken)
+		dst = append(dst, " file-hash="...)
+		dst = append(dst, windowHashToken...)
 	}
-	b.WriteString(" next=")
-	b.WriteString(strconv.FormatInt(next, 10))
+	dst = append(dst, " next="...)
+	dst = strconv.AppendInt(dst, next, 10)
 	if metadata != nil {
-		for _, token := range metadataTrailerTokens(metadata) {
-			b.WriteString(" ")
-			b.WriteString(token)
+		dst = appendMetadataTrailerTokens(dst, metadata)
+	}
+	return append(dst, '\n')
+}
+
+// appendMetadataTrailerTokens appends the space-prefixed meta: tokens of a
+// terminal trailer. Spaces in user and group names become underscores, since
+// tokens are space-separated.
+func appendMetadataTrailerTokens(dst []byte, metadata *encoding.FileFrameMetadata) []byte {
+	dst = append(dst, " meta:size="...)
+	dst = strconv.AppendInt(dst, metadata.Size, 10)
+	dst = append(dst, " meta:mtime_ns="...)
+	dst = strconv.AppendInt(dst, metadata.MtimeNS, 10)
+	dst = append(dst, " meta:mode="...)
+	dst = append(dst, metadata.Mode...)
+	dst = append(dst, " meta:uid="...)
+	dst = append(dst, metadata.UID...)
+	dst = append(dst, " meta:gid="...)
+	dst = append(dst, metadata.GID...)
+	dst = append(dst, " meta:user="...)
+	dst = appendSpacesAsUnderscores(dst, metadata.User)
+	dst = append(dst, " meta:group="...)
+	return appendSpacesAsUnderscores(dst, metadata.Group)
+}
+
+func appendSpacesAsUnderscores(dst []byte, s string) []byte {
+	for i := 0; i < len(s); i++ {
+		if s[i] == ' ' {
+			dst = append(dst, '_')
+		} else {
+			dst = append(dst, s[i])
 		}
 	}
-	b.WriteString("\n")
-	return b.String()
-}
-
-func metadataTrailerTokens(metadata *encoding.FileFrameMetadata) []string {
-	if metadata == nil {
-		return nil
-	}
-	return []string{
-		"meta:size=" + strconv.FormatInt(metadata.Size, 10),
-		"meta:mtime_ns=" + strconv.FormatInt(metadata.MtimeNS, 10),
-		"meta:mode=" + metadata.Mode,
-		"meta:uid=" + metadata.UID,
-		"meta:gid=" + metadata.GID,
-		"meta:user=" + strings.ReplaceAll(metadata.User, " ", "_"),
-		"meta:group=" + strings.ReplaceAll(metadata.Group, " ", "_"),
-	}
+	return dst
 }
 
 func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStreamArgs) (frameStreamStats, error) {
-	readBuf, releaseRead, err := bufpool.Acquire(bufpool.BucketSize(args.FrameSize))
+	readBufPtr, err := bufpool.Get(bufpool.BucketSize(args.FrameSize))
 	if err != nil {
 		return frameStreamStats{}, err
 	}
-	defer releaseRead()
+	defer bufpool.Put(readBufPtr)
+	readBuf := *readBufPtr
 
 	writeLatency := time.Duration(0)
+	var timedWrites *time.Duration
+	if args.Timed {
+		timedWrites = &writeLatency
+	}
 	isCompressed := args.Comp != "none"
 
 	// For compressed: collect into frameBuf so wireSize is known before writing the header.
@@ -919,18 +958,29 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 			stagingBuf = bytes.NewBuffer(staging[:0])
 			payloadWriter = stagingBuf
 		} else {
-			if err := writeFrameHeader(args.Output, args, args.FrameSize, &writeLatency); err != nil {
+			if err := writeFrameHeader(args.Output, args, args.FrameSize, timedWrites); err != nil {
 				return frameStreamStats{}, err
 			}
 		}
 	}
 
+	timing := timeNothing
+	if args.Timed {
+		timing = timeReads
+		if isCompressed {
+			timing = timeReadsAndHandling
+		}
+	}
+	timeChunkWrites := args.Timed && !isCompressed && !stagedDirectWrite
 	readRegion := trace.StartRegion(args.Ctx, "frame-read")
-	prepareLatency, readLatency, err := streamBufferedRead(fd, fileOffset, args.FrameSize, readBuf, isCompressed, func(chunk []byte) error {
+	prepareLatency, readLatency, err := streamBufferedRead(fd, fileOffset, args.FrameSize, readBuf, timing, func(chunk []byte) error {
 		_, _ = args.WindowHasher.Write(chunk)
-		writeStart := time.Now()
+		var writeStart time.Time
+		if timeChunkWrites {
+			writeStart = time.Now()
+		}
 		written, writeErr := payloadWriter.Write(chunk)
-		if !isCompressed && !stagedDirectWrite {
+		if timeChunkWrites {
 			writeLatency += time.Since(writeStart)
 		}
 		if writeErr != nil {
@@ -954,29 +1004,25 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 			return frameStreamStats{}, err
 		}
 		wireSize = int64(frameBuf.Len())
-		if err := writeFrameHeader(args.Output, args, wireSize, &writeLatency); err != nil {
+		if err := writeFrameHeader(args.Output, args, wireSize, timedWrites); err != nil {
 			compRegion.End()
 			return frameStreamStats{}, err
 		}
-		writeStart := time.Now()
-		if _, err := args.Output.Write(frameBuf.Bytes()); err != nil {
+		if err := timedWrite(args.Output, frameBuf.Bytes(), timedWrites); err != nil {
 			compRegion.End()
 			return frameStreamStats{}, err
 		}
-		writeLatency += time.Since(writeStart)
 		compRegion.End()
 	} else if stagedDirectWrite {
-		if err := writeFrameHeader(args.Output, args, wireSize, &writeLatency); err != nil {
+		if err := writeFrameHeader(args.Output, args, wireSize, timedWrites); err != nil {
 			return frameStreamStats{}, err
 		}
-		writeStart := time.Now()
-		if _, err := args.Output.Write(stagingBuf.Bytes()); err != nil {
+		if err := timedWrite(args.Output, stagingBuf.Bytes(), timedWrites); err != nil {
 			return frameStreamStats{}, err
 		}
-		writeLatency += time.Since(writeStart)
 	}
 
-	windowHashToken, err := writeFrameTrailer(args.Output, args, &writeLatency)
+	windowHashToken, err := writeFrameTrailer(args.Output, args, timedWrites)
 	if err != nil {
 		return frameStreamStats{}, err
 	}
@@ -1209,15 +1255,27 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 }
 
 func writeFrameHeader(out io.Writer, args frameStreamArgs, wireSize int64, writeLatency *time.Duration) error {
-	headerLine := buildFrameHeaderLine(args.FileID, args.Offset, args.FrameSize, wireSize, args.Comp, args.MaxWSizeHint, args.HeaderTS)
-	writeStart := time.Now()
-	if _, err := io.WriteString(out, headerLine); err != nil {
+	buf, err := bufpool.Get(frameLineBytes)
+	if err != nil {
 		return err
 	}
-	if writeLatency != nil {
-		*writeLatency += time.Since(writeStart)
+	line := appendFrameHeaderLine((*buf)[:0], args.FileID, args.Offset, args.FrameSize, wireSize, args.Comp, args.MaxWSizeHint, args.HeaderTS)
+	err = timedWrite(out, line, writeLatency)
+	bufpool.Put(buf)
+	return err
+}
+
+// timedWrite writes p, adding the write's duration to latency when latency
+// is not nil.
+func timedWrite(out io.Writer, p []byte, latency *time.Duration) error {
+	if latency == nil {
+		_, err := out.Write(p)
+		return err
 	}
-	return nil
+	start := time.Now()
+	_, err := out.Write(p)
+	*latency += time.Since(start)
+	return err
 }
 
 func writeFrameTrailer(out io.Writer, args frameStreamArgs, writeLatency *time.Duration) (string, error) {
@@ -1225,23 +1283,41 @@ func writeFrameTrailer(out io.Writer, args frameStreamArgs, writeLatency *time.D
 	if args.IsTerminal {
 		windowHashToken = encoding.FormatXXH128HashToken(args.WindowHasher.Sum128())
 	}
-	trailerLine := buildFrameTrailerLine(args.FileID, time.Now().UnixMilli(), args.Next, windowHashToken, args.TerminalMD)
-	writeStart := time.Now()
-	if _, err := io.WriteString(out, trailerLine); err != nil {
+	buf, err := bufpool.Get(frameLineBytes)
+	if err != nil {
+		return "", err
+	}
+	// One clock read stamps the trailer and starts the write timing.
+	now := time.Now()
+	line := appendFrameTrailerLine((*buf)[:0], args.FileID, now.UnixMilli(), args.Next, windowHashToken, args.TerminalMD)
+	_, err = out.Write(line)
+	bufpool.Put(buf)
+	if err != nil {
 		return "", err
 	}
 	if writeLatency != nil {
-		*writeLatency += time.Since(writeStart)
+		*writeLatency += time.Since(now)
 	}
 	return windowHashToken, nil
 }
+
+// readTiming selects which latencies streamBufferedRead measures.
+type readTiming uint8
+
+const (
+	timeNothing readTiming = iota
+	timeReads
+	// timeReadsAndHandling also charges handle to prepare latency, for
+	// frames whose handler compresses.
+	timeReadsAndHandling
+)
 
 func streamBufferedRead(
 	fd *os.File,
 	fileOffset *int64,
 	frameSize int64,
 	buf []byte,
-	includeHandleInPrepare bool,
+	timing readTiming,
 	handle func([]byte) error,
 ) (prepareLatency, readLatency time.Duration, err error) {
 	remaining := frameSize
@@ -1250,18 +1326,25 @@ func streamBufferedRead(
 		if int64(readSize) > remaining {
 			readSize = int(remaining)
 		}
-		readStart := time.Now()
+		var start time.Time
+		if timing != timeNothing {
+			start = time.Now()
+		}
 		n, readErr := fd.ReadAt(buf[:readSize], *fileOffset)
-		readLatency += time.Since(readStart)
+		if timing != timeNothing {
+			readLatency += time.Since(start)
+		}
 		if n > 0 {
 			*fileOffset += int64(n)
 			remaining -= int64(n)
-			handleStart := time.Now()
+			if timing == timeReadsAndHandling {
+				start = time.Now()
+			}
 			if err := handle(buf[:n]); err != nil {
 				return 0, 0, err
 			}
-			if includeHandleInPrepare {
-				prepareLatency += time.Since(handleStart)
+			if timing == timeReadsAndHandling {
+				prepareLatency += time.Since(start)
 			}
 		}
 		if readErr != nil {
@@ -1310,8 +1393,13 @@ func releaseCompressedFrameBuffer(buf *bytes.Buffer) {
 	compressedFrameBufferPool.Put(buf)
 }
 
+// minSequentialAdviceBytes is the smallest window worth advising. The kernel's
+// default readahead (128 KiB) already covers a read this small, so the advice
+// would be a syscall per file that changes nothing.
+const minSequentialAdviceBytes = 128 << 10
+
 func tryAdviseSequential(fd *os.File, offset int64, length int64) {
-	if fd == nil || offset < 0 || length <= 0 {
+	if fd == nil || offset < 0 || length < minSequentialAdviceBytes {
 		return
 	}
 	_ = unix.Fadvise(int(fd.Fd()), offset, length, unix.FADV_SEQUENTIAL)

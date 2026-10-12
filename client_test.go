@@ -4337,3 +4337,94 @@ func TestRetryBusyReacquireHonorsDeadline(t *testing.T) {
 		t.Fatalf("retryBusy returned after %v, past its deadline", elapsed)
 	}
 }
+
+// A frame that declares more than was requested, or decodes to other than it
+// declares, must fail before any excess reaches the output: a small zstd frame
+// can expand to many GiB.
+func TestGetFilesRejectsFramesThatMisdeclareSize(t *testing.T) {
+	bomb := func(t *testing.T, offset, size int64) string {
+		frame := buildFXFrame(t, 0, "zstd", offset, make([]byte, 1<<20), nil)
+		return strings.Replace(frame, fmt.Sprintf(" size=%d ", 1<<20), fmt.Sprintf(" size=%d ", size), 1)
+	}
+	// A frame that honestly declares more than was requested.
+	oversized := func(t *testing.T, offset, _ int64) string {
+		return buildFXFrame(t, 0, "zstd", offset, make([]byte, 1<<20), nil)
+	}
+	// Junk after the compressed payload, inside wsize: the declared bytes
+	// decode, and then the decoder fails.
+	junk := func(t *testing.T, offset, size int64) string {
+		frame := buildFXFrame(t, 0, "zstd", offset, make([]byte, size), nil)
+		header, rest, _ := strings.Cut(frame, "\n")
+		wsize := strings.Fields(header)[4] // wsize=N
+		n, _ := strconv.Atoi(strings.TrimPrefix(wsize, "wsize="))
+		payload, trailer := rest[:n], rest[n:]
+		header = strings.Replace(header, wsize, fmt.Sprintf("wsize=%d", n+5), 1)
+		return header + "\n" + payload + "\x28\xb5\x2f\xfd\x00" + trailer
+	}
+	for _, tc := range []struct {
+		name   string
+		frame  func(t *testing.T, offset, size int64) string
+		size   int64
+		window int64
+		batch  int64
+	}{
+		{name: "expands/batched", frame: bomb, size: 4, window: 1 << 20, batch: 1 << 20},
+		{name: "expands/split window", frame: bomb, size: 8, window: 8, batch: 4},
+		{name: "declares more than requested/batched", frame: oversized, size: 4, window: 1 << 20, batch: 1 << 20},
+		{name: "declares more than requested/split window", frame: oversized, size: 8, window: 8, batch: 4},
+		{name: "junk after payload/batched", frame: junk, size: 4, window: 1 << 20, batch: 1 << 20},
+		{name: "junk after payload/split window", frame: junk, size: 8, window: 8, batch: 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := &Manifest{
+				TransferID: "txbomb",
+				Root:       "/remote",
+				Entries:    []ManifestEntry{{ID: 0, Size: tc.size, Path: "f.bin"}},
+			}
+			srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+				switch req.Verb {
+				case intftcp.VerbSEND:
+					item := req.Params[len(req.Params)-1]
+					size, _ := strconv.ParseInt(item["size"], 10, 64)
+					if size == 0 {
+						size = tc.size
+					}
+					offset, _ := strconv.ParseInt(item["offset"], 10, 64)
+					_, err := io.WriteString(out, tc.frame(t, offset, size))
+					return err
+				default:
+					_, err := io.WriteString(out, "OK\r\n")
+					return err
+				}
+			})
+			defer srv.Close()
+
+			var written int64
+			client := NewClient(srv.URL, WithFileRequestWindowBytes(tc.window))
+			_, err := client.GetFiles(context.Background(), GetFilesRequest{
+				Manifest:           manifest,
+				FileIDs:            []uint64{0},
+				BatchMaxBytes:      tc.batch,
+				SplitWindowWorkers: 1,
+				OutputWriter: func(ManifestEntry, int64) (io.WriteCloser, func() error, error) {
+					return nopCountingWriteCloser{&written}, nil, nil
+				},
+			})
+			if err == nil {
+				t.Fatal("client accepted a frame that misdeclares its size")
+			}
+			if written > tc.size {
+				t.Fatalf("wrote %d bytes for a %d-byte file before failing", written, tc.size)
+			}
+		})
+	}
+}
+
+type nopCountingWriteCloser struct{ n *int64 }
+
+func (w nopCountingWriteCloser) Write(p []byte) (int, error) {
+	atomic.AddInt64(w.n, int64(len(p)))
+	return len(p), nil
+}
+
+func (nopCountingWriteCloser) Close() error { return nil }

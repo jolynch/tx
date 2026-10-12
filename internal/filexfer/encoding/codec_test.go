@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 func TestMaxEncodedFrameSizeBytesZstdStableAcrossCalls(t *testing.T) {
@@ -304,5 +306,43 @@ func TestCompressZstdPooledSmallInputStaysSmall(t *testing.T) {
 		if gotCap > 16*1024 {
 			t.Errorf("a %d-byte chunk landed in a %d-byte buffer; small inputs should start small", size, gotCap)
 		}
+	}
+}
+
+// Framed bodies must keep zstd's frame checksum: tx recv copy saves TXFER
+// frames as-is to manifest.server.zst, where it is the only integrity check.
+// Data frames, verified by the client's window hash, omit it.
+func TestZstdChecksumOnlyWhereNothingElseVerifies(t *testing.T) {
+	payload := bytes.Repeat([]byte("fm/1 manifest body "), 1024)
+	body, release, err := CompressZstdPooled(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	var h zstd.Header
+	if err := h.Decode(body); err != nil {
+		t.Fatal(err)
+	}
+	if !h.HasCheckSum {
+		t.Fatal("CompressZstdPooled frame has no zstd checksum")
+	}
+
+	var data bytes.Buffer
+	w, closeFn, _, err := WrapCompressedWriter(&data, EncodingZstd, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := closeFn(); err != nil {
+		t.Fatal(err)
+	}
+	h = zstd.Header{}
+	if err := h.Decode(data.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if h.HasCheckSum {
+		t.Fatal("data frame carries a zstd checksum the window hash makes redundant")
 	}
 }

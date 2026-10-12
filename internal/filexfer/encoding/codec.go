@@ -136,6 +136,9 @@ func SelectEncoding(acceptEncoding string) string {
 	return best
 }
 
+// WrapCompressedWriter compresses a SEND data frame. Its output carries no
+// zstd or lz4 checksum, since the receiver verifies the window hash; do not
+// store it where nothing else checks it.
 func WrapCompressedWriter(dst io.Writer, acceptEncoding string, strategy string) (io.Writer, func() error, string, error) {
 	if dst == nil {
 		return nil, nil, "", errors.New("nil destination writer")
@@ -148,7 +151,11 @@ func WrapCompressedWriter(dst io.Writer, acceptEncoding string, strategy string)
 
 	switch SelectEncoding(acceptEncoding) {
 	case EncodingZstd:
-		zw, err := zstd.NewWriter(dst, zstd.WithEncoderLevel(1), zstd.WithEncoderConcurrency(concurrency))
+		// The client verifies each window's xxh3 hash, and data frames are
+		// never stored raw, so they carry no zstd checksum. Framed bodies
+		// keep theirs: tx recv copy saves TXFER frames as-is to
+		// manifest.server.zst, where nothing else checks them.
+		zw, err := zstd.NewWriter(dst, zstd.WithEncoderLevel(1), zstd.WithEncoderConcurrency(concurrency), zstd.WithEncoderCRC(false))
 		if err != nil {
 			return nil, nil, "", err
 		}
@@ -486,8 +493,12 @@ func ceilingMaxWSizeBucketBytes(size int64) int64 {
 }
 
 func FormatXXH128HashToken(v xxh3.Uint128) string {
+	const prefix = "xxh128:"
 	b := v.Bytes()
-	return "xxh128:" + hex.EncodeToString(b[:])
+	var token [len(prefix) + 2*len(b)]byte
+	copy(token[:], prefix)
+	hex.Encode(token[len(prefix):], b[:])
+	return string(token[:])
 }
 
 func FormatXXH64HashToken(v uint64) string {

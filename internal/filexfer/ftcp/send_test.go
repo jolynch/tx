@@ -67,7 +67,7 @@ func TestParseSENDItemCompDefaultsAndModes(t *testing.T) {
 }
 
 func TestBuildFrameHeaderLineOmitsPlaceholderHash(t *testing.T) {
-	header := buildFrameHeaderLine(7, 0, 5, 5, "none", nil, 1000)
+	header := string(appendFrameHeaderLine(nil, 7, 0, 5, 5, "none", nil, 1000))
 	if strings.Contains(header, " hash=") {
 		t.Fatalf("expected FTCP SEND header to omit placeholder hash, got %q", header)
 	}

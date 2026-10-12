@@ -124,6 +124,9 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
   it got there ("we first tried X, then switched to Y"); history belongs in
   git. Mention a rejected alternative only when it is the obvious choice a
   reader would otherwise expect, and say briefly why it was not taken.
+- Write byte sizes and rates in binary units: KiB, MiB, GiB, MiB/s. "MB" is
+  ambiguous, and many readers take it to mean MiB. Bit rates stay decimal
+  (Mbps, Gbps). Go benchmarks report decimal MB/s; convert before quoting.
 - Commit messages: a short imperative subject (about 60 characters or fewer)
   and, when needed, a body of no more than a few sentences on what changed and
   why. No per-file inventories or bullet lists of every change.

@@ -212,6 +212,8 @@ Path/blob arguments use one of:
 - length-prefixed bytes: `<len>:<bytes>`
 
 For this line protocol, token bytes cannot span command newlines.
+Lengths count bytes and must fit the remaining input. The command and item
+line limits bound path tokens independently of filesystem path limits.
 
 ## AUTH
 

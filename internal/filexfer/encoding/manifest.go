@@ -89,10 +89,10 @@ func DecodePathTokenPrefix(prev string, token string) (string, int, error) {
 		return "", 0, errors.New("invalid path suffix length")
 	}
 	suffixStart := second + 1
-	suffixEnd := suffixStart + suffixLen
-	if suffixEnd > len(token) {
+	if suffixLen > len(token)-suffixStart {
 		return "", 0, errors.New("path suffix length exceeds token")
 	}
+	suffixEnd := suffixStart + suffixLen
 	suffix := token[suffixStart:suffixEnd]
 	if prev == "" && prefixLen != 0 {
 		return "", 0, errors.New("first path prefix length must be zero")
@@ -613,9 +613,9 @@ func ParseLenPrefixedPrefix(raw string) (string, int, error) {
 		return "", 0, errors.New("invalid len prefix")
 	}
 	start := sep + 1
-	end := start + n
-	if end > len(raw) {
+	if n > len(raw)-start {
 		return "", 0, errors.New("len prefix mismatch")
 	}
+	end := start + n
 	return raw[start:end], end, nil
 }

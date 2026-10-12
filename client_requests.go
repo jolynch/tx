@@ -184,7 +184,14 @@ func (c *Client) VisitChecksumBatches(ctx context.Context, request GetChecksumRe
 			return err
 		}
 		defer reader.Close()
-		return consume(request.Targets[chunk.lo:chunk.hi], GetChecksumResponse{Reader: reader})
+		if err := consume(request.Targets[chunk.lo:chunk.hi], GetChecksumResponse{Reader: reader}); err != nil {
+			return err
+		}
+		// Close verifies what the consumer may not have read: an
+		// authenticated response's END, and nothing after it. The deferred
+		// Close is then a no-op: checksumStream closes once and returns the
+		// first result on every call.
+		return reader.Close()
 	})
 }
 
