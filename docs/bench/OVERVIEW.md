@@ -499,7 +499,7 @@ The grids:
   tx made for that N.
 
 The test fails when any cost ratio exceeds `TX_BENCH_THROUGHPUT_MAX_RATIO`
-(default 40). That is a regression bar for any CI host, not the goal. On the
+(default 30). That is a regression bar for any CI host, not the goal. On the
 Ryzen host, the code before the indexed manifest lookup and the zero-copy
 size limit measured 2.5x its current ratio. Lower the default as the ratio
 improves; compare grids from the same host to judge a change.
