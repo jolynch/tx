@@ -3,6 +3,7 @@ package ftcp
 import (
 	"bytes"
 	"io"
+	"maps"
 	"strings"
 
 	"github.com/jolynch/tx/internal/bufpool"
@@ -11,8 +12,8 @@ import (
 )
 
 // maxItemLineBytes bounds one item line in a framed request body. An item is a
-// file id, one path, and a handful of short tokens; PATH_MAX is 4096, so this
-// is roughly double the largest legal item.
+// file id, one path, and a handful of short tokens. This is a protocol limit,
+// independent of filesystem path limits.
 const maxItemLineBytes = 8 * 1024
 
 // itemKeys is the set of per-item option keys a verb accepts. Anything else is
@@ -37,7 +38,7 @@ func ReadRequestItems(in io.Reader, verb Verb) ([]map[string]string, error) {
 	defer body.Release()
 	items := make([]map[string]string, 0)
 	err = visitItemBody(body.Bytes(), allowed, name, func(item map[string]string) error {
-		items = append(items, item)
+		items = append(items, maps.Clone(item))
 		return nil
 	})
 	return items, err
@@ -147,8 +148,10 @@ func countRequestItemLines(body []byte, verb string) (int, error) {
 }
 
 // visitItemBody parses each line in body without retaining individual items.
-// Blank lines still consume the request's byte budget.
+// Blank lines still consume the request's byte budget. Every line reuses one
+// map, so visit must not retain it; its strings are its own to keep.
 func visitItemBody(body []byte, allowed map[string]bool, verb string, visit func(map[string]string) error) error {
+	item := make(map[string]string, 8)
 	for len(body) > 0 {
 		end := bytes.IndexByte(body, '\n')
 		var line []byte
@@ -161,8 +164,8 @@ func visitItemBody(body []byte, allowed map[string]bool, verb string, visit func
 			return protocolErr{code: "BAD_REQUEST", message: verb + " item line too large"}
 		}
 		if trimmed := utils.TrimLineTerminator(line); len(trimmed) > 0 {
-			item, err := parseItemLine(trimmed, allowed, verb)
-			if err != nil {
+			clear(item)
+			if err := parseItemLine(item, trimmed, allowed, verb); err != nil {
 				return err
 			}
 			if err := visit(item); err != nil {
@@ -174,40 +177,53 @@ func visitItemBody(body []byte, allowed map[string]bool, verb string, visit func
 }
 
 // parseItemLine parses one `fd=<id> <path> [key=value...]` item from a framed
-// request body. It is the single item grammar: SEND, ACK, and CXSUM differ only
-// in which option keys they keep.
-func parseItemLine(line []byte, allowed map[string]bool, verb string) (map[string]string, error) {
+// request body into item, an empty map the caller may reuse. It is the single
+// item grammar: SEND, ACK, and CXSUM differ only in which option keys they
+// keep. It copies the line into one string and slices every value from it, so
+// an item costs one allocation rather than one per token, and a value that
+// outlives the pooled request body keeps only that string alive.
+func parseItemLine(item map[string]string, line []byte, allowed map[string]bool, verb string) error {
+	s := string(line)
 	c := newCursor(line)
 	if c.eof() {
-		return nil, protocolErr{code: "BAD_REQUEST", message: "empty " + verb + " item"}
+		return protocolErr{code: "BAD_REQUEST", message: "empty " + verb + " item"}
 	}
-	fdToken, err := c.readToken()
-	if err != nil || !strings.HasPrefix(fdToken, "fd=") {
-		return nil, protocolErr{code: "BAD_REQUEST", message: "invalid " + verb + " file id"}
+	start := c.i
+	if !c.skipToken() || !strings.HasPrefix(s[start:c.i], "fd=") {
+		return protocolErr{code: "BAD_REQUEST", message: "invalid " + verb + " file id"}
 	}
-	fid := strings.TrimSpace(strings.TrimPrefix(fdToken, "fd="))
+	fid := strings.TrimSpace(strings.TrimPrefix(s[start:c.i], "fd="))
 	if fid == "" {
-		return nil, protocolErr{code: "BAD_REQUEST", message: "invalid " + verb + " file id"}
+		return protocolErr{code: "BAD_REQUEST", message: "invalid " + verb + " file id"}
 	}
+	c.skipSpaces()
+	quoted := c.i < len(c.b) && c.b[c.i] == '"'
 	path, err := c.readPathValue()
 	if err != nil {
-		return nil, protocolErr{code: "BAD_REQUEST", message: "invalid " + verb + " path"}
+		return protocolErr{code: "BAD_REQUEST", message: "invalid " + verb + " path"}
 	}
-	item := map[string]string{"fid": fid, "path": string(path)}
+	item["fid"] = fid
+	if quoted {
+		// Unescaped into a new buffer, so not a substring of the line.
+		item["path"] = string(path)
+	} else {
+		// A length-prefixed value ends where the cursor stops.
+		item["path"] = s[c.i-len(path) : c.i]
+	}
 	for !c.eof() {
-		tok, tokErr := c.readToken()
-		if tokErr != nil {
-			return nil, protocolErr{code: "BAD_REQUEST", message: "invalid " + verb + " item option"}
+		start := c.i
+		if !c.skipToken() {
+			return protocolErr{code: "BAD_REQUEST", message: "invalid " + verb + " item option"}
 		}
-		key, val, ok := strings.Cut(tok, "=")
+		key, val, ok := strings.Cut(s[start:c.i], "=")
 		if !ok {
-			return nil, protocolErr{code: "BAD_REQUEST", message: "invalid " + verb + " item option"}
+			return protocolErr{code: "BAD_REQUEST", message: "invalid " + verb + " item option"}
 		}
 		if allowed[key] {
 			item[key] = val
 		}
 	}
-	return item, nil
+	return nil
 }
 
 // drainItemBody lets a peer finish writing before receiving a header error.

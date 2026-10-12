@@ -190,20 +190,21 @@ func parseAckToken(raw string) (ackBytes int64, ackTS int64, ackHashToken string
 	if raw == "-1" {
 		return -1, 0, "", true, nil
 	}
-	parts := strings.SplitN(raw, "@", 3)
-	if len(parts) < 2 {
+	bytesRaw, rest, ok := strings.Cut(raw, "@")
+	if !ok {
 		return 0, 0, "", true, fmt.Errorf("invalid ack format")
 	}
-	ackBytes, err = strconv.ParseInt(parts[0], 10, 64)
+	tsRaw, hashRaw, hasHash := strings.Cut(rest, "@")
+	ackBytes, err = strconv.ParseInt(bytesRaw, 10, 64)
 	if err != nil || ackBytes < 0 {
 		return 0, 0, "", true, fmt.Errorf("invalid ack bytes")
 	}
-	ackTS, err = strconv.ParseInt(parts[1], 10, 64)
+	ackTS, err = strconv.ParseInt(tsRaw, 10, 64)
 	if err != nil || ackTS < 0 {
 		return 0, 0, "", true, fmt.Errorf("invalid ack timestamp")
 	}
-	if len(parts) == 3 {
-		ackHashToken = strings.TrimSpace(parts[2])
+	if hasHash {
+		ackHashToken = strings.TrimSpace(hashRaw)
 		if !encoding.ValidHashToken(ackHashToken) {
 			return 0, 0, "", true, fmt.Errorf("invalid ack hash token")
 		}

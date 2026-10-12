@@ -1024,8 +1024,8 @@ func validHashToken(raw string) bool {
 	if raw == "" {
 		return false
 	}
-	parts := strings.SplitN(raw, ":", 2)
-	return len(parts) == 2 && strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != ""
+	algo, digest, ok := strings.Cut(raw, ":")
+	return ok && strings.TrimSpace(algo) != "" && strings.TrimSpace(digest) != ""
 }
 
 func normalizeHashToken(raw string) string {

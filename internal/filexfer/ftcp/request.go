@@ -193,6 +193,20 @@ func (c *cursor) readToken() (string, error) {
 	return string(c.b[start:c.i]), nil
 }
 
+// skipToken advances past the next space-delimited token and reports whether
+// there was one. Callers that hold the line as a string slice the token from
+// it rather than allocating one here.
+func (c *cursor) skipToken() bool {
+	c.skipSpaces()
+	if c.i >= len(c.b) {
+		return false
+	}
+	for c.i < len(c.b) && c.b[c.i] != ' ' {
+		c.i++
+	}
+	return true
+}
+
 func (c *cursor) readLenValue() ([]byte, error) {
 	c.skipSpaces()
 	if c.i >= len(c.b) {
@@ -213,10 +227,10 @@ func (c *cursor) readLenValue() ([]byte, error) {
 		return nil, errors.New("invalid length")
 	}
 	start := j + 1
-	end := start + length
-	if end > len(c.b) {
+	if length > len(c.b)-start {
 		return nil, io.ErrUnexpectedEOF
 	}
+	end := start + length
 	value := c.b[start:end]
 	c.i = end
 	if c.i < len(c.b) && c.b[c.i] != ' ' {

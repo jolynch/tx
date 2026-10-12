@@ -193,8 +193,26 @@ type FrameTrailer struct {
 	Next           *int64
 }
 
+// NextFXToken returns the first token of an FX/1 line and the rest after it.
+// Tokens are separated by one or more spaces and by nothing else; tok is
+// empty once no tokens remain.
+func NextFXToken(s string) (tok, rest string) {
+	s = strings.TrimLeft(s, " ")
+	tok, rest, _ = strings.Cut(s, " ")
+	return tok, rest
+}
+
+// FXFields appends the tokens of an FX/1 line to fields. Callers pass a stack
+// buffer, so a typical line splits without allocating.
+func FXFields(fields []string, line string) []string {
+	for tok, rest := NextFXToken(line); tok != ""; tok, rest = NextFXToken(rest) {
+		fields = append(fields, tok)
+	}
+	return fields
+}
+
 func ParseFXHeader(line string) (FileFrameMeta, error) {
-	fields := strings.Fields(line)
+	fields := FXFields(make([]string, 0, 16), line)
 	if len(fields) < 3 || fields[0] != "FX/1" {
 		return FileFrameMeta{}, errors.New("invalid FX/1 header")
 	}
@@ -204,11 +222,11 @@ func ParseFXHeader(line string) (FileFrameMeta, error) {
 	}
 	props := make(map[string]string, len(fields)-2)
 	for _, token := range fields[2:] {
-		parts := strings.SplitN(token, "=", 2)
-		if len(parts) != 2 {
+		key, val, ok := strings.Cut(token, "=")
+		if !ok {
 			continue
 		}
-		props[parts[0]] = parts[1]
+		props[key] = val
 	}
 
 	comp := props["comp"]
@@ -285,7 +303,7 @@ func ParseFXTrailer(line string) (FrameTrailer, error) {
 	if err != nil {
 		return FrameTrailer{}, err
 	}
-	fields := strings.Fields(prefix)
+	fields := FXFields(make([]string, 0, 16), prefix)
 	if len(fields) < 3 || fields[0] != "FXT/1" {
 		return FrameTrailer{}, errors.New("invalid FXT/1 trailer")
 	}
@@ -341,6 +359,11 @@ func ParseFXTrailer(line string) (FrameTrailer, error) {
 }
 
 func SplitTrailerPrefixAndHash(line string) (string, string, error) {
+	// Most trailers carry no hash token. Contains scans forward with SIMD;
+	// LastIndex scans backward one byte at a time, so check first.
+	if !strings.Contains(line, " hash=") {
+		return strings.TrimSpace(line), "", nil
+	}
 	idx := strings.LastIndex(line, " hash=")
 	if idx <= 0 {
 		return strings.TrimSpace(line), "", nil
@@ -357,8 +380,8 @@ func ValidHashToken(raw string) bool {
 	if raw == "" {
 		return false
 	}
-	parts := strings.SplitN(raw, ":", 2)
-	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+	algo, digest, ok := strings.Cut(raw, ":")
+	return ok && algo != "" && digest != ""
 }
 
 func AbbrevHashToken(raw string) string {

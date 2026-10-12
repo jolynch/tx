@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -265,6 +266,19 @@ func TestDecodePathTokenRejectsTrailing(t *testing.T) {
 	_, err := DecodePathToken("", "0:5:a.txt extra")
 	if err == nil {
 		t.Fatal("expected error for trailing content")
+	}
+}
+
+func TestLengthPrefixedTokensRejectOversizedLengths(t *testing.T) {
+	for _, length := range []string{"5", strconv.Itoa(int(^uint(0) >> 1)), "18446744073709551616"} {
+		t.Run(length, func(t *testing.T) {
+			if _, _, err := DecodePathTokenPrefix("", "0:"+length+":x"); err == nil {
+				t.Fatal("accepted oversized path suffix")
+			}
+			if _, _, err := ParseLenPrefixedPrefix(length + ":x"); err == nil {
+				t.Fatal("accepted oversized value")
+			}
+		})
 	}
 }
 

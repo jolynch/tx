@@ -1204,7 +1204,7 @@ func readEntryMetadataFrame(br *bufio.Reader, fileID uint64) (*FileTrailerMetada
 	if trailer.FileID != fileID {
 		return nil, fmt.Errorf("trailer file id mismatch: expected=%d got=%d", fileID, trailer.FileID)
 	}
-	if trailer.Next == nil || *trailer.Next != 0 {
+	if !trailer.HasNext || trailer.Next != 0 {
 		return nil, errors.New("metadata trailer must be terminal next=0")
 	}
 	if trailer.Metadata == nil {
@@ -1446,8 +1446,15 @@ func (c *Client) downloadSubBatch(
 		}
 	}()
 
+	// One hasher serves every file of the sub-batch; a hasher per file is
+	// 1.2 KiB of garbage per file.
+	windowHasher := xxh3.New128()
+	// The frame's payload reader and its hashing output are reused for every
+	// frame rather than allocated per frame.
+	hashOut := &hashingWriter{h: windowHasher}
+	var payloadReader, frameLimit io.LimitedReader
 	for _, plan := range plans {
-		fileCtx, fileTask := trace.NewTask(ctx, "download-file")
+		fileCtx, fileTask := utils.NewTraceTask(ctx, "download-file")
 		writer, syncOutput, err := req.OutputWriter(plan.entry, plan.resumeFrom)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("create output writer for file %d: %w", plan.entry.ID, err)
@@ -1494,7 +1501,7 @@ func (c *Client) downloadSubBatch(
 		lastTrailerTS := int64(0)
 		var lastMetadata *FileTrailerMetadata
 		serverHash := ""
-		windowHasher := xxh3.New128()
+		windowHasher.Reset()
 
 		for {
 			headerLine, readErr := br.ReadString('\n')
@@ -1502,7 +1509,11 @@ func (c *Client) downloadSubBatch(
 				_ = closeWriter()
 				return nil, nil, nil, fmt.Errorf("read frame header: %w", readErr)
 			}
-			arrival := time.Now()
+			// Only a traced request reports when each frame arrived.
+			var arrival time.Time
+			if rt != nil {
+				arrival = time.Now()
+			}
 			headerTrimmed := strings.TrimRight(headerLine, "\r\n")
 			if isStatusLine(headerTrimmed) {
 				_ = closeWriter()
@@ -1521,18 +1532,32 @@ func (c *Client) downloadSubBatch(
 				_ = closeWriter()
 				return nil, nil, nil, fmt.Errorf("batched offset mismatch: expected=%d got=%d", offset, frameMeta.Offset)
 			}
+			// The server never streams past the manifest size, so a frame
+			// that declares more is rejected before anything is decoded.
+			if frameMeta.Size > plan.entry.Size-offset {
+				_ = closeWriter()
+				return nil, nil, nil, fmt.Errorf("frame for file %d declares %d bytes at offset %d, past its size %d", plan.entry.ID, frameMeta.Size, offset, plan.entry.Size)
+			}
 			if frameBuf == nil {
 				frameBuf, releaseFrameBuf = c.acquireFrameReadBuffer(frameMeta.MaxWireSizeHint)
 			}
 
-			payloadReader := io.LimitReader(br, frameMeta.WireSize)
-			logicalReader, decodeErr := decodePayloadReader(payloadReader, frameMeta.Comp)
-			if decodeErr != nil {
-				_ = closeWriter()
-				return nil, nil, nil, fmt.Errorf("decode payload reader: %w", decodeErr)
+			payloadReader.R, payloadReader.N = br, frameMeta.WireSize
+			var logicalReader io.Reader = &payloadReader
+			var decoder io.ReadCloser
+			if frameMeta.Comp != "none" {
+				var decodeErr error
+				decoder, decodeErr = decodePayloadReader(&payloadReader, frameMeta.Comp)
+				if decodeErr != nil {
+					_ = closeWriter()
+					return nil, nil, nil, fmt.Errorf("decode payload reader: %w", decodeErr)
+				}
+				logicalReader = decoder
 			}
+			hashOut.w = out
 			frameStartOffset := offset
-			copyErr := copyStreamWithProgress(io.MultiWriter(out, windowHasher), logicalReader, frameBuf, func(written int64) error {
+			frameLimit.R, frameLimit.N = logicalReader, frameMeta.Size
+			copyErr := copyStreamWithProgress(hashOut, &frameLimit, frameBuf, func(written int64) error {
 				emitProgressUpdate(DownloadProgressUpdate{
 					TransferID:  req.Manifest.TransferID,
 					FileID:      plan.entry.ID,
@@ -1542,7 +1567,13 @@ func (c *Client) downloadSubBatch(
 				})
 				return nil
 			})
-			closeLogicalErr := logicalReader.Close()
+			if copyErr == nil {
+				copyErr = checkDecodedFrameSize(logicalReader, frameMeta.Size, frameMeta.Size-frameLimit.N, frameBuf)
+			}
+			var closeLogicalErr error
+			if decoder != nil {
+				closeLogicalErr = decoder.Close()
+			}
 			if copyErr != nil {
 				_ = closeWriter()
 				return nil, nil, nil, fmt.Errorf("stream output file: %w", copyErr)
@@ -1576,19 +1607,16 @@ func (c *Client) downloadSubBatch(
 			}
 			lastTrailerTS = trailer.TS
 			if trailer.Metadata != nil {
-				lastMetadata = cloneTrailerMetadata(trailer.Metadata)
+				// Each parse returns its own metadata, so keep it as is.
+				lastMetadata = trailer.Metadata
 			}
-			if trailer.Next == nil {
+			if !trailer.HasNext || trailer.Next == 0 {
 				serverHash = trailer.FileHashToken
 				break
 			}
-			if *trailer.Next == 0 {
-				serverHash = trailer.FileHashToken
-				break
-			}
-			if *trailer.Next != offset {
+			if trailer.Next != offset {
 				_ = closeWriter()
-				return nil, nil, nil, fmt.Errorf("invalid trailer next offset: expected=%d got=%d", offset, *trailer.Next)
+				return nil, nil, nil, fmt.Errorf("invalid trailer next offset: expected=%d got=%d", offset, trailer.Next)
 			}
 		}
 		if offset != plan.entry.Size {
@@ -1608,22 +1636,24 @@ func (c *Client) downloadSubBatch(
 
 		syncMS := int64(0)
 		syncStart := time.Now()
-		_, syncTask := trace.NewTask(fileCtx, "sync")
+		_, syncTask := utils.NewTraceTask(fileCtx, "sync")
 		if err := syncOutput(); err != nil {
 			syncTask.End()
 			_ = closeWriter()
 			return nil, nil, nil, fmt.Errorf("sync output for file %d: %w", plan.entry.ID, err)
 		}
 		syncTask.End()
-		syncMS = time.Since(syncStart).Milliseconds()
-		c.emitFsync(req.Manifest.TransferID, plan.entry.ID, time.Since(syncStart))
+		syncDur := time.Since(syncStart)
+		syncMS = syncDur.Milliseconds()
+		c.emitFsync(req.Manifest.TransferID, plan.entry.ID, syncDur)
 		if err := closeWriter(); err != nil {
 			return nil, nil, nil, fmt.Errorf("close output for file %d: %w", plan.entry.ID, err)
 		}
-		c.emitFileDone(req.Manifest.TransferID, plan.entry.ID, time.Since(fileStart))
+		fileDur := time.Since(fileStart)
+		c.emitFileDone(req.Manifest.TransferID, plan.entry.ID, fileDur)
 
 		localHash := windowHash
-		recvMS := time.Since(fileStart).Milliseconds()
+		recvMS := fileDur.Milliseconds()
 		deltaBytes := offset - plan.resumeFrom
 		pendingAcks = append(pendingAcks, AcknowledgeFileProgressRequest{
 			TransferID: req.Manifest.TransferID,
@@ -2881,14 +2911,21 @@ func buildAckToken(ackBytes int64, serverTS int64, hashToken string) (string, er
 	if serverTS < 0 {
 		return "", errors.New("ack server timestamp must be non-negative")
 	}
-	token := fmt.Sprintf("%d@%d", ackBytes, serverTS)
-	if hashToken != "" {
-		if !intencoding.ValidHashToken(hashToken) {
-			return "", errors.New("invalid ack hash token")
-		}
-		token += "@" + hashToken
+	if hashToken != "" && !intencoding.ValidHashToken(hashToken) {
+		return "", errors.New("invalid ack hash token")
 	}
-	return token, nil
+	// bytes@ts[@hash], built in one allocation.
+	var b strings.Builder
+	var num [20]byte
+	b.Grow(2*len(num) + 2 + len(hashToken))
+	b.Write(strconv.AppendInt(num[:0], ackBytes, 10))
+	b.WriteByte('@')
+	b.Write(strconv.AppendInt(num[:0], serverTS, 10))
+	if hashToken != "" {
+		b.WriteByte('@')
+		b.WriteString(hashToken)
+	}
+	return b.String(), nil
 }
 
 // ackAttemptKey carries the attempt number to the ACK request, for ack
@@ -2943,6 +2980,44 @@ func mergeCompCounts(dst map[string]uint64, src map[string]uint64) {
 	for k, v := range src {
 		dst[k] += v
 	}
+}
+
+// checkDecodedFrameSize rejects a frame that decoded to other than its
+// declared size. The caller caps its copy at that size, so a frame that would
+// expand past it is caught by reading one more byte, before any excess reaches
+// the output. scratch is any buffer at least one byte long.
+func checkDecodedFrameSize(logical io.Reader, declared, copied int64, scratch []byte) error {
+	if copied != declared {
+		return fmt.Errorf("frame decoded to %d bytes, declared %d", copied, declared)
+	}
+	n, err := io.ReadAtLeast(logical, scratch[:1], 1)
+	if n > 0 {
+		return fmt.Errorf("frame decodes past its declared %d bytes", declared)
+	}
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
+}
+
+// hashingWriter writes to w and then hashes what it wrote, with the
+// semantics of io.MultiWriter(w, h), but is reused across frames rather than
+// allocated per frame.
+type hashingWriter struct {
+	w io.Writer
+	h *xxh3.Hasher128
+}
+
+func (hw *hashingWriter) Write(p []byte) (int, error) {
+	n, err := hw.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	if n != len(p) {
+		return n, io.ErrShortWrite
+	}
+	_, _ = hw.h.Write(p)
+	return n, nil
 }
 
 func copyStreamWithProgress(dst io.Writer, src io.Reader, buf []byte, onWrite func(written int64) error) error {
@@ -3308,6 +3383,9 @@ type fileStream struct {
 	frameMeta   FileFrameMeta
 	logical     io.ReadCloser
 	logicalRead int64
+	// requested is the bytes the request asked for, or 0 when unbounded;
+	// declared is the sum of the sizes the frames so far declared.
+	requested, declared int64
 
 	expectOffset    bool
 	expectedOffset  int64
@@ -3446,11 +3524,14 @@ func (c *Client) fileStreamBufferHint(fileSizeHint int64, firstFrameSize int64) 
 	return int64(effectiveFrameReadBufferSize(c.FrameBufferBytes, fileSizeHint, c.MaxFrameReadBufferBytes))
 }
 
-func (c *Client) newFileStream(respBody io.ReadCloser, ageIdentity string, fileSizeHint int64) (io.ReadCloser, *FileFrameMeta, error) {
-	return c.newFileStreamTraced(respBody, ageIdentity, fileSizeHint, nil)
+func (c *Client) newFileStream(respBody io.ReadCloser, ageIdentity string, requested int64) (io.ReadCloser, *FileFrameMeta, error) {
+	return c.newFileStreamTraced(respBody, ageIdentity, requested, nil)
 }
 
-func (c *Client) newFileStreamTraced(respBody io.ReadCloser, ageIdentity string, fileSizeHint int64, rt *reqTrace) (io.ReadCloser, *FileFrameMeta, error) {
+// newFileStreamTraced reads a SEND response for one window of requested bytes,
+// or for the rest of the file when requested is 0. Frames that together
+// declare more than requested are rejected before they are decoded.
+func (c *Client) newFileStreamTraced(respBody io.ReadCloser, ageIdentity string, requested int64, rt *reqTrace) (io.ReadCloser, *FileFrameMeta, error) {
 	identity, err := parseAgeIdentity(ageIdentity)
 	if err != nil {
 		return nil, nil, err
@@ -3471,7 +3552,7 @@ func (c *Client) newFileStreamTraced(respBody io.ReadCloser, ageIdentity string,
 		return nil, nil, errors.New("negative frame offset")
 	}
 
-	bufferHint := c.fileStreamBufferHint(fileSizeHint, firstMeta.Size)
+	bufferHint := c.fileStreamBufferHint(requested, firstMeta.Size)
 	readBuf, release := c.acquireFrameReadBuffer(bufferHint)
 	stream := &fileStream{
 		respBody:  respBody,
@@ -3484,6 +3565,7 @@ func (c *Client) newFileStreamTraced(respBody io.ReadCloser, ageIdentity string,
 		meta:      &FileFrameMeta{},
 		pending:   &firstMeta,
 		releaseBr: release,
+		requested: requested,
 	}
 	if err := stream.openNextFrame(); err != nil {
 		release()
@@ -3532,7 +3614,14 @@ func (s *fileStream) read(p []byte) (int, error) {
 			}
 		}
 
-		n, err := s.logical.Read(p)
+		// Read no further than the frame's declared size. Once it is reached,
+		// a one-byte read must hit EOF; any excess fails the frame before it
+		// reaches the caller.
+		remaining := s.frameMeta.Size - s.logicalRead
+		n, err := s.logical.Read(p[:min(int64(len(p)), max(remaining, 1))])
+		if remaining <= 0 && n > 0 {
+			return 0, fmt.Errorf("frame decodes past its declared %d bytes", s.frameMeta.Size)
+		}
 		if n > 0 {
 			s.logicalRead += int64(n)
 		}
@@ -3661,6 +3750,10 @@ func (s *fileStream) openNextFrame() error {
 		}
 	}
 
+	if s.requested > 0 && meta.Size > s.requested-s.declared {
+		return fmt.Errorf("frames declare more than the %d bytes requested", s.requested)
+	}
+	s.declared += meta.Size
 	payloadReader := io.LimitReader(s.br, meta.WireSize)
 	logicalReader, err := decodePayloadReader(payloadReader, meta.Comp)
 	if err != nil {
@@ -3691,12 +3784,12 @@ func (s *fileStream) finishFrame() error {
 	}
 
 	nextOffset := s.frameMeta.Offset + s.frameMeta.Size
-	if trailer.Next != nil {
-		if *trailer.Next == 0 {
+	if trailer.HasNext {
+		if trailer.Next == 0 {
 			s.expectNextFrame = false
 		} else {
-			if *trailer.Next != nextOffset {
-				return fmt.Errorf("invalid trailer next offset: expected=%d got=%d", nextOffset, *trailer.Next)
+			if trailer.Next != nextOffset {
+				return fmt.Errorf("invalid trailer next offset: expected=%d got=%d", nextOffset, trailer.Next)
 			}
 			s.expectNextFrame = true
 		}
@@ -3732,43 +3825,58 @@ func (s *fileStream) finishFrame() error {
 }
 
 func parseFXHeader(line string) (FileFrameMeta, error) {
-	fields := strings.Fields(line)
-	if len(fields) < 3 || fields[0] != "FX/1" {
+	version, rest := intencoding.NextFXToken(line)
+	fileIDRaw, rest := intencoding.NextFXToken(rest)
+	if version != "FX/1" || strings.TrimLeft(rest, " ") == "" {
 		return FileFrameMeta{}, errors.New("invalid FX/1 header")
 	}
-	fileID, err := strconv.ParseUint(fields[1], 10, 64)
+	// A later duplicate key wins.
+	var comp, offsetRaw, sizeRaw, wsizeRaw, tsRaw, maxWRaw string
+	hasMaxWSize := false
+	for field, rest := intencoding.NextFXToken(rest); field != ""; field, rest = intencoding.NextFXToken(rest) {
+		key, val, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "comp":
+			comp = val
+		case "offset":
+			offsetRaw = val
+		case "size":
+			sizeRaw = val
+		case "wsize":
+			wsizeRaw = val
+		case "ts":
+			tsRaw = val
+		case "max-wsize":
+			maxWRaw, hasMaxWSize = val, true
+		}
+	}
+	fileID, err := strconv.ParseUint(fileIDRaw, 10, 64)
 	if err != nil {
 		return FileFrameMeta{}, fmt.Errorf("invalid header file id: %w", err)
 	}
-	props := make(map[string]string, len(fields)-2)
-	for _, token := range fields[2:] {
-		parts := strings.SplitN(token, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		props[parts[0]] = parts[1]
-	}
 
-	comp := props["comp"]
-	offset, err := parseHeaderInt(props["offset"], "offset")
+	offset, err := parseHeaderInt(offsetRaw, "offset")
 	if err != nil {
 		return FileFrameMeta{}, err
 	}
-	size, err := parseHeaderInt(props["size"], "size")
+	size, err := parseHeaderInt(sizeRaw, "size")
 	if err != nil {
 		return FileFrameMeta{}, err
 	}
-	wsize, err := parseHeaderInt(props["wsize"], "wsize")
+	wsize, err := parseHeaderInt(wsizeRaw, "wsize")
 	if err != nil {
 		return FileFrameMeta{}, err
 	}
-	ts, err := parseHeaderInt(props["ts"], "ts")
+	ts, err := parseHeaderInt(tsRaw, "ts")
 	if err != nil {
 		return FileFrameMeta{}, err
 	}
 	maxWSizeHint := int64(0)
-	if raw, ok := props["max-wsize"]; ok {
-		maxWSizeHint, err = parseHeaderInt(raw, "max-wsize")
+	if hasMaxWSize {
+		maxWSizeHint, err = parseHeaderInt(maxWRaw, "max-wsize")
 		if err != nil {
 			return FileFrameMeta{}, err
 		}
@@ -3810,8 +3918,11 @@ type frameTrailer struct {
 	HashToken      string
 	FileHashToken  string
 	ChecksumPrefix string
-	Next           *int64
-	Metadata       *FileTrailerMetadata
+	// Next is the next frame's offset, or 0 after the last frame; HasNext
+	// reports whether the trailer carried one.
+	Next     int64
+	HasNext  bool
+	Metadata *FileTrailerMetadata
 }
 
 func parseFXTrailer(line string) (frameTrailer, error) {
@@ -3819,24 +3930,26 @@ func parseFXTrailer(line string) (frameTrailer, error) {
 	if err != nil {
 		return frameTrailer{}, err
 	}
-	fields := strings.Fields(prefix)
-	if len(fields) < 3 || fields[0] != "FXT/1" {
+	version, rest := intencoding.NextFXToken(prefix)
+	fileIDRaw, rest := intencoding.NextFXToken(rest)
+	if version != "FXT/1" || strings.TrimLeft(rest, " ") == "" {
 		return frameTrailer{}, errors.New("invalid FXT/1 trailer")
 	}
-	fileID, err := strconv.ParseUint(fields[1], 10, 64)
+	fileID, err := strconv.ParseUint(fileIDRaw, 10, 64)
 	if err != nil {
 		return frameTrailer{}, fmt.Errorf("invalid trailer file id: %w", err)
 	}
 	status := ""
 	var fileHashToken string
 	var ts int64 = -1
-	var nextOffset *int64
+	var nextOffset int64
+	hasNext := false
 	meta := FileTrailerMetadata{
 		Size:    -1,
 		MtimeNS: -1,
 	}
 	hasMeta := false
-	for _, token := range fields[2:] {
+	for token, rest := intencoding.NextFXToken(rest); token != ""; token, rest = intencoding.NextFXToken(rest) {
 		if val, ok := strings.CutPrefix(token, "status="); ok {
 			status = val
 		} else if tsRaw, ok := strings.CutPrefix(token, "ts="); ok {
@@ -3852,15 +3965,14 @@ func parseFXTrailer(line string) (frameTrailer, error) {
 			if parseErr != nil || nextValue < 0 {
 				return frameTrailer{}, errors.New("invalid trailer next offset")
 			}
-			nextOffset = &nextValue
+			nextOffset, hasNext = nextValue, true
 		}
 		if strings.HasPrefix(token, "meta:") {
-			parts := strings.SplitN(token, "=", 2)
-			if len(parts) != 2 {
+			key, val, ok := strings.Cut(token, "=")
+			if !ok {
 				continue
 			}
-			key := strings.TrimPrefix(parts[0], "meta:")
-			val := parts[1]
+			key = strings.TrimPrefix(key, "meta:")
 			switch key {
 			case "size":
 				sizeVal, parseErr := strconv.ParseInt(val, 10, 64)
@@ -3911,7 +4023,9 @@ func parseFXTrailer(line string) (frameTrailer, error) {
 		if meta.MtimeNS < 0 {
 			meta.MtimeNS = 0
 		}
-		metaPtr = &meta
+		// Copy so the metadata escapes only when the trailer carries it.
+		m := meta
+		metaPtr = &m
 	}
 	return frameTrailer{
 		FileID:         fileID,
@@ -3920,6 +4034,7 @@ func parseFXTrailer(line string) (frameTrailer, error) {
 		FileHashToken:  fileHashToken,
 		ChecksumPrefix: prefix,
 		Next:           nextOffset,
+		HasNext:        hasNext,
 		Metadata:       metaPtr,
 	}, nil
 }

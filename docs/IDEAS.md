@@ -6,6 +6,15 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Bugs
 
+- **Trailer user and group names can corrupt the line.** The server turns
+  spaces in `meta:user` and `meta:group` into `_`, but passes other bytes
+  through: a `\n` ends the trailer early, and a `\r` either stays inside the
+  name or, at the end of the line, is trimmed silently. Escape or reject them.
+- **Cancelled split downloads can leave their initial output writer open.**
+  `downloadWindows` opens the writer before acquiring a SEND slot and
+  launching the first window. Cancellation at either step leaves it open.
+  Guard ownership until the first window takes it, closing an unclaimed
+  writer on every exit.
 - **`tx recv get` drops flags for local sources.** The local branch in
   `cli_get.go` builds `localGetArgs` and silently discards `--compress`,
   `--encrypt`, `--auth-token`, `--auth-token-file`, `--keys`,
@@ -41,6 +50,12 @@ instead of widening the current change; remove an entry when it ships.
   throughput probe opens one connection per server CPU, in both the transfer
   and converge phases of `tx recv copy`. Probe over pooled connections, or
   once per client.
+- **Data-frame compressors are built per frame.** `WrapCompressedWriter`
+  creates a zstd or lz4 writer for every compressed SEND frame, sized to
+  GOMAXPROCS in fast mode. At 24 CPUs a 4 KiB frame costs about 19
+  allocations and 630 KiB with zstd (7 and 200 KiB with lz4), which dominates
+  small compressible files sent with `comp=zstd`. Pool them with
+  `Reset`, apart from the framed-body pool, which must keep zstd's checksum.
 - **Framed-body zstd buffer churn.** `CompressZstdPooled` reallocates about
   8 MiB of encoder history and decoder block whenever GC empties the pool:
   about 60% of the bytes allocated during a small-file `--verify full`.
@@ -81,11 +96,20 @@ instead of widening the current change; remove an entry when it ships.
     - Take no exclusive lock per request: keep per-file state and
       `StateCounts` in atomics, and the TTL as an atomic deadline, so the
       transfer lock guards only registration and deletion.
-  - CPU per GiB grows with available cores even though the work does not.
-    In `make bench-throughput`, 4 KiB files cost 9.7 core-s/GiB with
-    `THROUGHPUT_CPUS=2` and 62 with 24 (16 MiB files: 1.0 and 4.8). That
-    suggests spinning or contention that scales with concurrency; profile
-    an unpinned run for scheduler and lock time.
+  - CPU per GiB grows with available cores even though the work does not,
+    and mostly because of the host, not tx. On a Ryzen AI 9 HX 370 (4 Zen5
+    and 8 Zen5c cores, two threads each), every function costs about 3x
+    more CPU at 24 CPUs than at 8, with no new hotspot. Pinned to 12
+    physical cores, 4 KiB files ran at 673 MiB/s and 15.6 core-s/GiB; on
+    all 24 threads, 578 MiB/s and 35. Rows above the physical core count
+    measure SMT, and the unpinned `THROUGHPUT_CPUS` rows also use cores
+    outside GOMAXPROCS for kernel loopback work. Consider pinning the grid.
+  - About 26 allocations per 4 KiB file remain. `CollectFileFrameMetadata`
+    formats mode, uid, and gid as strings (4 per file); `streamSendItem`
+    moves `maxWSizeHint`, `md`, and `frameOffset` to the heap; the client
+    reads each frame's header and trailer with `ReadString`, which also has
+    no length bound; and `buildAckToken` builds each ACK token as a string
+    before copying it into the request body.
 
 ## Security
 
@@ -145,3 +169,7 @@ instead of widening the current change; remove an entry when it ships.
 - **TXFER and SYNC repeat setup code.** Their transfer setup overlaps, and the
   close-the-updates-channel closure is copied three times in `txfer.go` and
   `sync.go`.
+- **Short forms for common auth flags.** The client has `-t` for
+  `--auth-token` and `-k` for `--keys`, but `tx send tree` has no short form
+  for `--require-auth-token`, the usual way to start an authenticated
+  server. `-t` is free there and would mirror the client.

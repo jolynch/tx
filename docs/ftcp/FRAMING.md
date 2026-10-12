@@ -111,6 +111,10 @@ effective frame ceiling, including after reuse. Output grows incrementally and
 must match the declared logical size; the output bound alone does not bound
 decoder history.
 
+`SEND` data frames carry no zstd or lz4 checksum: the receiver verifies each
+window against `file-hash`. Framed bodies (manifests, request items, `STATUS`
+lists) keep it, because a client may store TXFER frames as-is.
+
 ## Parsing Rules
 
 - Maximum header/trailer line bytes: 4 MiB (defensive limit; a real header or
@@ -125,6 +129,9 @@ decoder history.
   the peer and each sizes an allocation, so neither may be decoded first and
   checked afterwards. See [OVERVIEW.md](./OVERVIEW.md#size-limits).
 - Header must be exactly one line; no multi-line property blocks.
+- Header and trailer tokens are separated by one or more spaces (0x20), and
+  spaces before the first token or after the last are ignored. No other byte
+  separates tokens.
 
 ## Semantics
 
@@ -132,7 +139,9 @@ decoder history.
 - `offset` allows resumable/partial writes.
 - `size` is the logical uncompressed bytes covered by this frame.
 - `wsize` is the exact payload byte count that follows the header newline.
-- For `comp=none`, `size` must equal `wsize`.
+- For `comp=none`, `size` must equal `wsize`, except in `CXSUM` frames: they
+  carry no payload (`wsize=0`), and `size` is the length of the checksummed
+  range.
 - For `comp=zstd|lz4`, decompressed bytes must equal `size`.
 - Trailer `hash=<algo>:<value>`, when present, is used for frame-integrity
   validation/logging.

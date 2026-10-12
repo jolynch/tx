@@ -3,6 +3,7 @@ package ftcp
 import (
 	"bytes"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -308,7 +309,7 @@ func readItemBody(in io.Reader, allowed map[string]bool, verb string) ([]map[str
 	defer body.Release()
 	var items []map[string]string
 	err = visitItemBody(body.Bytes(), allowed, verb, func(item map[string]string) error {
-		items = append(items, item)
+		items = append(items, maps.Clone(item))
 		return nil
 	})
 	return items, err

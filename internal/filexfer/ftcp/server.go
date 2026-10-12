@@ -30,8 +30,7 @@ const (
 	// maxCommandLineBytes bounds a command line. Command lines carry headers
 	// only — a verb, at most one path, and a few short options — since every
 	// argument list that grows with the transfer now travels in a framed body.
-	// PATH_MAX is 4096, so this is an order of magnitude past the longest
-	// legitimate command and exists only to stop a hostile peer.
+	// This is a protocol limit, independent of filesystem path limits.
 	maxCommandLineBytes = 64 * 1024
 
 	// defaultMaxSyncBodyBytes bounds the prior manifest a SYNC may upload.

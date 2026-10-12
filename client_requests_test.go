@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/jolynch/tx/internal/aead"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	"github.com/zeebo/xxh3"
@@ -419,5 +420,36 @@ func TestChecksumResponseTimeout(t *testing.T) {
 		if got := checksumResponseTimeout(per, tc.targets); got != tc.want {
 			t.Errorf("%s: checksumResponseTimeout = %s, want %s", tc.name, got, tc.want)
 		}
+	}
+}
+
+// A consumer may stop at the OK line; the batch must still fail when the
+// authenticated response then lacks its END or carries bytes past it.
+func TestChecksumBatchReportsUnreadResponseEnd(t *testing.T) {
+	const body = "FX/1 5 offset=0 size=3 wsize=3 comp=none ts=1\n" + "abc" + "FXT/1 5 status=ok ts=1 next=0\n" + "OK\r\n"
+	for _, tc := range []struct {
+		name    string
+		finish  func(w *aead.MessageWriter)
+		wantErr bool
+	}{
+		{"END", func(w *aead.MessageWriter) { _ = w.End() }, false},
+		{"no END", func(w *aead.MessageWriter) { _ = w.Flush() }, true},
+		{"bytes after OK", func(w *aead.MessageWriter) { _, _ = io.WriteString(w, "X"); _ = w.End() }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := noiseScriptServer(t, func(w *aead.MessageWriter) {
+				_, _ = io.WriteString(w, body)
+				tc.finish(w)
+			})
+			c := NewClient(addr, WithEncryptMode("chacha20"))
+			defer c.Close()
+			err := c.VisitChecksumBatches(context.Background(), GetChecksumRequest{TransferID: "tx1", Targets: []ChecksumTarget{{FileID: 5, FullPath: "/tmp/a", Size: 3}}}, ChecksumBatchOptions{}, func(_ []ChecksumTarget, response GetChecksumResponse) error {
+				_, err := io.ReadFull(response.Reader, make([]byte, len(body)))
+				return err
+			})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, want error %v", err, tc.wantErr)
+			}
+		})
 	}
 }
