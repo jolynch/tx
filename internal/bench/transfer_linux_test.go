@@ -430,12 +430,12 @@ func throughputCPUCounts(t *testing.T) []int {
 }
 
 // defaultTPMaxRatio is the regression bar for the worst cost ratio. It must
-// hold on any CI host, and hosts differ: 4 KiB files measured 9.5-15 on a
-// Ryzen AI 9 HX 370 (2-24 CPUs) but 17.8-21.8 on a GitHub Actions EPYC 9V45
-// (2-4 CPUs), where bulk byte work is relatively cheaper. Before small frames
-// skipped zero-copy and manifest lookups were indexed, the Ryzen measured
-// 2.5x its current ratio.
-const defaultTPMaxRatio = 40.0
+// hold on any CI host, and hosts differ: 4 KiB files measure about 2.5-5 on a
+// Ryzen AI 9 HX 370 (2-24 CPUs) and 5.8-7.6 on a GitHub Actions EPYC 9V74
+// (2-4 CPUs). An EPYC 9V45 runner, where bulk byte work is relatively
+// cheaper, measured up to 22 when small files cost about a third more than
+// they do now, so the bar leaves room for such hosts.
+const defaultTPMaxRatio = 30.0
 
 // The largest size is the reference every ratio divides by.
 var memTransferReference = memTransferSizes[len(memTransferSizes)-1]

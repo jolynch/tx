@@ -97,14 +97,15 @@ instead of widening the current change; remove an entry when it ships.
       `StateCounts` in atomics, and the TTL as an atomic deadline, so the
       transfer lock guards only registration and deletion.
   - CPU per GiB grows with available cores even though the work does not,
-    and mostly because of the host, not tx. On a Ryzen AI 9 HX 370 (4 Zen5
-    and 8 Zen5c cores, two threads each), every function costs about 3x
-    more CPU at 24 CPUs than at 8, with no new hotspot. Pinned to 12
-    physical cores, 4 KiB files ran at 673 MiB/s and 15.6 core-s/GiB; on
-    all 24 threads, 578 MiB/s and 35. Rows above the physical core count
-    measure SMT, and the unpinned `THROUGHPUT_CPUS` rows also use cores
-    outside GOMAXPROCS for kernel loopback work. Consider pinning the grid.
-  - About 26 allocations per 4 KiB file remain. `CollectFileFrameMetadata`
+    mostly because of the host, not tx. On a Ryzen AI 9 HX 370 (4 Zen5 and
+    8 Zen5c cores, two threads each), firmware drops core clocks from about
+    4.9 GHz with one busy core to about 1.7 GHz with four or more, whatever
+    the governor, so core-s/GiB triples while cycles per GiB stay roughly
+    flat. Rows above the 12 physical cores add SMT, and unpinned
+    `THROUGHPUT_CPUS` rows also use cores outside GOMAXPROCS for kernel
+    loopback work. A single grid cell can vary by 45% between runs, so judge
+    a change with interleaved A/B runs on pinned cores, not one grid.
+  - About 25 allocations per 4 KiB file remain. `CollectFileFrameMetadata`
     formats mode, uid, and gid as strings (4 per file); `streamSendItem`
     moves `maxWSizeHint`, `md`, and `frameOffset` to the heap; the client
     reads each frame's header and trailer with `ReadString`, which also has

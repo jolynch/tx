@@ -7,7 +7,11 @@
 # own shutdown as "context deadline exceeded", failing a run that found
 # nothing; an interrupt ends fuzzing through a path without that race.
 # DEADLINE is the test binary's -test.timeout. A TARGET that matches no fuzz
-# test fails instead of silently passing.
+# test fails instead of silently passing, as does one that spends DURATION
+# replaying its cached corpus and never reaches new inputs: Go prints "now
+# fuzzing" only once that replay ends. A failure prints how long the target
+# ran and the contents of each failing input it wrote, so a CI log alone is
+# enough to reproduce it.
 set -euo pipefail
 
 race=()
@@ -38,6 +42,9 @@ done
 
 echo "fuzz $importpath $target for $duration"
 cd "$dir"
+corpus="testdata/fuzz/$target"
+before=$(ls "$corpus" 2>/dev/null || true)
+start=$SECONDS
 set +e
 timeout -s INT --preserve-status --kill-after=60s "$duration" \
 	"$bin" -test.run='^$' -test.fuzz="^${target}\$" -test.timeout="$deadline" \
@@ -45,8 +52,24 @@ timeout -s INT --preserve-status --kill-after=60s "$duration" \
 	"${flags[@]}" 2>&1 | tee "$log"
 rc=${PIPESTATUS[0]}
 set -e
-if [ "$rc" -eq 0 ] && ! grep -q '^fuzz: elapsed' "$log"; then
-	echo "fuzz: $target in $importpath ran no fuzzing; check the package and target name" >&2
+if [ "$rc" -ne 0 ]; then
+	echo "fuzz: $target in $importpath failed after $((SECONDS - start))s of $duration (exit $rc)" >&2
+	for name in $(ls "$corpus" 2>/dev/null || true); do
+		if grep -qxF "$name" <<<"$before"; then
+			continue
+		fi
+		echo "fuzz: failing input $dir/$corpus/$name:" >&2
+		cat "$corpus/$name" >&2
+		echo "fuzz: to reproduce, save it there and run: go test ${race[*]} -run='^$target\$/^$name\$' $pkg" >&2
+	done
+fi
+if [ "$rc" -eq 0 ] && ! grep -q 'now fuzzing' "$log"; then
+	if grep -q '^fuzz: elapsed' "$log"; then
+		echo "fuzz: $target in $importpath spent $duration replaying its corpus and never fuzzed;" \
+			"run go clean -fuzzcache to empty $(go env GOCACHE)/fuzz/$importpath/$target, or allow more time" >&2
+	else
+		echo "fuzz: $target in $importpath ran no fuzzing; check the package and target name" >&2
+	fi
 	exit 1
 fi
 exit "$rc"

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"net"
 	"os"
@@ -141,8 +142,10 @@ func FuzzCopyVerifyDetectsCorruption(f *testing.F) {
 		var total, slots int64
 		for i := range 1 + rng.IntN(4) {
 			// Sizes cover sub-slot files, multi-slot files, and a short
-			// last slot.
-			data := make([]byte, 1+rng.IntN(9<<20))
+			// last slot. They are drawn log-uniformly up to 9 MiB, so most
+			// files are small and an input stays cheap, while about 1 in 20
+			// files still spans more than one 4 MiB slot.
+			data := make([]byte, max(1, int(math.Exp(rng.Float64()*math.Log(9<<20)))))
 			_, _ = fill.Read(data)
 			name := fmt.Sprintf("f%d.bin", i)
 			writeLocalTestFile(t, filepath.Join(src, name), data)
