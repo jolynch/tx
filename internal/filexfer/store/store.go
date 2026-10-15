@@ -422,6 +422,10 @@ func (s *Store) GetTransferLimiterBps(txferID string) int64 {
 	return managed.limiterBps
 }
 
+// ReportTransferObservedLink folds a client's observed link speed into the
+// transfer's moving average and retunes its gentle limiter. It never creates
+// a limiter: only a gentle SEND does (GetTransferGentleLimiter), so a fast
+// transfer reports no rate change and keeps GetTransferLimiterBps at zero.
 func (s *Store) ReportTransferObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool) {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
@@ -448,23 +452,24 @@ func (s *Store) ReportTransferObservedLink(txferID string, observedLinkMbps int6
 	if roundedLinkMbps <= 0 {
 		roundedLinkMbps = observedLinkMbps
 	}
-	newRateBps := deriveGentleRateBps(roundedLinkMbps, gentleBWPct)
 	update := TransferObservedLinkUpdate{
 		ObservedLinkMbps: observedLinkMbps,
 		EMALinkMbps:      ema,
 		RoundedLinkMbps:  roundedLinkMbps,
 		OldRateBps:       managed.limiterBps,
-		NewRateBps:       newRateBps,
+		NewRateBps:       managed.limiterBps,
 	}
 
 	managed.observedEMA = ema
 	managed.transfer.LinkMbps = roundedLinkMbps
-	if newRateBps <= 0 {
+	if managed.limiter.Load() == nil {
 		return update, true
 	}
-	if newRateBps == managed.limiterBps && managed.limiter.Load() != nil {
+	newRateBps := deriveGentleRateBps(roundedLinkMbps, gentleBWPct)
+	if newRateBps <= 0 || newRateBps == managed.limiterBps {
 		return update, true
 	}
+	update.NewRateBps = newRateBps
 	limiter, err := limit.NewLimiterFromBps(newRateBps, burstBytes)
 	if err != nil {
 		return TransferObservedLinkUpdate{}, false

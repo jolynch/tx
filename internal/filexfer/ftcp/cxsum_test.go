@@ -3,6 +3,8 @@ package ftcp
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,5 +53,164 @@ func TestHandleCXSUMMultipleRanges(t *testing.T) {
 	}
 	if got := strings.Count(raw, "next=0"); got != 2 {
 		t.Fatalf("expected terminal trailers for each range, got %d output=%q", got, raw)
+	}
+}
+
+func TestHandleCXSUMRangeBounds(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "data")
+	if err := os.WriteFile(filePath, []byte("hello"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	req, err := ParseRequest([]byte("CXSUM tx1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, algo := range []string{"none", "xxh128", "xxh64"} {
+		for _, tc := range []struct {
+			name         string
+			offset, size int64
+			invalid      bool
+		}{
+			{"within file", 1, 4, false},
+			{"empty at eof", 5, 0, false},
+			{"past eof", 5, 1, true},
+			{"offset past eof", 6, 0, true},
+			{"overflow", 1, 1<<63 - 1, true},
+		} {
+			t.Run(algo+"/"+tc.name, func(t *testing.T) {
+				var out bytes.Buffer
+				body := framedItemBody(t, fmt.Sprintf(`fd=1 "/file" offset=%d size=%d algo=%s`, tc.offset, tc.size, algo))
+				err := handleCXSUMWithInput(context.Background(), req, body, &out, &mockDeps{filePath: filePath})
+				if tc.invalid {
+					var pe protocolErr
+					if !errors.As(err, &pe) || pe.code != "BAD_REQUEST" || out.Len() != 0 {
+						t.Fatalf("err=%v output=%q", err, out.String())
+					}
+				} else if err != nil || strings.Count(out.String(), "FX/1 ") != 1 {
+					t.Fatalf("err=%v output=%q", err, out.String())
+				}
+			})
+		}
+	}
+}
+
+// failingReaderAt fails every read, so a hash that reads nothing passes.
+type failingReaderAt struct{}
+
+func (failingReaderAt) ReadAt([]byte, int64) (int, error) { return 0, os.ErrClosed }
+
+func TestHashChecksumRangeComputesOnlyRequested(t *testing.T) {
+	data := []byte("hello world")
+	want128 := encoding.FormatXXH128HashToken(xxh3.Hash128(data[6:]))
+	want64 := encoding.FormatXXH64HashToken(xxh3.Hash(data[6:]))
+	// One set of hashers serves every case, as one request's items share it.
+	var hashers checksumHashers
+	for _, tc := range []struct {
+		algorithms []string
+		want       []string
+	}{
+		{[]string{"xxh128"}, []string{want128}},
+		{[]string{"xxh64"}, []string{want64}},
+		{[]string{"xxh128", "xxh64"}, []string{want128, want64}},
+	} {
+		got, err := hashChecksumRange(bytes.NewReader(data), 6, 5, tc.algorithms, make([]byte, 2), &hashers)
+		if err != nil {
+			t.Fatalf("%v: %v", tc.algorithms, err)
+		}
+		if len(tc.algorithms) == 1 && tc.algorithms[0] == "xxh128" && hashers.h64 != nil {
+			t.Fatal("allocated the unrequested xxh64 hasher")
+		}
+		if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+			t.Fatalf("%v: got %v want %v", tc.algorithms, got, tc.want)
+		}
+	}
+	got, err := hashChecksumRange(failingReaderAt{}, 0, 5, nil, nil, &hashers)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("no algorithms: got %v, %v; want no tokens and no read", got, err)
+	}
+}
+
+// FuzzChecksumFrameMatchesWriteFrame checks that CXSUM's pooled frame
+// encoder writes exactly what encoding.WriteFrame writes for the same frame,
+// so clients see no change in format or frame hash.
+func FuzzChecksumFrameMatchesWriteFrame(f *testing.F) {
+	f.Add(uint64(1), int64(0), int64(5), int64(1700000000000), uint8(1), "root", "0644")
+	f.Add(uint64(1<<63), int64(6), int64(0), int64(0), uint8(3), "a user", "0755")
+	f.Add(uint64(7), int64(1<<40), int64(4<<20), int64(-1), uint8(0), "", "")
+	f.Fuzz(func(t *testing.T, fileID uint64, offset, size, ts int64, algos uint8, user, mode string) {
+		hashes := []string{}
+		if algos&1 != 0 {
+			hashes = append(hashes, encoding.FormatXXH128HashToken(xxh3.Hash128([]byte(user))))
+		}
+		if algos&2 != 0 {
+			hashes = append(hashes, encoding.FormatXXH64HashToken(xxh3.Hash([]byte(mode))))
+		}
+		meta := encoding.FileFrameMetadata{Size: size, MtimeNS: ts, Mode: mode, UID: "1000", GID: "1000", User: user, Group: user}
+		headerHash := "none:0"
+		if len(hashes) > 0 {
+			headerHash = hashes[0]
+		}
+		var want bytes.Buffer
+		if _, err := encoding.WriteFrame(&want, encoding.WriteArgs{
+			FileID: fileID, Offset: offset, Size: size, Comp: "none", HeaderHash: headerHash,
+			HeaderTS: ts, TrailerTS: ts, FileHashes: hashes, Metadata: &meta,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		got := appendChecksumFrame([]byte("prefix"), fileID, offset, size, hashes, ts, &meta)
+		if !bytes.Equal(got[len("prefix"):], want.Bytes()) {
+			t.Fatalf("frame mismatch:\n got %q\nwant %q", got[len("prefix"):], want.Bytes())
+		}
+	})
+}
+
+func TestHandleCXSUMItemsKeepOrder(t *testing.T) {
+	data := make([]byte, 256)
+	for i := range data {
+		data[i] = byte(i * 7)
+	}
+	filePath := filepath.Join(t.TempDir(), "cxsum.bin")
+	if err := os.WriteFile(filePath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, failAt := range []int{-1, 0, 5, 12, 40, 73, 99} {
+		var items []string
+		for i := range 100 {
+			offset := i
+			if i == failAt {
+				offset = len(data) + 1 // past EOF
+			}
+			items = append(items, fmt.Sprintf(`fd=1 "/tmp/a" offset=%d size=%d algo=xxh128`, offset, 1+i%50))
+		}
+		req, err := ParseRequest([]byte(`CXSUM tx1`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		err = handleCXSUMWithInput(context.Background(), req, framedItemBody(t, items...), &out, &mockDeps{filePath: filePath})
+		want := 100
+		if failAt >= 0 {
+			want = failAt
+			if err == nil || !strings.Contains(err.Error(), "beyond eof") {
+				t.Fatalf("failAt=%d: err = %v, want beyond eof", failAt, err)
+			}
+		} else if err != nil {
+			t.Fatalf("handleCXSUMWithInput: %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+		if out.Len() == 0 {
+			lines = nil
+		}
+		if len(lines) != 2*want {
+			t.Fatalf("failAt=%d: got %d lines, want %d frames", failAt, len(lines), want)
+		}
+		for i := range want {
+			size := 1 + i%50
+			wantHeader := fmt.Sprintf("FX/1 1 offset=%d size=%d ", i, size)
+			wantHash := "file-hash=" + encoding.FormatXXH128HashToken(xxh3.Hash128(data[i:i+size]))
+			if !strings.HasPrefix(lines[2*i], wantHeader) || !strings.Contains(lines[2*i+1], wantHash) {
+				t.Fatalf("failAt=%d: frame %d out of order or wrong:\n%s\n%s", failAt, i, lines[2*i], lines[2*i+1])
+			}
+		}
 	}
 }

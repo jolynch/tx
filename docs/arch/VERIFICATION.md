@@ -58,9 +58,9 @@ Data verification extends the metadata pass. Available modes are:
 The data path is:
 
 1. Draw a random run seed and build a sample generator per file from it.
-2. Read the selected ranges locally and hash them with `xxh128`.
-3. Issue `CXSUM` requests to the server for the same ranges.
-4. Compare returned checksum tokens to the local hashes.
+2. Hash the selected ranges locally with `xxh128` while requesting the same
+   ranges from the server with `CXSUM`.
+3. Compare returned checksum tokens to the local hashes.
 
 The verifier prints one final summary line. `files` and `bytes` report how
 much was verified out of every regular file with data:
@@ -104,11 +104,14 @@ The verifier does not send one giant `CXSUM` request per file. Instead it:
   splits across batches that workers verify in parallel, so it uses every
   worker. A file counts as verified once all its samples pass, in whichever
   batches they ran. A single slot larger than the cap still forms a batch
-- runs twice as many workers as data connections, so one worker hashes local
-  ranges while another waits on the server. Each worker hashes its batch's
-  local ranges, sends the `CXSUM` request, then compares every item in order:
-  file ID, offset, size, and hash. Local copies hash source and destination
-  in the same worker
+- caps remote verification workers at the requested or manifest concurrency and
+  negotiated data-pool size. Each worker starts its CXSUM request while hashing
+  local ranges. Both sides hash their items serially; there are no hashing worker
+  pools within a batch or request. The first failure cancels the peer, and the
+  worker joins both operations before returning. It compares file ID, offset,
+  size, and hash after both operations succeed and responses close successfully.
+  Daemonless local copies retain their existing worker count and hash source and
+  destination sequentially
 - scales each batch's sample cap with the worker count so every worker gets
   work on small runs
 - caps each request body at 3 MiB, or the server's target if smaller
@@ -117,7 +120,11 @@ The verifier does not send one giant `CXSUM` request per file. Instead it:
   connections alike
 
 This keeps memory use, request size, and the server's hashing per request
-bounded on very large files.
+bounded on very large files. CXSUM reuses request-owned hashers and computes
+only requested algorithms. It formats zero-payload FX/1 frames in a pooled
+buffer, preserving request order and emitting exactly the frames before an
+item error. A `verify_hash` event records each successful local batch's hashing
+time, excluding remote waits.
 
 ## Deterministic Sampling Algorithm
 

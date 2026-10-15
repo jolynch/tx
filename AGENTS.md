@@ -172,6 +172,8 @@ go run ./cmd/tx-bench local -s 256MiB -n 1
 - `internal/filexfer/store`: transfer state and TTL reaping; `interface.go`
   holds the `Interface` contract consumers depend on.
 - `internal/filexfer/{policy,limit}`: adaptive compression and rate limiting.
+- `internal/benchio`: optional read-latency injection for the verification
+  microbenchmark; production readers pass through unchanged.
 - `internal/bufpool`: size-bucketed reusable byte buffers for per-request I/O,
   plus `Growing`, whose buffer tracks bytes actually received rather than a
   size a peer declared.

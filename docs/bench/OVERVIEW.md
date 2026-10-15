@@ -610,3 +610,53 @@ Internally:
 4. **Tracing.** `internal/events`, the tx `events` progress format on both
    sides, `--trace` and `--go-trace` pass-through.
 5. **Trace analysis in `report`,** then retire `bench/run`.
+
+
+## Verification microbenchmark
+
+`BenchmarkVerifyInMemory` in `internal/cmd/filexfercli` runs the real verification
+path against a loopback FTCP server. Source and destination contents live in
+memfds; the server still resolves file references through the store. Each
+operation verifies a 256 MiB logical tree backed by at most 64 MiB of memfds.
+The default matrix covers 4 KiB, 16 KiB, 64 KiB, 1 MiB, 4 MiB, and 16 MiB files;
+Go CPU budgets 2/4/8/12 where available; and requested concurrency one or the
+planned concurrency. Local-only hashing is a separate control. `make bench`
+includes the benchmark.
+
+Remote verification uses one worker per requested connection, capped at the
+negotiated pool size. Each batch and CXSUM request hashes its items serially.
+`data-conns` reports the actual pool size: the client currently opens two even
+when one is requested. `hash-busy` and `server-busy` report summed local hashing
+and server command durations divided by wall time. These include read waits and
+scheduling; they do not measure CPU utilization. `core-s/GiB`, `cpu-cores`, and
+`cpu-percent` cover both sides together. CPU percent represents capacity use
+only when OS affinity also restricts the process to GOMAXPROCS CPUs.
+
+Benchmark controls:
+
+- `TX_VERIFY_CONCURRENCY=N` replaces the one/planned connection matrix.
+- `TX_VERIFY_BYTES=N` changes logical bytes per operation, with a 16 MiB minimum.
+- `TX_VERIFY_IO_DEPTH=N` sets the server advertisement; the default remains four.
+- `TX_VERIFY_IO_LATENCY=gp3|i4i|ephem|io2` injects a wait before each actual
+  content read on both sides. Omission preserves cached reads.
+
+The gp3/i4i models use beta fits from Netflix service-capacity-modeling
+revision `c56c0dd7861a`. They model
+independent read-service latency, with assumed size terms for reads over 16 KiB.
+They have no shared drive queue, aggregate IOPS/bandwidth cap, cache model, or
+correlated stalls. Requested and delivered waits are reported separately.
+Neither cached memfds nor these delays establish physical-storage performance.
+There are no worker-tuning controls or tuning traces in this benchmark.
+
+For a pinned comparison, compile each build once and alternate the binaries:
+
+```sh
+go test -c -o /tmp/verify.test ./internal/cmd/filexfercli
+TX_VERIFY_CONCURRENCY=2 taskset -c 0-7 /tmp/verify.test \
+  -test.run='^$' \
+  -test.bench='^BenchmarkVerifyInMemory$/.*/^cpus=8$/^c=2$' \
+  -test.benchtime=200ms
+```
+
+Benchmark runs saturate the machine and require authorization under AGENTS.md.
+See the [verification results](./VERIFY.md) for the measured comparison.

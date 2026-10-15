@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 	"testing"
@@ -209,5 +210,56 @@ func TestParsePROBERequestObservedLinkRequiresTransferID(t *testing.T) {
 	}
 	if _, err := parsePROBERequest(req); err == nil {
 		t.Fatalf("expected obs-link-mbps validation error")
+	}
+}
+
+// A fast transfer has no limiter, so PROBE neither logs one nor advertises
+// one, however often the client reports its observed link; the first gentle
+// SEND creates it.
+func TestHandlePROBEFastTransferHasNoLimiter(t *testing.T) {
+	deps := realDeps(t, "/")
+	tr, err := deps.NewTransfer("/tmp/x", 0, 0)
+	if err != nil {
+		t.Fatalf("NewTransfer: %v", err)
+	}
+	deps.SetTransferHints(tr.ID, "fast", 1000, 8)
+
+	var logs bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(oldWriter)
+
+	probe := func() string {
+		t.Helper()
+		req, err := ParseRequest([]byte("PROBE cpu=8 probe-bytes=0 cts0=100 txferid=" + tr.ID + " obs-link-mbps=900"))
+		if err != nil {
+			t.Fatalf("ParseRequest failed: %v", err)
+		}
+		var out bytes.Buffer
+		if err := handlePROBEWithInput(context.Background(), req, bytes.NewReader(nil), &out, deps, 8, 25, 25, 1*1024*1024, 0, defaultMaxSyncBodyBytes); err != nil {
+			t.Fatalf("handlePROBEWithInput failed: %v", err)
+		}
+		for _, field := range strings.Fields(out.String()) {
+			if v, ok := strings.CutPrefix(field, "limiter-bps="); ok {
+				return v
+			}
+		}
+		t.Fatalf("PROBE response lacks limiter-bps: %s", out.String())
+		return ""
+	}
+	for range 3 {
+		if got := probe(); got != "0" {
+			t.Fatalf("fast transfer advertised limiter-bps=%s", got)
+		}
+	}
+	if strings.Contains(logs.String(), "limiter=") {
+		t.Fatalf("fast transfer logged a limiter: %s", logs.String())
+	}
+
+	if deps.GetTransferGentleLimiter(tr.ID, 0, 25, 1*1024*1024) == nil {
+		t.Fatalf("expected a gentle limiter")
+	}
+	if got := probe(); got == "0" {
+		t.Fatalf("gentle limiter not advertised")
 	}
 }

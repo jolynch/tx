@@ -3,12 +3,15 @@ package ftcp
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jolynch/tx/internal/benchio"
 	"github.com/jolynch/tx/internal/bufpool"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/zeebo/xxh3"
@@ -133,7 +136,7 @@ func handleCXSUM(_ context.Context, req Request, out io.Writer, deps Deps) error
 }
 
 // handleCXSUMWithInput validates the complete body before emitting checksums.
-func handleCXSUMWithInput(_ context.Context, req Request, in io.Reader, out io.Writer, deps Deps) error {
+func handleCXSUMWithInput(ctx context.Context, req Request, in io.Reader, out io.Writer, deps Deps) error {
 	txferID, err := cxsumTransferID(req)
 	if err != nil {
 		return err
@@ -146,11 +149,11 @@ func handleCXSUMWithInput(_ context.Context, req Request, in io.Reader, out io.W
 		return protocolErr{code: "BAD_REQUEST", message: "CXSUM requires at least one item"}
 	}
 
-	buf, release, err := bufpool.Acquire(int(checksumReadBufferSize))
+	buf, err := bufpool.Get(checksumBufferSize(records))
 	if err != nil {
 		return err
 	}
-	defer release()
+	defer bufpool.Put(buf)
 
 	// Buffer the small frames so each costs no write syscall. Flush before
 	// any return, so an ERR line written after an error follows the frames.
@@ -171,9 +174,15 @@ func handleCXSUMWithInput(_ context.Context, req Request, in io.Reader, out io.W
 		}
 		return bw.Flush()
 	}
+	line, err := bufpool.Get(frameLineBytes)
+	if err != nil {
+		return err
+	}
+	defer bufpool.Put(line)
+	scratch := checksumScratch{buf: *buf, line: line}
 	lastFlush := time.Now()
 	for _, record := range records {
-		if err := streamChecksumItem(w, deps, txferID, record.item(), buf); err != nil {
+		if err := streamChecksumItem(ctx, w, deps, txferID, record.item(), &scratch); err != nil {
 			_ = flushBuffer()
 			return err
 		}
@@ -187,7 +196,31 @@ func handleCXSUMWithInput(_ context.Context, req Request, in io.Reader, out io.W
 	return flushBuffer()
 }
 
-func streamChecksumItem(out io.Writer, deps Deps, txferID string, item cxsumItem, buf []byte) error {
+// checksumBufferSize sizes the request's read buffer for the largest range
+// in the request, up to checksumReadBufferSize, so a request of small files
+// needs only a small read buffer.
+func checksumBufferSize(records []checksumRequestRecord) int {
+	var largest int64
+	for _, r := range records {
+		if r.Flags&checksumHasSize == 0 {
+			return int(checksumReadBufferSize)
+		}
+		largest = max(largest, r.Size)
+	}
+	return bufpool.BucketSize(min(max(largest, 1), checksumReadBufferSize))
+}
+
+type checksumScratch struct {
+	buf     []byte
+	line    *[]byte
+	hashers checksumHashers
+}
+
+func streamChecksumItem(ctx context.Context, out io.Writer, deps Deps, txferID string, item cxsumItem, scratch *checksumScratch) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	fd, fileRef, err := deps.GetFile(txferID, item.FileID, item.Path)
 	if err != nil {
 		return mapLookupError(err)
@@ -205,45 +238,95 @@ func streamChecksumItem(out io.Writer, deps Deps, txferID string, item cxsumItem
 	}
 	rangeSize := fileSize - item.Offset
 	if item.HasSize {
-		if item.Offset+item.Size > fileSize {
+		if item.Size > fileSize-item.Offset {
 			_ = fd.Close()
 			return protocolErr{code: "BAD_REQUEST", message: "checksum range beyond eof"}
 		}
 		rangeSize = item.Size
 	}
-	fileHashes, hashErr := hashChecksumRange(fd, item.Offset, rangeSize, item.Algorithms, buf)
+	fileHashes, hashErr := hashChecksumRange(benchio.WithReadLatency(ctx, "server", fd), item.Offset, rangeSize, item.Algorithms, scratch.buf, &scratch.hashers)
 	_ = fd.Close()
 	if hashErr != nil {
 		return protocolErr{code: "INTERNAL", message: "failed to checksum file range"}
 	}
 
+	metadata := encoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
+	*scratch.line = appendChecksumFrame((*scratch.line)[:0], item.FileID, item.Offset, rangeSize, fileHashes, time.Now().UnixMilli(), &metadata)
+	_, err = out.Write(*scratch.line)
+	return err
+}
+
+// appendChecksumFrame appends a CXSUM frame, a header and its terminal
+// trailer with no payload between them, as encoding.WriteFrame formats it.
+// With no payload, the frame hash covers exactly the header line and the
+// trailer prefix, which sit side by side in dst.
+func appendChecksumFrame(dst []byte, fileID uint64, offset, size int64, fileHashes []string, ts int64, metadata *encoding.FileFrameMetadata) []byte {
+	start := len(dst)
 	headerHash := "none:0"
 	if len(fileHashes) > 0 {
 		headerHash = fileHashes[0]
 	}
-	metadata := encoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
-	headerTS := time.Now().UnixMilli()
-	trailerTS := time.Now().UnixMilli()
-	_, err = encoding.WriteFrame(out, encoding.WriteArgs{
-		FileID:     item.FileID,
-		Offset:     item.Offset,
-		Size:       rangeSize,
-		WSize:      0,
-		Comp:       "none",
-		HeaderHash: headerHash,
-		HeaderTS:   headerTS,
-		TrailerTS:  trailerTS,
-		FileHashes: fileHashes,
-		Next:       0,
-		Metadata:   &metadata,
-	})
-	return err
+	dst = append(dst, "FX/1 "...)
+	dst = strconv.AppendUint(dst, fileID, 10)
+	dst = append(dst, " offset="...)
+	dst = strconv.AppendInt(dst, offset, 10)
+	dst = append(dst, " size="...)
+	dst = strconv.AppendInt(dst, size, 10)
+	dst = append(dst, " wsize=0 comp=none hash="...)
+	dst = append(dst, headerHash...)
+	dst = append(dst, " ts="...)
+	dst = strconv.AppendInt(dst, ts, 10)
+	dst = append(dst, "\nFXT/1 "...)
+	dst = strconv.AppendUint(dst, fileID, 10)
+	dst = append(dst, " status=ok ts="...)
+	dst = strconv.AppendInt(dst, ts, 10)
+	for _, token := range fileHashes {
+		if token != "" {
+			dst = append(dst, " file-hash="...)
+			dst = append(dst, token...)
+		}
+	}
+	dst = append(dst, " next=0"...)
+	if metadata != nil {
+		dst = appendMetadataTrailerTokens(dst, metadata)
+	}
+	var frameHash [8]byte
+	binary.BigEndian.PutUint64(frameHash[:], xxh3.Hash(dst[start:]))
+	dst = append(dst, " hash=xxh64:"...)
+	dst = hex.AppendEncode(dst, frameHash[:])
+	return append(dst, '\n')
 }
 
-func hashChecksumRange(fd io.ReaderAt, offset int64, size int64, algorithms []string, buf []byte) ([]string, error) {
-	full128 := xxh3.New128()
-	full64 := xxh3.New()
-	if size == 0 {
+// checksumHashers holds the hashers one CXSUM request reuses for every
+// range: each is about 1 KiB, too much to allocate per item. A hasher is
+// created on first use, so a request asks only for what it hashes.
+type checksumHashers struct {
+	h128 *xxh3.Hasher128
+	h64  *xxh3.Hasher
+}
+
+// hashChecksumRange hashes the range with only the requested algorithms, and
+// reads nothing when none is requested.
+func hashChecksumRange(fd io.ReaderAt, offset int64, size int64, algorithms []string, buf []byte, h *checksumHashers) ([]string, error) {
+	var full128 *xxh3.Hasher128
+	var full64 *xxh3.Hasher
+	for _, name := range algorithms {
+		switch name {
+		case "xxh128":
+			if h.h128 == nil {
+				h.h128 = xxh3.New128()
+			}
+			full128 = h.h128
+			full128.Reset()
+		case "xxh64":
+			if h.h64 == nil {
+				h.h64 = xxh3.New()
+			}
+			full64 = h.h64
+			full64.Reset()
+		}
+	}
+	if size == 0 || (full128 == nil && full64 == nil) {
 		return finalChecksumTokens(algorithms, full128, full64), nil
 	}
 	if len(buf) == 0 {
@@ -264,8 +347,12 @@ func hashChecksumRange(fd io.ReaderAt, offset int64, size int64, algorithms []st
 		n, err := io.ReadFull(reader, buf[:chunk])
 		if n > 0 {
 			part := buf[:n]
-			_, _ = full128.Write(part)
-			_, _ = full64.Write(part)
+			if full128 != nil {
+				_, _ = full128.Write(part)
+			}
+			if full64 != nil {
+				_, _ = full64.Write(part)
+			}
 			remaining -= int64(n)
 		}
 		if err == nil {

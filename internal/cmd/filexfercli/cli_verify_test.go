@@ -20,6 +20,8 @@ import (
 
 	"filippo.io/age"
 	"github.com/jolynch/tx"
+	"github.com/jolynch/tx/internal/benchio"
+	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	"github.com/jolynch/tx/internal/sampler"
@@ -202,11 +204,11 @@ func TestVerifyCopyDataSamplesBudget(t *testing.T) {
 		wantLog       string
 	}{
 		// Each file is one slot of verifyBatchBytes, so each is a batch of its
-		// own. One data connection runs two workers, so two batches start
-		// before the budget expires and the other two never do.
+		// own. One data connection runs one worker, so one batch starts
+		// before the budget expires and the other three never do.
 		{name: "stops dispatch", files: 4, size: verifyBatchBytes, frame: verifyBatchBytes, budget: 100 * time.Millisecond, grace: 2 * time.Second,
-			slowFirst: 2, delay: 300 * time.Millisecond, answer: "zeros", wantPartial: true, wantFiles: 2, wantRequests: 2,
-			wantLog: "copy-verify-data: budget expired, verified files=2/4 (50.0%) bytes=32.00 MiB/64.00 MiB (50.0%) samples=2"},
+			slowFirst: 2, delay: 300 * time.Millisecond, answer: "zeros", wantPartial: true, wantFiles: 1, wantRequests: 1,
+			wantLog: "copy-verify-data: budget expired, verified files=1/4 (25.0%) bytes=16.00 MiB/64.00 MiB (25.0%) samples=1"},
 		// A batch in flight when the budget expires that finishes within the
 		// grace period completes the run, which must then report [ok].
 		{name: "complete in grace", files: 1, size: 1 << 20, frame: 1 << 20, budget: 50 * time.Millisecond, grace: 2 * time.Second,
@@ -216,7 +218,7 @@ func TestVerifyCopyDataSamplesBudget(t *testing.T) {
 		// Batches in flight that outlast the grace period are cancelled, and
 		// the batches never dispatched stay unverified; the run still succeeds.
 		{name: "forced stop while dispatching", files: 4, size: verifyBatchBytes, frame: verifyBatchBytes, budget: 100 * time.Millisecond, grace: time.Second,
-			slowFirst: 2, delay: 2 * time.Second, answer: "silence", wantPartial: true, wantRequests: 2,
+			slowFirst: 2, delay: 2 * time.Second, answer: "silence", wantPartial: true, wantRequests: 1,
 			wantLog: "copy-verify-data: budget expired, verified files=0/4 (0.0%)"},
 		// A batch that outlasts the grace period is cancelled, and the run
 		// returns what it verified without failing.
@@ -692,7 +694,7 @@ func TestVerifyCopyItemsErrorPaths(t *testing.T) {
 				time.AfterFunc(30*time.Millisecond, cancel)
 			}
 			start := time.Now()
-			err := verifyCopyItems(ctx, client, "txverify-items", verifyTestItems(entries, "/remote", dir, frame))
+			err := verifyCopyItems(ctx, client, nil, "txverify-items", verifyTestItems(entries, "/remote", dir, frame))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err = %v, want it to contain %q", err, tc.want)
 			}
@@ -857,4 +859,140 @@ type closeCounter struct {
 func (c closeCounter) Close() error {
 	c.closes.Add(1)
 	return c.Conn.Close()
+}
+
+// Neither side can finish until the other starts. Failure must cancel and join
+// the peer, even while it is blocked in a local read or a remote response.
+func TestVerifyCopyItemsOverlap(t *testing.T) {
+	for _, mode := range []string{"match", "local failure", "server failure", "cancelled"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			entries, _ := packedVerifyTree(t, dir, 3, 4096)
+			localStarted, remoteStarted := make(chan struct{}), make(chan struct{})
+			releaseServer := make(chan struct{})
+			var first sync.Once
+			var active, peak atomic.Int64
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			localFailure := errors.New("local read failed")
+			restore := benchio.SetReadLatency(func(ctx context.Context, side string, _ int) error {
+				if side != "client" {
+					t.Errorf("unexpected side %q", side)
+				}
+				n := active.Add(1)
+				defer active.Add(-1)
+				for old := peak.Load(); n > old; old = peak.Load() {
+					if peak.CompareAndSwap(old, n) {
+						break
+					}
+				}
+				first.Do(func() { close(localStarted) })
+				if mode == "server failure" || mode == "cancelled" {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				select {
+				case <-remoteStarted:
+					if mode == "local failure" {
+						return localFailure
+					}
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			})
+			defer restore()
+			handler := zeroChecksumHandler(t, nil, nil)
+			srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+				close(remoteStarted)
+				select {
+				case <-localStarted:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				switch mode {
+				case "server failure":
+					return errors.New("server read failed")
+				case "cancelled":
+					cancel()
+					<-releaseServer
+					return nil
+				case "local failure":
+					<-releaseServer
+					return nil
+				default:
+					return handler(req, out)
+				}
+			})
+			defer srv.Close()
+			defer close(releaseServer)
+			client := tx.NewClient(srv.URL)
+			defer client.Close()
+			sink := events.NewSink()
+			var hashes atomic.Int64
+			sink.Subscribe(func(e events.Event) {
+				if e.Name == "verify_hash" {
+					hashes.Add(1)
+					if e.Int("bytes") != 3*4096 || e.Int("items") != 3 || e.Int("dur") <= 0 {
+						t.Error("invalid hashing event")
+					}
+				}
+			})
+			err := verifyCopyItems(ctx, client, sink, "tx-overlap", verifyTestItems(entries, "/remote", dir, 4096))
+			switch mode {
+			case "match":
+				if err != nil || hashes.Load() != 1 {
+					t.Fatalf("err=%v hash events=%d", err, hashes.Load())
+				}
+			case "local failure":
+				if !errors.Is(err, localFailure) {
+					t.Fatalf("err=%v", err)
+				}
+			case "server failure":
+				if err == nil || !strings.Contains(err.Error(), "server read failed") {
+					t.Fatalf("err=%v", err)
+				}
+			case "cancelled":
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("err=%v", err)
+				}
+			}
+			if active.Load() != 0 || peak.Load() != 1 {
+				t.Fatalf("active=%d peak=%d", active.Load(), peak.Load())
+			}
+			assertNoOpenFiles(t, dir)
+		})
+	}
+}
+
+func TestVerifyCopyDataSamplesNegotiatedWorkers(t *testing.T) {
+	for _, requested := range []int{0, 1, 8} {
+		t.Run(fmt.Sprintf("requested=%d", requested), func(t *testing.T) {
+			dir := t.TempDir()
+			entries, _ := packedVerifyTree(t, dir, 32, 4096)
+			var requests atomic.Int64
+			handler := zeroChecksumHandler(t, nil, nil)
+			srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+				if req.Verb == intftcp.VerbCXSUM {
+					requests.Add(1)
+				}
+				return handler(req, out)
+			})
+			defer srv.Close()
+			client := tx.NewClient(srv.URL, tx.WithConcurrency(2))
+			defer client.Close()
+			cfg := copyCLIConfig{client: client, localDst: dir, concurrency: requested, verifyDataSamplePct: 100}
+			manifest := &tx.Manifest{TransferID: "tx-cap", Root: "/remote", Entries: entries}
+			result, err := verifyCopyDataSamples(srv.URL, cfg, manifest, nil)
+			want := int64(2)
+			if requested == 1 {
+				want = 1
+			}
+			// The sample cap spreads this small tree into exactly one batch per
+			// verification worker, independently of how many server handlers run.
+			if err != nil || result.partial || requests.Load() != want {
+				t.Fatalf("err=%v partial=%v requests=%d want=%d", err, result.partial, requests.Load(), want)
+			}
+		})
+	}
 }

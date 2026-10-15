@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"github.com/jolynch/tx"
+	"github.com/jolynch/tx/internal/benchio"
 	"github.com/jolynch/tx/internal/bufpool"
+	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/sampler"
 	"github.com/zeebo/xxh3"
@@ -330,11 +332,16 @@ dispatch:
 // Items of one file are adjacent, so it holds one descriptor at a time. It
 // stops with ctx's error once ctx is cancelled.
 func hashItems(ctx context.Context, items []verifyItem, src bool) ([]string, error) {
-	buf, release, err := bufpool.Acquire(int(verifyHashBufferBytes))
+	var largest int64
+	for _, it := range items {
+		largest = max(largest, it.sample.Size)
+	}
+	pooled, err := bufpool.Get(bufpool.BucketSize(min(max(largest, 1), verifyHashBufferBytes)))
 	if err != nil {
 		return nil, err
 	}
-	defer release()
+	defer bufpool.Put(pooled)
+	buf := *pooled
 	h := xxh3.New128()
 	hashes := make([]string, len(items))
 	var fd *os.File
@@ -357,7 +364,7 @@ func hashItems(ctx context.Context, items []verifyItem, src bool) ([]string, err
 			}
 		}
 		h.Reset()
-		r := io.NewSectionReader(fd, it.sample.Offset, it.sample.Size)
+		r := io.NewSectionReader(benchio.WithReadLatency(ctx, "client", fd), it.sample.Offset, it.sample.Size)
 		for remaining := it.sample.Size; remaining > 0; {
 			if err := ctx.Err(); err != nil {
 				return nil, err
@@ -389,7 +396,7 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 	client, closeClient := phaseClient(cfg.client, serverURL, append(cfg.auth.options(), tx.WithClientMetrics(cfg.stats.ClientMetrics()), tx.WithEventSink(cfg.stats.EventSink()))...)
 	defer closeClient()
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), verifyChecksumRequestTimeout)
-	_, err := client.ProbeLink(probeCtx, tx.ProbeRequest{ProbeBytes: 1})
+	probe, err := client.ProbeLink(probeCtx, tx.ProbeRequest{ProbeBytes: 1})
 	probeCancel()
 	if err != nil {
 		return totals, fmt.Errorf("probe checksum request limits: %w", err)
@@ -398,16 +405,21 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 	if connections <= 0 {
 		connections = manifest.Concurrency
 	}
+	if connections <= 0 {
+		connections = probe.WarmConnectionPoolSize
+	}
+	if probe.WarmConnectionPoolSize > 0 {
+		connections = min(connections, probe.WarmConnectionPoolSize)
+	}
 	run := verifyRun{
 		files:  files,
 		totals: totals,
-		// Twice the data connections: while half the workers wait on the
-		// server's hashing, the rest hash locally, so both sides stay busy.
-		workers: 2 * max(1, connections),
+		// Each worker owns at most one data connection.
+		workers: max(1, connections),
 		budget:  opts.budget,
 		grace:   verifyBudgetGracePeriod,
 		check: func(ctx context.Context, items []verifyItem) error {
-			return verifyCopyItems(ctx, client, manifest.TransferID, items)
+			return verifyCopyItems(ctx, client, cfg.stats.EventSink(), manifest.TransferID, items)
 		},
 	}
 	if stderr != nil {
@@ -423,20 +435,61 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 }
 
 // verifyCopyItems compares the items' local hashes with the server's CXSUM
-// hashes of the same ranges.
-func verifyCopyItems(ctx context.Context, client *tx.Client, transferID string, items []verifyItem) error {
+// hashes of the same ranges. The server hashes while this worker hashes the
+// local copy. Batch duration approaches the slower side's duration.
+// The first failure on either side cancels the other and is the one
+// returned. A verify_hash event times the local hashing; the client's CXSUM
+// req_start/req_end events time the remote request.
+func verifyCopyItems(ctx context.Context, client *tx.Client, sink *events.Sink, transferID string, items []verifyItem) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var failOnce sync.Once
+	var failure error
+	fail := func(err error) {
+		failOnce.Do(func() { failure = err; cancel() })
+	}
+	remote := make([]string, len(items))
+	remoteDone := make(chan struct{})
+	go func() {
+		defer close(remoteDone)
+		if err := remoteChecksums(ctx, client, transferID, items, remote); err != nil {
+			fail(err)
+		}
+	}()
+	start := time.Now()
 	want, err := hashItems(ctx, items, false)
 	if err != nil {
-		return err
+		fail(err)
+	} else if sink.Enabled() {
+		var bytes int64
+		for _, it := range items {
+			bytes += it.sample.Size
+		}
+		sink.Emit("verify_hash", transferID, events.F("items", len(items)), events.F("bytes", bytes), events.Dur("dur", time.Since(start)))
 	}
+	<-remoteDone
+	if failure != nil {
+		return failure
+	}
+	for i, it := range items {
+		if !strings.EqualFold(remote[i], want[i]) {
+			return mismatchError{fmt.Errorf("checksum mismatch for %s at offset=%d size=%d", it.file.dstPath, it.sample.Offset, it.sample.Size)}
+		}
+	}
+	return nil
+}
+
+// remoteChecksums stores the server's CXSUM hash of each item's range in
+// hashes, in item order.
+func remoteChecksums(ctx context.Context, client *tx.Client, transferID string, items []verifyItem, hashes []string) error {
 	targets := make([]tx.ChecksumTarget, len(items))
 	for i, it := range items {
 		targets[i] = tx.ChecksumTarget{FileID: it.file.entry.ID, FullPath: it.file.srcPath, Offset: it.sample.Offset, Size: it.sample.Size, Algo: "xxh128"}
 	}
 	verified := 0
-	err = client.VisitChecksumBatches(ctx, tx.GetChecksumRequest{TransferID: transferID, Targets: targets}, tx.ChecksumBatchOptions{
-		TargetRequestBytes: verifyChecksumRequestTargetBytes, HashTimeout: verifyChecksumRequestTimeout,
-	}, func(requested []tx.ChecksumTarget, resp tx.GetChecksumResponse) error {
+	request := tx.GetChecksumRequest{TransferID: transferID, Targets: targets}
+	options := tx.ChecksumBatchOptions{TargetRequestBytes: verifyChecksumRequestTargetBytes, HashTimeout: verifyChecksumRequestTimeout}
+	err := client.VisitChecksumBatches(ctx, request, options, func(requested []tx.ChecksumTarget, resp tx.GetChecksumResponse) error {
 		results, err := readChecksumResults(resp.Reader)
 		if err != nil {
 			return fmt.Errorf("read checksum response: %w", err)
@@ -450,9 +503,7 @@ func verifyCopyItems(ctx context.Context, client *tx.Client, transferID string, 
 				return fmt.Errorf("checksum response for file %d offset=%d size=%d does not match request for %s offset=%d size=%d",
 					result.FileID, result.Offset, result.Size, f.srcPath, s.Offset, s.Size)
 			}
-			if !strings.EqualFold(result.FileHashToken, want[verified+i]) {
-				return mismatchError{fmt.Errorf("checksum mismatch for %s at offset=%d size=%d", f.dstPath, s.Offset, s.Size)}
-			}
+			hashes[verified+i] = result.FileHashToken
 		}
 		verified += len(requested)
 		return nil
