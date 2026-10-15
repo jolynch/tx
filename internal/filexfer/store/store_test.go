@@ -910,6 +910,46 @@ func TestReportTransferObservedLinkUpdatesEMAAndLimiter(t *testing.T) {
 	}
 }
 
+func TestReportTransferObservedLinkWithoutLimiterCreatesNone(t *testing.T) {
+	s := newTestStore(t)
+	transfer, err := s.NewTransfer("/tmp/x", 0, 0)
+	if err != nil {
+		t.Fatalf("NewTransfer returned error: %v", err)
+	}
+	if ok := s.SetTransferHints(transfer.ID, "fast", 1000, 6); !ok {
+		t.Fatalf("SetTransferHints failed")
+	}
+
+	update, ok := s.ReportTransferObservedLink(transfer.ID, 500, 25, 1*1024*1024, 0.2)
+	if !ok {
+		t.Fatalf("expected report update")
+	}
+	if update.OldRateBps != 0 || update.NewRateBps != 0 {
+		t.Fatalf("fast transfer reported a limiter change: %d->%d", update.OldRateBps, update.NewRateBps)
+	}
+	if update.RoundedLinkMbps != 900 {
+		t.Fatalf("unexpected rounded ema link: %d", update.RoundedLinkMbps)
+	}
+	if bps := s.GetTransferLimiterBps(transfer.ID); bps != 0 {
+		t.Fatalf("fast transfer has limiter rate %d", bps)
+	}
+	if stored, ok := s.GetTransferSummary(transfer.ID); !ok || stored.LinkMbps != 900 {
+		t.Fatalf("unexpected stored link mbps: %d", stored.LinkMbps)
+	}
+
+	// A gentle SEND then builds its limiter from the moving average.
+	limiter := s.GetTransferGentleLimiter(transfer.ID, 0, 25, 1*1024*1024)
+	if limiter == nil {
+		t.Fatalf("expected gentle limiter")
+	}
+	if cfg := limiter.Config(); cfg.RateBps != 28_125_000 {
+		t.Fatalf("unexpected limiter rate: %d", cfg.RateBps)
+	}
+	if bps := s.GetTransferLimiterBps(transfer.ID); bps != 28_125_000 {
+		t.Fatalf("unexpected limiter bps: %d", bps)
+	}
+}
+
 func TestTransferDeadlineState(t *testing.T) {
 	s := newTestStore(t)
 	transfer, err := s.NewTransfer("/tmp/x", 0, 0)

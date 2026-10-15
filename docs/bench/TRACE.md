@@ -70,6 +70,7 @@ t side run tid ev file off len dur k=v...
 | `file_start` / `file_done`   | `file`, `path`, `len`, `off` (resume offset); done: `dur` |
 | `window`                     | `file`, `off`, `len`, `wire`, `codec`, `conn`, `server_ts_ms`, `first_byte` (ns the client waited for the window's header after `req_start` or the previous window of the request), `dur` (header arrival to last byte written, so `t - dur` is the arrival), `write_dur` (0 for split windows of large files, whose writes the caller does) |
 | `fsync`                      | `file`, `dur` |
+| `verify_hash`                | `items`, `bytes`, `dur`: successful local data-verification hashing, excluding remote waits |
 | `ack`                        | `files`, `bytes`, `dur`, `attempt`, `ok` |
 | `retry`                      | `verb`, `attempt`, `err` |
 | `error`                      | `verb`, `file`, `files`, `err` |

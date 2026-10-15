@@ -58,9 +58,10 @@ fuzz-short:
 	$(FUZZ) -race ./internal/bench/dataset FuzzPlan $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race ./internal/bench/dataset FuzzSelectWarmBlocks $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 
-# End-to-end properties driving the whole system. These are still finding new
-# coverage past 10s, so CI gives them a larger budget to keep exploring.
+# Properties still finding new coverage past 10s. CI gives them a larger
+# budget to keep exploring.
 fuzz-long:
+	$(FUZZ) -race ./internal/filexfer/ftcp FuzzChecksumFrameMatchesWriteFrame $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race . FuzzTCPConnPool $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/aead FuzzReadRecords $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/encoding FuzzManifestEntryRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
@@ -82,7 +83,7 @@ fuzz-long:
 # between hosts are tx-bench's job (docs/bench).
 bench: build
 	@mkdir -p bench/results
-	go test -bench=. -run=^$$ -benchmem ./internal/bench ./internal/aead . ./internal/filexfer/ftcp | tee bench/results/latest.txt
+	go test -bench=. -run=^$$ -benchmem ./internal/bench ./internal/aead . ./internal/filexfer/ftcp ./internal/cmd/filexfercli | tee bench/results/latest.txt
 
 # Runs tx-bench remote send-tree and recv-copy as separate processes on a
 # BENCH_SIZE dataset and checks correctness, liveness and shutdown, and

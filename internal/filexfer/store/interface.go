@@ -24,6 +24,8 @@ type Interface interface {
 	GetTransferSummary(txferID string) (Transfer, bool)
 	ListTransfers() []Transfer
 	SetTransferHints(txferID string, mode string, linkMbps int64, concurrency int) bool
+	// A gentle SEND creates a transfer's limiter; an observed-link report
+	// only retunes one that exists, so fast transfers never have one.
 	GetTransferGentleLimiter(txferID string, fallbackLinkMbps int64, gentleBWPct int, burstBytes int64) *limit.Limiter
 	ReportTransferObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool)
 	GetTransferLimiterBps(txferID string) int64

@@ -33,19 +33,17 @@ instead of widening the current change; remove an entry when it ships.
   order, so a run that keeps hitting its budget re-checks the start of the tree
   and never reaches the end. Walk the file list with the seeded coprime step
   as well, but only under a budget, so `--verify full` stays sequential.
-- **Fast transfers rebuild and log a limiter they never use.** The client's
-  10s probe reporter sends `obs-link-mbps` in every mode, so the server
-  rebuilds the gentle limiter and logs `txfer-probe ... limiter=`, but `SEND`
-  applies it only to gentle items. The probe also competes with the transfer,
-  so `observed_link` swings between 200 and 2800 Mbps. Skip the report, or at
-  least the log line, in fast mode.
 
 ## Performance
 
+- **Observed-link probes compete with the transfer.** The fast-mode limiter
+  fix removes the unused limiter, but repeated throughput probes still compete
+  with SEND and make observed-link rates noisy. Measure probe scheduling before
+  using those samples for more tuning.
 - **`bufpool.Acquire` allocates a release closure.** `Get`/`Put` are
   allocation-free, but `Acquire` returns a new closure per call, and
   `Release` boxes a pointer for a bare slice. Move the per-frame callers
-  (`send.go`, `cxsum.go`, the client's frame buffers) to `Get`/`Put`.
+  (`send.go`, the client's frame buffers) to `Get`/`Put`.
 - **Probes bypass the pools.** `probeTCP` dials directly, and a fast-mode
   throughput probe opens one connection per server CPU, in both the transfer
   and converge phases of `tx recv copy`. Probe over pooled connections, or
@@ -59,9 +57,14 @@ instead of widening the current change; remove an entry when it ships.
 - **Framed-body zstd buffer churn.** `CompressZstdPooled` reallocates about
   8 MiB of encoder history and decoder block whenever GC empties the pool:
   about 60% of the bytes allocated during a small-file `--verify full`.
-- **`CXSUM` always computes xxh64.** `hashChecksumRange` hashes every range
-  with both xxh128 and xxh64, doubling server hash CPU when only one was
-  requested.
+- **Per-file verification overhead.** CXSUM still opens and stats every item;
+  the client allocates per-frame parsing state. Profile these costs with
+  `BenchmarkVerifyInMemory` before adding hashing workers.
+- **Explicit concurrency one opens two pooled connections.** `ProbeLink`
+  clamps explicit `WithConcurrency(1)` to two. The verifier stays at one worker;
+  the benchmark reports the actual pool size separately.
+- **Server I/O depth defaults disagree.** CLI defaults to four, but a
+  zero-valued server option advertises eight. Unify these separately.
 - **Copy into an existing destination walks the source twice.** `runCopyCLI`
   runs `runTransfer` (`PROBE` + full `TXFER` walk) before `runSync`, which
   probes again and sends `SYNC`, a second walk. `runSync` uses only the
