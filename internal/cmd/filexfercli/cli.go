@@ -1565,30 +1565,39 @@ func isChecksumOKLine(line string) bool {
 }
 
 func parseChecksumFrameHeader(line string) (checksumFrameHeader, error) {
-	fields := encoding.FXFields(make([]string, 0, 16), line)
-	if len(fields) < 3 || fields[0] != "FX/1" {
+	version, rest := encoding.NextFXToken(line)
+	fileIDRaw, rest := encoding.NextFXToken(rest)
+	if version != "FX/1" || strings.TrimLeft(rest, " ") == "" {
 		return checksumFrameHeader{}, errors.New("invalid checksum frame header")
 	}
-	fileID, err := strconv.ParseUint(fields[1], 10, 64)
+	fileID, err := strconv.ParseUint(fileIDRaw, 10, 64)
 	if err != nil {
 		return checksumFrameHeader{}, errors.New("invalid checksum frame file id")
 	}
-	props := make(map[string]string, len(fields)-2)
-	for _, token := range fields[2:] {
+	var offsetRaw, sizeRaw, wsizeRaw string
+	for token, rest := encoding.NextFXToken(rest); token != ""; token, rest = encoding.NextFXToken(rest) {
 		key, val, ok := strings.Cut(token, "=")
-		if ok {
-			props[key] = val
+		if !ok {
+			continue
+		}
+		switch key {
+		case "offset":
+			offsetRaw = val
+		case "size":
+			sizeRaw = val
+		case "wsize":
+			wsizeRaw = val
 		}
 	}
-	offset, err := strconv.ParseInt(props["offset"], 10, 64)
+	offset, err := strconv.ParseInt(offsetRaw, 10, 64)
 	if err != nil || offset < 0 {
 		return checksumFrameHeader{}, errors.New("invalid checksum frame offset")
 	}
-	size, err := strconv.ParseInt(props["size"], 10, 64)
+	size, err := strconv.ParseInt(sizeRaw, 10, 64)
 	if err != nil || size < 0 {
 		return checksumFrameHeader{}, errors.New("invalid checksum frame size")
 	}
-	wsize, err := strconv.ParseInt(props["wsize"], 10, 64)
+	wsize, err := strconv.ParseInt(wsizeRaw, 10, 64)
 	if err != nil || wsize < 0 {
 		return checksumFrameHeader{}, errors.New("invalid checksum frame wsize")
 	}
@@ -1601,11 +1610,12 @@ func parseChecksumFrameHeader(line string) (checksumFrameHeader, error) {
 }
 
 func parseChecksumFrameTrailer(line string) (checksumFrameTrailer, error) {
-	fields := encoding.FXFields(make([]string, 0, 16), line)
-	if len(fields) < 3 || fields[0] != "FXT/1" {
+	version, rest := encoding.NextFXToken(line)
+	fileIDRaw, rest := encoding.NextFXToken(rest)
+	if version != "FXT/1" || strings.TrimLeft(rest, " ") == "" {
 		return checksumFrameTrailer{}, errors.New("invalid checksum frame trailer")
 	}
-	fileID, err := strconv.ParseUint(fields[1], 10, 64)
+	fileID, err := strconv.ParseUint(fileIDRaw, 10, 64)
 	if err != nil {
 		return checksumFrameTrailer{}, errors.New("invalid checksum frame trailer file id")
 	}
@@ -1613,45 +1623,36 @@ func parseChecksumFrameTrailer(line string) (checksumFrameTrailer, error) {
 	meta := &tx.FileTrailerMetadata{}
 	hasMeta := false
 	fileHashToken := ""
-	for _, token := range fields[2:] {
-		if strings.HasPrefix(token, "next=") {
-			nextRaw := strings.TrimPrefix(token, "next=")
-			next, err = strconv.ParseInt(nextRaw, 10, 64)
+	for token, rest := encoding.NextFXToken(rest); token != ""; token, rest = encoding.NextFXToken(rest) {
+		key, val, ok := strings.Cut(token, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "next":
+			next, err = strconv.ParseInt(val, 10, 64)
 			if err != nil || next < 0 {
 				return checksumFrameTrailer{}, errors.New("invalid checksum frame trailer next offset")
 			}
-			continue
-		}
-		if strings.HasPrefix(token, "file-hash=") {
-			fileHashToken = strings.TrimPrefix(token, "file-hash=")
-			continue
-		}
-		if strings.HasPrefix(token, "meta:") {
-			parts := strings.SplitN(token, "=", 2)
-			if len(parts) != 2 {
-				continue
-			}
-			key := strings.TrimPrefix(parts[0], "meta:")
-			val := parts[1]
-			switch key {
-			case "mode":
-				meta.Mode = val
-				hasMeta = true
-			case "uid":
-				meta.UID = val
-				hasMeta = true
-			case "gid":
-				meta.GID = val
-				hasMeta = true
-			case "user":
-				meta.User = val
-			case "group":
-				meta.Group = val
-			case "size":
-				meta.Size, _ = strconv.ParseInt(val, 10, 64)
-			case "mtime_ns":
-				meta.MtimeNS, _ = strconv.ParseInt(val, 10, 64)
-			}
+		case "file-hash":
+			fileHashToken = val
+		case "meta:mode":
+			meta.Mode = val
+			hasMeta = true
+		case "meta:uid":
+			meta.UID = val
+			hasMeta = true
+		case "meta:gid":
+			meta.GID = val
+			hasMeta = true
+		case "meta:user":
+			meta.User = val
+		case "meta:group":
+			meta.Group = val
+		case "meta:size":
+			meta.Size, _ = strconv.ParseInt(val, 10, 64)
+		case "meta:mtime_ns":
+			meta.MtimeNS, _ = strconv.ParseInt(val, 10, 64)
 		}
 	}
 	if next != 0 {

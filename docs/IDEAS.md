@@ -36,6 +36,20 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Performance
 
+- **Bound batch lookup metadata.** SEND and CXSUM resolve all request items
+  together to avoid per-file transfer locking. Their lookup and reference arrays
+  add peak memory beyond the decoded body limit, especially for many tiny items.
+  Measure dense requests and consider bounded lookup chunks if that memory cost
+  outweighs the extra lock acquisitions.
+- **Choose checksum workers by average work size.** Evaluate a fixed pool on
+  both the verifier and CXSUM server, chosen once per batch/request from average
+  requested range size: four workers at 4 KiB, three at 16 KiB, two at 64 KiB,
+  and one at 256 KiB or larger. Pass reusable work objects that own their
+  buffer, file/range, hasher, and result index. Keep transfer connection counts
+  unchanged and bound queued work and bytes. Preserve file grouping, ordered
+  results/errors, cancellation, and cleanup. Workers read and hash their owned
+  ranges. The cached profiles in [VERIFY.md](bench/VERIFY.md) identify per-file
+  overhead; worker scheduling may cost more than it saves there.
 - **Observed-link probes compete with the transfer.** The fast-mode limiter
   fix removes the unused limiter, but repeated throughput probes still compete
   with SEND and make observed-link rates noisy. Measure probe scheduling before
@@ -57,9 +71,13 @@ instead of widening the current change; remove an entry when it ships.
 - **Framed-body zstd buffer churn.** `CompressZstdPooled` reallocates about
   8 MiB of encoder history and decoder block whenever GC empties the pool:
   about 60% of the bytes allocated during a small-file `--verify full`.
-- **Per-file verification overhead.** CXSUM still opens and stats every item;
-  the client allocates per-frame parsing state. Profile these costs with
-  `BenchmarkVerifyInMemory` before adding hashing workers.
+- **Per-file verification overhead.** CXSUM still opens and stats every item,
+  and the client's `ReadString` allocates each frame's header and trailer
+  line: response parsing is still about 4% of CPU. The cached profiles in
+  [VERIFY.md](bench/VERIFY.md#profiling-findings) support testing a Linux
+  `unix.Open`/`os.NewFile` helper to skip failed regular-file poller setup. Keep
+  close-on-exec, EINTR handling, cleanup, and error mapping; measure real paths
+  because the memfd server duplicates descriptors instead of opening paths.
 - **Explicit concurrency one opens two pooled connections.** `ProbeLink`
   clamps explicit `WithConcurrency(1)` to two. The verifier stays at one worker;
   the benchmark reports the actual pool size separately.

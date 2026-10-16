@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,9 @@ func TestHandleCXSUMMultipleRanges(t *testing.T) {
 	var out bytes.Buffer
 	if err := handleCXSUMWithInput(context.Background(), req, body, &out, deps); err != nil {
 		t.Fatalf("handleCXSUMWithInput err: %v", err)
+	}
+	if deps.refBatches != 1 || deps.openFileCalls != 2 {
+		t.Fatalf("lookups=%d opens=%d; want 1, 2", deps.refBatches, deps.openFileCalls)
 	}
 
 	raw := out.String()
@@ -173,44 +177,85 @@ func TestHandleCXSUMItemsKeepOrder(t *testing.T) {
 	if err := os.WriteFile(filePath, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	for _, failAt := range []int{-1, 0, 5, 12, 40, 73, 99} {
-		var items []string
-		for i := range 100 {
-			offset := i
-			if i == failAt {
-				offset = len(data) + 1 // past EOF
+	for _, kind := range []string{"range", "lookup", "open"} {
+		for _, failAt := range []int{-1, 0, 5, 12, 40, 73, 99} {
+			deps := &mockDeps{filePath: filePath, missingIDs: map[uint64]bool{}, openErrors: map[uint64]error{}}
+			var items []string
+			for i := range 100 {
+				offset := i
+				if i == failAt {
+					switch kind {
+					case "range":
+						offset = len(data) + 1
+					case "lookup":
+						deps.missingIDs[uint64(i+1)] = true
+					case "open":
+						deps.openErrors[uint64(i+1)] = &FileLookupError{Code: http.StatusNotFound, Msg: "file disappeared"}
+					}
+				}
+				items = append(items, fmt.Sprintf(`fd=%d "/tmp/a" offset=%d size=%d algo=xxh128`, i+1, offset, 1+i%50))
 			}
-			items = append(items, fmt.Sprintf(`fd=1 "/tmp/a" offset=%d size=%d algo=xxh128`, offset, 1+i%50))
-		}
-		req, err := ParseRequest([]byte(`CXSUM tx1`))
-		if err != nil {
-			t.Fatal(err)
-		}
-		var out bytes.Buffer
-		err = handleCXSUMWithInput(context.Background(), req, framedItemBody(t, items...), &out, &mockDeps{filePath: filePath})
-		want := 100
-		if failAt >= 0 {
-			want = failAt
-			if err == nil || !strings.Contains(err.Error(), "beyond eof") {
-				t.Fatalf("failAt=%d: err = %v, want beyond eof", failAt, err)
+			req, err := ParseRequest([]byte(`CXSUM tx1`))
+			if err != nil {
+				t.Fatal(err)
 			}
-		} else if err != nil {
-			t.Fatalf("handleCXSUMWithInput: %v", err)
-		}
-		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-		if out.Len() == 0 {
-			lines = nil
-		}
-		if len(lines) != 2*want {
-			t.Fatalf("failAt=%d: got %d lines, want %d frames", failAt, len(lines), want)
-		}
-		for i := range want {
-			size := 1 + i%50
-			wantHeader := fmt.Sprintf("FX/1 1 offset=%d size=%d ", i, size)
-			wantHash := "file-hash=" + encoding.FormatXXH128HashToken(xxh3.Hash128(data[i:i+size]))
-			if !strings.HasPrefix(lines[2*i], wantHeader) || !strings.Contains(lines[2*i+1], wantHash) {
-				t.Fatalf("failAt=%d: frame %d out of order or wrong:\n%s\n%s", failAt, i, lines[2*i], lines[2*i+1])
+			var out bytes.Buffer
+			err = handleCXSUMWithInput(context.Background(), req, framedItemBody(t, items...), &out, deps)
+			want, opens := 100, 100
+			if failAt >= 0 {
+				want, opens = failAt, failAt+1
+				code := "BAD_REQUEST"
+				if kind != "range" {
+					code = "NOT_FOUND"
+				}
+				if kind == "lookup" {
+					opens--
+				}
+				var pe protocolErr
+				if !errors.As(err, &pe) || pe.code != code {
+					t.Fatalf("%s failAt=%d: err=%v, want %s", kind, failAt, err, code)
+				}
+			} else if err != nil {
+				t.Fatalf("handleCXSUMWithInput: %v", err)
+			}
+			if deps.refBatches != 1 || deps.openFileCalls != opens {
+				t.Fatalf("%s failAt=%d: lookups=%d opens=%d, want 1, %d", kind, failAt, deps.refBatches, deps.openFileCalls, opens)
+			}
+			for _, fd := range deps.openedFiles {
+				if _, err := fd.Stat(); !errors.Is(err, os.ErrClosed) {
+					t.Fatalf("%s failAt=%d: file left open: %v", kind, failAt, err)
+				}
+			}
+			lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+			if out.Len() == 0 {
+				lines = nil
+			}
+			if len(lines) != 2*want {
+				t.Fatalf("%s failAt=%d: got %d lines, want %d frames", kind, failAt, len(lines), want)
+			}
+			for i := range want {
+				size := 1 + i%50
+				wantHeader := fmt.Sprintf("FX/1 %d offset=%d size=%d ", i+1, i, size)
+				wantHash := "file-hash=" + encoding.FormatXXH128HashToken(xxh3.Hash128(data[i:i+size]))
+				if !strings.HasPrefix(lines[2*i], wantHeader) || !strings.Contains(lines[2*i+1], wantHash) {
+					t.Fatalf("%s failAt=%d: frame %d out of order or wrong:\n%s\n%s", kind, failAt, i, lines[2*i], lines[2*i+1])
+				}
 			}
 		}
+	}
+}
+
+func TestHandleCXSUMCancelledBeforeLookup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req, err := ParseRequest([]byte("CXSUM tx1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := &mockDeps{}
+	var out bytes.Buffer
+	err = handleCXSUMWithInput(ctx, req, framedItemBody(t, `fd=1 "/file" size=0`), &out, deps)
+	if !errors.Is(err, context.Canceled) || deps.refBatches != 0 || deps.openFileCalls != 0 || out.Len() != 0 {
+		t.Fatalf("err=%v lookups=%d opens=%d output=%q", err, deps.refBatches, deps.openFileCalls, out.String())
 	}
 }

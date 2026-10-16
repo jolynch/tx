@@ -148,6 +148,16 @@ func handleCXSUMWithInput(ctx context.Context, req Request, in io.Reader, out io
 	if len(records) == 0 {
 		return protocolErr{code: "BAD_REQUEST", message: "CXSUM requires at least one item"}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Resolve under one transfer lock; report lookup errors only when their
+	// item is reached, after writing the preceding checksum frames.
+	lookups := make([]FileLookup, len(records))
+	for i, record := range records {
+		lookups[i] = FileLookup{FileID: record.FileID, Path: record.Path}
+	}
+	refs, refErrs := deps.GetFileRefs(txferID, lookups)
 
 	buf, err := bufpool.Get(checksumBufferSize(records))
 	if err != nil {
@@ -181,8 +191,15 @@ func handleCXSUMWithInput(ctx context.Context, req Request, in io.Reader, out io
 	defer bufpool.Put(line)
 	scratch := checksumScratch{buf: *buf, line: line}
 	lastFlush := time.Now()
-	for _, record := range records {
-		if err := streamChecksumItem(ctx, w, deps, txferID, record.item(), &scratch); err != nil {
+	for i, record := range records {
+		err := ctx.Err()
+		if err == nil {
+			err = mapLookupError(refErrs[i])
+		}
+		if err == nil {
+			err = streamChecksumItem(ctx, w, deps, refs[i], record.item(), &scratch)
+		}
+		if err != nil {
 			_ = flushBuffer()
 			return err
 		}
@@ -216,12 +233,8 @@ type checksumScratch struct {
 	hashers checksumHashers
 }
 
-func streamChecksumItem(ctx context.Context, out io.Writer, deps Deps, txferID string, item cxsumItem, scratch *checksumScratch) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	fd, fileRef, err := deps.GetFile(txferID, item.FileID, item.Path)
+func streamChecksumItem(ctx context.Context, out io.Writer, deps Deps, fileRef FileRef, item cxsumItem, scratch *checksumScratch) error {
+	fd, err := deps.OpenFileRef(fileRef)
 	if err != nil {
 		return mapLookupError(err)
 	}

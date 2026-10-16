@@ -121,10 +121,11 @@ The verifier does not send one giant `CXSUM` request per file. Instead it:
 
 This keeps memory use, request size, and the server's hashing per request
 bounded on very large files. CXSUM reuses request-owned hashers and computes
-only requested algorithms. It formats zero-payload FX/1 frames in a pooled
-buffer, preserving request order and emitting exactly the frames before an
-item error. A `verify_hash` event records each successful local batch's hashing
-time, excluding remote waits.
+only requested algorithms. It resolves file references under one transfer lock
+per request, then opens and hashes them in request order. It formats zero-payload
+FX/1 frames in a pooled buffer, preserving request order and emitting exactly
+the frames before an item error. A `verify_hash` event records each successful
+local batch's hashing time, excluding remote waits.
 
 ## Deterministic Sampling Algorithm
 

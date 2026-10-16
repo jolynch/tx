@@ -804,10 +804,14 @@ func TestGetFileRefRejectsDigestMismatch(t *testing.T) {
 	}
 }
 
-func TestGetFileReturnsNotFoundWhenMissing(t *testing.T) {
+func TestOpenFileRefReturnsNotFoundWhenMissing(t *testing.T) {
 	s := newTestStore(t)
 	txferID, fullPath := setupLookupFixture(t, s, "missing.txt", nil)
-	fd, _, err := s.GetFile(txferID, 1, fullPath)
+	ref, err := s.GetFileRef(txferID, 1, fullPath)
+	if err != nil {
+		t.Fatalf("GetFileRef failed: %v", err)
+	}
+	fd, err := s.OpenFileRef(ref)
 	if fd != nil {
 		_ = fd.Close()
 		t.Fatalf("expected nil fd for missing file")
@@ -818,12 +822,16 @@ func TestGetFileReturnsNotFoundWhenMissing(t *testing.T) {
 	}
 }
 
-func TestGetFileSuccess(t *testing.T) {
+func TestGetFileRefAndOpenSuccess(t *testing.T) {
 	s := newTestStore(t)
 	txferID, fullPath := setupLookupFixture(t, s, "a.txt", []byte("hello"))
-	fd, ref, err := s.GetFile(txferID, 1, fullPath)
+	ref, err := s.GetFileRef(txferID, 1, fullPath)
 	if err != nil {
-		t.Fatalf("GetFile failed: %v", err)
+		t.Fatalf("GetFileRef failed: %v", err)
+	}
+	fd, err := s.OpenFileRef(ref)
+	if err != nil {
+		t.Fatalf("OpenFileRef failed: %v", err)
 	}
 	defer fd.Close()
 	if ref.TransferID != txferID || ref.FileID != 1 {
