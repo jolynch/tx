@@ -545,6 +545,10 @@ fd=<fid> <path> ...\n
 - `FX/1` frame stream (one zero-payload frame per requested range, in request order)
 - terminal status line: `OK` or `ERR ...`
 
+The server resolves all file references together, then opens and checksums ranges
+in request order. A lookup, open, or checksum error ends the response after
+exactly the successful frames preceding that item.
+
 ## STATUS
 
 Returns transfer status JSON. Two forms:

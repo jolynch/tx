@@ -41,8 +41,9 @@ func realDeps(t *testing.T, root string) Deps {
 // and server_test.go.
 type mockDeps struct {
 	// Inputs.
-	filePath   string          // GetFile/GetFileRef serve this file when non-empty
-	missingIDs map[uint64]bool // GetFile/GetFileRef report these file IDs as not found
+	filePath   string           // GetFileRef and OpenFileRef serve this file when non-empty
+	missingIDs map[uint64]bool  // GetFileRef reports these file IDs as not found
+	openErrors map[uint64]error // OpenFileRef returns these errors by file ID
 	entryType  byte
 	transfer   Transfer // returned by GetTransfer and GetTransferSummary when transferOK
 	transferOK bool
@@ -68,10 +69,12 @@ type mockDeps struct {
 	windowHash       string
 	setStateCalls    int
 	setWindowCalls   int
-	stateBatches     int // SetTransferFilesState calls
-	windowBatches    int // SetTransferFileWindowHashes calls
-	refBatches       int // GetFileRefs calls
-	verifyBatches    int // VerifyTransferFileWindowHashes calls
+	stateBatches     int        // SetTransferFilesState calls
+	windowBatches    int        // SetTransferFileWindowHashes calls
+	refBatches       int        // GetFileRefs calls
+	openFileCalls    int        // OpenFileRef calls
+	openedFiles      []*os.File // files OpenFileRef opened, to check they close
+	verifyBatches    int        // VerifyTransferFileWindowHashes calls
 	reportTxferID    string
 	reportObserved   int64
 	reportBWPct      int
@@ -128,25 +131,6 @@ func (m *mockDeps) ReportTransferObservedLink(txferID string, observedLinkMbps i
 
 func (m *mockDeps) GetTransferLimiterBps(string) int64 { return 0 }
 
-func (m *mockDeps) GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error) {
-	if m.missingIDs[fileID] {
-		return nil, FileRef{}, &FileLookupError{Code: http.StatusNotFound, Msg: "file not found"}
-	}
-	if m.filePath == "" {
-		return nil, FileRef{}, nil
-	}
-	fd, err := os.Open(m.filePath)
-	if err != nil {
-		return nil, FileRef{}, err
-	}
-	info, err := fd.Stat()
-	if err != nil {
-		_ = fd.Close()
-		return nil, FileRef{}, err
-	}
-	return fd, m.fileRef(txferID, fileID, info.Size()), nil
-}
-
 // GetFileRefs resolves each lookup as GetFileRef does.
 func (m *mockDeps) GetFileRefs(txferID string, lookups []FileLookup) ([]FileRef, []error) {
 	m.refBatches++
@@ -158,12 +142,20 @@ func (m *mockDeps) GetFileRefs(txferID string, lookups []FileLookup) ([]FileRef,
 	return refs, errs
 }
 
-// OpenFileRef opens the served file, as GetFile does.
+// OpenFileRef opens the served file.
 func (m *mockDeps) OpenFileRef(ref FileRef) (*os.File, error) {
+	m.openFileCalls++
+	if err := m.openErrors[ref.FileID]; err != nil {
+		return nil, err
+	}
 	if m.filePath == "" {
 		return nil, nil
 	}
-	return os.Open(m.filePath)
+	fd, err := os.Open(m.filePath)
+	if err == nil {
+		m.openedFiles = append(m.openedFiles, fd)
+	}
+	return fd, err
 }
 
 func (m *mockDeps) GetFileRef(txferID string, fileID uint64, fullPathRaw string) (FileRef, error) {

@@ -29,7 +29,6 @@ type Interface interface {
 	GetTransferGentleLimiter(txferID string, fallbackLinkMbps int64, gentleBWPct int, burstBytes int64) *limit.Limiter
 	ReportTransferObservedLink(txferID string, observedLinkMbps int64, gentleBWPct int, burstBytes int64, emaAlpha float64) (TransferObservedLinkUpdate, bool)
 	GetTransferLimiterBps(txferID string) int64
-	GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error)
 	GetFileRefs(txferID string, lookups []FileLookup) ([]FileRef, []error)
 	OpenFileRef(ref FileRef) (*os.File, error)
 

@@ -16,6 +16,7 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"runtime/trace"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -51,16 +52,12 @@ type verifyMemDeps struct {
 	srcs []*os.File
 }
 
-func (d verifyMemDeps) GetFile(txferID string, fileID uint64, fullPath string) (*os.File, intftcp.FileRef, error) {
-	refs, errs := d.GetFileRefs(txferID, []intftcp.FileLookup{{FileID: fileID, Path: fullPath}})
-	if errs[0] != nil {
-		return nil, intftcp.FileRef{}, errs[0]
-	}
-	fd, err := unix.Dup(int(d.srcs[fileID%uint64(len(d.srcs))].Fd()))
+func (d verifyMemDeps) OpenFileRef(ref intftcp.FileRef) (*os.File, error) {
+	fd, err := unix.Dup(int(d.srcs[ref.FileID%uint64(len(d.srcs))].Fd()))
 	if err != nil {
-		return nil, intftcp.FileRef{}, err
+		return nil, err
 	}
-	return os.NewFile(uintptr(fd), refs[0].Path), refs[0], nil
+	return os.NewFile(uintptr(fd), ref.Path), nil
 }
 
 const verifyMemRoot = "/tx-verify-bench"
@@ -327,7 +324,9 @@ func benchVerify(b *testing.B, env *verifyMemEnv, files int, size int64, op func
 	b.ResetTimer()
 	for b.Loop() {
 		cpu0 := verifyProcessCPUNS()
+		region := trace.StartRegion(context.Background(), "verify-measured")
 		op()
+		region.End()
 		cpuNS += verifyProcessCPUNS() - cpu0
 	}
 	wall := float64(b.Elapsed().Nanoseconds())

@@ -1184,18 +1184,6 @@ func (s *Store) RegisterTransferFileState(txferID string, updatesCh <-chan Trans
 	return done
 }
 
-func (s *Store) GetFile(txferID string, fileID uint64, fullPathRaw string) (*os.File, FileRef, error) {
-	ref, err := s.GetFileRef(txferID, fileID, fullPathRaw)
-	if err != nil {
-		return nil, FileRef{}, err
-	}
-	fd, err := s.OpenFileRef(ref)
-	if err != nil {
-		return nil, FileRef{}, err
-	}
-	return fd, ref, nil
-}
-
 // OpenFileRef opens a file that GetFileRef or GetFileRefs resolved.
 func (s *Store) OpenFileRef(ref FileRef) (*os.File, error) {
 	fd, err := os.Open(ref.Path)

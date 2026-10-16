@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -289,4 +290,78 @@ func verifyFuzzManifest(t *testing.T, source string, encrypt bool) (string, []tx
 		t.Fatal(err)
 	}
 	return resp.Manifest.Root, resp.Manifest.Entries
+}
+
+// Keep malformed input and duplicate handling stable while scanning fields
+// without a temporary token slice or property map.
+func TestChecksumFrameParserCompatibility(t *testing.T) {
+	for _, tc := range []struct {
+		line, want string
+		trailer    bool
+	}{
+		{"FX/1 1", "invalid checksum frame header", false},
+		{"FX/1 bad", "invalid checksum frame header", false},
+		{"FX/1 bad offset=0", "invalid checksum frame file id", false},
+		{"FX/1 1 size=0 wsize=0", "invalid checksum frame offset", false},
+		{"FX/1 1 offset=-1 size=0 wsize=0", "invalid checksum frame offset", false},
+		{"FX/1 1 offset=0 size=9223372036854775808 wsize=0", "invalid checksum frame size", false},
+		{"FX/1 1 offset=0 size=0 wsize=1 wsize=bad", "invalid checksum frame wsize", false},
+		{"FXT/1 1", "invalid checksum frame trailer", true},
+		{"FXT/1 bad", "invalid checksum frame trailer", true},
+		{"FXT/1 bad next=0", "invalid checksum frame trailer file id", true},
+		{"FXT/1 1 status=ok", "checksum frame trailer next offset must be 0", true},
+		{"FXT/1 1 next=1", "checksum frame trailer next offset must be 0", true},
+		{"FXT/1 1 next=bad next=0", "invalid checksum frame trailer next offset", true},
+		{"FXT/1 1 next=-1 next=0", "invalid checksum frame trailer next offset", true},
+	} {
+		var err error
+		if tc.trailer {
+			_, err = parseChecksumFrameTrailer(tc.line)
+		} else {
+			_, err = parseChecksumFrameHeader(tc.line)
+		}
+		if err == nil || err.Error() != tc.want {
+			t.Errorf("%q: err=%v, want %q", tc.line, err, tc.want)
+		}
+	}
+	for _, suffix := range []string{"", " meta:user=only meta:size=bad meta:mtime_ns=bad"} {
+		got, err := parseChecksumFrameTrailer(" FXT/1 1 next=1 next=0 file-hash=old file-hash=new=hash" + suffix)
+		if err != nil || got.FileHashToken != "new=hash" || got.Metadata != nil {
+			t.Fatalf("non-metadata trailer: got=%+v err=%v", got, err)
+		}
+	}
+	got, err := parseChecksumFrameTrailer("FXT/1 1 next=0 meta:mode=0600 meta:mode= meta:uid=2 meta:uid=3")
+	if err != nil || got.Metadata == nil || got.Metadata.Mode != "" || got.Metadata.UID != "3" {
+		t.Fatalf("duplicate metadata: got=%+v err=%v", got, err)
+	}
+}
+
+// FuzzChecksumFrameParsing uses the real encoder as an oracle, with unknown
+// fields, spacing, and overwritten header properties added to the response.
+func FuzzChecksumFrameParsing(f *testing.F) {
+	f.Add(uint64(1), int64(0), int64(4096), "user=name", uint8(0))
+	f.Add(uint64(math.MaxUint64), int64(math.MaxInt64), int64(0), "a user\n", uint8(31))
+	f.Fuzz(func(t *testing.T, id uint64, offset, size int64, user string, extras uint8) {
+		offset &= math.MaxInt64
+		size &= math.MaxInt64
+		user = strings.NewReplacer("\r", "_", "\n", "_", " ", "_").Replace(user)
+		hash := fmt.Sprintf("xxh128:%032x", id)
+		meta := encoding.FileFrameMetadata{Size: size, MtimeNS: offset, Mode: "0644", UID: "1000", GID: "1001", User: user, Group: user}
+		var out bytes.Buffer
+		if _, err := encoding.WriteFrame(&out, encoding.WriteArgs{
+			FileID: id, Offset: offset, Size: size, Comp: "none", HeaderHash: hash,
+			FileHashes: []string{hash}, Metadata: &meta,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		header, rest, _ := strings.Cut(out.String(), "\n")
+		header = strings.Replace(header, " offset=", " offset=bad size=-1 wsize=bad offset=", 1)
+		header = "  " + header + strings.Repeat(" unknown=x=y", int(extras%32)) + "  "
+		got, err := readChecksumResults(strings.NewReader(header + "\n" + rest + "OK\n"))
+		want := []checksumResult{{FileID: id, Offset: offset, Size: size, FileHashToken: hash,
+			Metadata: &tx.FileTrailerMetadata{Size: size, MtimeNS: offset, Mode: "0644", UID: "1000", GID: "1001", User: user, Group: user}}}
+		if err != nil || !reflect.DeepEqual(got, want) {
+			t.Fatalf("got=%+v err=%v, want=%+v", got, err, want)
+		}
+	})
 }

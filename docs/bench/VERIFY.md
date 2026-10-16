@@ -168,3 +168,160 @@ continued growing beyond ten seconds.
 These measurements support overlapping verification and reducing serial checksum
 costs. They do not establish physical-storage throughput, full CPU saturation,
 or the best storage concurrency.
+
+## Checksum parsing and batched lookups
+
+This section measures two per-file cuts: the verifier parses checksum frames
+without temporary field collections, and CXSUM resolves file references once
+per request. [Verification](../arch/VERIFICATION.md) describes the behavior.
+
+### Experiment and results
+
+The baseline is `5b34346`, with the previous response parsers and per-item
+`GetFile`. Both builds use 256 MiB logical trees backed by memfds, without
+injected latency. The 54-case matrix covers all six file sizes, 2/4/8 pinned
+physical cores, and 2/4/8 requested connections. Advertised I/O depth is four.
+Each build runs six alternating times per case with a 200 ms minimum. Odd runs
+reverse the CPU/connection and build orders. Both sides share the CPU budget.
+
+Changes are equal-weight geometric means of paired case ratios. The 95%
+intervals resample six whole paired runs 10,000 times, keeping cases together.
+
+Together, the changes improve throughput **2.8% overall** (95% interval
+**1.7% to 4.0%**) and **6.1% for 4 KiB files** (**2.9% to 9.1%**). Small-file
+allocations fall about 25%, from roughly 40 to 30 per file. Across all sizes,
+CPU/GiB falls 2.6%, allocation count falls 20.0%, and allocated bytes fall 3.8%.
+
+| File size | Throughput change, 95% interval | CPU/GiB change | Allocation count change |
+|---|---:|---:|---:|
+| 4 KiB | +6.1% (+2.9% to +9.1%) | −6.1% | −25.0% |
+| 16 KiB | +3.9% (+0.8% to +6.3%) | −4.6% | −24.9% |
+| 64 KiB | +5.2% (+3.1% to +7.4%) | −4.4% | −24.6% |
+| 1 MiB | +1.5% (−0.5% to +3.3%) | −1.1% | −19.9% |
+| 4 MiB | +0.5% (−3.9% to +4.8%) | +0.5% | −11.7% |
+| 16 MiB | −0.1% (−3.5% to +3.2%) | +0.2% | −12.4% |
+
+At eight cores and eight connections, median 4 KiB throughput is
+798 → 853 MiB/s. Large-file throughput as a group is +0.6% (−1.9% to +3.2%),
+which these runs cannot distinguish from no change.
+
+Separate 4 KiB comparisons run the baseline, parser-only, lookup-only, and
+combined builds six times at four cores/two connections and eight cores/eight
+connections, rotating and reversing build order. The parser alone reduces
+allocations from 40 to 33 per file, and batched lookups alone reduce them to 37.
+Neither isolated throughput change has an interval excluding zero in these
+runs; the full matrix supports the combined small-file gain.
+
+The short matrix's worst cell is 4 MiB / two cores / eight connections, down
+10.0%. A separate one-second follow-up repeats all 1/4/16 MiB cases at two cores
+and four/eight connections, six alternating times per build. That cell becomes
++8.0% (−3.7% to +23.3%), so the 10% regression does not repeat reliably. The
+16 MiB / two cores / four connections case remains uncertain at −5.2%
+(−11.4% to +1.1%). These results support the small-file gain, with less certainty
+about individual larger-file cells. They do not establish physical-storage
+throughput or independent client/server saturation.
+
+### Profiling findings
+
+Six-second CPU/allocation captures and two-operation Go traces identify
+per-file overhead in the baseline. For 4 KiB files at eight cores/eight
+connections, xxh3 accounts for only 2.6% of sampled process CPU, while CLI
+response parsers account for 7.9% and server file lookups for 3.7%. Trailer
+parsing accounts for about 22% of allocated objects.
+
+Combined-build captures at four cores/two connections and eight cores/eight
+connections put CLI response parsing at 3.9–4.2% of sampled CPU and trailer
+parsing at 3.5–3.8% of allocated objects. These profiles confirm the changed cost
+distribution; the paired benchmarks measure the throughput effect. Profiles
+include setup and warmup, while `verify-measured` trace regions delimit timed
+operations. Traced timing is excluded from throughput comparisons.
+
+The traces also record four `fcntl` calls per local file from Go's failed
+regular-file poller setup. A Linux file-open helper remains deferred in
+[Ideas](../IDEAS.md#performance), along with size-based hashing workers.
+
+### Reproduce the comparison
+
+Run on Linux with Go 1.26 and `taskset`, from the repository root. Choose
+physical cores without SMT siblings; this machine uses cores 0–7. Adjust the
+affinity sets for other hardware. Keep generated binaries, logs, traces, and
+profiles outside the repository. The following Bash commands build the baseline
+in an isolated worktree and the proposed code from the working tree:
+
+```bash
+set -e
+verify_out=$(mktemp -d /tmp/tx-verify.XXXXXX)
+git worktree add --detach "$verify_out/baseline" 5b34346
+(
+  cd "$verify_out/baseline"
+  go test -c -o "$verify_out/baseline.test" ./internal/cmd/filexfercli
+)
+go test -c -o "$verify_out/current.test" ./internal/cmd/filexfercli
+unset TX_VERIFY_IO_LATENCY TX_VERIFY_BYTES
+
+for run in 0 1 2 3 4 5; do
+  cpu_budgets=(2 4 8)
+  connections=(2 4 8)
+  builds=(baseline current)
+  if (( run % 2 )); then
+    cpu_budgets=(8 4 2)
+    connections=(8 4 2)
+    builds=(current baseline)
+  fi
+  for cpus in "${cpu_budgets[@]}"; do
+    for conc in "${connections[@]}"; do
+      for build in "${builds[@]}"; do
+        TX_VERIFY_IO_DEPTH=4 TX_VERIFY_CONCURRENCY="$conc" \
+          taskset -c "0-$((cpus-1))" "$verify_out/$build.test" \
+          -test.run='^$' \
+          -test.bench="^BenchmarkVerifyInMemory$/^(4KiB|16KiB|64KiB|1MiB|4MiB|16MiB)$/^cpus=${cpus}$/^c=${conc}$" \
+          -test.benchtime=200ms \
+          > "$verify_out/run${run}-p${cpus}-c${conc}-${build}.txt"
+      done
+    done
+  done
+done
+```
+
+Compare matching case/run pairs. Convert Go's decimal `MB/s` to MiB/s by dividing
+by 1.048576. Report `core-s/GiB`, `allocs/op`, `B/op`, `hash-busy`, and
+`server-busy` alongside throughput. Busy metrics count batches/requests in
+progress, including waits; they do not measure CPU use or hashing workers.
+Compute geometric means from log ratios. For confidence intervals, resample
+whole paired runs rather than individual cases.
+
+For the longer follow-up, restrict the filter to `1MiB|4MiB|16MiB`, two cores,
+and four/eight connections, and use `-test.benchtime=1s`. Analyze it separately
+from the main matrix. To isolate the two changes, build parser-only and
+lookup-only variants and repeat just the 4 KiB cases at four cores/two
+connections and eight cores/eight connections.
+
+### Reproduce profiles and traces
+
+Use separate runs for throughput, CPU/allocation profiles, and tracing. For
+example, after building the current binary above:
+
+```bash
+verify_filter='^BenchmarkVerifyInMemory$/^4KiB$/^cpus=8$/^c=8$'
+TX_VERIFY_IO_DEPTH=4 TX_VERIFY_CONCURRENCY=8 \
+  taskset -c 0-7 "$verify_out/current.test" -test.run='^$' \
+  -test.bench="$verify_filter" -test.benchtime=6s \
+  -test.cpuprofile="$verify_out/verify.cpu" \
+  -test.memprofile="$verify_out/verify.allocs"
+
+go tool pprof -http=localhost:8080 \
+  "$verify_out/current.test" "$verify_out/verify.cpu"
+go tool pprof -sample_index=alloc_objects -top \
+  "$verify_out/current.test" "$verify_out/verify.allocs"
+
+TX_VERIFY_IO_DEPTH=4 TX_VERIFY_CONCURRENCY=8 \
+  taskset -c 0-7 "$verify_out/current.test" -test.run='^$' \
+  -test.bench="$verify_filter" -test.benchtime=2x \
+  -test.trace="$verify_out/verify.trace"
+go tool trace "$verify_out/verify.trace"
+```
+
+The pprof web interface includes flamegraphs. In Go trace, inspect the
+`verify-measured` regions to exclude setup and warmup. Whole-trace `sched`,
+`syscall`, `sync`, and `net` profiles include background goroutines and summed
+goroutine wait time; do not interpret their totals as wall time or CPU use.
