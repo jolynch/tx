@@ -10,24 +10,43 @@ fresh `tx send tree` for every run, and on the receiver it forks one
 `tx recv copy` per run. Each run is therefore a true end-to-end test of the
 shipped binary, measured per process. `tx-bench` never speaks FTCP itself.
 
-```text
-host A (sender)
-$ ./tx-bench remote send-tree --size 10GiB
-  prep: generate, check, cache
-  start tx send tree #1, print the recv-copy command
-  on each prep request: stop tx #k, record runs/server-<tid>.json,
-                        cache step, start tx #k+1, write prep.json
+Start the sender on host A:
 
-host B (receiver)
-$ ./tx-bench remote recv-copy 10.0.4.17:3453 --expect 7f3a9c21e0b4d8aa
-  tx recv get bench.json, files.tsv, ...
-  for each warmup + measured run:
-    clean DST, request prep (tx recv get runs/prep), wait for prep.json
-    tx recv get the previous run's runs/server-<tid>.json
-    fork: tx recv copy <data root> DST
-    verify DST against files.tsv
-  request a final flush, fetch the last server-<tid>.json
-  print report, write metrics
+```sh
+./tx-bench remote send-tree --size 10GiB
+```
+
+Run the printed command on host B, for example:
+
+```sh
+./tx-bench remote recv-copy 10.0.4.17:3453 --expect 7f3a9c21e0b4d8aa
+```
+
+```mermaid
+sequenceDiagram
+    participant A as Host A (sender harness)
+    participant B as Host B (receiver harness)
+    Note over A: Generate, check and cache dataset<br/>Start tx send tree #1<br/>Print recv-copy command
+    Note over A,B: All network exchanges use forked tx processes
+    B->>A: Fetch bench.json, files.tsv and server facts
+    A-->>B: Dataset metadata and oracle
+    loop Warmup and measured runs
+        Note over B: Clean destination
+        B->>A: Fetch runs/prep to request preparation
+        A-->>B: Complete prep request transfer
+        Note over A: Stop current tx process<br/>Record previous run metrics<br/>Set cache state<br/>Start next tx process<br/>Write prep.json
+        B->>A: Poll prep.json until this request is ready
+        A-->>B: Prep result
+        B->>A: Fetch previous run sender metrics, if any
+        A-->>B: server-tid.json
+        B->>A: Fork tx recv copy for data root
+        A-->>B: Dataset via tx send tree
+        Note over B: Verify destination against files.tsv
+    end
+    B->>A: Request final flush
+    Note over A: Stop tx process, record final run<br/>Start replacement process
+    A-->>B: Flush result and final sender metrics (fetched via tx)
+    Note over B: Print report and write metrics
 ```
 
 Companion references:

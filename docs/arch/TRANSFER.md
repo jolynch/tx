@@ -23,20 +23,24 @@ intent is that source-side impact is bounded and explicit.
 
 ## High-level Shape
 
-```text
-                fast                                  gentle
-
-PROBE discovery + parallel link probe       PROBE discovery + linear link probe
-        |                                           |
-cpu * io-depth concurrency                  gentle-cpu% concurrency
-        |                                           |
-no SEND bandwidth cap                        gentle-bw% / --bwlimit cap
-        |                                           |
-fadvise + async readahead                    O_DIRECT where supported
-        |                                           |
-zero-copy when eligible                      buffered, rate-limited writes
-        |                                           |
-packed SEND batches / split windows         larger batches, fewer splits
+```mermaid
+flowchart TB
+    subgraph fast["Fast"]
+        direction TB
+        fprobe["PROBE discovery + parallel link probe"] --> fcpu["cpu × io-depth concurrency"]
+        fcpu --> fbw["No SEND bandwidth cap"]
+        fbw --> fread["fadvise + async readahead"]
+        fread --> fwrite["Zero-copy when eligible"]
+        fwrite --> fbatch["Packed SEND batches / split windows"]
+    end
+    subgraph gentle["Gentle"]
+        direction TB
+        gprobe["PROBE discovery + linear link probe"] --> gcpu["gentle-cpu% concurrency"]
+        gcpu --> gbw["gentle-bw% / --bwlimit cap"]
+        gbw --> gread["O_DIRECT where supported"]
+        gread --> gwrite["Buffered, rate-limited writes"]
+        gwrite --> gbatch["Larger batches, fewer splits"]
+    end
 ```
 
 Both modes use the same client-side planner:
@@ -54,35 +58,28 @@ A fast transfer is the clean-start path: the client has no usable local
 manifest or destination state, so it asks the server for a full manifest and
 then downloads every required entry.
 
-```text
-client                                             server
-  |                                                  |
-  | PROBE discovery                                 |
-  |------------------------------------------------->| read cpu/io-depth/socket/gentle budgets
-  |<-------------------------------------------------| return caps + RTT timestamps
-  |                                                  |
-  | PROBE throughput, parallel across server CPUs    |
-  |=================================================>| echo payload on many conns
-  |<=================================================| aggregate link estimate
-  |                                                  |
-  | compute concurrency = server_cpu * io_depth      |
-  | warm authenticated data + control conn pools     |
-  | plan batch size from concurrency/window/link     |
-  |                                                  |
-  | TXFER mode=fast link-mbps=N concurrency=C        |
-  |------------------------------------------------->| walk source tree
-  |<-------------------------------------------------| stream FM/1 manifest frames
-  |                                                  |
-  | parallel SEND batches / split windows            |
-  |=================================================>| fadvise(SEQUENTIAL)
-  |                                                  | readahead(next frame)
-  |                                                  | splice/tee zero-copy if eligible
-  |<=================================================| FX/1 + FXT/1 frame streams
-  | write target files, hash windows, enqueue fsync  |
-  |                                                  |
-  | batched ACK                                      |
-  |------------------------------------------------->| validate window hash, mark progress
-  |<-------------------------------------------------| OK
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    C->>S: PROBE discovery
+    Note right of S: Read CPU, IO depth, socket and gentle budgets
+    S-->>C: Capabilities + RTT timestamps
+    C->>S: PROBE throughput (parallel across server CPUs)
+    S-->>C: Echo payloads for aggregate link estimate
+    Note over C: Compute concurrency = server_cpu × io_depth<br/>Warm authenticated data + control pools<br/>Plan batch size from concurrency, window and link
+    C->>S: TXFER mode=fast link-mbps=N concurrency=C
+    Note right of S: Walk source tree
+    S-->>C: FM/1 manifest frames
+    loop Parallel SEND batches / split windows
+        C->>S: SEND
+        Note right of S: fadvise(SEQUENTIAL)<br/>Readahead next frame<br/>splice/tee zero-copy if eligible
+        S-->>C: FX/1 + FXT/1 frame streams
+        Note over C: Write files, hash windows, enqueue fsync
+        C->>S: Batched ACK
+        Note right of S: Validate window hash, mark progress
+        S-->>C: OK
+    end
 ```
 
 Fast mode's core choices:
@@ -104,11 +101,14 @@ Fast mode's core choices:
 
 The expected result is a full pipeline:
 
-```text
-source SSD -> source page cache -> frame/read path -> socket -> receiver write -> bg fdatasync
-       ^             |                    |              |             |
-       |             +-- async readahead  +-- optional   +-- many      +-- batched
-       |                                  zero-copy       TCP streams   durability
+```mermaid
+flowchart LR
+    ssd["Source SSD"] --> cache["Source page cache"]
+    cache --> frame["Frame/read path"]
+    frame -->|Optional zero-copy| socket["Socket"]
+    socket -->|Many TCP streams| write["Receiver write"]
+    write -->|Batched durability| sync["Background fdatasync"]
+    cache -.->|Async readahead| ssd
 ```
 
 The tradeoff is that fast mode may intentionally consume source CPU, NIC,
@@ -121,28 +121,23 @@ A fast sync is the convergence path when the destination already has state. The
 client sends what it believes about the old tree; the server streams a fresh
 manifest plus removals; the client downloads only the delta.
 
-```text
-client                                             server
-  |                                                  |
-  | scan local destination or load saved manifest    |
-  | PROBE discovery + parallel throughput            |
-  |=================================================>|
-  |<=================================================|
-  |                                                  |
-  | SYNC mode=fast + old FM/1 manifest body          |
-  |------------------------------------------------->| parse old manifest
-  |                                                  | walk source tree
-  |                                                  | compare by path hash
-  |<-------------------------------------------------| new FM/1 + RM lines
-  |                                                  |
-  | classify delta: same / new / stale / removed     |
-  | remove local RM paths                            |
-  |                                                  |
-  | parallel SEND only for new + stale files         |
-  |=================================================>| same fast SEND path
-  |<=================================================|
-  | batched ACK                                      |
-  |------------------------------------------------->|
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    Note over C: Scan destination or load saved manifest
+    C->>S: PROBE discovery + parallel throughput
+    S-->>C: Capabilities + probe payloads
+    C->>S: SYNC mode=fast + old FM/1 manifest body
+    Note right of S: Parse old manifest<br/>Walk source tree<br/>Compare by path hash
+    S-->>C: New FM/1 + RM lines
+    Note over C: Classify same / new / stale / removed<br/>Remove local RM paths
+    loop New and stale files only
+        C->>S: Parallel SEND batches
+        Note right of S: Same fast SEND path
+        S-->>C: File frames
+        C->>S: Batched ACK
+    end
 ```
 
 Unchanged files are not re-read from the source. On the server, matching regular
@@ -160,31 +155,24 @@ Gentle mode keeps the same logical ordering as fast mode: probe, manifest,
 plan, `SEND`, `ACK`. The changed pieces are the resource budgets and the
 server-side read/write path.
 
-```text
-client                                             server
-  |                                                  |
-  | PROBE discovery                                 |
-  |------------------------------------------------->| return gentle-cpu% and gentle-bw%
-  |<-------------------------------------------------|
-  | PROBE throughput, linear samples                 |
-  |------------------------------------------------->| avoid probe fan-out
-  |<-------------------------------------------------|
-  |                                                  |
-  | compute concurrency = ceil(cpu * gentle-cpu%)    |
-  | compute gentle rate = link * gentle-bw%          |
-  | use larger batches / fewer split windows         |
-  |                                                  |
-  | TXFER or SYNC mode=gentle                        |
-  |------------------------------------------------->| manifest path is unchanged
-  |<-------------------------------------------------|
-  |                                                  |
-  | SEND mode=gentle                                 |
-  |=================================================>| open with O_DIRECT if possible
-  |                                                  | no fast-mode readahead
-  |                                                  | wrap writer in gentle limiter
-  |<=================================================| buffered FX/1 + FXT/1 frames
-  | ACK                                             |
-  |------------------------------------------------->|
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    C->>S: PROBE discovery
+    S-->>C: Gentle CPU and bandwidth percentages
+    C->>S: PROBE throughput (linear samples)
+    Note right of S: Avoid probe fan-out
+    S-->>C: Probe payloads
+    Note over C: Concurrency = ceil(cpu × gentle-cpu%)<br/>Gentle rate = link × gentle-bw%<br/>Larger batches / fewer split windows
+    C->>S: TXFER or SYNC mode=gentle
+    S-->>C: Manifest (and removals for SYNC)
+    loop Required files / windows
+        C->>S: SEND mode=gentle
+        Note right of S: O_DIRECT if possible<br/>No fast-mode readahead<br/>Gentle writer limiter
+        S-->>C: Buffered FX/1 + FXT/1 frames
+        C->>S: ACK
+    end
 ```
 
 Gentle mode's core choices:
@@ -217,11 +205,17 @@ and network behavior remains bounded.
 When `copy --cache-load` is enabled, sync also participates in page-cache
 convergence:
 
-```text
-initial TXFER cache-map=send     server attaches pc:<hex> residency hints
-download/verify/cache-load       receiver warms local cache as requested
-closing SYNC cache-map=recv      client sends desired cache map back
-server restore pool              evict + WILLNEED/touch matching source pages
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    participant R as Server restore pool
+    C->>S: Initial TXFER cache-map=send
+    S-->>C: Manifest with pc:hex residency hints
+    Note over C: Download, verify and warm local cache as requested
+    C->>S: Closing SYNC cache-map=recv + desired cache map
+    S->>R: Queue cache restore
+    Note over R: Evict + WILLNEED/touch matching source pages
 ```
 
 That cache-restore work is asynchronous and advisory, and fast mode only: the
@@ -240,8 +234,6 @@ network share, and page-cache residency are more important than peak throughput.
 
 It is normal to combine them:
 
-```text
 1. Run an initial copy in gentle mode to avoid disrupting the source.
 2. Rerun syncs in gentle mode until the delta is small.
 3. Use fast mode for the final convergence window if the source can tolerate it.
-```
