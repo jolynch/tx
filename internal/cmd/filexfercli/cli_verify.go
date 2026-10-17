@@ -18,6 +18,7 @@ import (
 	"github.com/jolynch/tx/internal/benchio"
 	"github.com/jolynch/tx/internal/bufpool"
 	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/sampler"
 	"github.com/zeebo/xxh3"
@@ -331,7 +332,7 @@ dispatch:
 // hashItems hashes each item's range of its source or destination file.
 // Items of one file are adjacent, so it holds one descriptor at a time. It
 // stops with ctx's error once ctx is cancelled.
-func hashItems(ctx context.Context, items []verifyItem, src bool) ([]string, error) {
+func hashItems(ctx context.Context, items []verifyItem, src bool, inj *faults.Injector) ([]string, error) {
 	var largest int64
 	for _, it := range items {
 		largest = max(largest, it.sample.Size)
@@ -364,7 +365,11 @@ func hashItems(ctx context.Context, items []verifyItem, src bool) ([]string, err
 			}
 		}
 		h.Reset()
-		r := io.NewSectionReader(benchio.WithReadLatency(ctx, "client", fd), it.sample.Offset, it.sample.Size)
+		var fr io.ReaderAt = fd
+		if inj != nil {
+			fr = inj.WrapReaderAt(ctx, faults.SiteVerifyRead, fd)
+		}
+		r := io.NewSectionReader(benchio.WithReadLatency(ctx, "client", fr), it.sample.Offset, it.sample.Size)
 		for remaining := it.sample.Size; remaining > 0; {
 			if err := ctx.Err(); err != nil {
 				return nil, err
@@ -457,7 +462,7 @@ func verifyCopyItems(ctx context.Context, client *tx.Client, sink *events.Sink, 
 		}
 	}()
 	start := time.Now()
-	want, err := hashItems(ctx, items, false)
+	want, err := hashItems(ctx, items, false, client.Faults())
 	if err != nil {
 		fail(err)
 	} else if sink.Enabled() {
@@ -514,7 +519,7 @@ func remoteChecksums(ctx context.Context, client *tx.Client, transferID string, 
 	return nil
 }
 
-func verifyLocalCopyData(srcRoot, dstRoot string, entries []localEntry, opts verifyOptions, concurrency int) (verifyDataResult, error) {
+func verifyLocalCopyData(srcRoot, dstRoot string, entries []localEntry, opts verifyOptions, concurrency int, inj *faults.Injector) (verifyDataResult, error) {
 	manifestEntries := make([]tx.ManifestEntry, len(entries))
 	for i, le := range entries {
 		manifestEntries[i] = le.entry
@@ -523,16 +528,17 @@ func verifyLocalCopyData(srcRoot, dstRoot string, entries []localEntry, opts ver
 		return filepath.Join(srcRoot, filepath.FromSlash(entry.Path)), filepath.Join(dstRoot, filepath.FromSlash(entry.Path))
 	})
 	// Twice the concurrency keeps the I/O depth up on both trees.
-	return runVerify(verifyRun{files: files, totals: totals, workers: 2 * max(1, concurrency), budget: opts.budget, check: verifyLocalItems})
+	check := func(ctx context.Context, items []verifyItem) error { return verifyLocalItems(ctx, items, inj) }
+	return runVerify(verifyRun{files: files, totals: totals, workers: 2 * max(1, concurrency), budget: opts.budget, check: check})
 }
 
 // verifyLocalItems compares the items' ranges between source and destination.
-func verifyLocalItems(ctx context.Context, items []verifyItem) error {
-	src, err := hashItems(ctx, items, true)
+func verifyLocalItems(ctx context.Context, items []verifyItem, inj *faults.Injector) error {
+	src, err := hashItems(ctx, items, true, inj)
 	if err != nil {
 		return err
 	}
-	dst, err := hashItems(ctx, items, false)
+	dst, err := hashItems(ctx, items, false, inj)
 	if err != nil {
 		return err
 	}

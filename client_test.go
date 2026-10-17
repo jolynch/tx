@@ -26,11 +26,13 @@ import (
 	"filippo.io/age"
 	"github.com/jolynch/tx/internal/aead"
 	"github.com/jolynch/tx/internal/bufpool"
+	"github.com/jolynch/tx/internal/faults"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/utils"
 	"github.com/zeebo/xxh3"
+	"golang.org/x/sys/unix"
 )
 
 type ftcpTestServer struct {
@@ -4428,3 +4430,49 @@ func (w nopCountingWriteCloser) Write(p []byte) (int, error) {
 }
 
 func (nopCountingWriteCloser) Close() error { return nil }
+
+// TestDialTCPTunesSocketThroughFaultWrapper checks the client's socket
+// options reach the socket whether or not an injector wraps it.
+func TestDialTCPTunesSocketThroughFaultWrapper(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+	const want = 24 << 10 // Linux reports twice the size set
+	for _, inj := range []*faults.Injector{nil, faults.New(faults.Config{Seed: 1})} {
+		c := NewClient(ln.Addr().String(), WithFaults(inj), WithSocketReadBufferBytes(want))
+		conn, err := c.dialTCP(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		tc, ok := conn.(*net.TCPConn)
+		if fc, wrapped := conn.(*faults.Conn); wrapped {
+			tc, ok = fc.Unwrap().(*net.TCPConn)
+		}
+		if !ok || (inj != nil) != (conn != net.Conn(tc)) {
+			t.Fatalf("injector %v: dialed %T", inj != nil, conn)
+		}
+		raw, err := tc.SyscallConn()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got int
+		var sockErr error
+		_ = raw.Control(func(fd uintptr) { got, sockErr = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF) })
+		if sockErr != nil || got != 2*want {
+			t.Fatalf("injector %v: SO_RCVBUF = %d (%v), want %d", inj != nil, got, sockErr, 2*want)
+		}
+		_ = conn.Close()
+		c.Close()
+	}
+}

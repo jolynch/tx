@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"unsafe"
 
+	"github.com/jolynch/tx/internal/faults"
 	"golang.org/x/sys/unix"
 )
 
@@ -43,6 +44,9 @@ func loadResidency(path string) ([]byte, int, error) {
 	numPages := int((size + int64(pageSize) - 1) / int64(pageSize))
 	mappedBytes := numPages * pageSize
 
+	if err := sysGate(faults.SysMmap); err != nil {
+		return nil, 0, err
+	}
 	addr, err := unix.Mmap(int(fd.Fd()), 0, mappedBytes, unix.PROT_NONE, unix.MAP_SHARED)
 	if err != nil {
 		return nil, 0, err
@@ -107,6 +111,9 @@ func loadResidencyRange(path string, startPage, numPages int) ([]byte, int, erro
 	}
 	mappedBytes := int(end - offsetBytes)
 
+	if err := sysGate(faults.SysMmap); err != nil {
+		return nil, 0, err
+	}
 	addr, err := unix.Mmap(int(fd.Fd()), offsetBytes, mappedBytes, unix.PROT_NONE, unix.MAP_SHARED)
 	if err != nil {
 		return nil, 0, err
@@ -193,7 +200,7 @@ func touchPages(path string, bits []byte, numPages int, advise bool) (int, error
 				if offset+length > info.Size() {
 					length = info.Size() - offset
 				}
-				if err := unix.Fadvise(int(fd.Fd()), offset, length, unix.FADV_WILLNEED); err != nil {
+				if err := fadviseGated(fd.Fd(), offset, length, unix.FADV_WILLNEED); err != nil {
 					adviseErrs++
 				}
 			}
@@ -205,6 +212,9 @@ func touchPages(path string, bits []byte, numPages int, advise bool) (int, error
 			}
 			if length <= 0 {
 				continue
+			}
+			if sysGate(faults.SysMmap) != nil {
+				continue // advisory, as a real mmap failure is
 			}
 			addr, mErr := unix.Mmap(int(fd.Fd()), offset, int(length), unix.PROT_READ, unix.MAP_SHARED)
 			if mErr != nil {
@@ -231,7 +241,15 @@ func evictPages(path string) error {
 		return err
 	}
 	defer fd.Close()
-	return unix.Fadvise(int(fd.Fd()), 0, 0, unix.FADV_DONTNEED)
+	return fadviseGated(fd.Fd(), 0, 0, unix.FADV_DONTNEED)
+}
+
+// fadviseGated issues posix_fadvise behind the fault gate.
+func fadviseGated(fd uintptr, offset, length int64, advice int) error {
+	if err := sysGate(faults.SysFadvise); err != nil {
+		return err
+	}
+	return unix.Fadvise(int(fd), offset, length, advice)
 }
 
 // systemMemoryBytes returns total system RAM via sysinfo(2).
@@ -249,6 +267,9 @@ func systemMemoryBytes() (int64, error) {
 func mincore(b []byte, vec []byte) error {
 	if len(b) == 0 {
 		return nil
+	}
+	if err := sysGate(faults.SysMincore); err != nil {
+		return err
 	}
 	_, _, errno := unix.Syscall(
 		unix.SYS_MINCORE,

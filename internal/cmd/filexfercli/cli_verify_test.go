@@ -400,7 +400,7 @@ func TestVerifyLocalCopyDataBudgetReportsPartial(t *testing.T) {
 	for _, budget := range []time.Duration{time.Nanosecond, 20 * time.Microsecond, 200 * time.Microsecond, time.Millisecond} {
 		for run := range 5 {
 			opts := verifyOptions{pct: 100, budget: budget, frameSize: defaultVerifyFrameSize, seed: uint64(run)}
-			result, err := verifyLocalCopyData(src, dst, entries, opts, 4)
+			result, err := verifyLocalCopyData(src, dst, entries, opts, 4, nil)
 			if err != nil {
 				t.Fatalf("budget %s: %v", budget, err)
 			}
@@ -753,7 +753,7 @@ func TestVerifyLocalItemsErrorPaths(t *testing.T) {
 			if tc.cancel {
 				cancel()
 			}
-			err := verifyLocalItems(ctx, verifyTestItems(entries, src, dst, frame))
+			err := verifyLocalItems(ctx, verifyTestItems(entries, src, dst, frame), nil)
 			switch {
 			case tc.want == "" && tc.wantErr == nil:
 				if err != nil {

@@ -3,12 +3,15 @@ package fsync
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jolynch/tx/internal/faults"
 )
 
 func TestStartSyncWorkerDisabled(t *testing.T) {
@@ -377,4 +380,73 @@ type ioDiscard struct{}
 
 func (ioDiscard) Write(p []byte) (int, error) {
 	return len(p), nil
+}
+
+// TestSyncSyscallsGoThroughFaults checks the inline and background sync
+// paths, and syncfs, ask the injector's gates.
+func TestSyncSyscallsGoThroughFaults(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString("data"); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		interval int64
+		want     []faults.Syscall
+	}{
+		{"inline", 0, []faults.Syscall{faults.SysFdatasync}},
+		{"background", 1, []faults.Syscall{faults.SysDup, faults.SysFstat, faults.SysFdatasync}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inj := faults.New(faults.Config{Seed: 1})
+			worker, stop := StartSyncWorker(tc.interval, false, 0, io.Discard, WithFaults(inj))
+			if err := worker.SyncOutput(f, 0)(); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			stop(ctx)
+			for _, sc := range tc.want {
+				if inj.Counts().Sys[sc] == 0 {
+					t.Fatalf("syscall %d skipped its gate: %+v", sc, inj.Counts().Sys)
+				}
+			}
+		})
+	}
+	inj := faults.New(faults.Config{Seed: 1})
+	SyncfsDir(context.Background(), t.TempDir(), 0, io.Discard, WithFaults(inj))
+	if inj.Counts().Sys[faults.SysSyncfs] == 0 {
+		t.Fatal("syncfs skipped its gate")
+	}
+}
+
+// TestBackgroundSyncBatchSyncsEveryFile checks a passing fstat gate still
+// lets the batch tell files apart: two files in one batch are both synced.
+func TestBackgroundSyncBatchSyncsEveryFile(t *testing.T) {
+	inj := faults.New(faults.Config{Seed: 1})
+	worker, stop := StartSyncWorker(1<<30, false, 0, io.Discard, WithFaults(inj))
+	dir := t.TempDir()
+	for _, name := range []string{"a", "b"} {
+		f, err := os.Create(dir + "/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteString(name); err != nil {
+			t.Fatal(err)
+		}
+		if err := worker.SyncOutput(f, 0)(); err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stop(ctx)
+	if got := inj.Counts().Sys[faults.SysFdatasync]; got != 2 {
+		t.Fatalf("fdatasync gate asked %d times for two files in one batch, want 2", got)
+	}
 }

@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +29,8 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/jolynch/tx"
+	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/ftcp"
 	"github.com/jolynch/tx/internal/filexfer/store"
@@ -66,6 +69,11 @@ type memTransferConfig struct {
 	// keepAlive grants keep-alive, so pooled connections carry many
 	// commands; without it every command dials and authenticates afresh.
 	keepAlive bool
+	// faults, when set, wraps both sides' connections and gates their
+	// file and syscall sites.
+	faults *faults.Injector
+	// events, when set, receives the server's event timeline.
+	events *events.Sink
 }
 
 // parseThroughputMode splits a grid mode such as "aes+ka" into its cipher
@@ -148,11 +156,11 @@ func startMemTransfer(tb testing.TB, cfg memTransferConfig) *memTransferEnv {
 
 	// Keys as tx send tree and tx recv copy --keys set them up: a server
 	// identity, and a client identity proven in the Noise handshake.
-	serverOpts := ftcp.ServerOptions{}
+	serverOpts := ftcp.ServerOptions{Faults: cfg.faults, Events: cfg.events}
 	if cfg.keepAlive {
 		serverOpts.KeepAliveTimeout = time.Minute
 	}
-	var clientOpts []tx.ClientOption
+	clientOpts := []tx.ClientOption{tx.WithFaults(cfg.faults)}
 	if cfg.encrypted() {
 		serverID, err := age.GenerateX25519Identity()
 		if err != nil {
@@ -310,6 +318,60 @@ func processCPUNS() int64 {
 		return 0
 	}
 	return ru.Utime.Nano() + ru.Stime.Nano()
+}
+
+// TestTransferInMemoryThroughFaultWrappers copies through an injector that
+// injects nothing: every connection and file site is wrapped, and the copy
+// must still succeed in every session mode. Plaintext files of at least one
+// 1 MiB frame must still be sent zero-copy, as the server's window events
+// report; encrypted sessions never are.
+func TestTransferInMemoryThroughFaultWrappers(t *testing.T) {
+	for _, encrypt := range []string{"none", "aes", "chacha20"} {
+		for _, size := range []int64{4 << 10, 2 << 20} {
+			t.Run(fmt.Sprintf("%s/%d", encrypt, size), func(t *testing.T) {
+				sink := events.NewSink()
+				var mu sync.Mutex
+				paths := map[string]int{}
+				sink.Subscribe(func(e events.Event) {
+					if v, ok := e.Get("send_path"); ok && e.Name == "window" {
+						mu.Lock()
+						paths[v.(string)]++
+						mu.Unlock()
+					}
+				})
+				inj := faults.New(faults.Config{Seed: uint64(size)})
+				env := startMemTransfer(t, memTransferConfig{
+					fileSize:   size,
+					totalBytes: 8 << 20,
+					encrypt:    encrypt,
+					keepAlive:  true,
+					faults:     inj,
+					events:     sink,
+				})
+				defer env.close()
+				env.copyOnce(t)
+				mu.Lock()
+				defer mu.Unlock()
+				zeroCopy := encrypt == "none" && size >= 1<<20
+				if got := paths["sendfile"] > 0; got != zeroCopy {
+					t.Fatalf("window send paths %v; want zero-copy windows %t", paths, zeroCopy)
+				}
+				// Both sides wrapped their connections, and frames went
+				// through the splice and tee gates or the read wrapper.
+				c := inj.Counts()
+				wrapped := c.ClientConns > 0 && c.ServerConns > 0 && c.Opens[faults.SiteSendOpen] > 0 && c.Sys[faults.SysFstat] > 0
+				if zeroCopy {
+					wrapped = wrapped && c.Sys[faults.SysSplice] > 0 && c.Sys[faults.SysTee] > 0 && c.Sys[faults.SysPipe] > 0 &&
+						c.Sys[faults.SysDup] > 0 && c.Sys[faults.SysFcntl] > 0 && c.Sys[faults.SysFadvise] > 0
+				} else {
+					wrapped = wrapped && c.Reads[faults.SiteSendRead] > 0 && c.Sys[faults.SysSplice] == 0
+				}
+				if !wrapped {
+					t.Fatalf("injector counts %+v: a site was not reached", c)
+				}
+			})
+		}
+	}
 }
 
 // memTransferSizes covers small files through files large enough to split

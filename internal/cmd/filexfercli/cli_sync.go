@@ -106,7 +106,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 
 	outRoot := ps.TargetDir
 
-	syncWorker, stopSync := fsync.StartSyncWorker(cfg.fsyncInterval, cfg.noSync, cfg.progressInterval, stderr)
+	syncWorker, stopSync := fsync.StartSyncWorker(cfg.fsyncInterval, cfg.noSync, cfg.progressInterval, stderr, fsync.WithFaults(cfg.auth.faults))
 	defer func() {
 		stopCtx, cancelStop := context.WithTimeout(context.Background(), defaultFsyncTimeout)
 		stopSync(stopCtx)
@@ -114,7 +114,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		if !cfg.noSync {
 			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
 			defer cancel()
-			fsync.SyncfsDir(syncCtx, filepath.Dir(ps.TargetDir), cfg.progressInterval, stderr)
+			fsync.SyncfsDir(syncCtx, filepath.Dir(ps.TargetDir), cfg.progressInterval, stderr, fsync.WithFaults(cfg.auth.faults))
 		}
 	}()
 
@@ -366,7 +366,7 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			if cfg.skipWrite {
 				destPath = os.DevNull
 			}
-			w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, syncWorker)
+			w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, syncWorker, cfg.auth.faults)
 			if err != nil {
 				return nil, nil, err
 			}

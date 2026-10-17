@@ -19,6 +19,7 @@ import (
 
 	"github.com/jolynch/tx/internal/bufpool"
 	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/filexfer/policy"
@@ -112,6 +113,8 @@ type frameStreamArgs struct {
 	OutputTCPConn *net.TCPConn
 	PipeSizeBytes int
 	DirectIO      bool
+	// Faults gates the frame's file reads and syscalls; nil disables it.
+	Faults *faults.Injector
 	// Timed reports whether anything reads the frame's latencies: window
 	// events, or the adaptive policy choosing the next frame's codec. A
 	// frame nothing reads skips its clock reads.
@@ -279,11 +282,13 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 	// requests stay unbuffered, so their rate limiters pace the socket writes
 	// themselves rather than writes into a buffer. A transport that batches
 	// writes, an authenticated session, already buffers into whole records.
+	inj := faults.FromContext(ctx)
 	resp := unbufferedSendOutput(out)
 	if header.Mode != loadStrategyGentle && transportFlusher(out) == nil {
 		resp = newBufferedSendOutput(out)
 		defer resp.release()
 	}
+	resp.faults = inj
 	transfer, hasTransfer := deps.GetTransferSummary(header.TransferID)
 	for i, record := range records {
 		item := record.item(header.Mode)
@@ -305,6 +310,7 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 			}
 			itemOut = unbufferedSendOutput(limited)
 			itemOut.frameFlush = transportFlusher(out)
+			itemOut.faults = inj
 		}
 		var sent sentItem
 		err := mapLookupError(refErrs[i])
@@ -345,6 +351,8 @@ type sendOutput struct {
 	// hasher is reset and reused by each item, rather than allocating 1.2 KiB
 	// per file.
 	hasher xxh3.Hasher128
+	// faults gates the request's file and syscall sites; nil disables it.
+	faults *faults.Injector
 }
 
 var sendOutputBufferPool = sync.Pool{
@@ -426,7 +434,8 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 	if scope.Sink.Enabled() {
 		itemStart = time.Now()
 	}
-	fd, usedDirectOpen, err := openSendFile(deps, item, fileRef)
+	inj := out.faults
+	fd, usedDirectOpen, err := openSendFile(inj, deps, item, fileRef)
 	if err != nil {
 		return sentItem{}, mapLookupError(err)
 	}
@@ -441,6 +450,9 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 		}
 	}()
 
+	if err := inj.Sys(faults.SysFstat); err != nil {
+		return sentItem{}, protocolErr{code: "INTERNAL", message: "failed to stat file"}
+	}
 	fileInfo, err := fd.Stat()
 	if err != nil {
 		return sentItem{}, protocolErr{code: "INTERNAL", message: "failed to stat file"}
@@ -486,11 +498,11 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 	// at least two frames worth of data.
 	var readaheadCh chan readaheadHint
 	if item.Mode == loadStrategyFast {
-		tryAdviseSequential(fd, item.Offset, windowLen)
+		tryAdviseSequential(inj, fd, item.Offset, windowLen)
 		if runtime.GOOS == "linux" && windowLen > defaultFileFrameLogicalSize {
 			done := make(chan struct{})
 			var stopReadahead func()
-			readaheadCh, stopReadahead = startFrameReadahead(fd, done)
+			readaheadCh, stopReadahead = startFrameReadahead(inj, fd, done)
 			defer func() { close(done); stopReadahead() }()
 		}
 	}
@@ -583,6 +595,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 			OutputTCPConn: out.conn,
 			PipeSizeBytes: pipeSizeBytes,
 			DirectIO:      usedDirectOpen,
+			Faults:        inj,
 			// The policy is per item, so a terminal frame's latencies would
 			// only choose a codec for a frame that never comes.
 			Timed: scope.Sink.Enabled() || (adaptive && !isTerminal),
@@ -621,7 +634,8 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 				}
 				_ = fd.Close()
 				fd = nil
-				fd, err = deps.OpenFileRef(fileRef)
+				// Reopen without direct I/O, through the same open gate.
+				fd, _, err = openSendFile(inj, deps, sendItem{Mode: loadStrategyFast}, fileRef)
 				if err != nil {
 					return sentItem{}, mapLookupError(err)
 				}
@@ -632,7 +646,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 				}
 				if cursor == item.Offset {
 					if item.Mode == loadStrategyFast {
-						tryAdviseSequential(fd, item.Offset, windowLen)
+						tryAdviseSequential(inj, fd, item.Offset, windowLen)
 					}
 					firstFrame = true
 					currentMode = initialCompressionMode(item.Comp)
@@ -640,7 +654,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 					windowHasher.Reset()
 				} else {
 					if item.Mode == loadStrategyFast {
-						tryAdviseSequential(fd, cursor, remaining)
+						tryAdviseSequential(inj, fd, cursor, remaining)
 					}
 				}
 				continue
@@ -703,8 +717,12 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 }
 
 // openSendFile opens an item's resolved file, with direct I/O in gentle mode
-// when the filesystem allows it, and reports whether it did.
-func openSendFile(deps Deps, item sendItem, fileRef FileRef) (*os.File, bool, error) {
+// when the filesystem allows it, and reports whether it did. The open fault
+// gate comes first, so an injected open error stops either kind of open.
+func openSendFile(inj *faults.Injector, deps Deps, item sendItem, fileRef FileRef) (*os.File, bool, error) {
+	if err := inj.OpenErr(faults.SiteSendOpen); err != nil {
+		return nil, false, err
+	}
 	if item.Mode == loadStrategyGentle {
 		if fd, err := os.OpenFile(fileRef.Path, os.O_RDONLY|unix.O_DIRECT, 0); err == nil {
 			return fd, true, nil
@@ -735,8 +753,37 @@ func canZeroCopy(args frameStreamArgs) bool {
 		args.OutputTCPConn != nil
 }
 
+// extractTCPConn returns the raw socket a SEND response may splice into, or
+// nil. The exact-type check comes first, so a raw socket pays nothing for the
+// fault-injection case after it; other writers pay one more type check per
+// SEND output.
 func extractTCPConn(w io.Writer) *net.TCPConn {
 	if tc, ok := w.(*net.TCPConn); ok {
+		return tc
+	}
+	if zc, ok := w.(zeroCopyConn); ok {
+		return zc.ZeroCopyConn()
+	}
+	return nil
+}
+
+// zeroCopyConn is a wrapped connection, such as a faults.Conn, that may still
+// let a SEND splice into its socket.
+type zeroCopyConn interface {
+	ZeroCopyConn() *net.TCPConn
+}
+
+// rawTCPConn returns the TCP socket under conn, looking through one
+// fault-injection wrapper, or nil for other transports. Socket options,
+// half-close, and TCP_INFO go to the socket itself, whatever the wrapper's
+// fault schedule; data never does. extractTCPConn, by contrast, asks the
+// wrapper whether a SEND may splice past it.
+func rawTCPConn(conn net.Conn) *net.TCPConn {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		return tc
+	}
+	if fc, ok := conn.(*faults.Conn); ok {
+		tc, _ := fc.Unwrap().(*net.TCPConn)
 		return tc
 	}
 	return nil
@@ -831,8 +878,8 @@ func bestEffortPipeMaxSizeBytes() int64 {
 	return pipeMaxSizeBytes
 }
 
-func growPipeBestEffort(pipeFD *os.File, sizeBytes int) {
-	if sizeBytes <= 0 {
+func growPipeBestEffort(inj *faults.Injector, pipeFD *os.File, sizeBytes int) {
+	if sizeBytes <= 0 || inj.Sys(faults.SysFcntl) != nil {
 		return
 	}
 	_, _ = unix.FcntlInt(pipeFD.Fd(), unix.F_SETPIPE_SZ, sizeBytes)
@@ -973,7 +1020,11 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 	}
 	timeChunkWrites := args.Timed && !isCompressed && !stagedDirectWrite
 	readRegion := trace.StartRegion(args.Ctx, "frame-read")
-	prepareLatency, readLatency, err := streamBufferedRead(fd, fileOffset, args.FrameSize, readBuf, timing, func(chunk []byte) error {
+	var src io.ReaderAt = fd
+	if args.Faults != nil {
+		src = args.Faults.WrapReaderAt(args.Ctx, faults.SiteSendRead, fd)
+	}
+	prepareLatency, readLatency, err := streamBufferedRead(src, fileOffset, args.FrameSize, readBuf, timing, func(chunk []byte) error {
 		_, _ = args.WindowHasher.Write(chunk)
 		var writeStart time.Time
 		if timeChunkWrites {
@@ -1102,18 +1153,34 @@ func waitSocketWritable(fd int, syscalls zeroCopySyscalls) error {
 }
 
 func streamFramePayloadZeroCopy(fd *os.File, fileOffset *int64, args frameStreamArgs) (frameStreamStats, error) {
-	return streamFramePayloadZeroCopyWithSyscalls(fd, fileOffset, args, kernelZeroCopySyscalls())
+	syscalls := kernelZeroCopySyscalls()
+	if args.Faults != nil {
+		syscalls = faultZeroCopySyscalls(args.Faults, syscalls)
+	}
+	return streamFramePayloadZeroCopyWithSyscalls(fd, fileOffset, args, syscalls)
+}
+
+// faultZeroCopySyscalls puts inj's gates in front of each zero-copy syscall.
+func faultZeroCopySyscalls(inj *faults.Injector, sc zeroCopySyscalls) zeroCopySyscalls {
+	return zeroCopySyscalls{
+		splice: inj.WrapSplice(sc.splice),
+		tee:    inj.WrapTee(sc.tee),
+		poll:   inj.WrapPoll(sc.poll),
+	}
 }
 
 func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args frameStreamArgs, syscalls zeroCopySyscalls) (frameStreamStats, error) {
+	if err := args.Faults.Sys(faults.SysPipe); err != nil {
+		return frameStreamStats{}, err
+	}
 	srcR, srcW, err := os.Pipe()
 	if err != nil {
 		return frameStreamStats{}, err
 	}
 	defer srcR.Close()
 	defer srcW.Close()
-	growPipeBestEffort(srcR, args.PipeSizeBytes)
-	growPipeBestEffort(srcW, args.PipeSizeBytes)
+	growPipeBestEffort(args.Faults, srcR, args.PipeSizeBytes)
+	growPipeBestEffort(args.Faults, srcW, args.PipeSizeBytes)
 
 	copyBufSize := bufpool.BucketSize(int64(args.PipeSizeBytes))
 	copyBuf, releaseCopyBuf, err := bufpool.Acquire(copyBufSize)
@@ -1122,6 +1189,9 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 	}
 	defer releaseCopyBuf()
 
+	if err := args.Faults.Sys(faults.SysDup); err != nil {
+		return frameStreamStats{}, err
+	}
 	outFD, err := dupConnFD(args.OutputTCPConn)
 	if err != nil {
 		return frameStreamStats{}, err
@@ -1130,14 +1200,17 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 
 	// Hash pipe: tee duplicates pipe1 data here for hashing, while pipe1
 	// data is spliced directly to the socket without entering userspace.
+	if err := args.Faults.Sys(faults.SysPipe); err != nil {
+		return frameStreamStats{}, err
+	}
 	hashPipeR, hashPipeW, err := os.Pipe()
 	if err != nil {
 		return frameStreamStats{}, err
 	}
 	defer hashPipeR.Close()
 	defer hashPipeW.Close()
-	growPipeBestEffort(hashPipeR, args.PipeSizeBytes)
-	growPipeBestEffort(hashPipeW, args.PipeSizeBytes)
+	growPipeBestEffort(args.Faults, hashPipeR, args.PipeSizeBytes)
+	growPipeBestEffort(args.Faults, hashPipeW, args.PipeSizeBytes)
 
 	writeLatency := time.Duration(0)
 	if err := writeFrameHeader(args.Output, args, args.FrameSize, &writeLatency); err != nil {
@@ -1313,7 +1386,7 @@ const (
 )
 
 func streamBufferedRead(
-	fd *os.File,
+	src io.ReaderAt,
 	fileOffset *int64,
 	frameSize int64,
 	buf []byte,
@@ -1330,7 +1403,7 @@ func streamBufferedRead(
 		if timing != timeNothing {
 			start = time.Now()
 		}
-		n, readErr := fd.ReadAt(buf[:readSize], *fileOffset)
+		n, readErr := src.ReadAt(buf[:readSize], *fileOffset)
 		if timing != timeNothing {
 			readLatency += time.Since(start)
 		}
@@ -1398,8 +1471,8 @@ func releaseCompressedFrameBuffer(buf *bytes.Buffer) {
 // would be a syscall per file that changes nothing.
 const minSequentialAdviceBytes = 128 << 10
 
-func tryAdviseSequential(fd *os.File, offset int64, length int64) {
-	if fd == nil || offset < 0 || length < minSequentialAdviceBytes {
+func tryAdviseSequential(inj *faults.Injector, fd *os.File, offset int64, length int64) {
+	if fd == nil || offset < 0 || length < minSequentialAdviceBytes || inj.Sys(faults.SysFadvise) != nil {
 		return
 	}
 	_ = unix.Fadvise(int(fd.Fd()), offset, length, unix.FADV_SEQUENTIAL)
@@ -1414,8 +1487,8 @@ type readaheadHint struct {
 
 // tryReadAheadRange issues the readahead(2) syscall to asynchronously populate
 // the page cache for the given byte range.
-func tryReadAheadRange(fd *os.File, offset int64, length int64) {
-	if fd == nil || offset < 0 || length <= 0 {
+func tryReadAheadRange(inj *faults.Injector, fd *os.File, offset int64, length int64) {
+	if fd == nil || offset < 0 || length <= 0 || inj.Sys(faults.SysReadahead) != nil {
 		return
 	}
 	_, _, _ = unix.Syscall(unix.SYS_READAHEAD, fd.Fd(), uintptr(offset), uintptr(length))
@@ -1425,7 +1498,7 @@ func tryReadAheadRange(fd *os.File, offset int64, length int64) {
 // for file regions received on the returned channel. The goroutine exits when
 // done is closed or the channel is closed. Call the returned stop function to
 // ensure the goroutine has exited before closing fd.
-func startFrameReadahead(fd *os.File, done <-chan struct{}) (chan readaheadHint, func()) {
+func startFrameReadahead(inj *faults.Injector, fd *os.File, done <-chan struct{}) (chan readaheadHint, func()) {
 	ch := make(chan readaheadHint, 1)
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -1437,7 +1510,7 @@ func startFrameReadahead(fd *os.File, done <-chan struct{}) (chan readaheadHint,
 				if !ok {
 					return
 				}
-				tryReadAheadRange(fd, hint.offset, hint.length)
+				tryReadAheadRange(inj, fd, hint.offset, hint.length)
 			case <-done:
 				return
 			}

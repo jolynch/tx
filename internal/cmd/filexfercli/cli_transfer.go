@@ -78,7 +78,7 @@ func runTransferCLI(serverURL string, args []string, stdout io.Writer, stderr io
 		fmt.Fprintf(stderr, "invalid --load-strategy: %v\n", err)
 		return 2
 	}
-	auth, err := resolveClientAuth(authFlags)
+	auth, err := resolveClientAuth(authFlags, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2

@@ -25,6 +25,7 @@ import (
 	"github.com/jolynch/tx/internal/aead"
 	"github.com/jolynch/tx/internal/bufpool"
 	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/faults"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	intlimit "github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/metrics"
@@ -71,6 +72,23 @@ func WithContextDialer(dialer func(context.Context, string) (net.Conn, error)) C
 	return clientOptionFunc(func(c *Client) {
 		c.contextDialer = dialer
 	})
+}
+
+// WithFaults wraps every connection the client dials in inj, so fault
+// property tests can fault them. A nil injector, the default, leaves
+// connections unwrapped.
+func WithFaults(inj *faults.Injector) ClientOption {
+	return clientOptionFunc(func(c *Client) {
+		c.faults = inj
+	})
+}
+
+// Faults returns the client's fault injector, or nil.
+func (c *Client) Faults() *faults.Injector {
+	if c == nil {
+		return nil
+	}
+	return c.faults
 }
 
 func WithFileRequestWindowBytes(windowBytes int64) ClientOption {
@@ -273,6 +291,8 @@ type Client struct {
 	// Context dialer allows clients to setup custom connections
 	// For example injecting TLS
 	contextDialer func(context.Context, string) (net.Conn, error)
+	// faults wraps each dialed connection; nil disables fault injection.
+	faults *faults.Injector
 
 	tcpPoolMu   sync.Mutex
 	dataPool    *tcpConnPool

@@ -9,8 +9,8 @@ import (
 // tcpByteCounts returns the bytes a TCP connection has received and sent,
 // from TCP_INFO. It returns zeros for other transports.
 func tcpByteCounts(conn net.Conn) (received, sent int64) {
-	tc, ok := conn.(*net.TCPConn)
-	if !ok {
+	tc := rawTCPConn(conn)
+	if tc == nil {
 		return 0, 0
 	}
 	raw, err := tc.SyscallConn()

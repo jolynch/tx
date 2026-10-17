@@ -17,7 +17,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/pagecache"
 	"github.com/zeebo/xxh3"
 )
 
@@ -440,16 +442,31 @@ func FuzzServeZeroCopySEND(f *testing.F) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, disableZeroCopy := range []bool{false, true} {
-			t.Run(fmt.Sprintf("disable-zero-copy=%t", disableZeroCopy), func(t *testing.T) {
+		// The faults mode wraps every connection in an injector that injects
+		// nothing, so the wire contract must hold exactly as without it.
+		for _, mode := range []struct {
+			name            string
+			disableZeroCopy bool
+			faults          bool
+		}{
+			{"zero-copy", false, false},
+			{"disable-zero-copy", true, false},
+			{"zero-copy-wrapped", false, true},
+		} {
+			disableZeroCopy := mode.disableZeroCopy
+			t.Run(mode.name, func(t *testing.T) {
 				deps := realDeps(t, "/")
 				ln, err := net.Listen("tcp", "127.0.0.1:0")
 				if err != nil {
 					t.Fatal(err)
 				}
+				var inj *faults.Injector
+				if mode.faults {
+					inj = faults.New(faults.Config{Seed: uint64(sizeRaw)})
+				}
 				done := make(chan error, 1)
 				go func() {
-					done <- Serve(ln, ServerOptions{Deps: deps, DisableZeroCopy: disableZeroCopy, zeroCopyMinFrameBytes: zeroCopyMin})
+					done <- Serve(ln, ServerOptions{Deps: deps, DisableZeroCopy: disableZeroCopy, zeroCopyMinFrameBytes: zeroCopyMin, Faults: inj})
 				}()
 				t.Cleanup(func() {
 					_ = ln.Close()
@@ -804,5 +821,52 @@ func TestServeSENDHeaderErrorIsReadableNotBrokenPipe(t *testing.T) {
 	}
 	if err := <-writeErr; err != nil {
 		t.Errorf("client body write failed instead of completing: %v", err)
+	}
+}
+
+// TestServeRoutesPageCacheThroughFaults checks that a server with an injector
+// wraps the accepted connection, gates its socket options, and sends its
+// page-cache syscalls (here a TXFER cache-map probe) through the injector,
+// and that page-cache calls stop reaching it once Serve returns.
+func TestServeRoutesPageCacheThroughFaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.bin")
+	if err := os.WriteFile(path, zeroCopyPayload(64<<10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inj := faults.New(faults.Config{Seed: 1})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- Serve(ln, ServerOptions{Deps: realDeps(t, "/"), Faults: inj}) }()
+	conn, err := net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := fmt.Fprintf(conn, "TXFER %q mode=fast link-mbps=1000 concurrency=1 comp=none cache-map=send\r\n", dir); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(conn)
+	_ = conn.Close()
+	if err != nil || !bytes.HasSuffix(raw, []byte("OK\r\n")) {
+		t.Fatalf("TXFER: %v %q", err, raw)
+	}
+	if c := inj.Counts(); c.Sys[faults.SysMmap] == 0 || c.Sys[faults.SysMincore] == 0 || c.ServerConns != 1 || c.Sys[faults.SysSetsockopt] != 1 {
+		t.Fatalf("injector counts %+v: the page-cache probe skipped the gates", c)
+	}
+	_ = ln.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	before := inj.Counts().Sys[faults.SysMmap]
+	ce := &pagecache.CacheEntry{}
+	if err := ce.Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if inj.Counts().Sys[faults.SysMmap] != before {
+		t.Fatal("page-cache calls still reach the injector after Serve returned")
 	}
 }

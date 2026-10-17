@@ -268,12 +268,15 @@ func runCopyCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 		return runLocalCopyCLI(src.LocalPath, cfg.localDst, cfg, stdout, stderr)
 	}
 	serverURL := src.HostPort
-	auth, err := resolveClientAuth(cfg.authFlags)
+	auth, err := resolveClientAuth(cfg.authFlags, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
 	cfg.auth = auth
+	if auth.faults != nil {
+		defer pagecache.SetFaults(auth.faults)()
+	}
 	compress, err := resolveCompress(cfg.compressRaw)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid --compress: %v\n", err)

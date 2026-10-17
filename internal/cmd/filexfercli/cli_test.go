@@ -1005,7 +1005,7 @@ func TestPartialSplitDownloadPersistsAndResumesWithoutRedownloading(t *testing.T
 			SplitWindowWorkers: 3,
 			ProgressUpdates:    progressUpdates,
 			OutputWriter: func(entry tx.ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
-				w, syncFn, err := openDownloadOutput(entry, offset, resolveDownloadDestinationPath(entry, outRoot, ""), nil, syncWorker)
+				w, syncFn, err := openDownloadOutput(entry, offset, resolveDownloadDestinationPath(entry, outRoot, ""), nil, syncWorker, nil)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -4306,8 +4306,14 @@ func TestClientAuthFlagPrecedence(t *testing.T) {
 	if err := os.WriteFile(serverFile, []byte(server.Recipient().String()+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Only TX_AUTH_TOKEN is set; resolve also reads the TX_FAULTS_* variables.
 	env := func(v string, set bool) func(string) (string, bool) {
-		return func(string) (string, bool) { return v, set }
+		return func(key string) (string, bool) {
+			if key != envAuthToken {
+				return "", false
+			}
+			return v, set
+		}
 	}
 	for _, tc := range []struct {
 		name    string

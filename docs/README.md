@@ -12,6 +12,7 @@ The docs are organized into four top-level sections:
 - [Overview](./arch/OVERVIEW.md)
 - [Transfer Modes](./arch/TRANSFER.md)
 - [Verification](./arch/VERIFICATION.md)
+- [Fault Injection](./arch/FAULTS.md)
 
 ## Public Interface
 

@@ -114,7 +114,7 @@ func refuseBusy(conn net.Conn, br *bufio.Reader) {
 	if _, err := conn.Write([]byte(aead.DiagBusy + "\r\n")); err != nil {
 		return
 	}
-	if tc, ok := conn.(*net.TCPConn); ok {
+	if tc := rawTCPConn(conn); tc != nil {
 		_ = tc.CloseWrite()
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(busyDrainTimeout))
@@ -134,7 +134,7 @@ func writeDiagnostic(conn net.Conn, line string, deadline time.Time) {
 	if _, err := conn.Write([]byte(line + "\r\n")); err != nil {
 		return
 	}
-	if tc, ok := conn.(*net.TCPConn); ok {
+	if tc := rawTCPConn(conn); tc != nil {
 		_ = tc.CloseWrite()
 	}
 	_ = conn.SetReadDeadline(minTime(deadline, time.Now().Add(busyDrainTimeout)))

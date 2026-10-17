@@ -22,6 +22,7 @@ import (
 	"github.com/jolynch/tx/internal/cliflags"
 	"github.com/jolynch/tx/internal/cmd/filexfercli"
 	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/ftcp"
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/txstats"
@@ -388,6 +389,14 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 		defer eventWriter.Stop()
 	}
 
+	faultInjector, err := faults.FromEnv(os.LookupEnv)
+	if err != nil {
+		log.Fatalf("Invalid fault injection settings: %v", err)
+	}
+	if faultInjector != nil {
+		log.Printf("WARNING: fault injection is on; reproduce with %s", faultInjector.Repro())
+	}
+
 	fileLn, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		log.Fatalf("Failed to bind file listener at %s: %v", listenAddr, err)
@@ -457,6 +466,7 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 		ExitAfter:               exitAfter,
 		KeepAliveTimeout:        idleTimeout,
 		Events:                  sink,
+		Faults:                  faultInjector,
 	}); serveErr != nil {
 		log.Fatalf("File transfer listener stopped: %v", serveErr)
 	}
