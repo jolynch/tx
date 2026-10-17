@@ -242,8 +242,12 @@ direction (hysteresis streak = 2).
 
 The adaptation walks a three-rung ladder:
 
-```
-none (default) → lz4 → zstd (level 1)
+```mermaid
+flowchart LR
+    none["none (starting mode)"] -->|Upgrade| lz4["lz4"]
+    lz4 -->|Upgrade| zstd["zstd (level 1)"]
+    zstd -->|Downgrade| lz4
+    lz4 -->|Downgrade| none
 ```
 
 The default starting point is `none`. On slow links with compressible data, the
