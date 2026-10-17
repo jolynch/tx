@@ -7,12 +7,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jolynch/tx/internal/benchio"
 	"github.com/jolynch/tx/internal/bufpool"
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/zeebo/xxh3"
 )
@@ -189,7 +191,7 @@ func handleCXSUMWithInput(ctx context.Context, req Request, in io.Reader, out io
 		return err
 	}
 	defer bufpool.Put(line)
-	scratch := checksumScratch{buf: *buf, line: line}
+	scratch := checksumScratch{buf: *buf, line: line, faults: faults.FromContext(ctx)}
 	lastFlush := time.Now()
 	for i, record := range records {
 		err := ctx.Err()
@@ -231,15 +233,25 @@ type checksumScratch struct {
 	buf     []byte
 	line    *[]byte
 	hashers checksumHashers
+	// faults gates the request's file and syscall sites; nil disables it.
+	faults *faults.Injector
 }
 
 func streamChecksumItem(ctx context.Context, out io.Writer, deps Deps, fileRef FileRef, item cxsumItem, scratch *checksumScratch) error {
+	inj := scratch.faults
+	if err := inj.OpenErr(faults.SiteCXSUMOpen); err != nil {
+		return mapLookupError(err)
+	}
 	fd, err := deps.OpenFileRef(fileRef)
 	if err != nil {
 		return mapLookupError(err)
 	}
 
-	fileInfo, statErr := fd.Stat()
+	statErr := inj.Sys(faults.SysFstat)
+	var fileInfo os.FileInfo
+	if statErr == nil {
+		fileInfo, statErr = fd.Stat()
+	}
 	if statErr != nil {
 		_ = fd.Close()
 		return protocolErr{code: "INTERNAL", message: "failed to stat file"}
@@ -257,7 +269,11 @@ func streamChecksumItem(ctx context.Context, out io.Writer, deps Deps, fileRef F
 		}
 		rangeSize = item.Size
 	}
-	fileHashes, hashErr := hashChecksumRange(benchio.WithReadLatency(ctx, "server", fd), item.Offset, rangeSize, item.Algorithms, scratch.buf, &scratch.hashers)
+	var src io.ReaderAt = fd
+	if inj != nil {
+		src = inj.WrapReaderAt(ctx, faults.SiteCXSUMRead, fd)
+	}
+	fileHashes, hashErr := hashChecksumRange(benchio.WithReadLatency(ctx, "server", src), item.Offset, rangeSize, item.Algorithms, scratch.buf, &scratch.hashers)
 	_ = fd.Close()
 	if hashErr != nil {
 		return protocolErr{code: "INTERNAL", message: "failed to checksum file range"}

@@ -16,6 +16,7 @@ import (
 	"github.com/jolynch/tx"
 	"github.com/jolynch/tx/internal/bufpool"
 	"github.com/jolynch/tx/internal/cliflags"
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/fsync"
@@ -93,6 +94,15 @@ func runLocalCopyCLI(srcRoot, dstRoot string, cfg copyCLIConfig, stdout, stderr 
 		return 2
 	}
 	warnIgnoredLocalFlags(cfg.authFlags, stderr)
+	inj, err := resolveFaults(stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	cfg.auth.faults = inj
+	if inj != nil {
+		defer pagecache.SetFaults(inj)()
+	}
 
 	progressInterval, err := time.ParseDuration(cfg.progressIntervalRaw)
 	if err != nil {
@@ -162,7 +172,7 @@ func runLocalCopyCLI(srcRoot, dstRoot string, cfg copyCLIConfig, stdout, stderr 
 	// --skip-write: read every file through copy_file_range into /dev/null and
 	// never touch the destination.
 	if cfg.skipWrite {
-		err := localCopyDiscard(ctx, entries, concurrency, onBytes, onFile)
+		err := localCopyDiscard(ctx, entries, concurrency, localWrite{onBytes: onBytes, onFile: onFile, faults: inj})
 		stopTicker()
 		if err != nil {
 			fmt.Fprintf(stderr, "local copy (discard) failed: %v\n", err)
@@ -190,7 +200,8 @@ func runLocalCopyCLI(srcRoot, dstRoot string, cfg copyCLIConfig, stdout, stderr 
 	cache := newLocalCacheCollector(cfg.cacheLoadEnabled)
 	metaFailures := &metadataFailureCollector{}
 	start := time.Now()
-	if err := localCopyTree(ctx, staging, srcRoot, srcInfo, entries, concurrency, onBytes, onFile, preserveOwner, cache, metaFailures); err != nil {
+	write := localWrite{onBytes: onBytes, onFile: onFile, preserveOwner: preserveOwner, cache: cache, mf: metaFailures, faults: inj}
+	if err := localCopyTree(ctx, staging, srcRoot, srcInfo, entries, concurrency, write); err != nil {
 		cleanupStaging()
 		fmt.Fprintf(stderr, "local copy failed: %v\n", err)
 		return 1
@@ -206,7 +217,7 @@ func runLocalCopyCLI(srcRoot, dstRoot string, cfg copyCLIConfig, stdout, stderr 
 
 	if !cfg.skipFsync {
 		syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
-		fsync.SyncfsDir(syncCtx, staging, progressInterval, stderr)
+		fsync.SyncfsDir(syncCtx, staging, progressInterval, stderr, fsync.WithFaults(inj))
 		cancel()
 	}
 
@@ -312,7 +323,8 @@ func runLocalSync(srcRoot, dstRoot string, srcInfo os.FileInfo, cfg copyCLIConfi
 		}
 
 		start := time.Now()
-		if err := localApplyDelta(srcRoot, dstRoot, srcInfo, srcManifest, delta, concurrency, onBytes, onFile, preserveOwner, cache, metaFailures); err != nil {
+		write := localWrite{onBytes: onBytes, onFile: onFile, preserveOwner: preserveOwner, cache: cache, mf: metaFailures, faults: cfg.auth.faults}
+		if err := localApplyDelta(srcRoot, dstRoot, srcInfo, srcManifest, delta, concurrency, write); err != nil {
 			stopTicker()
 			stopFileProgress()
 			fmt.Fprintf(stderr, "local sync failed: %v\n", err)
@@ -335,7 +347,7 @@ func runLocalSync(srcRoot, dstRoot string, srcInfo os.FileInfo, cfg copyCLIConfi
 
 		if !cfg.skipFsync {
 			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
-			fsync.SyncfsDir(syncCtx, dstRoot, progressInterval, stderr)
+			fsync.SyncfsDir(syncCtx, dstRoot, progressInterval, stderr, fsync.WithFaults(cfg.auth.faults))
 			cancel()
 		}
 	}
@@ -370,11 +382,24 @@ func runLocalSync(srcRoot, dstRoot string, srcInfo os.FileInfo, cfg copyCLIConfi
 	return exitCode
 }
 
+// localWrite is what every file a local copy writes shares: progress
+// callbacks, whether to preserve ownership, page-cache capture, metadata
+// failure collection, and fault injection.
+type localWrite struct {
+	onBytes       func(int64)
+	onFile        func()
+	preserveOwner bool
+	cache         *localCacheCollector
+	mf            *metadataFailureCollector
+	faults        *faults.Injector
+}
+
 // localApplyDelta applies a source->destination delta in place: it copies new and
 // changed files (creating the directories/symlinks/hardlinks they need), removes
 // paths no longer present in the source, then restores directory mtimes so
 // metadata verification stays consistent.
-func localApplyDelta(srcRoot, dstRoot string, srcInfo os.FileInfo, srcManifest *tx.Manifest, delta manifestDelta, concurrency int, onBytes func(int64), onFile func(), preserveOwner bool, cache *localCacheCollector, mf *metadataFailureCollector) error {
+func localApplyDelta(srcRoot, dstRoot string, srcInfo os.FileInfo, srcManifest *tx.Manifest, delta manifestDelta, concurrency int, w localWrite) error {
+	onFile, preserveOwner, mf := w.onFile, w.preserveOwner, w.mf
 	idToPath := make(map[uint64]string, len(srcManifest.Entries))
 	for _, e := range srcManifest.Entries {
 		idToPath[e.ID] = e.Path
@@ -418,7 +443,7 @@ func localApplyDelta(srcRoot, dstRoot string, srcInfo os.FileInfo, srcManifest *
 		if le.entry.Type == encoding.EntryTypeSymlink {
 			return createLocalSymlink(dst, le, preserveOwner, mf)
 		}
-		if err := copyLocalRegularFile(dst, le, onBytes, preserveOwner, cache, mf); err != nil {
+		if err := copyLocalRegularFile(dst, le, w); err != nil {
 			return err
 		}
 		if onFile != nil {
@@ -537,7 +562,8 @@ func runLocalCopyWorkers(items []localEntry, concurrency int, fn func(localEntry
 //	B) regular files+links  (parallel: copy_file_range / symlink)
 //	C) hardlinks            (serial: os.Link to the already-created primary)
 //	D) directory mtimes     (serial: re-applied after children were written)
-func localCopyTree(ctx context.Context, dstBase, srcRoot string, srcRootInfo os.FileInfo, entries []localEntry, concurrency int, onBytes func(int64), onFile func(), preserveOwner bool, cache *localCacheCollector, mf *metadataFailureCollector) error {
+func localCopyTree(ctx context.Context, dstBase, srcRoot string, srcRootInfo os.FileInfo, entries []localEntry, concurrency int, w localWrite) error {
+	onFile, preserveOwner, mf := w.onFile, w.preserveOwner, w.mf
 	idToDst := make(map[uint64]string, len(entries))
 	var idMu sync.Mutex
 
@@ -589,7 +615,7 @@ func localCopyTree(ctx context.Context, dstBase, srcRoot string, srcRootInfo os.
 				if le.entry.Type == encoding.EntryTypeSymlink {
 					err = createLocalSymlink(dst, le, preserveOwner, mf)
 				} else {
-					err = copyLocalRegularFile(dst, le, onBytes, preserveOwner, cache, mf)
+					err = copyLocalRegularFile(dst, le, w)
 				}
 				if err != nil {
 					setErr(err)
@@ -663,8 +689,8 @@ func localCopyTree(ctx context.Context, dstBase, srcRoot string, srcRootInfo os.
 
 // copyLocalRegularFile copies one regular file with copy_file_range, snapshotting
 // the source's page-cache residency first when cache-load is enabled.
-func copyLocalRegularFile(dst string, le localEntry, onBytes func(int64), preserveOwner bool, cache *localCacheCollector, mf *metadataFailureCollector) error {
-	cache.snapshot(le.srcPath, dst)
+func copyLocalRegularFile(dst string, le localEntry, w localWrite) error {
+	w.cache.snapshot(le.srcPath, dst)
 
 	src, err := os.Open(le.srcPath)
 	if err != nil {
@@ -676,7 +702,7 @@ func copyLocalRegularFile(dst string, le localEntry, onBytes func(int64), preser
 		return fmt.Errorf("create %s: %w", le.entry.Path, err)
 	}
 	if le.entry.Size > 0 {
-		if _, err := localCopyFile(out, src, le.entry.Size, onBytes); err != nil {
+		if _, err := localCopyFile(w.faults, out, src, le.entry.Size, w.onBytes); err != nil {
 			_ = out.Close()
 			return fmt.Errorf("copy %s: %w", le.entry.Path, err)
 		}
@@ -684,7 +710,7 @@ func copyLocalRegularFile(dst string, le localEntry, onBytes func(int64), preser
 	if err := out.Close(); err != nil {
 		return fmt.Errorf("close %s: %w", le.entry.Path, err)
 	}
-	applyLocalFileMetadata(dst, le, preserveOwner, mf)
+	applyLocalFileMetadata(dst, le, w.preserveOwner, w.mf)
 	return nil
 }
 
@@ -731,7 +757,8 @@ func applyLocalOwner(dst, srcPath string, entryType byte, relPath string, mf *me
 
 // localCopyDiscard reads every regular file through copy_file_range into
 // /dev/null without writing a destination (for --skip-write).
-func localCopyDiscard(ctx context.Context, entries []localEntry, concurrency int, onBytes func(int64), onFile func()) error {
+func localCopyDiscard(ctx context.Context, entries []localEntry, concurrency int, w localWrite) error {
+	onFile := w.onFile
 	workCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var (
@@ -759,7 +786,7 @@ func localCopyDiscard(ctx context.Context, entries []localEntry, concurrency int
 				if workCtx.Err() != nil {
 					continue
 				}
-				if err := discardLocalFile(le, onBytes); err != nil {
+				if err := discardLocalFile(le, w); err != nil {
 					setErr(err)
 					continue
 				}
@@ -783,7 +810,7 @@ func localCopyDiscard(ctx context.Context, entries []localEntry, concurrency int
 	return firstErr
 }
 
-func discardLocalFile(le localEntry, onBytes func(int64)) error {
+func discardLocalFile(le localEntry, w localWrite) error {
 	if le.entry.Size == 0 {
 		return nil
 	}
@@ -797,7 +824,7 @@ func discardLocalFile(le localEntry, onBytes func(int64)) error {
 		return fmt.Errorf("open /dev/null: %w", err)
 	}
 	defer devnull.Close()
-	if _, err := localCopyFile(devnull, src, le.entry.Size, onBytes); err != nil {
+	if _, err := localCopyFile(w.faults, devnull, src, le.entry.Size, w.onBytes); err != nil {
 		return fmt.Errorf("read %s: %w", le.entry.Path, err)
 	}
 	return nil
@@ -931,7 +958,7 @@ func verifyLocalCopy(srcRoot, dstRoot string, entries []localEntry, cfg copyCLIC
 			len(srcManifest.Entries), files, hardlinks, symlinks, dirs)
 	}
 	return finishDataVerify(stderr, "local-verify-data", cfg, metaFailed, func() (verifyDataResult, error) {
-		return verifyLocalCopyData(srcRoot, dstRoot, entries, cfg.verifyOptions(), concurrency)
+		return verifyLocalCopyData(srcRoot, dstRoot, entries, cfg.verifyOptions(), concurrency, cfg.auth.faults)
 	})
 }
 
@@ -1038,6 +1065,14 @@ type localGetArgs struct {
 
 // runLocalGetCLI copies a single local file to outputPath with copy_file_range.
 func runLocalGetCLI(a localGetArgs, stdout, stderr io.Writer) int {
+	inj, err := resolveFaults(stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if inj != nil {
+		defer pagecache.SetFaults(inj)()
+	}
 	info, err := os.Lstat(a.srcPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "get failed: %v\n", err)
@@ -1092,7 +1127,7 @@ func runLocalGetCLI(a localGetArgs, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if size > 0 {
-		if _, err := localCopyFile(out, src, size, nil); err != nil {
+		if _, err := localCopyFile(inj, out, src, size, nil); err != nil {
 			_ = out.Close()
 			fmt.Fprintf(stderr, "get failed: %v\n", err)
 			return 1
@@ -1114,7 +1149,7 @@ func runLocalGetCLI(a localGetArgs, stdout, stderr io.Writer) int {
 		}
 		if !a.skipFsync {
 			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
-			fsync.SyncfsDir(syncCtx, filepath.Dir(a.outputPath), a.progressInterval, stderr)
+			fsync.SyncfsDir(syncCtx, filepath.Dir(a.outputPath), a.progressInterval, stderr, fsync.WithFaults(inj))
 			cancel()
 		}
 		if srcCE != nil {

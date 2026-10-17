@@ -53,7 +53,7 @@ func runStatusCLI(args []string, stdout io.Writer, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "status REMOTE_HOST must be a host:port address")
 		return 2
 	}
-	auth, err := resolveClientAuth(authFlags)
+	auth, err := resolveClientAuth(authFlags, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2

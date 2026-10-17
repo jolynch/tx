@@ -23,6 +23,7 @@ import (
 	"github.com/jolynch/tx"
 	"github.com/jolynch/tx/internal/cliflags"
 	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/fsync"
@@ -998,7 +999,7 @@ func resolveDownloadDestinationPath(entry tx.ManifestEntry, outRoot string, outF
 	return filepath.Clean(filepath.Join(outRoot, filepath.FromSlash(entry.Path)))
 }
 
-func openDownloadOutput(entry tx.ManifestEntry, offset int64, destPath string, stdout io.Writer, syncWorker *fsync.SyncWorker) (io.WriteCloser, func() error, error) {
+func openDownloadOutput(entry tx.ManifestEntry, offset int64, destPath string, stdout io.Writer, syncWorker *fsync.SyncWorker, inj *faults.Injector) (io.WriteCloser, func() error, error) {
 	if destPath == "-" {
 		if offset > 0 {
 			return nil, nil, errors.New("cannot resume when output is stdout")
@@ -1057,7 +1058,7 @@ func openDownloadOutput(entry tx.ManifestEntry, offset int64, destPath string, s
 		}
 	}
 	syncOutput := syncWorker.SyncOutput(fd, offset)
-	return fd, syncOutput, nil
+	return inj.WrapWriter(faults.SiteOutputWrite, fd), syncOutput, nil
 }
 
 func applyDownloadedTrailerMetadata(destPath string, meta *tx.FileTrailerMetadata) error {

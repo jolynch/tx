@@ -190,10 +190,13 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 	}
 
 	// Remote only: a local copy never reads TX_AUTH_TOKEN or loads keys.
-	auth, err := resolveClientAuth(authFlags)
+	auth, err := resolveClientAuth(authFlags, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
+	}
+	if auth.faults != nil {
+		defer pagecache.SetFaults(auth.faults)()
 	}
 	effectiveConcurrency := tx.DefaultClientConcurrency()
 	if concurrency > 0 {
@@ -266,7 +269,7 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 		}
 	}()
 
-	syncWorker, stopSync := fsync.StartSyncWorker(fsyncInterval, skipFsync, progressInterval, stderr)
+	syncWorker, stopSync := fsync.StartSyncWorker(fsyncInterval, skipFsync, progressInterval, stderr, fsync.WithFaults(auth.faults))
 	defer func() {
 		stopCtx, cancelStop := context.WithTimeout(context.Background(), defaultFsyncTimeout)
 		stopSync(stopCtx)
@@ -274,7 +277,7 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 		if !skipFsync && outputPath != "-" && outputPath != os.DevNull {
 			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
 			defer cancel()
-			fsync.SyncfsDir(syncCtx, filepath.Dir(outputPath), progressInterval, stderr)
+			fsync.SyncfsDir(syncCtx, filepath.Dir(outputPath), progressInterval, stderr, fsync.WithFaults(auth.faults))
 		}
 	}()
 
@@ -285,7 +288,7 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 		defer stopStatusPolling()
 	}
 	outputWriter := func(me tx.ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
-		w, syncFn, wErr := openDownloadOutput(me, offset, outputPath, stdout, syncWorker)
+		w, syncFn, wErr := openDownloadOutput(me, offset, outputPath, stdout, syncWorker, auth.faults)
 		if wErr != nil {
 			return nil, nil, wErr
 		}

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/zeebo/xxh3"
 	"golang.org/x/sys/unix"
@@ -699,10 +700,14 @@ func TestStreamSendItemZeroCopyMinFrameBytes(t *testing.T) {
 		name    string
 		minimum int64
 		want    string
+		// wrapped sends through a fault-injection wrapper that injects
+		// nothing, which must keep the zero-copy path.
+		wrapped bool
 	}{
-		{"default", defaultZeroCopyMinFrameBytes, sendPathBuffered},
-		{"at-minimum", 64 << 10, sendPathSendfile},
-		{"off", zeroCopyOff, sendPathBuffered},
+		{"default", defaultZeroCopyMinFrameBytes, sendPathBuffered, false},
+		{"at-minimum", 64 << 10, sendPathSendfile, false},
+		{"off", zeroCopyOff, sendPathBuffered, false},
+		{"at-minimum-wrapped", 64 << 10, sendPathSendfile, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server, client := newTCPPair(t)
@@ -729,7 +734,13 @@ func TestStreamSendItemZeroCopyMinFrameBytes(t *testing.T) {
 			})
 			ctx := events.WithScope(context.Background(), events.Scope{Sink: sink, Conn: 1})
 			deps := &mockDeps{filePath: path}
-			_, err := streamSendItem(ctx, unbufferedSendOutput(server), deps, "tx1", sendItem{
+			out := unbufferedSendOutput(server)
+			if tc.wrapped {
+				inj := faults.New(faults.Config{Seed: 1})
+				out = unbufferedSendOutput(inj.WrapConn(server, faults.Server))
+				out.faults = inj
+			}
+			_, err := streamSendItem(ctx, out, deps, "tx1", sendItem{
 				FileID: 1,
 				Comp:   "none",
 				Path:   path,
@@ -885,4 +896,74 @@ func zeroCopyPayload(size int) []byte {
 		offset += copy(payload[offset:], block[:])
 	}
 	return payload
+}
+
+// A fault-injection wrapper must still expose its socket for zero-copy and
+// socket options, and an unwrapped socket must cost nothing extra.
+func TestTCPConnHelpersSeeThroughFaultWrapper(t *testing.T) {
+	server, client := newTCPPair(t)
+	defer server.Close()
+	defer client.Close()
+	if extractTCPConn(server) != server || rawTCPConn(server) != server {
+		t.Fatal("raw socket not returned as itself")
+	}
+	wrapped := faults.New(faults.Config{Seed: 1}).WrapConn(server, faults.Server)
+	if extractTCPConn(wrapped) != server || rawTCPConn(wrapped) != server {
+		t.Fatal("wrapped socket hidden from zero-copy or socket options")
+	}
+	var buf bytes.Buffer
+	if extractTCPConn(&buf) != nil {
+		t.Fatal("a buffer offered a socket")
+	}
+	pipeA, pipeB := net.Pipe()
+	defer pipeA.Close()
+	defer pipeB.Close()
+	if rawTCPConn(faults.New(faults.Config{}).WrapConn(pipeA, faults.Server)) != nil {
+		t.Fatal("a wrapped pipe offered a socket")
+	}
+	// TCP_INFO reads the socket under the wrapper.
+	if _, err := wrapped.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, sent := tcpByteCounts(wrapped); sent == 0 {
+		t.Fatal("TCP byte counts did not see through the wrapper")
+	}
+	var w io.Writer = server
+	if allocs := testing.AllocsPerRun(100, func() {
+		_ = extractTCPConn(w)
+		_ = rawTCPConn(server)
+	}); allocs != 0 {
+		t.Fatalf("socket lookup allocated %.1f times per run", allocs)
+	}
+}
+
+// socketBuffer returns a socket's SO_SNDBUF or SO_RCVBUF.
+func socketBuffer(t *testing.T, tc *net.TCPConn, opt int) int {
+	t.Helper()
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var size int
+	var sockErr error
+	if err := raw.Control(func(fd uintptr) { size, sockErr = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, opt) }); err != nil || sockErr != nil {
+		t.Fatal(err, sockErr)
+	}
+	return size
+}
+
+// TestTuneServerSocketThroughFaultWrapper checks the server's socket options
+// reach the socket under a fault wrapper whose gate passes, and are skipped
+// only when no socket is there.
+func TestTuneServerSocketThroughFaultWrapper(t *testing.T) {
+	const want = 24 << 10 // Linux reports twice the size set
+	for _, inj := range []*faults.Injector{nil, faults.New(faults.Config{Seed: 1})} {
+		server, client := newTCPPair(t)
+		tuneServerSocket(inj.WrapConn(server, faults.Server), inj, want)
+		if got := socketBuffer(t, server, unix.SO_SNDBUF); got != 2*want {
+			t.Fatalf("injector %v: SO_SNDBUF = %d, want %d", inj != nil, got, 2*want)
+		}
+		_ = server.Close()
+		_ = client.Close()
+	}
 }

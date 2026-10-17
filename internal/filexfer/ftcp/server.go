@@ -19,6 +19,7 @@ import (
 	"filippo.io/age"
 	"github.com/jolynch/tx/internal/aead"
 	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer"
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/filexfer/store"
@@ -84,6 +85,9 @@ type ServerOptions struct {
 	ExitAfter               time.Duration             // 0 = disabled; exit this long after last transfer completes
 	KeepAliveTimeout        time.Duration             // idle window for kept-alive connections; 0 = keep-alive disabled (close after every verb)
 	Events                  *events.Sink              // nil disables the event timeline; also handed to the store Serve creates
+	// Faults wraps every accepted connection and gates the server's file and
+	// syscall sites; nil, the default, disables fault injection.
+	Faults *faults.Injector
 
 	// zeroCopyMinFrameBytes overrides defaultZeroCopyMinFrameBytes when > 0,
 	// so tests can drive small frames through the zero-copy path.
@@ -212,6 +216,11 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 		deps = &exitAfterDeps{Deps: deps, onComplete: startExitTimer}
 	}
 
+	if opts.Faults != nil {
+		clearFaults := pagecache.SetFaults(opts.Faults)
+		defer clearFaults()
+	}
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -224,6 +233,7 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 			}
 			return err
 		}
+		conn = opts.Faults.WrapConn(conn, faults.Server)
 		// A server that requires auth admits a connection only with a
 		// permit, held until FINISH. Admission never blocks the loop.
 		var release func()
@@ -271,6 +281,7 @@ type connSession struct {
 	zeroCopyMinBytes       int64
 	targetIODepth          int
 	respOut                io.Writer
+	faults                 *faults.Injector
 	onTransferCreated      func(string)
 	onClientActivity       func()
 	keepAliveTimeout       time.Duration
@@ -321,6 +332,7 @@ func handleConn(conn net.Conn, opts ServerOptions, auth *authPolicy, release fun
 		zeroCopyMinBytes:       opts.zeroCopyMinBytes(),
 		targetIODepth:          opts.TargetIODepth,
 		respOut:                conn,
+		faults:                 opts.Faults,
 		onTransferCreated:      onTransferCreated,
 		onClientActivity:       onClientActivity,
 		keepAliveTimeout:       keepAliveTimeout,
@@ -332,12 +344,7 @@ func handleConn(conn net.Conn, opts ServerOptions, auth *authPolicy, release fun
 			s.releasePermit()
 		}
 	}()
-	if tc, ok := conn.(*net.TCPConn); ok {
-		_ = tc.SetNoDelay(true)
-		if s.socketWriteBufferBytes > 0 {
-			_ = tc.SetWriteBuffer(s.socketWriteBufferBytes)
-		}
-	}
+	tuneServerSocket(conn, opts.Faults, s.socketWriteBufferBytes)
 	err := s.run()
 	if err != nil {
 		s.reportError(err)
@@ -348,6 +355,20 @@ func handleConn(conn net.Conn, opts ServerOptions, auth *authPolicy, release fun
 			reason = err.Error()
 		}
 		scope.Sink.Emit("conn_close", "", events.F("conn", scope.Conn), events.F("reason", reason))
+	}
+}
+
+// tuneServerSocket sets an accepted connection's socket options. They are
+// best-effort, so an injected setsockopt failure skips them as a real one
+// would.
+func tuneServerSocket(conn net.Conn, inj *faults.Injector, writeBufferBytes int) {
+	tc := rawTCPConn(conn)
+	if tc == nil || inj.Sys(faults.SysSetsockopt) != nil {
+		return
+	}
+	_ = tc.SetNoDelay(true)
+	if writeBufferBytes > 0 {
+		_ = tc.SetWriteBuffer(writeBufferBytes)
 	}
 }
 
@@ -500,6 +521,7 @@ func (s *connSession) run() error {
 
 func (s *connSession) commandContext() (context.Context, func()) {
 	cmdCtx, connTask := trace.NewTask(context.Background(), "tcp-connection")
+	cmdCtx = faults.NewContext(cmdCtx, s.faults)
 	return events.WithScope(cmdCtx, s.events), connTask.End
 }
 

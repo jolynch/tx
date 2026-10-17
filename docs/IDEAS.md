@@ -34,6 +34,12 @@ instead of widening the current change; remove an entry when it ships.
   and never reaches the end. Walk the file list with the seeded coprime step
   as well, but only under a budget, so `--verify full` stays sequential.
 
+- **A background fsync batch skips a file whose `fstat` fails.** `syncBatch`
+  fstats each descriptor to dedupe by inode, and on an error it closes the
+  descriptor without `fdatasync` and without reporting anything, so the file
+  is acknowledged but never synced. Fall back to `fdatasync` on the
+  descriptor, or count and report the failure.
+
 ## Performance
 
 - **Bound batch lookup metadata.** SEND and CXSUM resolve all request items
@@ -160,12 +166,14 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Testing
 
-- **Fault injection.** Inject disk faults (short reads, `EIO`, `ENOSPC`),
-  network faults (resets, stalls, partial writes, slow peers), and server
-  restarts during `SEND`, `ACK`, `CXSUM`, and `SYNC`. Every run must either
-  finish with correct data or fail loudly. The per-call syscall struct behind
-  the zero-copy `SEND` tests is a model for injecting faults without global
-  hooks.
+- **Fault injection.** `internal/faults` wraps connections, file reads and
+  writes, and syscalls, but no fault kinds exist yet. Add the catalog
+  (network, request, disk, and syscall faults) and the properties that must
+  hold under it: every run either finishes with correct data or fails loudly.
+- **Fault shims do not reach the manifest walk or `.tx/` state.** TXFER and
+  SYNC walk the tree with `filepath.WalkDir` and `Lstat`, and the client
+  writes `.tx/` manifests and progress through `os` directly. Faulting them
+  needs a filesystem seam on a per-file path, so measure its cost first.
 - **Untested failure paths.** `mapLookupError` (every `ACK`, `CXSUM`, and
   `SEND` file-lookup failure), `checkTransferDeadline` (gentle-mode
   `TOO_SLOW`), `isDirectIOReadError`, and `EnqueueCacheRestoreBatch` have no

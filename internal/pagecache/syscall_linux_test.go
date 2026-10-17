@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/jolynch/tx/internal/faults"
 )
 
 // TestLoadRealMincore exercises the actual loadResidency path against a
@@ -188,4 +190,52 @@ func TestLoadRealMincoreEmptyFile(t *testing.T) {
 	if !entry.Empty() {
 		t.Fatalf("expected empty entry for 0-byte file")
 	}
+}
+
+// TestSetFaultsClear checks that clearing removes only the caller's own
+// injector and never reinstates an earlier one.
+func TestSetFaultsClear(t *testing.T) {
+	t.Cleanup(func() { injector.Store(nil) })
+	a, b := faults.New(faults.Config{Seed: 1}), faults.New(faults.Config{Seed: 2})
+	clearA := SetFaults(a)
+	if injector.Load() != a {
+		t.Fatal("SetFaults did not install its injector")
+	}
+	clearB := SetFaults(b)
+	clearA() // out of order: b is still in use
+	if injector.Load() != b {
+		t.Fatal("an earlier clear removed a later injector")
+	}
+	clearB()
+	if injector.Load() != nil {
+		t.Fatal("clear reinstated an earlier injector")
+	}
+}
+
+// TestPageCacheSyscallsGoThroughFaults checks every page-cache syscall site
+// asks the installed injector's gate first.
+func TestPageCacheSyscallsGoThroughFaults(t *testing.T) {
+	t.Cleanup(func() { injector.Store(nil) })
+	path := filepath.Join(t.TempDir(), "data.bin")
+	if err := os.WriteFile(path, make([]byte, 4*os.Getpagesize()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inj := faults.New(faults.Config{Seed: 1})
+	defer SetFaults(inj)()
+	step := func(name string, sc faults.Syscall, run func() error) {
+		t.Helper()
+		before := inj.Counts().Sys[sc]
+		if err := run(); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if inj.Counts().Sys[sc] == before {
+			t.Fatalf("%s skipped the gate", name)
+		}
+	}
+	step("loadResidency mmap", faults.SysMmap, func() error { _, _, err := loadResidency(path); return err })
+	step("loadResidency mincore", faults.SysMincore, func() error { _, _, err := loadResidency(path); return err })
+	step("loadResidencyRange mmap", faults.SysMmap, func() error { _, _, err := loadResidencyRange(path, 0, 2); return err })
+	step("touchPages mmap", faults.SysMmap, func() error { _, err := touchPages(path, []byte{0x0f}, 4, false); return err })
+	step("touchPages fadvise", faults.SysFadvise, func() error { _, err := touchPages(path, []byte{0x0f}, 4, true); return err })
+	step("evictPages fadvise", faults.SysFadvise, func() error { return evictPages(path) })
 }

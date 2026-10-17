@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/faults"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	ftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	intlimit "github.com/jolynch/tx/internal/filexfer/limit"
@@ -371,33 +372,27 @@ func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
 	dialer := c.contextDialer
 	c.metrics().IncDial()
 	start := time.Now()
+	var conn net.Conn
+	var err error
 	if dialer == nil {
-		dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-		conn, err := dialer.DialContext(ctx, "tcp", addr)
-		if err != nil {
-			c.metrics().IncRequestError()
-			return nil, err
-		}
-		if tc, ok := conn.(*net.TCPConn); ok {
-			_ = tc.SetNoDelay(true)
-			if c.SocketReadBufferBytes > 0 {
-				_ = tc.SetReadBuffer(c.SocketReadBufferBytes)
-			}
-		}
-		c.noteDial(ctx, conn, start)
-		return conn, nil
+		d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+		conn, err = d.DialContext(ctx, "tcp", addr)
+	} else {
+		conn, err = dialer(ctx, addr)
 	}
-	conn, err := dialer(ctx, addr)
 	if err != nil {
 		c.metrics().IncRequestError()
 		return nil, err
 	}
-	if tc, ok := conn.(*net.TCPConn); ok {
+	// Socket options are best-effort, so an injected setsockopt failure
+	// skips them as a real one would.
+	if tc, ok := conn.(*net.TCPConn); ok && c.faults.Sys(faults.SysSetsockopt) == nil {
 		_ = tc.SetNoDelay(true)
 		if c.SocketReadBufferBytes > 0 {
 			_ = tc.SetReadBuffer(c.SocketReadBufferBytes)
 		}
 	}
+	conn = c.faults.WrapConn(conn, faults.Client)
 	c.noteDial(ctx, conn, start)
 	return conn, nil
 }

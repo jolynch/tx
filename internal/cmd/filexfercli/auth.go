@@ -3,16 +3,22 @@ package filexfercli
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
 	tx "github.com/jolynch/tx"
 	"github.com/jolynch/tx/internal/aead"
 	"github.com/jolynch/tx/internal/cliflags"
+	"github.com/jolynch/tx/internal/faults"
 )
 
 // envAuthToken supplies one client token when no explicit credential is set.
 const envAuthToken = "TX_AUTH_TOKEN"
+
+// faultsFromEnv builds every command's fault injector. Tests replace it to
+// observe the injector a command used.
+var faultsFromEnv = faults.FromEnv
 
 // clientAuthFlags are the authentication flags every remote command takes.
 type clientAuthFlags struct {
@@ -42,6 +48,8 @@ type clientAuth struct {
 	encMode         string
 	tokens          []string
 	serverRecipient string
+	// faults comes from the TX_FAULTS_* variables; nil when none is set.
+	faults *faults.Injector
 }
 
 // options returns the client options that carry the credentials.
@@ -52,6 +60,7 @@ func (a clientAuth) options() []tx.ClientOption {
 		tx.WithEncryptMode(a.encMode),
 		tx.WithClientAuthTokens(a.tokens...),
 		tx.WithRequiredServerRecipient(a.serverRecipient),
+		tx.WithFaults(a.faults),
 	}
 }
 
@@ -71,6 +80,11 @@ func (f clientAuthFlags) resolve(lookupEnv func(string) (string, bool)) (clientA
 		return clientAuth{}, errors.New("use --auth-token or --auth-token-file, not both")
 	}
 	var auth clientAuth
+	inj, err := faultsFromEnv(lookupEnv)
+	if err != nil {
+		return clientAuth{}, err
+	}
+	auth.faults = inj
 	auth.tokens = append([]string(nil), f.tokens...)
 	for _, path := range f.tokenFiles {
 		tok, err := cliflags.ReadCredentialFile(path)
@@ -139,7 +153,30 @@ func (f clientAuthFlags) resolve(lookupEnv func(string) (string, bool)) (clientA
 	return auth, nil
 }
 
-// resolveClientAuth resolves f against the process environment.
-func resolveClientAuth(f clientAuthFlags) (clientAuth, error) {
-	return f.resolve(os.LookupEnv)
+// resolveClientAuth resolves f against the process environment, warning on
+// stderr when fault injection is on.
+func resolveClientAuth(f clientAuthFlags, stderr io.Writer) (clientAuth, error) {
+	auth, err := f.resolve(os.LookupEnv)
+	if err != nil {
+		return clientAuth{}, err
+	}
+	warnFaults(auth.faults, stderr)
+	return auth, nil
+}
+
+// resolveFaults reads the TX_FAULTS_* variables for a command that takes no
+// credentials, such as a local copy, warning on stderr when they are set.
+func resolveFaults(stderr io.Writer) (*faults.Injector, error) {
+	inj, err := faultsFromEnv(os.LookupEnv)
+	if err != nil {
+		return nil, err
+	}
+	warnFaults(inj, stderr)
+	return inj, nil
+}
+
+func warnFaults(inj *faults.Injector, stderr io.Writer) {
+	if inj != nil {
+		fmt.Fprintf(stderr, "WARNING: fault injection is on; reproduce with %s\n", inj.Repro())
+	}
 }

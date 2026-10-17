@@ -638,6 +638,11 @@ The manifest files are standalone zstd archives — `zstdcat` works on them.
 
 ## Notes
 
+- `TX_FAULTS_SEED`, `TX_FAULTS_NET`, `TX_FAULTS_MSG`, `TX_FAULTS_DISK`, and
+  `TX_FAULTS_SYS` turn on fault injection in `tx send tree` and every `tx recv`
+  command, for testing only. Each run that sets one prints a warning with the
+  line that reproduces it. See [Fault Injection](../arch/FAULTS.md).
+
 - `REMOTE_SRC` is a `tx://host:port/abs/path` URL; its path component must be
   absolute on the remote server (host:port may be omitted to use 127.0.0.1:3453)
 - `REMOTE_SRC` may instead be a local path (`file:///abs/path`, `/abs/path`, or

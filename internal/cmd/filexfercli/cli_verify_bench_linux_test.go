@@ -276,7 +276,7 @@ func BenchmarkVerifyInMemory(b *testing.B) {
 					b.Run("local", func(b *testing.B) {
 						benchVerify(b, env, len(env.entries), size.bytes, func() {
 							env.run(b, planned, func(ctx context.Context, items []verifyItem) error {
-								_, err := hashItems(ctx, items, false)
+								_, err := hashItems(ctx, items, false, nil)
 								return err
 							})
 						})

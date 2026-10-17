@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"golang.org/x/sys/unix"
 )
@@ -29,6 +30,28 @@ const (
 type SyncWorker struct {
 	background *backgroundSyncer
 	inlineSync bool
+	faults     *faults.Injector
+}
+
+// Option configures StartSyncWorker and SyncfsDir.
+type Option func(*options)
+
+type options struct {
+	faults *faults.Injector
+}
+
+// WithFaults gates the worker's syscalls behind inj; nil, the default,
+// disables fault injection.
+func WithFaults(inj *faults.Injector) Option {
+	return func(o *options) { o.faults = inj }
+}
+
+func applyOptions(opts []Option) options {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
 }
 
 type SyncSnapshot struct {
@@ -49,8 +72,9 @@ type SyncSnapshot struct {
 //   - <0: no per-file fdatasync
 //
 // If noSync is true, all per-file syncing is disabled and stop is a no-op.
-func StartSyncWorker(fsyncInterval int64, noSync bool, progressInterval time.Duration, stderr io.Writer) (*SyncWorker, func(context.Context)) {
-	worker := &SyncWorker{}
+func StartSyncWorker(fsyncInterval int64, noSync bool, progressInterval time.Duration, stderr io.Writer, opts ...Option) (*SyncWorker, func(context.Context)) {
+	o := applyOptions(opts)
+	worker := &SyncWorker{faults: o.faults}
 	if noSync {
 		return worker, func(context.Context) {}
 	}
@@ -59,7 +83,7 @@ func StartSyncWorker(fsyncInterval int64, noSync bool, progressInterval time.Dur
 		worker.inlineSync = true
 		return worker, func(context.Context) {}
 	case fsyncInterval > 0:
-		worker.background = newBackgroundSyncer(fsyncInterval, stderr)
+		worker.background = newBackgroundSyncer(fsyncInterval, stderr, o.faults)
 		return worker, func(ctx context.Context) { worker.background.stop(ctx, progressInterval, stderr) }
 	default:
 		return worker, func(context.Context) {}
@@ -79,9 +103,12 @@ func (w *SyncWorker) SyncOutput(fd *os.File, offset int64) func() error {
 	}
 	return func() error {
 		if w.background != nil {
-			dupFD, err := syscall.Dup(int(fd.Fd()))
+			dupFD, err := -1, w.faults.Sys(faults.SysDup)
+			if err == nil {
+				dupFD, err = syscall.Dup(int(fd.Fd()))
+			}
 			if err != nil {
-				return syscall.Fdatasync(int(fd.Fd()))
+				return fdatasync(w.faults, int(fd.Fd()))
 			}
 			pos, _ := fd.Seek(0, io.SeekCurrent)
 			written := pos - offset
@@ -92,15 +119,24 @@ func (w *SyncWorker) SyncOutput(fd *os.File, offset int64) func() error {
 			return nil
 		}
 		if w.inlineSync {
-			return syscall.Fdatasync(int(fd.Fd()))
+			return fdatasync(w.faults, int(fd.Fd()))
 		}
 		return nil
 	}
 }
 
+// fdatasync syncs fd behind inj's gate.
+func fdatasync(inj *faults.Injector, fd int) error {
+	if err := inj.Sys(faults.SysFdatasync); err != nil {
+		return err
+	}
+	return syscall.Fdatasync(fd)
+}
+
 // SyncfsDir issues a best-effort syncfs against dir and returns when either
 // syncfs completes or ctx is done.
-func SyncfsDir(ctx context.Context, dir string, progressInterval time.Duration, stderr io.Writer) {
+func SyncfsDir(ctx context.Context, dir string, progressInterval time.Duration, stderr io.Writer, opts ...Option) {
+	inj := applyOptions(opts).faults
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -116,6 +152,10 @@ func SyncfsDir(ctx context.Context, dir string, progressInterval time.Duration, 
 	start := time.Now()
 	done := make(chan error, 1)
 	go func() {
+		if err := inj.Sys(faults.SysSyncfs); err != nil {
+			done <- err
+			return
+		}
 		done <- loadSyncfsFunc()(fd)
 	}()
 	var tick <-chan time.Time
@@ -204,6 +244,7 @@ type backgroundSyncer struct {
 	peakFiles     atomic.Int64
 	currentBatch  atomic.Int64
 	peakBatch     atomic.Int64
+	faults        *faults.Injector
 }
 
 type syncRequest struct {
@@ -211,8 +252,9 @@ type syncRequest struct {
 	size int64
 }
 
-func newBackgroundSyncer(threshold int64, stderr io.Writer) *backgroundSyncer {
+func newBackgroundSyncer(threshold int64, stderr io.Writer, inj *faults.Injector) *backgroundSyncer {
 	bs := &backgroundSyncer{
+		faults:        inj,
 		ch:            make(chan syncRequest, 1024),
 		done:          make(chan struct{}),
 		baseThreshold: threshold,
@@ -263,10 +305,14 @@ func (bs *backgroundSyncer) syncBatch(batch []syncRequest, stderr io.Writer) {
 	seen := make(map[fileKey]bool, len(batch))
 	for _, req := range batch {
 		var stat syscall.Stat_t
-		if err := syscall.Fstat(req.fd, &stat); err == nil {
+		err := bs.faults.Sys(faults.SysFstat)
+		if err == nil {
+			err = syscall.Fstat(req.fd, &stat)
+		}
+		if err == nil {
 			key := fileKey{stat.Dev, stat.Ino}
 			if !seen[key] {
-				if err := syscall.Fdatasync(req.fd); err != nil {
+				if err := fdatasync(bs.faults, req.fd); err != nil {
 					fmt.Fprintf(stderr, "background fdatasync: %v\n", err)
 				}
 				seen[key] = true

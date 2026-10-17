@@ -248,7 +248,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 			return 2
 		}
 	}
-	auth, err := resolveClientAuth(authFlags)
+	auth, err := resolveClientAuth(authFlags, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
@@ -400,7 +400,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		recordFailure,
 	)
 	completed += completedNow
-	syncWorker, stopSync := fsync.StartSyncWorker(cfg.fsyncInterval, cfg.noSync, cfg.progressInterval, stderr)
+	syncWorker, stopSync := fsync.StartSyncWorker(cfg.fsyncInterval, cfg.noSync, cfg.progressInterval, stderr, fsync.WithFaults(cfg.auth.faults))
 	defer func() {
 		stopCtx, cancelStop := context.WithTimeout(context.Background(), defaultFsyncTimeout)
 		stopSync(stopCtx)
@@ -408,7 +408,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		if !cfg.noSync && !cfg.discard {
 			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
 			defer cancel()
-			fsync.SyncfsDir(syncCtx, filepath.Dir(ps.TargetDir), cfg.progressInterval, stderr)
+			fsync.SyncfsDir(syncCtx, filepath.Dir(ps.TargetDir), cfg.progressInterval, stderr, fsync.WithFaults(cfg.auth.faults))
 		}
 	}()
 
@@ -449,7 +449,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		})
 		outputWriter := func(entry tx.ManifestEntry, offset int64) (io.WriteCloser, func() error, error) {
 			destPath := resolveDownloadDestinationPath(entry, outRoot, "")
-			w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, syncWorker)
+			w, syncFn, err := openDownloadOutput(entry, offset, destPath, nil, syncWorker, cfg.auth.faults)
 			if err != nil {
 				return nil, nil, err
 			}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"syscall"
 
+	"github.com/jolynch/tx/internal/faults"
 	"golang.org/x/sys/unix"
 )
 
@@ -18,10 +19,11 @@ import (
 // cross-device on kernels < 5.3 (EXDEV), or pseudo-files like /dev/null
 // (EINVAL). The fallback only triggers before any bytes are copied; a mid-copy
 // error on a single fd pair is a genuine I/O error and propagates.
-func localCopyFile(dst, src *os.File, size int64, onBytes func(int64)) (int64, error) {
+func localCopyFile(inj *faults.Injector, dst, src *os.File, size int64, onBytes func(int64)) (int64, error) {
+	copyFileRange := inj.WrapCopyFileRange(unix.CopyFileRange)
 	var copied int64
 	for copied < size {
-		n, err := unix.CopyFileRange(int(src.Fd()), nil, int(dst.Fd()), nil, int(size-copied), 0)
+		n, err := copyFileRange(int(src.Fd()), nil, int(dst.Fd()), nil, int(size-copied), 0)
 		if err != nil {
 			if errors.Is(err, syscall.EINTR) {
 				continue

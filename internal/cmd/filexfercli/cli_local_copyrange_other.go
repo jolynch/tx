@@ -2,11 +2,15 @@
 
 package filexfercli
 
-import "os"
+import (
+	"os"
+
+	"github.com/jolynch/tx/internal/faults"
+)
 
 // localCopyFile on non-Linux platforms has no copy_file_range; it always uses
 // the buffered userspace copy.
-func localCopyFile(dst, src *os.File, _ int64, onBytes func(int64)) (int64, error) {
+func localCopyFile(_ *faults.Injector, dst, src *os.File, _ int64, onBytes func(int64)) (int64, error) {
 	return localCopyFileBuffered(dst, src, onBytes)
 }
 

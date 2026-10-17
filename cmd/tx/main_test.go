@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jolynch/tx/internal/aead"
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/ftcp"
 )
 
@@ -243,5 +244,37 @@ func TestRunSendTreeExitWithValidation(t *testing.T) {
 	// The default never looks at stdin, so /dev/null is fine.
 	if code, out := run(); code != 0 || !served {
 		t.Fatalf("default: code %d served %v: %s", code, served, out)
+	}
+}
+
+// TestRunSendTreeFaultsFromEnv checks that tx send tree hands the server the
+// injector TX_FAULTS_* describe, and none when they are unset.
+func TestRunSendTreeFaultsFromEnv(t *testing.T) {
+	for _, seed := range []string{"", "5"} {
+		t.Run("seed="+seed, func(t *testing.T) {
+			// Blank counts as unset, which shields the test from the
+			// developer's own environment.
+			for _, env := range []string{faults.EnvSeed, faults.EnvNet, faults.EnvMsg, faults.EnvDisk, faults.EnvSys} {
+				t.Setenv(env, "")
+			}
+			if seed != "" {
+				t.Setenv(faults.EnvSeed, seed)
+			}
+			var got *faults.Injector
+			called := false
+			serve := func(_ net.Listener, opts ftcp.ServerOptions) error {
+				called, got = true, opts.Faults
+				return nil
+			}
+			if code := runSendTree([]string{"--listen", "127.0.0.1:0", "--keys", t.TempDir(), t.TempDir()}, io.Discard, serve); code != 0 || !called {
+				t.Fatalf("runSendTree exit %d, called %t", code, called)
+			}
+			if seed == "" && got != nil {
+				t.Fatal("server got an injector with no TX_FAULTS_* set")
+			}
+			if seed != "" && (got == nil || got.Seed() != 5) {
+				t.Fatalf("server injector = %+v, want seed 5", got)
+			}
+		})
 	}
 }
