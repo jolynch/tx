@@ -14,9 +14,11 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/jolynch/tx/internal/aead"
 	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/pagecache"
@@ -869,4 +871,117 @@ func TestServeRoutesPageCacheThroughFaults(t *testing.T) {
 	if inj.Counts().Sys[faults.SysMmap] != before {
 		t.Fatal("page-cache calls still reach the injector after Serve returned")
 	}
+}
+
+// TestServeConnectionFaults checks the server's accept-time and response
+// faults: accept.fail fails an accept, which Serve survives, busy refuses one on a
+// server that requires auth, and lose-response applies a request but resets
+// the connection instead of replying.
+func TestServeConnectionFaults(t *testing.T) {
+	serve := func(t *testing.T, opts ServerOptions) string {
+		t.Helper()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- Serve(ln, opts) }()
+		t.Cleanup(func() { _ = ln.Close(); <-done })
+		return ln.Addr().String()
+	}
+	// exchangeErr sends one command line and returns whatever comes back
+	// before the server closes the connection, and the error that ended it.
+	exchangeErr := func(t *testing.T, addr, line string) (string, error) {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		_, _ = io.WriteString(conn, line+"\r\n")
+		got, err := io.ReadAll(conn)
+		return string(got), err
+	}
+	exchange := func(t *testing.T, addr, line string) string {
+		t.Helper()
+		got, _ := exchangeErr(t, addr, line) // a reset ends the read with an error
+		return got
+	}
+	spec := func(f faults.Family, s string) *faults.Injector {
+		return faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{f: s}})
+	}
+
+	t.Run("accept.fail", func(t *testing.T) {
+		// Half the accepts fail. Each failure goes through Serve's
+		// accept-error path, which must keep serving the connections after
+		// it.
+		inj := spec(faults.FamilyNet, "accept.fail=0.5")
+		addr := serve(t, ServerOptions{Deps: realDeps(t, "/"), Faults: inj})
+		var answered, dropped int
+		for answeredAfterDrop := false; !answeredAfterDrop; {
+			if answered+dropped == 16 {
+				t.Fatalf("%d connections answered and %d dropped; want an answer after a drop", answered, dropped)
+			}
+			start := time.Now()
+			got := exchange(t, addr, "STATUS")
+			// A dropped connection closes at once; one left waiting means
+			// Serve stopped accepting.
+			if time.Since(start) > 2*time.Second {
+				t.Fatalf("no answer or close after %v: Serve stopped accepting", time.Since(start))
+			}
+			if got == "" {
+				dropped++
+			} else {
+				answered++
+				answeredAfterDrop = dropped > 0
+			}
+		}
+		if got := inj.Counts().ServerConns; got != uint64(answered) {
+			t.Fatalf("%d connections wrapped, %d answered: a failed accept reached a handler", got, answered)
+		}
+	})
+	t.Run("busy", func(t *testing.T) {
+		addr := serve(t, ServerOptions{Deps: realDeps(t, "/"), RequireAuth: true, Faults: spec(faults.FamilyMsg, "busy=1")})
+		if got := exchange(t, addr, "AUTH key noise-v1"); !strings.HasPrefix(got, aead.DiagBusy) {
+			t.Fatalf("busy server answered %q", got)
+		}
+		// A busy refusal returns its admission permit: with one permit and
+		// half the connections refused, the rest are still answered.
+		addr1 := serve(t, ServerOptions{Deps: realDeps(t, "/"), RequireAuth: true, MaxUnauthenticatedConns: 1, Faults: spec(faults.FamilyMsg, "busy=0.5")})
+		answered := 0
+		for range 40 {
+			if got := exchange(t, addr1, "AUTH key noise-v1"); strings.HasPrefix(got, "OK ") {
+				answered++
+			}
+		}
+		if answered < 5 {
+			t.Fatalf("%d of 40 connections answered with one permit and busy=0.5; refusals leak permits", answered)
+		}
+		// Only a server that requires auth answers busy.
+		addr = serve(t, ServerOptions{Deps: realDeps(t, "/"), Faults: spec(faults.FamilyMsg, "busy=1")})
+		if got := exchange(t, addr, "STATUS"); !strings.HasSuffix(got, "OK\r\n") {
+			t.Fatalf("a server without auth refused as busy: %q", got)
+		}
+	})
+	t.Run("lose-response", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		deps := realDeps(t, "/")
+		addr := serve(t, ServerOptions{Deps: deps, Faults: spec(faults.FamilyMsg, "lose-response=1")})
+		got, err := exchangeErr(t, addr, fmt.Sprintf("TXFER %q mode=fast link-mbps=1000 concurrency=1 comp=none", dir))
+		if got != "" || !errors.Is(err, syscall.ECONNRESET) {
+			t.Fatalf("lost response sent %q and ended with %v, want nothing and a reset", got, err)
+		}
+		if n := len(deps.ListTransfers()); n != 1 {
+			t.Fatalf("lost-response TXFER left %d transfers, want the one it applied", n)
+		}
+		// A request the handler rejects ends in a reset too, not an ERR.
+		got, err = exchangeErr(t, addr, fmt.Sprintf("TXFER %q mode=fast link-mbps=1000 concurrency=1 comp=none", filepath.Join(dir, "missing")))
+		if got != "" || !errors.Is(err, syscall.ECONNRESET) {
+			t.Fatalf("lost error response sent %q and ended with %v", got, err)
+		}
+	})
 }

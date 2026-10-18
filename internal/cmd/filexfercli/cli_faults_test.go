@@ -335,3 +335,61 @@ func TestVerifyLocalItemsWrapsBothSides(t *testing.T) {
 		t.Fatalf("verify read wraps = %d, want %d (source and destination per item)", got, want)
 	}
 }
+
+// TestOutputWriteFaultsNameTheirFile checks download outputs pass the
+// entry's ID and window offset to the write fault site, which keys faults
+// per file and offset; a fault event reports both.
+func TestOutputWriteFaultsNameTheirFile(t *testing.T) {
+	sink := events.NewSink()
+	type at struct {
+		file   uint64
+		offset int64
+	}
+	var got []at
+	sink.Subscribe(func(e events.Event) {
+		if e.Name == "fault" {
+			off, _ := e.Get("offset")
+			got = append(got, at{uint64(e.Int("file")), off.(int64)})
+		}
+	})
+	inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilyDisk: "write.eio=1"}, Events: sink})
+	const offset = 128 << 10 // a resumed window, on a write-fault block boundary
+	w, _, err := openDownloadOutput(tx.ManifestEntry{ID: 7, Path: "out.bin"}, offset, filepath.Join(t.TempDir(), "out.bin"), nil, nil, inj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if _, err := w.Write([]byte("abc")); err == nil {
+		t.Fatal("write.eio=1 did not fail the write")
+	}
+	if want := (at{7, offset}); len(got) != 1 || got[0] != want {
+		t.Fatalf("fault events %v, want [%v]", got, want)
+	}
+}
+
+// TestVerifyReadFaultsNameTheirFile checks verify reads pass the entry's ID
+// to the read fault site, which keys faults per file and offset; a fault
+// event reports both.
+func TestVerifyReadFaultsNameTheirFile(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	data := bytes.Repeat([]byte("x"), 3<<10)
+	writeLocalTestFile(t, filepath.Join(dst, "a.bin"), data)
+	sink := events.NewSink()
+	var file uint64
+	var offset int64
+	sink.Subscribe(func(e events.Event) {
+		if e.Name == "fault" {
+			off, _ := e.Get("offset")
+			file, offset = uint64(e.Int("file")), off.(int64)
+		}
+	})
+	inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilyDisk: "read.eio=1"}, Events: sink})
+	entries := []tx.ManifestEntry{{ID: 11, Path: "a.bin", Size: int64(len(data))}}
+	items := verifyTestItems(entries, src, dst, 1<<10)[1:] // start at the second 1 KiB sample
+	if _, err := hashItems(context.Background(), items, false, inj); err == nil {
+		t.Fatal("read.eio=1 did not fail the verify read")
+	}
+	if file != 11 || offset != 1<<10 {
+		t.Fatalf("fault event named file %d offset %d, want file 11 offset %d", file, offset, 1<<10)
+	}
+}

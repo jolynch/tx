@@ -239,7 +239,7 @@ type checksumScratch struct {
 
 func streamChecksumItem(ctx context.Context, out io.Writer, deps Deps, fileRef FileRef, item cxsumItem, scratch *checksumScratch) error {
 	inj := scratch.faults
-	if err := inj.OpenErr(faults.SiteCXSUMOpen); err != nil {
+	if err := openFault(inj, faults.SiteCXSUMOpen, item.FileID, item.Offset); err != nil {
 		return mapLookupError(err)
 	}
 	fd, err := deps.OpenFileRef(fileRef)
@@ -271,7 +271,7 @@ func streamChecksumItem(ctx context.Context, out io.Writer, deps Deps, fileRef F
 	}
 	var src io.ReaderAt = fd
 	if inj != nil {
-		src = inj.WrapReaderAt(ctx, faults.SiteCXSUMRead, fd)
+		src = inj.WrapReaderAt(ctx, faults.SiteCXSUMRead, item.FileID, fd)
 	}
 	fileHashes, hashErr := hashChecksumRange(benchio.WithReadLatency(ctx, "server", src), item.Offset, rangeSize, item.Algorithms, scratch.buf, &scratch.hashers)
 	_ = fd.Close()

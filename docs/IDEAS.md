@@ -40,6 +40,20 @@ instead of widening the current change; remove an entry when it ships.
   is acknowledged but never synced. Fall back to `fdatasync` on the
   descriptor, or count and report the failure.
 
+- **A replayed ACK fails with `CONFLICT`.** The first ACK of a window
+  consumes its recorded hash, so the same ACK sent again cannot verify and
+  the server answers `CONFLICT window ack hash token mismatch`. When an ACK's
+  response is lost and `retryAck` resends it, the client reports a failed
+  batch whose files the server already counted as done. Accept an ACK that
+  matches a file's acknowledged state as a no-op. MSG `dup` and
+  `lose-response` faults reproduce it.
+- **One fault in a SEND batch discards the whole batch's progress.** The
+  client ACKs a batch only after reading its entire response, so a failure
+  at file 30 of 40 leaves files 1 to 29 written but unacknowledged, and the
+  next round downloads all 40 again. Under a steady per-file fault rate, a
+  large batch of small files can stop making progress. ACK the files read
+  before the failure.
+
 ## Performance
 
 - **Bound batch lookup metadata.** SEND and CXSUM resolve all request items
@@ -166,10 +180,34 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Testing
 
-- **Fault injection.** `internal/faults` wraps connections, file reads and
-  writes, and syscalls, but no fault kinds exist yet. Add the catalog
-  (network, request, disk, and syscall faults) and the properties that must
-  hold under it: every run either finishes with correct data or fails loudly.
+- **Fault-injection properties.** `internal/faults` has the catalog and the
+  `bad-day` profile, and `internal/memxfer` runs whole transfers under them,
+  but no property test sweeps them yet. Fuzz every session mode under random
+  subsets of faults and check that every run either finishes with correct
+  data or fails loudly. Also inject server restarts and client crashes, and
+  merge `internal/benchio` into `internal/faults`.
+- **`TestUpdateBatchThresholdConcurrentGrowthLogsOnce` is flaky.** About 1
+  run in 20 fails with "timed out waiting for first growth log" under
+  `-race`, already at commit c480f1e, so the growth log is sometimes never
+  written within its one-second wait. Find which interleaving skips it.
+- **A lost response logs negative byte counts.** After MSG `lose-response`
+  resets the socket, `tcpByteCounts` returns zeros, so `cmd_end` reports
+  `req_bytes` and `resp_bytes` as zero minus the counts at the command's
+  start. Clamp the deltas or read the counts before the reset.
+- **Verify reads share one fault key.** The client's source and destination
+  verify reads both use `SiteVerifyRead` with the same file ID and offset,
+  so the destination read takes attempt 1 at the source's offset. Give the
+  destination its own site.
+- **Wrapper-held bytes hide from the liveness peek.** Bytes a NET `dup`
+  holds in `faults.Conn` are invisible to `sessionConnAlive`'s `MSG_PEEK`,
+  so a pooled connection holding them is reused where a real duplicate
+  would show in the peek and evict it. A pbt-faults failure that needs this
+  may be the wrapper's, not tx's.
+- **SYS errnos are per syscall, not per call site.** `splice.fail` picks
+  `EINTR` or `EIO` at every splice, so the zero-copy loop never sees an
+  injected `EAGAIN` and reaches `waitSocketWritable` only on a real one.
+  `EAGAIN` is real only at the splice into the nonblocking socket, not the
+  one from the file, so it needs an errno set per call site.
 - **Fault shims do not reach the manifest walk or `.tx/` state.** TXFER and
   SYNC walk the tree with `filepath.WalkDir` and `Lstat`, and the client
   writes `.tx/` manifests and progress through `os` directly. Faulting them

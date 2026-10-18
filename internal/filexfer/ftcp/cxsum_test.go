@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/zeebo/xxh3"
 )
@@ -257,5 +259,93 @@ func TestHandleCXSUMCancelledBeforeLookup(t *testing.T) {
 	err = handleCXSUMWithInput(ctx, req, framedItemBody(t, `fd=1 "/file" size=0`), &out, deps)
 	if !errors.Is(err, context.Canceled) || deps.refBatches != 0 || deps.openFileCalls != 0 || out.Len() != 0 {
 		t.Fatalf("err=%v lookups=%d opens=%d output=%q", err, deps.refBatches, deps.openFileCalls, out.String())
+	}
+}
+
+// Disk fault sites in SEND and CXSUM.
+
+// TestOpenFaultsMapLikeStoreErrors checks an injected open failure reports
+// as the store reports a real one: a missing file as NOT_FOUND, anything
+// else as an internal error.
+func TestOpenFaultsMapLikeStoreErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(path, []byte("hello world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ spec, code string }{
+		{"open.enoent=1", mapHTTPErrorCode(http.StatusNotFound)},
+		{"open.eio=1", mapHTTPErrorCode(http.StatusInternalServerError)},
+	} {
+		inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilyDisk: tc.spec}})
+		ctx := faults.NewContext(context.Background(), inj)
+		req, err := ParseRequest([]byte("CXSUM tx1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		err = handleCXSUMWithInput(ctx, req, framedItemBody(t, `fd=1 "/a" offset=0 size=5 algo=xxh128`), &out, &mockDeps{filePath: path})
+		var perr protocolErr
+		if !errors.As(err, &perr) || perr.code != tc.code {
+			t.Fatalf("%s: CXSUM error %v, want code %s", tc.spec, err, tc.code)
+		}
+		o := unbufferedSendOutput(&out)
+		o.faults = inj
+		deps := &mockDeps{filePath: path}
+		_, err = streamSendItem(context.Background(), o, deps, "tx1", sendItem{FileID: 1, Comp: "none", Path: path, Mode: loadStrategyFast},
+			mustFileRef(t, deps, 1, path), defaultZeroCopyMinFrameBytes)
+		if !errors.As(err, &perr) || perr.code != tc.code {
+			t.Fatalf("%s: SEND error %v, want code %s", tc.spec, err, tc.code)
+		}
+	}
+}
+
+// TestDiskFaultsNameTheirFile checks SEND and CXSUM pass each item's file ID
+// and window offset to their disk fault sites, which key faults per file and
+// offset; a fault event reports both.
+func TestDiskFaultsNameTheirFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(path, []byte("hello world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	type at struct {
+		kind   string
+		file   uint64
+		offset int64
+	}
+	injector := func(spec string) (*faults.Injector, *[]at) {
+		sink := events.NewSink()
+		var got []at
+		sink.Subscribe(func(e events.Event) {
+			if e.Name == "fault" {
+				k, _ := e.Get("kind")
+				off, _ := e.Get("offset")
+				got = append(got, at{k.(string), uint64(e.Int("file")), off.(int64)})
+			}
+		})
+		return faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilyDisk: spec}, Events: sink}), &got
+	}
+	for _, spec := range []string{"open.eio=1", "read.eio=1"} {
+		kind := "disk." + strings.Split(spec, "=")[0]
+		inj, got := injector(spec)
+		var out bytes.Buffer
+		o := unbufferedSendOutput(&out)
+		o.faults = inj
+		deps := &mockDeps{filePath: path}
+		_, _ = streamSendItem(context.Background(), o, deps, "tx1", sendItem{FileID: 7, Offset: 3, Comp: "none", Path: path, Mode: loadStrategyFast},
+			mustFileRef(t, deps, 7, path), defaultZeroCopyMinFrameBytes)
+		if want := (at{kind, 7, 3}); len(*got) != 1 || (*got)[0] != want {
+			t.Fatalf("SEND %s: fault events %v, want [%v]", spec, *got, want)
+		}
+
+		inj, got = injector(spec)
+		req, err := ParseRequest([]byte("CXSUM tx1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := faults.NewContext(context.Background(), inj)
+		_ = handleCXSUMWithInput(ctx, req, framedItemBody(t, `fd=9 "/a" offset=2 size=5 algo=xxh128`), &out, &mockDeps{filePath: path})
+		if want := (at{kind, 9, 2}); len(*got) != 1 || (*got)[0] != want {
+			t.Fatalf("CXSUM %s: fault events %v, want [%v]", spec, *got, want)
+		}
 	}
 }

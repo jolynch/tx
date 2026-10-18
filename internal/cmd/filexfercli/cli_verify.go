@@ -367,7 +367,7 @@ func hashItems(ctx context.Context, items []verifyItem, src bool, inj *faults.In
 		h.Reset()
 		var fr io.ReaderAt = fd
 		if inj != nil {
-			fr = inj.WrapReaderAt(ctx, faults.SiteVerifyRead, fd)
+			fr = inj.WrapReaderAt(ctx, faults.SiteVerifyRead, it.file.entry.ID, fd)
 		}
 		r := io.NewSectionReader(benchio.WithReadLatency(ctx, "client", fr), it.sample.Offset, it.sample.Size)
 		for remaining := it.sample.Size; remaining > 0; {

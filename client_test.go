@@ -4476,3 +4476,29 @@ func TestDialTCPTunesSocketThroughFaultWrapper(t *testing.T) {
 		c.Close()
 	}
 }
+
+// TestClientConnectionFaults checks the client's dial and request faults:
+// dial.fail refuses a dial to a live server, and a MSG delay holds each
+// request back.
+func TestClientConnectionFaults(t *testing.T) {
+	addr := startRealKeepAliveServer(t, intftcp.ServerOptions{Deps: intftcp.NewRuntimeDeps(store.NewStore())})
+	spec := func(f faults.Family, s string) *faults.Injector {
+		return faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{f: s}})
+	}
+	c := NewClient(addr, WithFaults(spec(faults.FamilyNet, "dial.fail=1")))
+	if _, err := c.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("probe through dial.fail: %v", err)
+	}
+	c.Close()
+
+	inj := spec(faults.FamilyMsg, "delay=1:β(30ms,35ms,40ms,50ms)")
+	c = NewClient(addr, WithFaults(inj))
+	defer c.Close()
+	start := time.Now()
+	if _, err := c.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < 30*time.Millisecond || inj.Counts().InjectedByKind()["msg.delay"] == 0 {
+		t.Fatalf("delayed probe took %v with injections %v", elapsed, inj.Counts().InjectedByKind())
+	}
+}

@@ -635,7 +635,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 				_ = fd.Close()
 				fd = nil
 				// Reopen without direct I/O, through the same open gate.
-				fd, _, err = openSendFile(inj, deps, sendItem{Mode: loadStrategyFast}, fileRef)
+				fd, _, err = openSendFile(inj, deps, sendItem{FileID: item.FileID, Offset: item.Offset, Mode: loadStrategyFast}, fileRef)
 				if err != nil {
 					return sentItem{}, mapLookupError(err)
 				}
@@ -720,7 +720,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 // when the filesystem allows it, and reports whether it did. The open fault
 // gate comes first, so an injected open error stops either kind of open.
 func openSendFile(inj *faults.Injector, deps Deps, item sendItem, fileRef FileRef) (*os.File, bool, error) {
-	if err := inj.OpenErr(faults.SiteSendOpen); err != nil {
+	if err := openFault(inj, faults.SiteSendOpen, item.FileID, item.Offset); err != nil {
 		return nil, false, err
 	}
 	if item.Mode == loadStrategyGentle {
@@ -746,11 +746,13 @@ func isDirectIOReadError(err error) bool {
 //   - No compression (compressed data must be assembled in userspace)
 //   - No O_DIRECT (direct I/O requires aligned userspace buffers, not pipes)
 //   - A raw TCP socket (no encryption or rate-limit wrapper over the conn)
+//   - No fault injection that must see the payload (read.flip)
 func canZeroCopy(args frameStreamArgs) bool {
 	return runtime.GOOS == "linux" &&
 		args.Comp == "none" &&
 		!args.DirectIO &&
-		args.OutputTCPConn != nil
+		args.OutputTCPConn != nil &&
+		args.Faults.ZeroCopyReads()
 }
 
 // extractTCPConn returns the raw socket a SEND response may splice into, or
@@ -1022,7 +1024,7 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 	readRegion := trace.StartRegion(args.Ctx, "frame-read")
 	var src io.ReaderAt = fd
 	if args.Faults != nil {
-		src = args.Faults.WrapReaderAt(args.Ctx, faults.SiteSendRead, fd)
+		src = args.Faults.WrapReaderAt(args.Ctx, faults.SiteSendRead, args.FileID, fd)
 	}
 	prepareLatency, readLatency, err := streamBufferedRead(src, fileOffset, args.FrameSize, readBuf, timing, func(chunk []byte) error {
 		_, _ = args.WindowHasher.Write(chunk)

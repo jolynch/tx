@@ -223,6 +223,13 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 
 	for {
 		conn, err := listener.Accept()
+		if err == nil {
+			// An injected accept error takes the path of a real one; the
+			// connection it replaces never reaches a handler.
+			if err = opts.Faults.AcceptErr(); err != nil {
+				_ = conn.Close()
+			}
+		}
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
@@ -235,11 +242,15 @@ func Serve(listener net.Listener, opts ServerOptions) error {
 		}
 		conn = opts.Faults.WrapConn(conn, faults.Server)
 		// A server that requires auth admits a connection only with a
-		// permit, held until FINISH. Admission never blocks the loop.
+		// permit, held until FINISH. Admission never blocks the loop. Only
+		// such a server answers busy, so only it gets busy faults.
 		var release func()
 		if auth.required {
 			r, ok := auth.tryAcquire()
-			if !ok {
+			if !ok || opts.Faults.Busy() {
+				if ok {
+					r()
+				}
 				go refuseBusy(conn, nil)
 				continue
 			}
@@ -604,8 +615,24 @@ func (s *connSession) serveCommandInner(ctx context.Context, req Request, in io.
 		defer func() { _ = s.conn.SetWriteDeadline(time.Time{}) }()
 	}
 	respOut, closeResp := s.newResponseWriter(req)
+	// A lost response: the handler applies the request but its response
+	// goes nowhere, and the connection resets instead of replying.
+	lose := s.faults.LoseResponse()
+	if lose {
+		respOut, closeResp = io.Discard, func() error { return nil }
+	}
 	nr, _ := in.(*noiseRequest)
-	if err := s.handleCommand(ctx, req, in, respOut); err != nil {
+	err := s.handleCommand(ctx, req, in, respOut)
+	if lose {
+		// Whatever the handler did, the client sees only a reset.
+		if fc, ok := s.conn.(*faults.Conn); ok {
+			fc.Reset()
+		} else {
+			_ = s.conn.Close()
+		}
+		return errConnDone
+	}
+	if err != nil {
 		// An authenticated request is answered only once it is known to
 		// have ended; a request that cannot be read to its END closes the
 		// connection without a response.

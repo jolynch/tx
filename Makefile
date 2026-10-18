@@ -63,6 +63,8 @@ fuzz-short:
 # budget to keep exploring.
 fuzz-long:
 	$(FUZZ) -race ./internal/filexfer/ftcp FuzzChecksumFrameMatchesWriteFrame $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/stats FuzzFitBeta $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/faults FuzzSpecRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race . FuzzTCPConnPool $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/aead FuzzReadRecords $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/encoding FuzzManifestEntryRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)

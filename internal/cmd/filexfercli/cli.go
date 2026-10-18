@@ -1058,7 +1058,7 @@ func openDownloadOutput(entry tx.ManifestEntry, offset int64, destPath string, s
 		}
 	}
 	syncOutput := syncWorker.SyncOutput(fd, offset)
-	return inj.WrapWriter(faults.SiteOutputWrite, fd), syncOutput, nil
+	return inj.WrapWriter(faults.SiteOutputWrite, entry.ID, offset, fd), syncOutput, nil
 }
 
 func applyDownloadedTrailerMetadata(destPath string, meta *tx.FileTrailerMetadata) error {
