@@ -42,7 +42,8 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
   timing/expiry, and goroutine lifecycle. Models: `FuzzCommonPrefixLen` in
   `internal/utils/strings_test.go` and `FuzzSync` in
   `internal/filexfer/ftcp/sync_test.go`.
-- **Register every fuzz test in the Makefile, in `fuzz-short` or `fuzz-long`.**
+- **Register every fuzz test in the Makefile, in `fuzz-short`, `fuzz-long`, or
+  `pbt-faults`.**
   Verify its package path and confirm `go test -fuzz=X` reports a real `execs:`
   count; unmatched targets exit successfully without fuzzing.
   - `fuzz-short` — property tests standing in for unit tests: one function or
@@ -62,6 +63,17 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
     SIGINT rather than `-fuzztime`, whose expiry Go can misreport as a
     `context deadline exceeded` failure, and it fails a target that fuzzes
     nothing.
+  - `pbt-faults` — fault-injection properties (pbt-faults), which drive whole
+    transfers under the `internal/faults` catalog. Model:
+    `FuzzMemTransferUnderFaults`. They begin with `faults.SkipUnlessPBT`, so
+    they run only under `make pbt-faults`, and they sit outside `acceptance`
+    because they fail until the bugs they find are fixed. Go's fuzzer stops
+    any input past 10s without a message, so keep each input's budget near
+    8s; a property that cannot bound its steps that tightly sweeps seeds in
+    a plain test instead, as `TestTreeCopyUnderFaults` does. Record each
+    failure in IDEAS.md with its repro line, keeping a failing input as an
+    `f.Add` seed since the repository ignores fuzz corpora; move a property
+    to `fuzz-long` once it passes.
   - The tiers are a budget, not a ranking. Fuzzing exists to discover
     interesting behavior, not to finish quickly: a test that keeps finding new
     states is the better test. Never narrow one to make it fit `fuzz-short`.
@@ -142,6 +154,7 @@ make unit         # go test -race ./...
 make fuzz-short   # unit-test replacements; 5s each
 make fuzz-long    # whole-system properties; 30s each
 make acceptance   # fuzz-short, then fuzz-long
+make pbt-faults   # fault-injection properties; fail until their bugs are fixed
 make bench        # Go microbenchmarks; pre-commit only (pegs the machine)
 make bench-acceptance        # tx-bench end to end on a 5GiB dataset (BENCH_SIZE)
 make bench-acceptance-dials  # dial budget of that run
@@ -183,10 +196,14 @@ go run ./cmd/tx-bench local -s 256MiB -n 1
   `fsync.WithFaults` take one; `tx` builds one from `TX_FAULTS_*`.
   `pagecache.SetFaults` holds the page-cache package's injector process-wide.
   Every injected duration is a beta distribution from `internal/stats`.
+  `Swarm` draws random fault sets, and the `PBT*` helpers serve the
+  pbt-faults property tests (`make pbt-faults`).
 - `internal/stats`: the beta distribution, its fits from a mean and a
   percentile or from two percentiles, and its sampler.
 - `internal/memxfer`: whole transfers between a real server and client in one
   process, with memfds for files on both sides, for fault-injection tests.
+  `Env.Restart` reruns both over the same state, and `Env.Verify` runs the
+  CLI's data verification (`filexfercli.VerifyCopy`) against the memfds.
 - `internal/bufpool`: size-bucketed reusable byte buffers for per-request I/O,
   plus `Growing`, whose buffer tracks bytes actually received rather than a
   size a peer declared.

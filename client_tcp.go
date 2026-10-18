@@ -289,7 +289,11 @@ func (s *checksumStream) Close() error {
 // reads the full response. Callers decide whether the probe is pool warm-up
 // negotiation or a scheduled heartbeat and record metrics accordingly.
 func (c *Client) probeKeepAliveSessionConn(conn net.Conn, state tcpAuthState) (bool, int64, error) {
-	_ = conn.SetDeadline(time.Now().Add(keepAliveHeartbeatTimeout))
+	timeout := keepAliveHeartbeatTimeout
+	if c.heartbeatTimeout > 0 {
+		timeout = c.heartbeatTimeout
+	}
+	_ = conn.SetDeadline(time.Now().Add(timeout))
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 	start := time.Now()
 	cmd := fmt.Sprintf("PROBE cpu=%d probe-bytes=0 cts0=%d keep-alive=auto", runtime.NumCPU(), start.UnixMilli())

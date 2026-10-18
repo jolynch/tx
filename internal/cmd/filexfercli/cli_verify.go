@@ -439,6 +439,39 @@ func verifyCopyDataSamples(serverURL string, cfg copyCLIConfig, manifest *tx.Man
 	return result, err
 }
 
+// VerifyCopyOptions configures VerifyCopy.
+type VerifyCopyOptions struct {
+	// Workers is how many batches verify at once; zero means one.
+	Workers int
+	// Budget stops dispatching batches once it expires, and Grace cancels
+	// the batches still running that long after; zero means no budget. A
+	// run the budget cuts short is an error.
+	Budget, Grace time.Duration
+}
+
+// VerifyCopy checks every byte of a remote copy, as tx recv copy --verify
+// full does: each regular file's local copy, at local(entry), against the
+// server's CXSUM hashes of the same ranges. It returns nil only when every
+// range matched. internal/memxfer uses it to run this verification against
+// its memfds.
+func VerifyCopy(client *tx.Client, manifest *tx.Manifest, local func(tx.ManifestEntry) string, opts VerifyCopyOptions) error {
+	sampling := verifyOptions{pct: 100, frameSize: defaultVerifyFrameSize, seed: 1, budget: opts.Budget}
+	files, totals := newVerifyFiles(manifest.Root, manifest.Entries, sampling, func(entry tx.ManifestEntry) (string, string) {
+		return filepath.Clean(filepath.Join(manifest.Root, filepath.FromSlash(entry.Path))), local(entry)
+	})
+	if len(files) == 0 {
+		return nil
+	}
+	result, err := runVerify(verifyRun{files: files, totals: totals, workers: max(1, opts.Workers), budget: opts.Budget, grace: opts.Grace,
+		check: func(ctx context.Context, items []verifyItem) error {
+			return verifyCopyItems(ctx, client, nil, manifest.TransferID, items)
+		}})
+	if err == nil && result.partial {
+		err = fmt.Errorf("verified only %s", result.coverage())
+	}
+	return err
+}
+
 // verifyCopyItems compares the items' local hashes with the server's CXSUM
 // hashes of the same ranges. The server hashes while this worker hashes the
 // local copy. Batch duration approaches the slower side's duration.

@@ -90,6 +90,16 @@ func StartSyncWorker(fsyncInterval int64, noSync bool, progressInterval time.Dur
 	}
 }
 
+// Unsynced returns how many files background batches gave up syncing, by a
+// failed fdatasync or a failed fstat before it. Neither is reported to the
+// file's writer, so a caller that must know checks this after stop.
+func (w *SyncWorker) Unsynced() int64 {
+	if w == nil || w.background == nil {
+		return 0
+	}
+	return w.background.unsynced.Load()
+}
+
 // SyncOutput returns a sync callback for fd. The returned function is intended
 // to run after all writes complete but before fd is closed.
 //
@@ -244,7 +254,10 @@ type backgroundSyncer struct {
 	peakFiles     atomic.Int64
 	currentBatch  atomic.Int64
 	peakBatch     atomic.Int64
-	faults        *faults.Injector
+	// unsynced counts files a batch gave up on: an fdatasync that failed,
+	// or an fstat that failed, after which the file is not synced.
+	unsynced atomic.Int64
+	faults   *faults.Injector
 }
 
 type syncRequest struct {
@@ -309,10 +322,13 @@ func (bs *backgroundSyncer) syncBatch(batch []syncRequest, stderr io.Writer) {
 		if err == nil {
 			err = syscall.Fstat(req.fd, &stat)
 		}
-		if err == nil {
+		if err != nil {
+			bs.unsynced.Add(1)
+		} else {
 			key := fileKey{stat.Dev, stat.Ino}
 			if !seen[key] {
 				if err := fdatasync(bs.faults, req.fd); err != nil {
+					bs.unsynced.Add(1)
 					fmt.Fprintf(stderr, "background fdatasync: %v\n", err)
 				}
 				seen[key] = true

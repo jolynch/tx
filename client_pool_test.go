@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/faults"
 	intftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	"github.com/jolynch/tx/internal/filexfer/store"
 )
@@ -1349,152 +1350,195 @@ func FuzzTCPConnPool(f *testing.F) {
 	f.Add([]byte{4, 4, 4, 4, 0, 0, 0, 0, 0, 1, 2, 3, 0, 0})
 	f.Add([]byte{0, 2, 1, 1, 0, 0, 0, 0, 9, 17, 25, 3, 3, 4})
 	f.Add([]byte{2, 2, 2, 2, 0, 0, 0, 5, 3, 7, 0, 6, 0, 1})
-	f.Fuzz(func(t *testing.T, data []byte) {
-		if len(data) < 4 {
-			return
-		}
-		opts := tcpPoolOptions{size: 1 + int(data[1]%5)}
-		if data[0]&1 != 0 {
-			opts.limit = opts.size
-		}
-		sessionMS := int64(5000)
-		if data[1]&0x80 != 0 {
-			sessionMS = 0
-		}
-		dialer := &keepAlivePipeDialer{}
-		c := &Client{FileAddr: "pipe", contextDialer: dialer.DialContext}
-		pool := newTCPConnPool(tcpAuthState{}, opts, sessionMS)
-		defer pool.stop()
-		cancelled, cancel := context.WithCancel(context.Background())
-		cancel()
+	f.Fuzz(func(t *testing.T, data []byte) { fuzzTCPConnPool(t, data, nil) })
+}
 
-		var borrowed []net.Conn
-		// peak mirrors the pool's own: the most borrowed at once since the
-		// last tick. used reports whether any acquire succeeded.
-		peak, used := 0, false
-		// killed reports whether any peer was closed. Pipes pass the liveness
-		// peek, so acquire never discards one here; the flag keeps the
-		// assertion below honest if the fake ever gains a liveness check.
-		killed := false
-		settle := func() {
-			deadline := time.Now().Add(5 * time.Second)
-			for pool.refilling.Load() != 0 {
-				if time.Now().After(deadline) {
-					t.Fatalf("fills never finished: %d in flight", pool.refilling.Load())
-				}
-				time.Sleep(time.Millisecond)
-			}
+// FuzzTCPConnPoolUnderFaults is FuzzTCPConnPool with a swarm of NET faults
+// on every connection the pool dials: delays, pauses, resets, broken-stream
+// faults, and failed or slow dials. Acquires and heartbeats may then fail,
+// but the pool's bookkeeping must still hold at every step and nothing may
+// stay open after stop. It is a pbt-faults property: it runs only with
+// TX_PBT_FAULTS set.
+func FuzzTCPConnPoolUnderFaults(f *testing.F) {
+	faults.SkipUnlessPBT(f)
+	f.Add(uint64(1), []byte{4, 4, 4, 4, 0, 0, 0, 0, 0, 1, 2, 3, 0, 0})
+	f.Add(uint64(2), []byte{0, 2, 1, 1, 0, 0, 0, 0, 9, 17, 25, 3, 3, 4})
+	f.Add(uint64(3), []byte{2, 2, 2, 2, 0, 0, 0, 5, 3, 7, 0, 6, 0, 1})
+	f.Fuzz(func(t *testing.T, seed uint64, data []byte) {
+		exclude, err := faults.PBTExclude()
+		if err != nil {
+			t.Fatal(err)
 		}
-		check := func(step int) {
-			t.Helper()
-			settle()
-			open, idle := dialer.Open(), len(pool.ready)
-			if idle > opts.size {
-				t.Fatalf("step %d: %d idle, size %d", step, idle, opts.size)
-			}
-			if open != idle+len(borrowed) {
-				t.Fatalf("step %d: %d open, but %d idle + %d borrowed", step, open, idle, len(borrowed))
-			}
-			if got := pool.borrowed.Load(); got != int64(len(borrowed)) {
-				t.Fatalf("step %d: pool counts %d borrowed, harness holds %d", step, got, len(borrowed))
-			}
-			pool.idleMu.Lock()
-			stacked := len(pool.idle)
-			pool.idleMu.Unlock()
-			if stacked != idle {
-				t.Fatalf("step %d: idle stack holds %d, but %d idle tokens", step, stacked, idle)
-			}
-			if target := int(pool.target.Load()); target > opts.size {
-				t.Fatalf("step %d: target %d above size %d", step, target, opts.size)
-			}
-			if opts.limit > 0 && (open > opts.limit || len(pool.slots) != open) {
-				t.Fatalf("step %d: %d open, %d slots held, limit %d", step, open, len(pool.slots), opts.limit)
-			}
+		cfg := faults.Swarm(seed, faults.SwarmOptions{Families: []faults.Family{faults.FamilyNet}, Exclude: exclude, MaxRate: 0.2})
+		inj, err := faults.PBTInjector(cfg)
+		if err != nil {
+			t.Fatal(err)
 		}
-		takeBorrowed := func(arg int) net.Conn {
-			i := arg % len(borrowed)
-			conn := borrowed[i]
-			borrowed = append(borrowed[:i], borrowed[i+1:]...)
-			return conn
-		}
-
-		pool.triggerRefill(c)
-		check(-1)
-		for step, b := range data[4:] {
-			arg := int(b / 10)
-			switch b % 10 {
-			case 0: // acquire; cancellation covers explicit requests and full pools
-				ctx, cancelAcquire := context.WithTimeout(context.Background(), time.Second)
-				if arg&16 != 0 || (opts.limit > 0 && len(pool.ready) == 0 && len(pool.slots) == opts.limit) {
-					cancelAcquire()
-					ctx = cancelled
-				}
-				idleBefore := len(pool.ready)
-				conn, err := pool.acquire(ctx, c)
-				cancelAcquire()
-				switch {
-				case err == nil:
-					borrowed = append(borrowed, conn)
-					peak, used = max(peak, len(borrowed)), true
-				case errors.Is(err, context.Canceled):
-					// Dialing a new session honors cancellation, but a live
-					// idle connection is lent without dialing.
-					if idleBefore > 0 && !killed {
-						t.Fatalf("step %d: canceled acquire skipped %d idle connections", step, idleBefore)
-					}
-				case !errors.Is(err, errTCPPoolStopped) && !dialer.failing.Load():
-					t.Fatalf("step %d: acquire: %v", step, err)
-				}
-			case 1: // return cleanly
-				if len(borrowed) > 0 {
-					_ = c.recycleManagedTCPConn(takeBorrowed(arg), pool)
-				}
-			case 2: // return dirty
-				if len(borrowed) > 0 {
-					_ = c.releaseManagedTCPConn(takeBorrowed(arg), pool)
-				}
-			case 3, 4: // heartbeat tick: every idle connection is due, or fresh
-				interval := time.Duration(0)
-				if b%10 == 4 {
-					interval = time.Hour
-				}
-				keep := keepFor(max(peak, len(borrowed)))
-				pool.heartbeatIdleConns(c, interval)
-				peak = len(borrowed)
-				settle()
-				// Once used, a tick scales the pool down to its peak use plus a
-				// quarter, and replacement fills restore no more than that.
-				if open := dialer.Open(); used && open > keep {
-					t.Fatalf("step %d: %d open after a tick, want at most %d", step, open, keep)
-				}
-			case 5:
-				dialer.kill(arg)
-				killed = true
-			case 6:
-				pool.triggerRefill(c)
-			case 7:
-				pool.stop()
-				if len(pool.ready) != 0 {
-					t.Fatalf("step %d: %d idle connections left after stop", step, len(pool.ready))
-				}
-			case 8:
-				dialer.failing.Store(!dialer.failing.Load())
-			case 9:
-				dialer.withdrawn.Store(true)
-			}
-			check(step)
-		}
-
-		pool.stop()
-		for len(borrowed) > 0 {
-			_ = c.recycleManagedTCPConn(takeBorrowed(0), pool)
-		}
-		settle()
-		if open := dialer.Open(); open != 0 {
-			t.Fatalf("%d connections open after stop and every return", open)
-		}
-		if opts.limit > 0 && len(pool.slots) != 0 {
-			t.Fatalf("%d slots held after stop and every return", len(pool.slots))
-		}
+		fuzzTCPConnPool(t, data, inj)
 	})
+}
+
+// fuzzTCPConnPool runs one FuzzTCPConnPool input, its connections faulted
+// by inj when it is not nil.
+func fuzzTCPConnPool(t *testing.T, data []byte, inj *faults.Injector) {
+	if len(data) < 4 {
+		return
+	}
+	opts := tcpPoolOptions{size: 1 + int(data[1]%5)}
+	if data[0]&1 != 0 {
+		opts.limit = opts.size
+	}
+	sessionMS := int64(5000)
+	if data[1]&0x80 != 0 {
+		sessionMS = 0
+	}
+	dialer := &keepAlivePipeDialer{}
+	c := &Client{FileAddr: "pipe", contextDialer: dialer.DialContext, faults: inj}
+	steps := data[4:]
+	if inj != nil {
+		// A fault can leave a heartbeat or fill waiting out its timeout.
+		// Go's fuzzer stops an input after 10s, so keep each wait short
+		// and the input to 40 steps.
+		c.heartbeatTimeout = 100 * time.Millisecond
+		steps = steps[:min(len(steps), 40)]
+		t.Cleanup(func() {
+			if t.Failed() {
+				t.Logf("faults %v; repro %s", inj.Counts().InjectedByKind(), inj.Repro())
+			}
+		})
+	}
+	pool := newTCPConnPool(tcpAuthState{}, opts, sessionMS)
+	defer pool.stop()
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var borrowed []net.Conn
+	// peak mirrors the pool's own: the most borrowed at once since the
+	// last tick. used reports whether any acquire succeeded.
+	peak, used := 0, false
+	// killed reports whether any peer was closed. Pipes pass the liveness
+	// peek, so acquire never discards one here; the flag keeps the
+	// assertion below honest if the fake ever gains a liveness check.
+	killed := false
+	settle := func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for pool.refilling.Load() != 0 {
+			if time.Now().After(deadline) {
+				t.Fatalf("fills never finished: %d in flight", pool.refilling.Load())
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	check := func(step int) {
+		t.Helper()
+		settle()
+		open, idle := dialer.Open(), len(pool.ready)
+		if idle > opts.size {
+			t.Fatalf("step %d: %d idle, size %d", step, idle, opts.size)
+		}
+		if open != idle+len(borrowed) {
+			t.Fatalf("step %d: %d open, but %d idle + %d borrowed", step, open, idle, len(borrowed))
+		}
+		if got := pool.borrowed.Load(); got != int64(len(borrowed)) {
+			t.Fatalf("step %d: pool counts %d borrowed, harness holds %d", step, got, len(borrowed))
+		}
+		pool.idleMu.Lock()
+		stacked := len(pool.idle)
+		pool.idleMu.Unlock()
+		if stacked != idle {
+			t.Fatalf("step %d: idle stack holds %d, but %d idle tokens", step, stacked, idle)
+		}
+		if target := int(pool.target.Load()); target > opts.size {
+			t.Fatalf("step %d: target %d above size %d", step, target, opts.size)
+		}
+		if opts.limit > 0 && (open > opts.limit || len(pool.slots) != open) {
+			t.Fatalf("step %d: %d open, %d slots held, limit %d", step, open, len(pool.slots), opts.limit)
+		}
+	}
+	takeBorrowed := func(arg int) net.Conn {
+		i := arg % len(borrowed)
+		conn := borrowed[i]
+		borrowed = append(borrowed[:i], borrowed[i+1:]...)
+		return conn
+	}
+
+	pool.triggerRefill(c)
+	check(-1)
+	for step, b := range steps {
+		arg := int(b / 10)
+		switch b % 10 {
+		case 0: // acquire; cancellation covers explicit requests and full pools
+			ctx, cancelAcquire := context.WithTimeout(context.Background(), time.Second)
+			if arg&16 != 0 || (opts.limit > 0 && len(pool.ready) == 0 && len(pool.slots) == opts.limit) {
+				cancelAcquire()
+				ctx = cancelled
+			}
+			idleBefore := len(pool.ready)
+			conn, err := pool.acquire(ctx, c)
+			cancelAcquire()
+			switch {
+			case err == nil:
+				borrowed = append(borrowed, conn)
+				peak, used = max(peak, len(borrowed)), true
+			case errors.Is(err, context.Canceled):
+				// Dialing a new session honors cancellation, but a live
+				// idle connection is lent without dialing.
+				if idleBefore > 0 && !killed {
+					t.Fatalf("step %d: canceled acquire skipped %d idle connections", step, idleBefore)
+				}
+			// Faults may fail any acquire; the bookkeeping must still hold.
+			case !errors.Is(err, errTCPPoolStopped) && !dialer.failing.Load() && inj == nil:
+				t.Fatalf("step %d: acquire: %v", step, err)
+			}
+		case 1: // return cleanly
+			if len(borrowed) > 0 {
+				_ = c.recycleManagedTCPConn(takeBorrowed(arg), pool)
+			}
+		case 2: // return dirty
+			if len(borrowed) > 0 {
+				_ = c.releaseManagedTCPConn(takeBorrowed(arg), pool)
+			}
+		case 3, 4: // heartbeat tick: every idle connection is due, or fresh
+			interval := time.Duration(0)
+			if b%10 == 4 {
+				interval = time.Hour
+			}
+			keep := keepFor(max(peak, len(borrowed)))
+			pool.heartbeatIdleConns(c, interval)
+			peak = len(borrowed)
+			settle()
+			// Once used, a tick scales the pool down to its peak use plus a
+			// quarter, and replacement fills restore no more than that.
+			if open := dialer.Open(); used && open > keep {
+				t.Fatalf("step %d: %d open after a tick, want at most %d", step, open, keep)
+			}
+		case 5:
+			dialer.kill(arg)
+			killed = true
+		case 6:
+			pool.triggerRefill(c)
+		case 7:
+			pool.stop()
+			if len(pool.ready) != 0 {
+				t.Fatalf("step %d: %d idle connections left after stop", step, len(pool.ready))
+			}
+		case 8:
+			dialer.failing.Store(!dialer.failing.Load())
+		case 9:
+			dialer.withdrawn.Store(true)
+		}
+		check(step)
+	}
+
+	pool.stop()
+	for len(borrowed) > 0 {
+		_ = c.recycleManagedTCPConn(takeBorrowed(0), pool)
+	}
+	settle()
+	if open := dialer.Open(); open != 0 {
+		t.Fatalf("%d connections open after stop and every return", open)
+	}
+	if opts.limit > 0 && len(pool.slots) != 0 {
+		t.Fatalf("%d slots held after stop and every return", len(pool.slots))
+	}
 }
