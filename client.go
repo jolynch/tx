@@ -2043,6 +2043,11 @@ func (c *Client) downloadWindows(
 			next = nextAckOffset
 		}
 	}
+	// A failed ACK leaves the loop early. Wait for every window to stop
+	// before returning, so none writes to or syncs its output after the
+	// caller has moved on; results closes once they all have.
+	for range results {
+	}
 
 	if firstErr != nil {
 		var missingErr *fileMissingError

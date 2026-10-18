@@ -29,6 +29,7 @@ import (
 	"github.com/jolynch/tx"
 	"github.com/jolynch/tx/internal/benchio"
 	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	"github.com/jolynch/tx/internal/filexfer/store"
@@ -350,13 +351,12 @@ func verifyProcessCPUNS() int64 {
 	return ru.Utime.Nano() + ru.Stime.Nano()
 }
 
-// verifyIOLatency is a queue-free synthetic cloud SSD read-service model.
-// gp3 and i4i use the Netflix service-capacity-modeling beta fit.
+// verifyIOLatency is a queue-free synthetic cloud SSD read-service model:
+// one of the fault injector's drive latency presets, plus a size term.
 type verifyIOLatency struct {
-	minimum, spread time.Duration
-	alpha, beta     float64
-	bytesPerSecond  float64
-	client, server  verifyIOStats
+	latency        faults.Dist
+	bytesPerSecond float64
+	client, server verifyIOStats
 }
 
 type verifyIOStats struct {
@@ -364,57 +364,20 @@ type verifyIOStats struct {
 	histogram                          [512]atomic.Int64 // 32 us bins; final bin includes larger waits.
 }
 
-// Fits: Netflix-Skunkworks/service-capacity-modeling@c56c0dd7861a,
-// stats.py _beta_dist_from_interval; shapes/aws/{manual_drives,auto_i4i}.json.
-// The larger-read bandwidth terms remain independent simulation assumptions.
+// The larger-read bandwidth terms are independent simulation assumptions.
 func newVerifyIOLatency(tb testing.TB, profile string) *verifyIOLatency {
-	switch profile {
-	case "":
+	if profile == "" {
 		return nil
-	case "io2":
-		return &verifyIOLatency{minimum: 100 * time.Microsecond, spread: 1400 * time.Microsecond, bytesPerSecond: 4e9}
-	case "gp3":
-		return &verifyIOLatency{minimum: 400 * time.Microsecond, spread: 9600 * time.Microsecond, alpha: 13.904287927818451, beta: 191.45134915996172, bytesPerSecond: 1e9}
-	case "i4i", "ephem":
-		return &verifyIOLatency{minimum: 50 * time.Microsecond, spread: 1950 * time.Microsecond, alpha: 17.546493426147688, beta: 438.6623356536922, bytesPerSecond: 4e9}
-	default:
+	}
+	latency, ok := faults.Preset(profile)
+	if !ok {
 		tb.Fatalf("invalid TX_VERIFY_IO_LATENCY %q", profile)
-		return nil
 	}
-}
-
-// Integer-shape gamma sampling gives Beta(2,8) without a shared RNG lock.
-func verifyBeta28(sequence uint64) float64 {
-	rng := rand.NewPCG(sequence, 0x8e6f239bc12d40a7)
-	var a, b float64
-	for i := 0; i < 10; i++ {
-		u := (float64(rng.Uint64()>>11) + .5) / (1 << 53)
-		value := -math.Log(u)
-		if i < 2 {
-			a += value
-		} else {
-			b += value
-		}
+	bytesPerSecond := 4e9
+	if profile == "gp3" {
+		bytesPerSecond = 1e9
 	}
-	return a / (a + b)
-}
-
-// Marsaglia–Tsang gamma sampling; fitted profile shapes are greater than one.
-func verifyGamma(rng *rand.Rand, shape float64) float64 {
-	d := shape - 1.0/3
-	c := 1 / math.Sqrt(9*d)
-	for {
-		x := rng.NormFloat64()
-		v := 1 + c*x
-		if v <= 0 {
-			continue
-		}
-		v = v * v * v
-		u := rng.Float64()
-		if u < 1-.0331*x*x*x*x || math.Log(u) < .5*x*x+d*(1-v+math.Log(v)) {
-			return d * v
-		}
-	}
+	return &verifyIOLatency{latency: latency, bytesPerSecond: bytesPerSecond}
 }
 
 func (m *verifyIOLatency) wait(ctx context.Context, side string, bytes int) error {
@@ -428,13 +391,8 @@ func (m *verifyIOLatency) wait(ctx context.Context, side string, bytes int) erro
 		salt = 1 << 63
 	}
 	sequence := uint64(stats.sequence.Add(1)) + salt
-	beta := verifyBeta28(sequence)
-	if m.alpha > 0 {
-		rng := rand.New(rand.NewPCG(sequence, 0x8e6f239bc12d40a7))
-		a, b := verifyGamma(rng, m.alpha), verifyGamma(rng, m.beta)
-		beta = a / (a + b)
-	}
-	delay := m.minimum + time.Duration(beta*float64(m.spread))
+	// A source per read, seeded by its sequence, needs no shared lock.
+	delay := m.latency.Sample(rand.New(rand.NewPCG(sequence, 0x8e6f239bc12d40a7)))
 	// Published latency guidance is for 16 KiB IO. Larger application reads
 	// add a size term; this is not an aggregate throughput or queueing limit.
 	delay += time.Duration(float64(max(0, bytes-(16<<10))) * 1e9 / m.bytesPerSecond)
@@ -488,27 +446,19 @@ func (m *verifyIOLatency) report(b *testing.B) {
 }
 
 func TestVerifyBetaLatencyModel(t *testing.T) {
-	var sum float64
-	for i := uint64(1); i <= 10000; i++ {
-		value := verifyBeta28(i)
-		if value <= 0 || value >= 1 || value != verifyBeta28(i) {
-			t.Fatal("invalid or nondeterministic beta sample")
-		}
-		sum += value
-	}
-	if mean := sum / 10000; math.Abs(mean-.2) > .01 {
-		t.Fatalf("mean=%f", mean)
-	}
-	for _, profile := range []string{"gp3", "i4i"} {
+	for _, profile := range []string{"io2", "gp3", "i4i"} {
 		m := newVerifyIOLatency(t, profile)
+		b := m.latency.Beta()
 		var sum float64
 		for i := uint64(1); i <= 10000; i++ {
-			rng := rand.New(rand.NewPCG(i, 42))
-			a, b := verifyGamma(rng, m.alpha), verifyGamma(rng, m.beta)
-			sum += a / (a + b)
+			d := m.latency.Sample(rand.New(rand.NewPCG(i, 42)))
+			if d.Seconds() < b.Min || d.Seconds() > b.Max {
+				t.Fatalf("%s sample %v outside [%g, %g] s", profile, d, b.Min, b.Max)
+			}
+			sum += d.Seconds()
 		}
-		if math.Abs(sum/10000-m.alpha/(m.alpha+m.beta)) > .001 {
-			t.Fatalf("%s mean mismatch", profile)
+		if mean := sum / 10000; math.Abs(mean-b.Mean()) > 0.01*b.Mean() {
+			t.Fatalf("%s mean %g s, want %g s", profile, mean, b.Mean())
 		}
 	}
 	model := newVerifyIOLatency(t, "io2")

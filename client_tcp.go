@@ -372,6 +372,10 @@ func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
 	dialer := c.contextDialer
 	c.metrics().IncDial()
 	start := time.Now()
+	if err := c.faults.DialErr(ctx); err != nil {
+		c.metrics().IncRequestError()
+		return nil, err
+	}
 	var conn net.Conn
 	var err error
 	if dialer == nil {
@@ -1132,6 +1136,12 @@ func (c *Client) acknowledgeFileProgressTCP(ctx context.Context, request Acknowl
 
 func (c *Client) acknowledgeFileProgressBatchTCP(ctx context.Context, commands []acknowledgeFileProgressCommand) (AcknowledgeFileProgressResponse, error) {
 	err := visitEncodedRequests(commands, c.currentRequestLimits(), acknowledgeItemBytes, func(chunk requestChunk) error {
+		// A duplicated ACK reaches the server once more, first. Its error
+		// is ignored: the ACK that follows is the one whose result counts,
+		// and a server that is not idempotent fails it (docs/IDEAS.md).
+		if c.faults.DupRequest() {
+			_, _ = c.acknowledgeFileProgressGroupTCP(ctx, commands[chunk.lo:chunk.hi], chunk.encodedRequest)
+		}
 		_, err := c.acknowledgeFileProgressGroupTCP(ctx, commands[chunk.lo:chunk.hi], chunk.encodedRequest)
 		return err
 	})

@@ -10,41 +10,47 @@ which faults fired and where.
 Unlike FoundationDB, tx does not simulate scheduling. Goroutines, real TCP
 sockets, and splice cannot be made deterministic, so a seed can at most fix
 which faults fire on a given connection or file, never the order in which
-goroutines interleave.
+goroutines interleave. See [Reproducing a run](#reproducing-a-run).
 
 ## Cost when disabled
 
 A nil `*faults.Injector` is the disabled state, as a nil `events.Sink` is.
 Every wrapper returns what it was given, and every gate returns nil. The shims
-sit at connection, file, and syscall-site granularity, never inside the
-read or write loops: production pays a nil check per connection accepted or
-dialed, per file opened, per SEND frame, and per gated syscall, plus one
-context lookup per SEND and CXSUM request. SEND's buffered reads go through
-an `io.ReaderAt` whether or not they are wrapped, one interface call per read.
-A wrapped connection or file adds one more call per read or write.
+sit at connection, file, request, and syscall-site granularity, never inside
+the read or write loops: production pays a nil check per connection accepted
+or dialed, per request, per file opened, per SEND frame, and per gated
+syscall, plus one context lookup per SEND and CXSUM request. SEND's buffered
+reads go through an `io.ReaderAt` whether or not they are wrapped, one
+interface call per read. A wrapped connection or file adds one more call per
+read or write.
 
 ## Where the shims sit
 
-| IO | Shim | Sites |
-|---|---|---|
+| IO          | Shim                                | Sites                                                        |
+| ----------- | ----------------------------------- | ------------------------------------------------------------ |
 | Connections | `WrapConn` returns a `*faults.Conn` | every client dial (`dialTCP`), every server accept (`Serve`) |
-| File opens | `OpenErr` gate | SEND and CXSUM, before `Deps.OpenFileRef` |
-| File reads | `WrapReaderAt` | SEND buffered frames, CXSUM, client `--verify` |
-| File writes | `WrapWriter` | client download outputs (`openDownloadOutput`) |
-| Syscalls | `Sys` gate, and `WrapSplice`, `WrapTee`, `WrapPoll`, `WrapCopyFileRange` | see below |
+| Dial        | `DialErr` gate                      | every client dial, before connecting                         |
+| Accept      | `AcceptErr` and `Busy` gates        | every server accept; busy only where auth is required        |
+| Requests    | `DelayRequest`, `DupRequest`        | every client request; every ACK                              |
+| Responses   | `LoseResponse` gate                 | every server command                                         |
+| File opens  | `OpenErr` gate                      | SEND and CXSUM, before `Deps.OpenFileRef`                    |
+| File reads  | `WrapReaderAt`                      | SEND buffered frames, CXSUM, client `--verify`               |
+| File writes | `WrapWriter`                        | client download outputs (`openDownloadOutput`)               |
+| Syscalls    | `Sys` gate and syscall wrappers     | see below                                                    |
 
-Gated syscalls:
+Gated syscalls, through the `Sys` gate or, for calls passed as functions, the
+`WrapSplice`, `WrapTee`, `WrapPoll`, and `WrapCopyFileRange` wrappers:
 
-| Syscall | Sites |
-|---|---|
-| `splice`, `tee`, `poll` | the zero-copy SEND loop, through its per-call `zeroCopySyscalls` |
-| `pipe`, `fcntl` (`F_SETPIPE_SZ`), `dup` | zero-copy SEND setup |
-| `fadvise`, `readahead` | SEND sequential hints and frame readahead |
-| `fstat` | SEND and CXSUM file stats, the background fsync batch |
-| `fdatasync`, `syncfs`, `dup` | the fsync worker (`fsync.WithFaults`) and `SyncfsDir` |
-| `copy_file_range` | daemonless local copies |
-| `mmap`, `mincore`, `fadvise` | the page-cache probe, restore, and eviction |
-| `setsockopt` | `SetNoDelay` and socket buffer sizes on dial and accept |
+| Syscall                                 | Sites                                                            |
+| --------------------------------------- | ---------------------------------------------------------------- |
+| `splice`, `tee`, `poll`                 | the zero-copy SEND loop, through its per-call `zeroCopySyscalls` |
+| `pipe`, `fcntl` (`F_SETPIPE_SZ`), `dup` | zero-copy SEND setup                                             |
+| `fadvise`, `readahead`                  | SEND sequential hints and frame readahead                        |
+| `fstat`                                 | SEND and CXSUM file stats, the background fsync batch            |
+| `fdatasync`, `syncfs`, `dup`            | the fsync worker (`fsync.WithFaults`) and `SyncfsDir`            |
+| `copy_file_range`                       | daemonless local copies                                          |
+| `mmap`, `mincore`, `fadvise`            | the page-cache probe, restore, and eviction                      |
+| `setsockopt`                            | `SetNoDelay` and socket buffer sizes on dial and accept          |
 
 Advisory syscalls (fadvise, readahead, pipe resize, page cache, setsockopt)
 are best-effort: an injected failure skips them as a real one would.
@@ -65,24 +71,171 @@ header, payload, and trailer go to the socket directly, past the wrapper, so
 a wrapper's writes are synchronous and never hold back bytes that would then
 arrive out of order. Encrypted sessions never splice, so they lose nothing.
 
+Write faults (NET `delay`, `pause`, `reset`, `partial`) cannot reach a
+spliced payload. When any is on, half the connections, chosen by the seed,
+give up zero-copy, so write faults reach SEND payloads on those and the
+syscall faults on the rest. A spliced payload also skips the file reader, so
+with DISK `read.flip` on, SEND reads every frame through it instead.
+
 ## Enabling
 
 Library code takes an explicit injector: `ftcp.ServerOptions.Faults`,
-`tx.WithFaults`, and `fsync.WithFaults`. The `tx` binary builds one from the
-environment, prints a warning with the line that reproduces the run, and
-passes it to the server or the client command:
+`tx.WithFaults`, and `fsync.WithFaults`. `faults.Build` makes one from a
+`faults.Config`. The `tx` binary builds one from the environment, prints a
+warning with the line that reproduces the run, and passes it to the server
+or the client command:
 
 ```text
-TX_FAULTS_SEED=42   the seed for every fault decision
-TX_FAULTS_NET       network faults
-TX_FAULTS_MSG       request and response faults
-TX_FAULTS_DISK      file open, read, and write faults
-TX_FAULTS_SYS       syscall faults
+TX_FAULTS_SEED=42          the seed for every fault decision
+TX_FAULTS_PROFILE=bad-day  a named set of family specs
+TX_FAULTS_NET              network faults
+TX_FAULTS_MSG              request and response faults
+TX_FAULTS_DISK             file open, read, and write faults
+TX_FAULTS_SYS              syscall faults
 ```
 
 Each family variable is a comma-separated list of `kind=rate[:dist]`
-entries. No fault kinds exist yet, so any entry is an error. A variable set
-to blank space counts as unset, so when none has a value the injector is nil.
-`TX_FAULTS_SEED` alone turns on every wrapper while injecting nothing, which
-tests use to show the shims are transparent; `faults.Injector.Counts` reports
-which sites each injector reached.
+entries, overriding the profile kind by kind:
+
+```text
+TX_FAULTS_NET='reset=0.001, flip=1e-6, pause=0.01:β(100ms,500ms,4s,5s)'
+TX_FAULTS_DISK='read.eio=0.001, read.latency=1:gp3'
+TX_FAULTS_SYS='*.fail=0.002, fdatasync.fail=0.05, splice.latency=0.01:β(10us,100us,1ms,2ms)'
+```
+
+The rate is the probability that the kind fires on each operation the kind
+applies to: each read or write call for NET, each read call and each
+64 KiB block written for DISK, the requests, ACKs, commands, or accepts the
+catalog names for MSG, each open, dial, or accept, and each syscall. A kind marked ⏱ needs a duration unless its rate
+is 0, so `kind=0` turns off a profile's kind. In SYS, a kind is
+`<syscall>.fail`, `<syscall>.latency`, or `<syscall>.short`, and `*` stands
+for every syscall; within one variable, a specific entry beats `*` whatever
+the order, and a variable's `*` entry overrides the profile's specific
+ones. A variable
+set to blank space counts as unset, so when none has a value the injector is
+nil. `TX_FAULTS_SEED` alone turns on every wrapper while injecting nothing,
+which tests use to show the shims are transparent; `faults.Injector.Counts`
+reports which sites each injector reached and which kinds fired.
+
+### Durations
+
+Every kind that takes time (marked ⏱ below) takes a beta distribution:
+
+| Form                         | Meaning                                                   |
+| ---------------------------- | --------------------------------------------------------- |
+| `β(min,avg,p99,max)`         | values in increasing order; the usual form                |
+| `β(1ms,5ms,p75=6ms,50ms)`    | a key replaces a middle slot's meaning: here avg and p75  |
+| `β(1ms,p50=4ms,40ms,50ms)`   | a median and a p99; two percentiles fit as well as a mean |
+| `β(min,α=A,β=B,max)`         | the shape directly, when it is already known              |
+| `io2`, `gp3`, `i4i`, `ephem` | drive read-latency profiles                               |
+
+`avg=`, `mean=`, `μ=`, and `µ=` are the same key. A distribution takes one
+average and one percentile, or two percentiles. `Β(`, `beta(`, and `Beta(`
+spell `β(`, and `alpha=` and `beta=` spell `α=` and `β=`. A shape that no beta
+distribution on the range can match is an error at startup. `internal/stats`
+fits the shape: from a mean and one percentile, or from two percentiles.
+
+### Profiles
+
+`bad-day` turns on most of the catalog at once, at rates low enough that an
+in-memory transfer still finishes with correct bytes within a few resume
+rounds; `TestBadDayCompletes` in `internal/memxfer` holds it to that in every
+session mode, each with its own seed. It leaves out `read.flip`,
+`write.lost`, and `write.flip`, which no layer detects without `--verify`, so
+a run could succeed with wrong data, and `open.enoent`, after which the file
+is correctly reported missing for good. Its per-file kinds stay near
+0.1–0.3%: one fault fails a whole SEND batch, so a batch of small files must
+usually get through.
+
+## Catalog
+
+The last column says what should catch each fault. The pbt-faults property
+tests check it.
+
+| Family | Kind                         | Injected at                                                          | Expected detector or outcome                                                 |
+| ------ | ---------------------------- | -------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| NET    | `delay` ⏱                    | each read and write                                                  | liveness only                                                                |
+| NET    | `pause` ⏱                    | each read and write                                                  | deadlines fire, even if set mid-pause; `Close` ends it                       |
+| NET    | `reset`                      | each read and write; later reads fail as reset                       | loud error; the pool evicts; ACK retries; resume converges                   |
+| NET    | `partial`                    | each write: a prefix, then a reset                                   | loud error                                                                   |
+| NET    | `eof`                        | each read: the stream ends early, and later writes fail with `EPIPE` | premature EOF is an error, never success                                     |
+| NET    | `flip`                       | each read: one bit                                                   | AEAD tag, framed-body checksum, window hash; plaintext lines are unprotected |
+| NET    | `drop`                       | each read: a span removed                                            | as `flip`, plus frame offsets and lengths                                    |
+| NET    | `dup`                        | each read: a span delivered twice                                    | as `drop`; a duplicated `OK` must not end a second request                   |
+| NET    | `reorder`                    | each read: two adjacent spans swapped                                | as `flip`                                                                    |
+| NET    | `dial.fail`, `dial.slow` ⏱   | each client dial                                                     | dial error, counted; the request fails or retries                            |
+| NET    | `accept.fail`                | each server accept: a temporary error in its place                   | `Serve` retries the accept; the client sees EOF or a reset                   |
+| MSG    | `lose-response`              | each server command, after applying it                               | the client sees a reset; ACK retries must be idempotent                      |
+| MSG    | `dup`                        | each client ACK: sent twice                                          | idempotent server state                                                      |
+| MSG    | `delay` ⏱                    | each client request                                                  | requests on other connections overtake it                                    |
+| MSG    | `busy`                       | each accept, on a server requiring auth                              | `ERR BUSY`; the client retries the handshake                                 |
+| DISK   | `open.enoent`, `open.eio`    | each SEND and CXSUM open                                             | the file is missing (404) or the open fails loudly                           |
+| DISK   | `read.eio`, `read.latency` ⏱ | each buffered SEND, CXSUM, and verify read                           | loud error; liveness. Spliced frames: SYS `splice`                           |
+| DISK   | `read.flip`                  | each SEND, CXSUM, and verify read: one bit                           | none without `--verify`: the server hashes what it read                      |
+| DISK   | `write.eio`, `write.enospc`  | each 64 KiB block of a client output                                 | loud error at the block; resume repairs                                      |
+| DISK   | `write.short`, `write.torn`  | each output block: stops inside it                                   | loud error; a short write breaks `io.Writer` and must be caught              |
+| DISK   | `write.latency` ⏱            | each output block                                                    | liveness only                                                                |
+| DISK   | `write.lost`, `write.flip`   | each output block: skipped (seekable outputs only), or one bit       | none without `--verify`: the client hashes before writing                    |
+| SYS    | `<syscall>.fail`             | each gated syscall                                                   | hard errors loud; advisory calls skipped; `EINTR` retried                    |
+| SYS    | `<syscall>.latency` ⏱        | each gated syscall                                                   | liveness only                                                                |
+| SYS    | `<syscall>.short`            | each splice, tee, or copy_file_range: fewer bytes                    | handled by the caller's loop                                                 |
+
+TCP turns lost, duplicated, or reordered packets into delay. NET `drop`,
+`dup`, and `reorder` break that contract on purpose, as middleboxes, offload
+firmware, and kernel bugs occasionally do, to show which layer catches it. In
+encrypted sessions the AEAD must reject every case.
+
+Each syscall's `fail` kind returns one of the errors that call can really
+return at tx's call sites, such as `EIO` or `ENOSPC` from `fdatasync`,
+`EMFILE` from `pipe`, and `EXDEV` from `copy_file_range`.
+
+## Reproducing a run
+
+Every decision is a hash of the seed, the kind, a key, and an operation
+number:
+
+- Disk faults key on the site, the file's manifest ID, a byte offset (the
+  window's start for an open or a write, the read's offset for a read), and
+  how many times that offset was tried before. A write's operation number is
+  the 64 KiB block of the file, so a window tried again gets fresh decisions
+  for all its blocks. Deciding writes per block rather than per write call
+  keeps them independent of how the writes are cut, which in plaintext
+  follows the network's reads. Blocks start on 64 KiB file boundaries, so a window that
+  starts mid-block has no write faults before its first boundary. Concurrent
+  windows of a file start at different offsets, and an offset is tried
+  again only after its earlier attempt ended, so disk faults reproduce from
+  the seed whatever the goroutines do, apart from the two cases below,
+  while a retry still gets a fresh decision. What reproduces is where
+  writes fail and which bytes change; fault events and counts can differ,
+  since a write that spans several blocks decides them all at once, and a
+  position drawn past a file's end counts as injected without applying.
+- Connection faults key on the side and the connection's ordinal and number
+  reads and writes separately; request, dial, accept, and syscall faults
+  number operations in the order they happen. These reproduce per ordinal,
+  but under concurrency which request or connection gets an ordinal can vary
+  between runs. A NET read fault also lands on whatever bytes that read
+  returned, and where reads split a stream follows segment arrival, so the
+  bytes it hits can vary even on one connection.
+
+Two cases break exact disk reproduction:
+
+- A server still handling a request whose client has given up can read an
+  offset at the same time as the client's retry, and then the two attempts
+  race for that offset's count.
+- A spliced SEND frame reads its file without the faulted reader, so it
+  takes no DISK read decision and uses no attempt at its offset. Which
+  frames splice can vary between runs: with NET write faults on, half the
+  connections by ordinal keep zero-copy, and `adapt` compression picks
+  identity from measured latency. A frame that spliced in one run can then
+  read through the faulted reader in the next, shifting later attempts at
+  that offset. With `read.flip` on, every frame reads through it.
+
+The per-offset attempt counts live as long as the injector, one entry per
+offset tried, which suits test runs rather than a long-lived server. NET
+pauses end at a deadline or a close, and DISK `read.latency` ends with its
+request's context; the other injected waits (MSG `delay`, DISK
+`write.latency`, and SYS `latency`) take no context and run to the end of
+their sample, at most the distribution's maximum.
+
+The repro line is the seed, the profile, and every family variable, quoted
+for a shell.

@@ -2,9 +2,11 @@ package ftcp
 
 import (
 	"errors"
+	"io/fs"
 	"net/http"
 	"path/filepath"
 
+	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/pagecache"
 )
@@ -92,6 +94,21 @@ func (d runtimeDeps) EnqueueCacheRestoreBatch(txferID string, items []pagecache.
 		return
 	}
 	d.pool.SendBatch(txferID, items)
+}
+
+// openFault returns an injected open failure for the window of file at site
+// that starts at offset, as the store reports a real one: a missing file is a
+// 404 lookup error, anything else a failed open.
+func openFault(inj *faults.Injector, site faults.Site, file uint64, offset int64) error {
+	err := inj.OpenErr(site, file, offset)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, fs.ErrNotExist):
+		return &store.FileLookupError{Code: http.StatusNotFound, Msg: "file not found"}
+	default:
+		return &store.FileLookupError{Code: http.StatusInternalServerError, Msg: "failed to open file"}
+	}
 }
 
 func mapLookupError(err error) error {

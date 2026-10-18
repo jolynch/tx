@@ -12,7 +12,8 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
 - [Verification](docs/arch/VERIFICATION.md): metadata/data integrity, sampling,
   ACK validation, and failure semantics.
 - [Fault injection](docs/arch/FAULTS.md): the network, disk, and syscall shims,
-  their cost when disabled, and the `TX_FAULTS_*` variables.
+  their cost when disabled, the fault catalog, and the `TX_FAULTS_*`
+  variables.
 - [FTCP protocol](docs/ftcp/OVERVIEW.md): transport, AUTH, commands, and responses.
 - [FTCP authentication specification](docs/ftcp/AUTH.md): server key discovery,
   the Noise handshake, admission, and the encrypted record layer.
@@ -176,11 +177,16 @@ go run ./cmd/tx-bench local -s 256MiB -n 1
 - `internal/filexfer/{policy,limit}`: adaptive compression and rate limiting.
 - `internal/benchio`: optional read-latency injection for the verification
   microbenchmark; production readers pass through unchanged.
-- `internal/faults`: the fault-injection shims. A nil `*Injector` (the
-  default) returns every connection, reader, writer, and syscall function
-  unchanged. `ServerOptions.Faults`, `tx.WithFaults`, and `fsync.WithFaults`
-  take one; `tx` builds one from `TX_FAULTS_*`. `pagecache.SetFaults` holds the
-  page-cache package's injector process-wide.
+- `internal/faults`: the fault-injection shims and catalog. A nil
+  `*Injector` (the default) returns every connection, reader, writer, and
+  syscall function unchanged. `ServerOptions.Faults`, `tx.WithFaults`, and
+  `fsync.WithFaults` take one; `tx` builds one from `TX_FAULTS_*`.
+  `pagecache.SetFaults` holds the page-cache package's injector process-wide.
+  Every injected duration is a beta distribution from `internal/stats`.
+- `internal/stats`: the beta distribution, its fits from a mean and a
+  percentile or from two percentiles, and its sampler.
+- `internal/memxfer`: whole transfers between a real server and client in one
+  process, with memfds for files on both sides, for fault-injection tests.
 - `internal/bufpool`: size-bucketed reusable byte buffers for per-request I/O,
   plus `Growing`, whose buffer tracks bytes actually received rather than a
   size a peer declared.

@@ -128,6 +128,7 @@ func finishStreamResponse(rc io.Closer, br io.Reader) error {
 // function that finalizes it. On an authenticated connection each command is
 // one Noise message ending in END; plain connections write straight through.
 func (c *Client) newTCPRequestWriter(conn net.Conn, state tcpAuthState) (io.Writer, func() error, error) {
+	c.faults.DelayRequest()
 	if sess := noiseSessionOf(conn); sess != nil {
 		w := sess.Writer(false)
 		return w, w.EndFunc(), nil
