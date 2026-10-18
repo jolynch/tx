@@ -239,3 +239,65 @@ their sample, at most the distribution's maximum.
 
 The repro line is the seed, the profile, and every family variable, quoted
 for a shell.
+
+## Property tests (pbt-faults)
+
+`make pbt-faults` runs three properties under faults, each also its own
+target (`pbt-memxfer`, `pbt-tree`, `pbt-pool`), so `make -k pbt-faults` runs
+every one past a failing one. Each input picks a
+fault set from its seed: a swarm (`faults.Swarm`), which turns on each kind
+with probability one half at a log-uniform rate; the `bad-day` profile; or a
+swarm of benign kinds only. The same seed derives the schedule, and a
+failure message ends with the line that reruns its faults; which operation
+a fault lands on can still vary with timing, as
+[Reproducing a run](#reproducing-a-run) describes.
+
+| Property                     | Package                    | What it drives                                                         |
+| ---------------------------- | -------------------------- | ---------------------------------------------------------------------- |
+| `FuzzMemTransferUnderFaults` | `internal/memxfer`         | memfd transfers in every session mode, then verify, then a clean round |
+| `TestTreeCopyUnderFaults`    | `internal/cmd/filexfercli` | `tx recv copy` of a tmpfs tree with links, resumed, then a clean copy  |
+| `FuzzTCPConnPoolUnderFaults` | root                       | the connection pool's bookkeeping under NET faults                     |
+
+They check that tx either finishes correctly or fails loudly:
+
+- A file the server marks done, or a copy that exits 0, holds exactly the
+  source's bytes and metadata.
+- A round that reports no errors had no background output sync fail or
+  get skipped.
+- A verify pass that reports success means every byte matches.
+- Latencies and failed advisory syscalls alone never fail a transfer.
+- After the faults stop, one clean round or copy converges.
+- Every step returns within its budget, and memxfer releases every
+  goroutine and descriptor it used.
+
+Go's fuzzer stops any input that runs past 10s, with no message, so the two
+fuzz targets keep each input near 8s at worst and report an overrun, with
+every goroutine's stack, before then. A CLI copy cannot be bounded that
+tightly: it may wait out tx's own timeouts, such as 15s for an ACK. So
+`TestTreeCopyUnderFaults` sweeps seeds in a plain test, allowing each copy
+90s.
+
+The tests never touch a disk: memxfer keeps files in memfds, and the tree
+copy runs on tmpfs (`/dev/shm`, or `TX_PBT_TMPFS`), skipping when neither
+is tmpfs. They sit outside `acceptance`, because they fail until the bugs
+they find are fixed; each moves to `fuzz-long` once it passes.
+
+| Variable                  | Effect                                                                                                         |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `TX_PBT_FAULTS`           | turns the properties on; `make pbt-faults` sets it, and without it they skip                                   |
+| `TX_PBT_FAULTS_EXCLUDE`   | kinds the swarms never draw, as `disk.write.lost`; `make pbt-faults PBT_EXCLUDE=known` lists the recorded ones |
+| `TX_FAULTS_*`             | when any is set, every input runs under those faults instead of its own                                        |
+| `TX_PBT_FAULTS_SEED`      | the one seed `TestTreeCopyUnderFaults` runs                                                                    |
+| `TX_PBT_FAULTS_SEED_BASE` | the sweep's first seed; random by default, and logged                                                          |
+| `TX_PBT_FAULTS_TIME`      | how long the sweep runs; 2m by default, `PBTTIME` under make                                                   |
+
+To rerun a failure, set its repro line and run the input:
+
+```sh
+TX_PBT_FAULTS=1 TX_FAULTS_SEED=7 TX_FAULTS_DISK='write.flip=0.2' \
+    go test -run 'FuzzMemTransferUnderFaults/seed#0' ./internal/memxfer
+TX_PBT_FAULTS=1 TX_PBT_FAULTS_SEED=9 go test -run TestTreeCopyUnderFaults ./internal/cmd/filexfercli
+```
+
+The [Ideas](../IDEAS.md) bug list records each failure the properties have
+found, with its repro line.

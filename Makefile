@@ -1,4 +1,4 @@
-.PHONY: all acceptance fuzz-short fuzz-long vet build test unit bench bench-acceptance bench-acceptance-dials bench-throughput
+.PHONY: all acceptance fuzz-short fuzz-long pbt-faults pbt-faults-clean pbt-memxfer pbt-tree pbt-pool vet build test unit bench bench-acceptance bench-acceptance-dials bench-throughput
 
 FUZZTIME_SHORT ?= 5s
 FUZZTIME_LONG ?= 30s
@@ -6,6 +6,20 @@ FUZZTIME_LONG ?= 30s
 # worker shutdown, and slower race-enabled executions in CI.
 FUZZDEADLINE_SHORT ?= 30s
 FUZZDEADLINE_LONG ?= 2m
+# pbt-faults: each property gets longer than fuzz-long, on a few workers
+# rather than every core. PBTCACHE is a fuzz cache each run starts empty:
+# replaying a grown corpus of these slow inputs would spend the budget.
+PBTTIME ?= 2m
+PBTDEADLINE ?= 10m
+PBTPARALLEL ?= 4
+PBTCACHE ?= $(CURDIR)/.pbt-fuzzcache
+# Fault kinds the pbt-faults swarms leave out, comma-separated, such as
+# disk.write.lost,disk.write.flip: to look past failures already recorded.
+# Until those are fixed, an empty list fails on its first seed; known, alone
+# or in the list, stands for PBT_KNOWN, the kinds behind the failures
+# docs/IDEAS.md records.
+PBT_EXCLUDE ?=
+PBT_KNOWN := disk.read.flip,disk.write.lost,disk.write.flip,disk.open.enoent,sys.fdatasync.fail,sys.fstat.fail,net.drop
 # Fuzzes one target for a time budget, ending it with SIGINT rather than
 # -fuzztime (see scripts/fuzz): [-race] PACKAGE TARGET DURATION DEADLINE.
 FUZZ := ./scripts/fuzz
@@ -79,6 +93,25 @@ fuzz-long:
 	$(FUZZ) -race ./internal/bench/dataset FuzzFilesTSVRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/bench/dataset FuzzVerifyDetectsCorruption $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/cmd/filexfercli FuzzCopyVerifyDetectsCorruption $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG) -parallel=4
+
+# Fault-injection properties (docs/arch/FAULTS.md). They are not part of
+# acceptance: they fail until the bugs they find are fixed, and each moves to
+# fuzz-long once it passes. They skip unless TX_PBT_FAULTS is set, so their
+# seeds never fail make unit. TestTreeCopyUnderFaults sweeps random seeds for
+# PBTTIME instead of fuzzing, since its CLI copies can outlast the fuzzer's
+# 10s limit per input. Each property is its own target, so make -k
+# pbt-faults runs every one past a failing one, and still fails.
+pbt-faults: pbt-memxfer pbt-tree pbt-pool
+pbt-faults pbt-memxfer pbt-tree pbt-pool: export TX_PBT_FAULTS := 1
+pbt-faults pbt-memxfer pbt-tree pbt-pool: export TX_PBT_FAULTS_EXCLUDE := $(subst known,$(PBT_KNOWN),$(PBT_EXCLUDE))
+pbt-faults-clean:
+	rm -rf $(PBTCACHE)
+pbt-memxfer: pbt-faults-clean
+	$(FUZZ) -race ./internal/memxfer FuzzMemTransferUnderFaults $(PBTTIME) $(PBTDEADLINE) -parallel=$(PBTPARALLEL) -fuzzcachedir=$(PBTCACHE)/memxfer
+pbt-tree:
+	TX_PBT_FAULTS_TIME=$(PBTTIME) go test -race -count=1 -timeout $(PBTDEADLINE) -run '^TestTreeCopyUnderFaults$$' ./internal/cmd/filexfercli
+pbt-pool: pbt-faults-clean
+	$(FUZZ) -race . FuzzTCPConnPoolUnderFaults $(PBTTIME) $(PBTDEADLINE) -parallel=$(PBTPARALLEL) -fuzzcachedir=$(PBTCACHE)/pool
 
 # internal/bench holds benchmarks of exported code. Benchmarks that need
 # unexported access live with their package; both sets are registered here so

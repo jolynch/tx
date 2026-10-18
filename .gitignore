@@ -19,3 +19,4 @@ tmp_*_test.go
 /tx-bench-src/
 /tx-bench-dst/
 /tx-bench-*.json
+/.pbt-fuzzcache/

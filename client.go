@@ -291,6 +291,9 @@ type Client struct {
 	// Context dialer allows clients to setup custom connections
 	// For example injecting TLS
 	contextDialer func(context.Context, string) (net.Conn, error)
+	// heartbeatTimeout overrides keepAliveHeartbeatTimeout when above
+	// zero. Only tests set it, to keep a faulted heartbeat short.
+	heartbeatTimeout time.Duration
 	// faults wraps each dialed connection; nil disables fault injection.
 	faults *faults.Injector
 

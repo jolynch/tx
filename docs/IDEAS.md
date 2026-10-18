@@ -38,8 +38,64 @@ instead of widening the current change; remove an entry when it ships.
   fstats each descriptor to dedupe by inode, and on an error it closes the
   descriptor without `fdatasync` and without reporting anything, so the file
   is acknowledged but never synced. Fall back to `fdatasync` on the
-  descriptor, or count and report the failure.
+  descriptor, or count and report the failure. pbt-faults finds it as a
+  round that reports success though a sync was skipped: `TX_PBT_FAULTS=1
+  TX_FAULTS_SEED=3 TX_FAULTS_SYS='fstat.fail=0.3' go test -run
+  'FuzzMemTransferUnderFaults/seed#10' ./internal/memxfer`.
 
+- **A failed background `fdatasync` still reports success.** `syncBatch`
+  prints the error and counts the file as synced, so `tx recv copy` exits 0
+  with data that may not be durable. pbt-faults confirms it:
+  `TX_PBT_FAULTS=1 TX_FAULTS_SEED=7 TX_FAULTS_SYS='fdatasync.fail=0.5' go test
+  -run 'FuzzMemTransferUnderFaults/seed#0' ./internal/memxfer`. Fail the
+  file's ACK, or the run, when its sync fails.
+- **Bytes changed after hashing pass without `--verify`.** The server hashes
+  what it read and the client hashes the buffer before writing it, so a
+  flipped read on the server (`read.flip`) or a lost or flipped write on the
+  client (`write.lost`, `write.flip`) leaves a file marked done with wrong
+  bytes. Only `--verify` catches them, as FAULTS.md's catalog says.
+  pbt-faults confirms all three, for example `TX_PBT_FAULTS=1
+  TX_FAULTS_SEED=7 TX_FAULTS_DISK='write.flip=0.2' go test -run
+  'FuzzMemTransferUnderFaults/seed#0' ./internal/memxfer`. Rereading written
+  ranges before the ACK would catch the client's; the server's needs a
+  second read or a checksum from below the page cache.
+- **A transient open failure marks a file missing for good.** An `ENOENT`
+  from opening a file for SEND marks it Missing, a terminal state: a later
+  ACK for it returns success but changes nothing, so the client believes it
+  delivered the file while the server keeps reporting it missing, and a
+  resume of the same transfer reports success but never finishes it. Only
+  a file sent in a batch of its own can become Missing: one larger than the
+  batch size, or one a batch boundary or the end of the list leaves alone. pbt-faults finds it, kept
+  as a seed: `TX_PBT_FAULTS=1 go test -run
+  'FuzzMemTransferUnderFaults/seed#10' ./internal/memxfer`. Let a full ACK
+  move a Missing file to Done, or reject it loudly.
+- **`StartFromManifest` reports nothing for batches it never starts.** When
+  its context ends, it stops submitting batches and returns without an
+  error for the files they held, so a caller that checks only `Errors`
+  takes an unfinished transfer for a finished one. Report the context's
+  error, or count the skipped files as failed.
+- **A truncated PROBE hangs both ends.** Neither `probeTCP` nor the
+  server's `drainProbePayload` sets a deadline, so when the probe payload
+  arrives short, the server waits for the rest and the client waits for the
+  response, forever. In plaintext a dropped span does it; any peer that
+  stalls mid-probe would too, and a flipped digit in `probe-bytes=` probably
+  does the same (untested). pbt-faults finds it as a copy still running
+  after 90s: `TX_PBT_FAULTS=1 TX_PBT_FAULTS_SEED=9 TX_FAULTS_SEED=2
+  TX_FAULTS_NET='flip=0.01, drop=0.01, dup=0.01, reorder=0.01' go test -run
+  TestTreeCopyUnderFaults ./internal/cmd/filexfercli`. Bound the probe by a
+  deadline on both sides.
+- **`StartFromManifest` ignores its entries' progress.** It passes only file
+  IDs to `GetFiles`, which looks each entry up in `Manifest`, so
+  `StartFromManifestRequest.Entries[i].Progress` never takes effect and a
+  caller that sets it there restarts every file from 0. Resume from the
+  request's entries, or document that progress belongs on the manifest.
+- **A stale SEND handler can overwrite a newer window's hash.** `Serve`
+  does not join its handlers, and a client that gives up on a SEND and
+  retries it on a new connection can race the old handler, which records
+  its window hash when it finishes. With an unchanged source the hashes
+  match; if the file changed between the two reads, the client's ACK fails
+  with `CONFLICT`. That is loud, not silent, but a server could drop a
+  window's hash recorded by a SEND whose connection has already closed.
 - **A replayed ACK fails with `CONFLICT`.** The first ACK of a window
   consumes its recorded hash, so the same ACK sent again cannot verify and
   the server answers `CONFLICT window ack hash token mismatch`. When an ACK's
@@ -180,12 +236,15 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Testing
 
-- **Fault-injection properties.** `internal/faults` has the catalog and the
-  `bad-day` profile, and `internal/memxfer` runs whole transfers under them,
-  but no property test sweeps them yet. Fuzz every session mode under random
-  subsets of faults and check that every run either finishes with correct
-  data or fails loudly. Also inject server restarts and client crashes, and
-  merge `internal/benchio` into `internal/faults`.
+- **Fault-injection properties.** `make pbt-faults` fuzzes whole transfers
+  and CLI copies under swarms of faults (FAULTS.md). Still missing: server
+  restarts and client crashes mid-transfer, which would test the
+  `.tx/` state and durability claims; a property input that varies the
+  zero-copy threshold, which `ServerOptions` does not expose; reaching the
+  page-cache `readahead` and `mincore` sites, which no property's copies
+  call; more DISK and SYS faults in `TestTreeCopyUnderFaults`, whose small
+  trees give low rates few operations to hit; and merging `internal/benchio`
+  into `internal/faults`.
 - **`TestUpdateBatchThresholdConcurrentGrowthLogsOnce` is flaky.** About 1
   run in 20 fails with "timed out waiting for first growth log" under
   `-race`, already at commit c480f1e, so the growth log is sometimes never
@@ -227,6 +286,10 @@ instead of widening the current change; remove an entry when it ships.
   or add a small-file acceptance case with `--exit-after 60s`.
 
 ## Code health
+
+- **`client_pool_test.go` is past the size rule.** It holds about 1,500
+  lines. Fold the pool's overlapping unit cases into `FuzzTCPConnPool`, then
+  split what remains by area: acquire and return, heartbeats, and refills.
 
 - **Split the oversized files.** `client.go` (about 3,850 lines: options,
   manifest model, download orchestration, probe math, ACK plumbing),

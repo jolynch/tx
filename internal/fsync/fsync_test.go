@@ -450,3 +450,32 @@ func TestBackgroundSyncBatchSyncsEveryFile(t *testing.T) {
 		t.Fatalf("fdatasync gate asked %d times for two files in one batch, want 2", got)
 	}
 }
+
+// TestBackgroundSyncCountsUnsynced checks Unsynced counts each file a
+// background batch gave up on, by a failed fdatasync or a failed fstat
+// before it, and nothing when every sync succeeds.
+func TestBackgroundSyncCountsUnsynced(t *testing.T) {
+	for spec, want := range map[string]int64{"": 0, "fdatasync.fail=1": 1, "fstat.fail=1": 1} {
+		var inj *faults.Injector
+		if spec != "" {
+			inj = faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: spec}})
+		}
+		worker, stop := StartSyncWorker(1, false, time.Second, ioDiscard{}, WithFaults(inj))
+		f, err := os.CreateTemp(t.TempDir(), "sync-unsynced-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		syncOutput := worker.SyncOutput(f, 0)
+		if _, err := f.WriteString("hello"); err != nil {
+			t.Fatal(err)
+		}
+		if err := syncOutput(); err != nil {
+			t.Fatalf("%q: SyncOutput: %v", spec, err)
+		}
+		_ = f.Close()
+		stop(context.Background())
+		if got := worker.Unsynced(); got != want {
+			t.Fatalf("%q: Unsynced %d, want %d", spec, got, want)
+		}
+	}
+}
