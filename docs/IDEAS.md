@@ -236,6 +236,12 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Testing
 
+- **Benchmark varied filesystem layouts.** The generated `mixed` dataset used
+  by `TestBenchAcceptance` has nonempty regular files in three flat part
+  directories. Add a seeded layout profile with nested and empty directories,
+  zero-byte files, symlinks, and hardlink groups, and verify the copied tree
+  with the existing oracle. Keep its results separate from the current
+  profile so historical throughput comparisons retain the same workload.
 - **Fault-injection properties.** `make pbt-faults` fuzzes whole transfers
   and CLI copies under swarms of faults (FAULTS.md). Still missing: server
   restarts and client crashes mid-transfer, which would test the
@@ -245,6 +251,11 @@ instead of widening the current change; remove an entry when it ships.
   call; more DISK and SYS faults in `TestTreeCopyUnderFaults`, whose small
   trees give low rates few operations to hit; and merging `internal/benchio`
   into `internal/faults`.
+- **A tx-bench harness test is load-sensitive.** One full `go test ./...` run
+  failed `internal/bench/harness`'s
+  `TestLocalReadOnlyImportedDirectoryStartsFreshRuns...` with "1 of 2
+  measured runs failed", and it passed on an immediate rerun. Find what the
+  measured run depends on that load can starve.
 - **`TestUpdateBatchThresholdConcurrentGrowthLogsOnce` is flaky.** About 1
   run in 20 fails with "timed out waiting for first growth log" under
   `-race`, already at commit c480f1e, so the growth log is sometimes never
@@ -287,6 +298,24 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Code health
 
+- **The IO lint has known gaps.** forbidigo matches calls by name, so it cannot
+  see a method reached through an embedded `*os.File` or `net.Dialer`, or
+  through an interface such as `interface{ Sync() error }`, or an open through
+  an `fs.FS` obtained some other way. golangci-lint analyzes only `GOOS=linux`
+  files, so `_other.go` files go unchecked. A call through an interface, such
+  as `http.DefaultTransport.RoundTrip`, escapes it too, and a nil injector
+  passed to a sysio function (`sysio.Fdatasync(nil, fd)`) skips every gate
+  and lints clean. Stdlib methods that make a cataloged syscall are not banned
+  either: `(*net.TCPConn).SetNoDelay` and the buffer setters (setsockopt),
+  `(*net.TCPConn).File` (dup), and `io.Copy` between two files
+  (copy_file_range). forbidigo covers only the data-path packages, not
+  `internal/filexfer` or `internal/filexfer/encoding`, where the manifest walk
+  lives. The lint guards against raw IO added by accident; review still has to
+  catch these.
+- **The pool's liveness peek allocates on every borrow.** `sysio.PeekAlive`'s
+  closure, byte buffer, and result escape to the heap: 3 allocations per
+  borrow. Pass them through a small reusable struct, and lock the path in with
+  a zero-allocation test.
 - **`client_pool_test.go` is past the size rule.** It holds about 1,500
   lines. Fold the pool's overlapping unit cases into `FuzzTCPConnPool`, then
   split what remains by area: acquire and return, heartbeats, and refills.

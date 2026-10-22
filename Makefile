@@ -1,4 +1,4 @@
-.PHONY: all acceptance fuzz-short fuzz-long pbt-faults pbt-faults-clean pbt-memxfer pbt-tree pbt-pool vet build test unit bench bench-acceptance bench-acceptance-dials bench-throughput
+.PHONY: all lint lint-check acceptance fuzz-short fuzz-long pbt-faults pbt-faults-clean pbt-memxfer pbt-tree pbt-pool vet build test unit bench bench-acceptance bench-acceptance-dials bench-throughput
 
 FUZZTIME_SHORT ?= 5s
 FUZZTIME_LONG ?= 30s
@@ -37,6 +37,19 @@ all: build test
 
 vet:
 	go vet ./...
+
+# Keeps raw IO behind the fault gates (.golangci.yml, docs/arch/FAULTS.md).
+# The version is pinned so CI and laptops agree; the first run builds it.
+GOLANGCI_LINT ?= go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1
+# scripts/lint-nolint rejects //nolint:depguard and //nolint:all, which would
+# switch the syscall ban off for a line; nolintlint cannot forbid them.
+lint:
+	$(GOLANGCI_LINT) run ./...
+	./scripts/lint-nolint
+
+# Proves each lint rule fires and stays quiet where it should, in a copy of the tree.
+lint-check:
+	./scripts/lint-check
 
 # Both binaries land in the repo root; tx-bench forks the tx next to it.
 build: vet
