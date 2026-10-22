@@ -3,11 +3,14 @@ package fsync
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -477,5 +480,108 @@ func TestBackgroundSyncCountsUnsynced(t *testing.T) {
 		if got := worker.Unsynced(); got != want {
 			t.Fatalf("%q: Unsynced %d, want %d", spec, got, want)
 		}
+	}
+}
+
+func TestSyncOutputInjectedFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		interval int64
+		spec     string
+		wantDup  uint64
+	}{
+		{"inline", 0, "fdatasync.fail=1", 0},
+		{"dup fallback", 1, "dup.fail=1,fdatasync.fail=1", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: tc.spec}})
+			worker, stop := StartSyncWorker(tc.interval, false, 0, io.Discard, WithFaults(inj))
+			defer stop(context.Background())
+			f, err := os.CreateTemp(t.TempDir(), "out")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			err = worker.SyncOutput(f, 0)()
+			if !errors.Is(err, syscall.EIO) && !errors.Is(err, syscall.ENOSPC) {
+				t.Fatalf("SyncOutput = %v, want injected fdatasync error", err)
+			}
+			counts := inj.Counts().Sys
+			if counts[faults.SysDup] != tc.wantDup || counts[faults.SysFdatasync] != 1 || counts[faults.SysFstat] != 0 {
+				t.Fatalf("unexpected syscall counts: %v", counts)
+			}
+		})
+	}
+}
+
+func TestSyncfsDirInjectedFailureSkipsSync(t *testing.T) {
+	prev := loadSyncfsFunc()
+	defer syncfsFunc.Store(prev)
+	var calls atomic.Int64
+	syncfsFunc.Store(syncfsFuncType(func(int) error {
+		calls.Add(1)
+		return nil
+	}))
+	inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: "syncfs.fail=1"}})
+	var stderr bytes.Buffer
+	SyncfsDir(context.Background(), t.TempDir(), 0, &stderr, WithFaults(inj))
+	if calls.Load() != 0 {
+		t.Fatal("syncfs ran after its gate failed")
+	}
+	if !strings.Contains(stderr.String(), "filesystem sync failed") {
+		t.Fatalf("SyncfsDir output = %q, want failure", stderr.String())
+	}
+	if got := inj.Counts().Sys[faults.SysSyncfs]; got != 1 {
+		t.Fatalf("syncfs gate asked %d times, want 1", got)
+	}
+}
+
+func TestDefaultSyncfsRejectsInvalidDescriptor(t *testing.T) {
+	if err := loadSyncfsFunc()(-1); !errors.Is(err, syscall.EBADF) {
+		t.Fatalf("default syncfs(-1) = %v, want EBADF", err)
+	}
+}
+
+func TestBackgroundSyncBatchDeduplicatesAndCloses(t *testing.T) {
+	for _, injected := range []bool{false, true} {
+		t.Run(fmt.Sprint(injected), func(t *testing.T) {
+			var inj *faults.Injector
+			if injected {
+				inj = faults.New(faults.Config{Seed: 1})
+			}
+			f, err := os.CreateTemp(t.TempDir(), "out")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			bs := &backgroundSyncer{faults: inj}
+			var batch []syncRequest
+			for range 2 {
+				fd, err := syscall.Dup(int(f.Fd()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				batch = append(batch, syncRequest{fd: fd, size: 3})
+			}
+			bs.pendingBytes.Store(6)
+			bs.pendingFiles.Store(2)
+			bs.syncBatch(batch, io.Discard)
+			for _, req := range batch {
+				var stat syscall.Stat_t
+				if err := syscall.Fstat(req.fd, &stat); !errors.Is(err, syscall.EBADF) {
+					syscall.Close(req.fd)
+					t.Errorf("batch descriptor %d remains open: %v", req.fd, err)
+				}
+			}
+			if got := bs.snapshot(); got != (SyncSnapshot{SyncedBytes: 6, SyncedFiles: 2}) || bs.unsynced.Load() != 0 {
+				t.Fatalf("batch did not drain: snapshot=%+v unsynced=%d", got, bs.unsynced.Load())
+			}
+			if inj != nil {
+				counts := inj.Counts().Sys
+				if counts[faults.SysFstat] != 2 || counts[faults.SysFdatasync] != 1 {
+					t.Fatalf("two aliases should sync once: %v", counts)
+				}
+			}
+		})
 	}
 }

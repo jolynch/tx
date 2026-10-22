@@ -236,6 +236,11 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Testing
 
+- **Page-cache tests do not check advisory syscall arguments.** The gate
+  tests pass if `touchPages` uses `FADV_DONTNEED` instead of `FADV_WILLNEED`.
+  Check advice, offsets, and lengths with syscall interception. Exact
+  residency assertions can fail under unrelated kernel eviction, and
+  `WILLNEED` schedules reads asynchronously.
 - **Benchmark varied filesystem layouts.** The generated `mixed` dataset used
   by `TestBenchAcceptance` has nonempty regular files in three flat part
   directories. Add a seeded layout profile with nested and empty directories,
