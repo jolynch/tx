@@ -10,11 +10,11 @@ import (
 	"net"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/jolynch/tx/internal/aead"
 	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/sysio"
 	"github.com/jolynch/tx/internal/utils"
 )
 
@@ -63,8 +63,8 @@ func (c *noiseConn) Write([]byte) (int, error) { return 0, errNoiseRawIO }
 func (c *noiseConn) Close() error              { return c.sess.Close() }
 
 // SyscallConn exposes the socket for liveness peeks.
-func (c *noiseConn) SyscallConn() (syscall.RawConn, error) {
-	if sc, ok := c.Conn.(syscall.Conn); ok {
+func (c *noiseConn) SyscallConn() (sysio.RawConn, error) {
+	if sc, ok := c.Conn.(sysio.Conn); ok {
 		return sc.SyscallConn()
 	}
 	return nil, errors.New("connection has no syscall access")

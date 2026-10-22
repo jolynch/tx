@@ -9,6 +9,7 @@ package ftcp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -150,6 +151,268 @@ func TestSendSyscallGates(t *testing.T) {
 	stop()
 	close(done)
 	reached(faults.SysReadahead, "readahead")
+}
+
+// A failing gate must prevent the raw operation, including test-supplied
+// operations. Short faults must change the request rather than the result.
+func TestSendZeroCopyCallFaults(t *testing.T) {
+	for _, kind := range []string{"splice", "tee", "poll"} {
+		t.Run(kind+" fail", func(t *testing.T) {
+			inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: kind + ".fail=1"}})
+			called := false
+			sc := faultZeroCopySyscalls(inj, zeroCopySyscalls{
+				splice: func(int, *int64, int, *int64, int, int) (int64, error) { called = true; return 7, nil },
+				tee:    func(int, int, int, int) (int64, error) { called = true; return 7, nil },
+				poll:   func([]unix.PollFd, int) (int, error) { called = true; return 7, nil },
+			})
+			var n int64
+			var err error
+			switch kind {
+			case "splice":
+				n, err = sc.splice(0, nil, 0, nil, 7, 0)
+			case "tee":
+				n, err = sc.tee(0, 0, 7, 0)
+			case "poll":
+				var count int
+				count, err = sc.poll(nil, 0)
+				n = int64(count)
+			}
+			if called || n != 0 || err == nil {
+				t.Fatalf("failed %s gate: called=%v, n=%d, err=%v", kind, called, n, err)
+			}
+		})
+	}
+	for _, kind := range []string{"splice", "tee"} {
+		t.Run(kind+" short", func(t *testing.T) {
+			inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: kind + ".short=1"}})
+			const requested = 4096
+			called := 0
+			check := func(rfd, wfd, n, flags int) (int64, error) {
+				called++
+				if rfd != 11 || wfd != 12 || flags != unix.SPLICE_F_MOVE || n <= 0 || n >= requested {
+					t.Fatalf("short %s forwarded (%d, %d, %d, %d)", kind, rfd, wfd, n, flags)
+				}
+				return int64(n), unix.EIO
+			}
+			roff, woff := int64(3), int64(5)
+			sc := faultZeroCopySyscalls(inj, zeroCopySyscalls{
+				splice: func(rfd int, ro *int64, wfd int, wo *int64, n int, flags int) (int64, error) {
+					if ro != &roff || wo != &woff {
+						t.Fatal("splice changed offset pointers")
+					}
+					return check(rfd, wfd, n, flags)
+				},
+				tee: check,
+			})
+			var n int64
+			var err error
+			if kind == "splice" {
+				n, err = sc.splice(11, &roff, 12, &woff, requested, unix.SPLICE_F_MOVE)
+			} else {
+				n, err = sc.tee(11, 12, requested, unix.SPLICE_F_MOVE)
+			}
+			if called != 1 || n <= 0 || !errors.Is(err, unix.EIO) {
+				t.Fatalf("short %s: calls=%d, n=%d, err=%v", kind, called, n, err)
+			}
+		})
+	}
+}
+
+func TestKernelZeroCopyPollReadiness(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	sc := kernelZeroCopySyscalls()
+	// An empty pipe is writable and has nothing to read. Checking both the
+	// count and revents proves the default binding performs the actual poll.
+	fds := []unix.PollFd{
+		{Fd: int32(r.Fd()), Events: unix.POLLIN},
+		{Fd: int32(w.Fd()), Events: unix.POLLOUT},
+	}
+	if n, err := sc.poll(fds, 0); n != 1 || err != nil || fds[0].Revents != 0 || fds[1].Revents != unix.POLLOUT {
+		t.Fatalf("empty pipe poll = %d, %v, fds=%+v", n, err, fds)
+	}
+	if _, err := w.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := sc.poll(fds[:1], 0); n != 1 || err != nil || fds[0].Revents != unix.POLLIN {
+		t.Fatalf("readable pipe poll = %d, %v, fds=%+v", n, err, fds[:1])
+	}
+}
+
+func TestSendZeroCopySetupFailure(t *testing.T) {
+	src := memfdWithPayload(t, []byte("payload"))
+	for _, sc := range []faults.Syscall{faults.SysPipe, faults.SysDup} {
+		t.Run(sc.String(), func(t *testing.T) {
+			inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: sc.String() + ".fail=1"}})
+			server, client := newTCPPair(t)
+			defer server.Close()
+			defer client.Close()
+			var out bytes.Buffer
+			offset := int64(0)
+			hasher := xxh3.New128()
+			stats, err := streamFramePayloadZeroCopy(src, &offset, frameStreamArgs{
+				Ctx: context.Background(), FileID: 1, FrameSize: 7, Comp: "none", Mode: loadStrategyFast,
+				HeaderTS: 1, IsTerminal: true, WindowHasher: hasher,
+				Output: &out, OutputTCPConn: server, PipeSizeBytes: 4096, Faults: inj,
+			})
+			if err == nil || stats.WindowHashToken != "" || offset != 0 || out.Len() != 0 || hasher.Sum128() != xxh3.New128().Sum128() {
+				t.Fatalf("setup failure emitted a frame: err=%v, stats=%+v, offset=%d, output=%q", err, stats, offset, out.Bytes())
+			}
+			if inj.Counts().Sys[sc] != 1 || inj.Counts().Sys[faults.SysSplice] != 0 {
+				t.Fatalf("setup failure gate counts: %v", inj.Counts().Sys)
+			}
+			sys := inj.Counts().Sys
+			if sc == faults.SysPipe && (sys[faults.SysDup] != 0 || sys[faults.SysFcntl] != 0) {
+				t.Fatalf("failed source pipe continued setup: %v", sys)
+			}
+			if sc == faults.SysDup && (sys[faults.SysPipe] != 1 || sys[faults.SysFcntl] != 2) {
+				t.Fatalf("failed dup continued setup: %v", sys)
+			}
+			if sc == faults.SysDup && !errors.Is(err, unix.EMFILE) {
+				t.Fatalf("dup failure = %v; want EMFILE", err)
+			}
+			// Cleanup must leave the original connection owned by its caller.
+			_ = client.SetReadDeadline(time.Now().Add(time.Second))
+			if _, err := server.Write([]byte("x")); err != nil {
+				t.Fatal(err)
+			}
+			var got [1]byte
+			if _, err := io.ReadFull(client, got[:]); err != nil || got[0] != 'x' {
+				t.Fatalf("original socket unusable after setup failure: %q, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestSendHintGuardsAndFailures(t *testing.T) {
+	src := memfdWithPayload(t, []byte("payload"))
+	for _, test := range []struct {
+		name    string
+		sc      faults.Syscall
+		call    func(*faults.Injector, *os.File, int64, int64)
+		minimum int64
+	}{
+		{"sequential", faults.SysFadvise, tryAdviseSequential, minSequentialAdviceBytes},
+		{"readahead", faults.SysReadahead, tryReadAheadRange, 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: test.sc.String() + ".fail=1"}})
+			test.call(inj, nil, 0, test.minimum)
+			test.call(inj, src, -1, test.minimum)
+			test.call(inj, src, 0, test.minimum-1)
+			if n := inj.Counts().Sys[test.sc]; n != 0 {
+				t.Fatalf("invalid hint asked gate %d times", n)
+			}
+			test.call(inj, src, 0, test.minimum)
+			if n := inj.Counts().Sys[test.sc]; n != 1 {
+				t.Fatalf("minimum valid hint asked gate %d times; want 1", n)
+			}
+		})
+	}
+	t.Run("pipe resize", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		defer w.Close()
+		before, err := unix.FcntlInt(r.Fd(), unix.F_GETPIPE_SZ, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: "fcntl.fail=1"}})
+		growPipeBestEffort(inj, r, 0)
+		if inj.Counts().Sys[faults.SysFcntl] != 0 {
+			t.Fatal("zero size asked fcntl gate")
+		}
+		growPipeBestEffort(inj, r, before/2)
+		after, err := unix.FcntlInt(r.Fd(), unix.F_GETPIPE_SZ, 0)
+		if err != nil || after != before || inj.Counts().Sys[faults.SysFcntl] != 1 {
+			t.Fatalf("failed resize changed pipe: before=%d after=%d err=%v counts=%v", before, after, err, inj.Counts().Sys)
+		}
+	})
+}
+
+func TestSendTCPByteCountsDirectionsAndFallback(t *testing.T) {
+	server, client := newTCPPair(t)
+	defer server.Close()
+	defer client.Close()
+	payload := []byte("one direction only")
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	_ = server.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadFull(server, make([]byte, len(payload))); err != nil {
+		t.Fatal(err)
+	}
+	wrapped := faults.New(faults.Config{}).WrapConn(server, faults.Server)
+	if received, sent := tcpByteCounts(wrapped); received < int64(len(payload)) || sent != 0 {
+		t.Fatalf("reader counts = %d, %d; want received >= %d, sent = 0", received, sent, len(payload))
+	}
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	server.Close()
+	for _, conn := range []net.Conn{nil, a, server} {
+		if received, sent := tcpByteCounts(conn); received != 0 || sent != 0 {
+			t.Fatalf("unsupported/closed socket counts = %d, %d", received, sent)
+		}
+	}
+}
+
+func TestSendDuplicateConnFDOwnership(t *testing.T) {
+	server, client := newTCPPair(t)
+	defer server.Close()
+	defer client.Close()
+	fd, err := dupConnFD(server)
+	if err != nil || fd < 0 {
+		t.Fatalf("dupConnFD = %d, %v", fd, err)
+	}
+	defer unix.Close(fd)
+	server.Close()
+	// Closing Go's connection must not close the descriptor the SEND loop
+	// owns. Returning the original socket descriptor would fail here.
+	if n, err := unix.Write(fd, []byte("x")); n != 1 || err != nil {
+		t.Fatalf("write through duplicate after source close = %d, %v", n, err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	var got [1]byte
+	if _, err := io.ReadFull(client, got[:]); err != nil || got[0] != 'x' {
+		t.Fatalf("read through duplicate = %q, %v", got, err)
+	}
+	if fd, err := dupConnFD(server); fd != -1 || err == nil {
+		t.Fatalf("closed connection dup = %d, %v; want -1, error", fd, err)
+	}
+}
+
+func TestFTCPErrnoClassification(t *testing.T) {
+	for _, test := range []struct {
+		err        error
+		brokenPipe bool
+		directIO   bool
+	}{
+		{nil, false, false},
+		{unix.EPIPE, true, false},
+		{unix.ECONNRESET, true, false},
+		{io.ErrClosedPipe, true, false},
+		{net.ErrClosed, true, false},
+		{unix.EINVAL, false, true},
+		{unix.EIO, false, false},
+		{io.EOF, false, false},
+	} {
+		for _, err := range []error{test.err, &os.PathError{Op: "test", Path: "/file", Err: test.err}} {
+			if got := isBrokenPipe(err); got != test.brokenPipe {
+				t.Errorf("isBrokenPipe(%v) = %v; want %v", err, got, test.brokenPipe)
+			}
+			if got := isDirectIOReadError(err); got != test.directIO {
+				t.Errorf("isDirectIOReadError(%v) = %v; want %v", err, got, test.directIO)
+			}
+		}
+	}
 }
 
 // TestSendSiteGateCounts checks the exact number of gate calls each SEND and
