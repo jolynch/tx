@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/jolynch/tx/internal/bufpool"
@@ -23,9 +22,9 @@ import (
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/filexfer/policy"
+	"github.com/jolynch/tx/internal/sysio"
 	"github.com/jolynch/tx/internal/utils"
 	"github.com/zeebo/xxh3"
-	"golang.org/x/sys/unix"
 )
 
 const defaultFileFrameLogicalSize int64 = 4 * 1024 * 1024
@@ -724,7 +723,7 @@ func openSendFile(inj *faults.Injector, deps Deps, item sendItem, fileRef FileRe
 		return nil, false, err
 	}
 	if item.Mode == loadStrategyGentle {
-		if fd, err := os.OpenFile(fileRef.Path, os.O_RDONLY|unix.O_DIRECT, 0); err == nil {
+		if fd, err := os.OpenFile(fileRef.Path, os.O_RDONLY|sysio.O_DIRECT, 0); err == nil { //nolint:forbidigo // OpenErr above; frame reads use WrapReaderAt or gated splice.
 			return fd, true, nil
 		}
 	}
@@ -736,7 +735,7 @@ func isDirectIOReadError(err error) bool {
 	if err == nil {
 		return false
 	}
-	return errors.Is(err, syscall.EINVAL) || errors.Is(err, unix.EINVAL)
+	return errors.Is(err, sysio.EINVAL)
 }
 
 // canZeroCopy reports whether a frame can use the tee+splice zero-copy send
@@ -867,7 +866,7 @@ func desiredPipeSizeBytes(windowLen int64, frameSize int64) int {
 
 func bestEffortPipeMaxSizeBytes() int64 {
 	pipeMaxSizeOnce.Do(func() {
-		raw, err := os.ReadFile("/proc/sys/fs/pipe-max-size")
+		raw, err := os.ReadFile("/proc/sys/fs/pipe-max-size") //nolint:forbidigo // Kernel limit lookup; pipe setup uses the pipe and fcntl gates.
 		if err != nil {
 			return
 		}
@@ -881,10 +880,7 @@ func bestEffortPipeMaxSizeBytes() int64 {
 }
 
 func growPipeBestEffort(inj *faults.Injector, pipeFD *os.File, sizeBytes int) {
-	if sizeBytes <= 0 || inj.Sys(faults.SysFcntl) != nil {
-		return
-	}
-	_, _ = unix.FcntlInt(pipeFD.Fd(), unix.F_SETPIPE_SZ, sizeBytes)
+	sysio.SetPipeSize(inj, pipeFD, sizeBytes)
 }
 
 // frameLineBytes is the pooled buffer a frame header or trailer line is
@@ -1092,19 +1088,10 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 }
 
 func dupConnFD(conn *net.TCPConn) (int, error) {
-	raw, err := conn.SyscallConn()
+	// The caller applies the dup gate before entering this helper.
+	dupFD, err := sysio.DupConn(nil, conn)
 	if err != nil {
 		return -1, err
-	}
-	dupFD := -1
-	var dupErr error
-	if err := raw.Control(func(fd uintptr) {
-		dupFD, dupErr = unix.Dup(int(fd))
-	}); err != nil {
-		return -1, err
-	}
-	if dupErr != nil {
-		return -1, dupErr
 	}
 	if dupFD < 0 {
 		return -1, errors.New("failed to duplicate connection fd")
@@ -1120,23 +1107,20 @@ const zeroCopyPollTimeoutMs = 30_000 // 30s per poll wait
 type zeroCopySyscalls struct {
 	splice func(int, *int64, int, *int64, int, int) (int64, error)
 	tee    func(int, int, int, int) (int64, error)
-	poll   func([]unix.PollFd, int) (int, error)
+	poll   func([]sysio.PollFd, int) (int, error)
 }
 
 func kernelZeroCopySyscalls() zeroCopySyscalls {
-	return zeroCopySyscalls{
-		splice: unix.Splice,
-		tee:    unix.Tee,
-		poll:   unix.Poll,
-	}
+	splice, tee, poll := sysio.ZeroCopyCalls(nil)
+	return zeroCopySyscalls{splice: splice, tee: tee, poll: poll}
 }
 
 func waitSocketWritable(fd int, syscalls zeroCopySyscalls) error {
-	pollFDs := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+	pollFDs := []sysio.PollFd{{Fd: int32(fd), Events: sysio.POLLOUT}}
 	for {
 		n, err := syscalls.poll(pollFDs, zeroCopyPollTimeoutMs)
 		if err != nil {
-			if errors.Is(err, unix.EINTR) {
+			if errors.Is(err, sysio.EINTR) {
 				continue
 			}
 			return err
@@ -1144,10 +1128,10 @@ func waitSocketWritable(fd int, syscalls zeroCopySyscalls) error {
 		if n == 0 {
 			return errors.New("zero-copy splice timed out waiting for socket writable")
 		}
-		if pollFDs[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+		if pollFDs[0].Revents&(sysio.POLLERR|sysio.POLLHUP|sysio.POLLNVAL) != 0 {
 			return errors.New("socket error during zero-copy splice")
 		}
-		if pollFDs[0].Revents&unix.POLLOUT != 0 {
+		if pollFDs[0].Revents&sysio.POLLOUT != 0 {
 			return nil
 		}
 		return errors.New("socket did not become writable during zero-copy splice")
@@ -1172,10 +1156,7 @@ func faultZeroCopySyscalls(inj *faults.Injector, sc zeroCopySyscalls) zeroCopySy
 }
 
 func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args frameStreamArgs, syscalls zeroCopySyscalls) (frameStreamStats, error) {
-	if err := args.Faults.Sys(faults.SysPipe); err != nil {
-		return frameStreamStats{}, err
-	}
-	srcR, srcW, err := os.Pipe()
+	srcR, srcW, err := sysio.Pipe(args.Faults)
 	if err != nil {
 		return frameStreamStats{}, err
 	}
@@ -1198,14 +1179,11 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 	if err != nil {
 		return frameStreamStats{}, err
 	}
-	defer unix.Close(outFD)
+	defer sysio.Close(outFD)
 
 	// Hash pipe: tee duplicates pipe1 data here for hashing, while pipe1
 	// data is spliced directly to the socket without entering userspace.
-	if err := args.Faults.Sys(faults.SysPipe); err != nil {
-		return frameStreamStats{}, err
-	}
-	hashPipeR, hashPipeW, err := os.Pipe()
+	hashPipeR, hashPipeW, err := sysio.Pipe(args.Faults)
 	if err != nil {
 		return frameStreamStats{}, err
 	}
@@ -1234,10 +1212,10 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 		}
 
 		spliceStart := time.Now()
-		splicedIn, spliceErr := syscalls.splice(int(fd.Fd()), fileOffset, int(srcW.Fd()), nil, int(step), unix.SPLICE_F_MOVE)
+		splicedIn, spliceErr := syscalls.splice(int(fd.Fd()), fileOffset, int(srcW.Fd()), nil, int(step), sysio.SPLICE_F_MOVE)
 		prepareLatency += time.Since(spliceStart)
 		if spliceErr != nil {
-			if errors.Is(spliceErr, unix.EINTR) {
+			if errors.Is(spliceErr, sysio.EINTR) {
 				continue
 			}
 			readRegion.End()
@@ -1258,7 +1236,7 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 			teed, teeErr := syscalls.tee(srcRFD, hashPipeWFD, int(sourceRemaining), 0)
 			prepareLatency += time.Since(teeStart)
 			if teeErr != nil {
-				if errors.Is(teeErr, unix.EINTR) {
+				if errors.Is(teeErr, sysio.EINTR) {
 					continue
 				}
 				readRegion.End()
@@ -1273,12 +1251,12 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 			writeStart := time.Now()
 			moveRemaining := teed
 			for moveRemaining > 0 {
-				moved, moveErr := syscalls.splice(srcRFD, nil, outFD, nil, int(moveRemaining), unix.SPLICE_F_MOVE)
+				moved, moveErr := syscalls.splice(srcRFD, nil, outFD, nil, int(moveRemaining), sysio.SPLICE_F_MOVE)
 				if moveErr != nil {
-					if errors.Is(moveErr, unix.EINTR) {
+					if errors.Is(moveErr, sysio.EINTR) {
 						continue
 					}
-					if errors.Is(moveErr, unix.EAGAIN) {
+					if errors.Is(moveErr, sysio.EAGAIN) {
 						if waitErr := waitSocketWritable(outFD, syscalls); waitErr != nil {
 							readRegion.End()
 							return frameStreamStats{}, waitErr
@@ -1474,10 +1452,10 @@ func releaseCompressedFrameBuffer(buf *bytes.Buffer) {
 const minSequentialAdviceBytes = 128 << 10
 
 func tryAdviseSequential(inj *faults.Injector, fd *os.File, offset int64, length int64) {
-	if fd == nil || offset < 0 || length < minSequentialAdviceBytes || inj.Sys(faults.SysFadvise) != nil {
+	if fd == nil || offset < 0 || length < minSequentialAdviceBytes {
 		return
 	}
-	_ = unix.Fadvise(int(fd.Fd()), offset, length, unix.FADV_SEQUENTIAL)
+	_ = sysio.Fadvise(inj, fd.Fd(), offset, length, sysio.FADV_SEQUENTIAL)
 }
 
 // readaheadHint describes a file region for the background readahead goroutine
@@ -1490,10 +1468,10 @@ type readaheadHint struct {
 // tryReadAheadRange issues the readahead(2) syscall to asynchronously populate
 // the page cache for the given byte range.
 func tryReadAheadRange(inj *faults.Injector, fd *os.File, offset int64, length int64) {
-	if fd == nil || offset < 0 || length <= 0 || inj.Sys(faults.SysReadahead) != nil {
+	if fd == nil || offset < 0 || length <= 0 {
 		return
 	}
-	_, _, _ = unix.Syscall(unix.SYS_READAHEAD, fd.Fd(), uintptr(offset), uintptr(length))
+	_ = sysio.Readahead(inj, fd.Fd(), offset, length)
 }
 
 // startFrameReadahead spawns a background goroutine that issues readahead(2)

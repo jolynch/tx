@@ -9,11 +9,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/pagecache"
+	"github.com/jolynch/tx/internal/sysio"
 	"github.com/jolynch/tx/internal/utils"
 	"github.com/zeebo/xxh3"
 )
@@ -230,7 +230,7 @@ func validatePath(path string) (isDir bool, err error) {
 		}
 		return true, nil
 	}
-	fd, err := os.Open(path)
+	fd, err := os.Open(path) //nolint:forbidigo // Manifest readability probe; SEND and CXSUM gate data opens with OpenErr.
 	if err != nil {
 		return false, errors.New("file is not readable")
 	}
@@ -492,6 +492,6 @@ func isBrokenPipe(err error) bool {
 	}
 	return errors.Is(err, io.ErrClosedPipe) ||
 		errors.Is(err, net.ErrClosed) ||
-		errors.Is(err, syscall.EPIPE) ||
-		errors.Is(err, syscall.ECONNRESET)
+		errors.Is(err, sysio.EPIPE) ||
+		errors.Is(err, sysio.ECONNRESET)
 }

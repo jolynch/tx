@@ -7,11 +7,10 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/jolynch/tx/internal/events"
-	"golang.org/x/sys/unix"
+	"github.com/jolynch/tx/internal/sysio"
 )
 
 // A probed client keeps two connection pools that never share connections.
@@ -767,7 +766,7 @@ func sessionConnAlive(sc *sessionTCPConn) bool {
 	if sess := noiseSessionOf(sc); sess != nil && (sess.Failed() || sess.Buffered() > 0) {
 		return false
 	}
-	syscallConn, ok := sc.Conn.(syscall.Conn)
+	syscallConn, ok := sc.Conn.(sysio.Conn)
 	if !ok {
 		// Cannot peek this transport (custom dialer); assume alive rather
 		// than evicting every pooled connection.
@@ -777,17 +776,8 @@ func sessionConnAlive(sc *sessionTCPConn) bool {
 	if err != nil {
 		return true
 	}
-	alive := true
-	// The closure runs synchronously inside raw.Read before this function
-	// returns, so capturing the stack array by reference keeps the peek
-	// buffer off-heap on this per-borrow hot path.
-	var peek [1]byte
-	ctrlErr := raw.Read(func(fd uintptr) bool {
-		_, _, recvErr := unix.Recvfrom(int(fd), peek[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
-		alive = recvErr == unix.EAGAIN || recvErr == unix.EWOULDBLOCK
-		return true // never block waiting for readability
-	})
-	if ctrlErr != nil {
+	alive, err := sysio.PeekAlive(raw)
+	if err != nil {
 		return true
 	}
 	return alive
