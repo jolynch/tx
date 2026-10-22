@@ -19,8 +19,3 @@ func SetFaults(inj *faults.Injector) (clear func()) {
 	injector.Store(inj)
 	return func() { injector.CompareAndSwap(inj, nil) }
 }
-
-// sysGate returns the error to report instead of making sc, or nil.
-func sysGate(sc faults.Syscall) error {
-	return injector.Load().Sys(sc)
-}

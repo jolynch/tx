@@ -5,10 +5,8 @@ package pagecache
 import (
 	"os"
 	"runtime"
-	"unsafe"
 
-	"github.com/jolynch/tx/internal/faults"
-	"golang.org/x/sys/unix"
+	"github.com/jolynch/tx/internal/sysio"
 )
 
 const touchSupported = true
@@ -25,7 +23,7 @@ var (
 )
 
 func loadResidency(path string) ([]byte, int, error) {
-	fd, err := os.Open(path)
+	fd, err := os.Open(path) //nolint:forbidigo // Page-cache bookkeeping; mmap, mincore, and fadvise use sysio gates.
 	if err != nil {
 		return nil, 0, err
 	}
@@ -44,14 +42,11 @@ func loadResidency(path string) ([]byte, int, error) {
 	numPages := int((size + int64(pageSize) - 1) / int64(pageSize))
 	mappedBytes := numPages * pageSize
 
-	if err := sysGate(faults.SysMmap); err != nil {
-		return nil, 0, err
-	}
-	addr, err := unix.Mmap(int(fd.Fd()), 0, mappedBytes, unix.PROT_NONE, unix.MAP_SHARED)
+	addr, err := sysio.Mmap(injector.Load(), fd.Fd(), 0, mappedBytes, sysio.PROT_NONE, sysio.MAP_SHARED)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer unix.Munmap(addr)
+	defer sysio.Munmap(addr)
 
 	bits := make([]byte, (numPages+7)/8)
 	vecPages := mincoreChunkPages
@@ -88,7 +83,7 @@ func loadResidencyRange(path string, startPage, numPages int) ([]byte, int, erro
 	if startPage < 0 || numPages <= 0 {
 		return nil, 0, nil
 	}
-	fd, err := os.Open(path)
+	fd, err := os.Open(path) //nolint:forbidigo // Page-cache bookkeeping; mmap, mincore, and fadvise use sysio gates.
 	if err != nil {
 		return nil, 0, err
 	}
@@ -111,14 +106,11 @@ func loadResidencyRange(path string, startPage, numPages int) ([]byte, int, erro
 	}
 	mappedBytes := int(end - offsetBytes)
 
-	if err := sysGate(faults.SysMmap); err != nil {
-		return nil, 0, err
-	}
-	addr, err := unix.Mmap(int(fd.Fd()), offsetBytes, mappedBytes, unix.PROT_NONE, unix.MAP_SHARED)
+	addr, err := sysio.Mmap(injector.Load(), fd.Fd(), offsetBytes, mappedBytes, sysio.PROT_NONE, sysio.MAP_SHARED)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer unix.Munmap(addr)
+	defer sysio.Munmap(addr)
 
 	bits := make([]byte, (numPages+7)/8)
 	vecPages := mincoreChunkPages
@@ -157,7 +149,7 @@ func loadResidencyRange(path string, startPage, numPages int) ([]byte, int, erro
 // advise=false. err is a setup error (open / stat). Per-run mmap failures
 // in the advise=false branch are dropped (advisory).
 func touchPages(path string, bits []byte, numPages int, advise bool) (int, error) {
-	fd, err := os.Open(path)
+	fd, err := os.Open(path) //nolint:forbidigo // Page-cache bookkeeping; mmap, mincore, and fadvise use sysio gates.
 	if err != nil {
 		return 0, err
 	}
@@ -200,7 +192,7 @@ func touchPages(path string, bits []byte, numPages int, advise bool) (int, error
 				if offset+length > info.Size() {
 					length = info.Size() - offset
 				}
-				if err := fadviseGated(fd.Fd(), offset, length, unix.FADV_WILLNEED); err != nil {
+				if err := fadviseGated(fd.Fd(), offset, length, sysio.FADV_WILLNEED); err != nil {
 					adviseErrs++
 				}
 			}
@@ -213,10 +205,7 @@ func touchPages(path string, bits []byte, numPages int, advise bool) (int, error
 			if length <= 0 {
 				continue
 			}
-			if sysGate(faults.SysMmap) != nil {
-				continue // advisory, as a real mmap failure is
-			}
-			addr, mErr := unix.Mmap(int(fd.Fd()), offset, int(length), unix.PROT_READ, unix.MAP_SHARED)
+			addr, mErr := sysio.Mmap(injector.Load(), fd.Fd(), offset, int(length), sysio.PROT_READ, sysio.MAP_SHARED)
 			if mErr != nil {
 				continue // advisory; drop per-run mmap failures
 			}
@@ -224,7 +213,7 @@ func touchPages(path string, bits []byte, numPages int, advise bool) (int, error
 			for p := int64(0); p < length; p += pageSize {
 				sink ^= addr[p]
 			}
-			_ = unix.Munmap(addr)
+			_ = sysio.Munmap(addr)
 		}
 	}
 	runtime.KeepAlive(sink)
@@ -236,49 +225,25 @@ func touchPages(path string, bits []byte, numPages int, advise bool) (int, error
 // wipe a receiver's writer-populated cache before warming with the sender's
 // snapshot. Returns the fadvise error if it failed.
 func evictPages(path string) error {
-	fd, err := os.Open(path)
+	fd, err := os.Open(path) //nolint:forbidigo // Page-cache bookkeeping; mmap, mincore, and fadvise use sysio gates.
 	if err != nil {
 		return err
 	}
 	defer fd.Close()
-	return fadviseGated(fd.Fd(), 0, 0, unix.FADV_DONTNEED)
+	return fadviseGated(fd.Fd(), 0, 0, sysio.FADV_DONTNEED)
 }
 
 // fadviseGated issues posix_fadvise behind the fault gate.
 func fadviseGated(fd uintptr, offset, length int64, advice int) error {
-	if err := sysGate(faults.SysFadvise); err != nil {
-		return err
-	}
-	return unix.Fadvise(int(fd), offset, length, advice)
+	return sysio.Fadvise(injector.Load(), fd, offset, length, advice)
 }
 
 // systemMemoryBytes returns total system RAM via sysinfo(2).
 func systemMemoryBytes() (int64, error) {
-	var info unix.Sysinfo_t
-	if err := unix.Sysinfo(&info); err != nil {
-		return 0, err
-	}
-	return int64(info.Totalram) * int64(info.Unit), nil
+	return sysio.TotalMemoryBytes()
 }
 
-// mincore wraps the SYS_MINCORE syscall. It returns one byte per page in
-// vec; bit 0 of each byte is set when the page is resident in the cache.
-// golang.org/x/sys/unix does not export Mincore, so we invoke it directly.
+// mincore reports one byte per page in vec; bit 0 marks a resident page.
 func mincore(b []byte, vec []byte) error {
-	if len(b) == 0 {
-		return nil
-	}
-	if err := sysGate(faults.SysMincore); err != nil {
-		return err
-	}
-	_, _, errno := unix.Syscall(
-		unix.SYS_MINCORE,
-		uintptr(unsafe.Pointer(&b[0])),
-		uintptr(len(b)),
-		uintptr(unsafe.Pointer(&vec[0])),
-	)
-	if errno != 0 {
-		return errno
-	}
-	return nil
+	return sysio.Mincore(injector.Load(), b, vec)
 }

@@ -105,9 +105,9 @@ linters:
       # Baseline: raw calls not yet moved behind sysio or annotated. Each
       # migration removes its files; nothing may be added.
       - linters: [depguard]
-        path: ^(client_auth|client_pool)\.go$|^internal/(aead/credential|filexfer/progress|fsync/fsync|pagecache/syscall_linux|cmd/filexfercli/cli_local_copyrange_linux|filexfer/encoding/(frame|manifest)|filexfer/ftcp/(send|tcpinfo_linux|txfer))\.go$
+        path: ^(client_auth|client_pool)\.go$|^internal/(aead/credential|filexfer/progress|cmd/filexfercli/cli_local_copyrange_linux|filexfer/encoding/(frame|manifest)|filexfer/ftcp/(send|tcpinfo_linux|txfer))\.go$
       - linters: [forbidigo]
-        path: ^(client|client_tcp)\.go$|^internal/(cmd/filexfercli/(cli|cli_local|cli_transfer|cli_verify)|filexfer/ftcp/(send|txfer)|filexfer/store/store|pagecache/syscall_linux)\.go$
+        path: ^(client|client_tcp)\.go$|^internal/(cmd/filexfercli/(cli|cli_local|cli_transfer|cli_verify)|filexfer/ftcp/(send|txfer)|filexfer/store/store)\.go$
 
 # Report every violation: the caps would hide repeats of the same raw call.
 issues:

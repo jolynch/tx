@@ -235,7 +235,66 @@ func TestPageCacheSyscallsGoThroughFaults(t *testing.T) {
 	step("loadResidency mmap", faults.SysMmap, func() error { _, _, err := loadResidency(path); return err })
 	step("loadResidency mincore", faults.SysMincore, func() error { _, _, err := loadResidency(path); return err })
 	step("loadResidencyRange mmap", faults.SysMmap, func() error { _, _, err := loadResidencyRange(path, 0, 2); return err })
+	step("loadResidencyRange mincore", faults.SysMincore, func() error { _, _, err := loadResidencyRange(path, 0, 2); return err })
 	step("touchPages mmap", faults.SysMmap, func() error { _, err := touchPages(path, []byte{0x0f}, 4, false); return err })
 	step("touchPages fadvise", faults.SysFadvise, func() error { _, err := touchPages(path, []byte{0x0f}, 4, true); return err })
 	step("evictPages fadvise", faults.SysFadvise, func() error { return evictPages(path) })
+}
+
+func TestPageCacheInjectedFailures(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.bin")
+	if err := os.WriteFile(path, make([]byte, 4*os.Getpagesize()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		sc   faults.Syscall
+		run  func() error
+	}{
+		{"load mmap", faults.SysMmap, func() error { _, _, err := loadResidency(path); return err }},
+		{"load mincore", faults.SysMincore, func() error { _, _, err := loadResidency(path); return err }},
+		{"range mmap", faults.SysMmap, func() error { _, _, err := loadResidencyRange(path, 1, 2); return err }},
+		{"range mincore", faults.SysMincore, func() error { _, _, err := loadResidencyRange(path, 1, 2); return err }},
+		{"evict fadvise", faults.SysFadvise, func() error { return evictPages(path) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: tc.sc.String() + ".fail=1"}})
+			defer SetFaults(inj)()
+			if err := tc.run(); err == nil {
+				t.Fatal("injected syscall failure was ignored")
+			}
+			if got := inj.Counts().Sys[tc.sc]; got != 1 {
+				t.Fatalf("%s gate asked %d times, want 1", tc.sc, got)
+			}
+		})
+	}
+}
+
+func TestTouchPagesInjectedFailuresAreAdvisory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.bin")
+	if err := os.WriteFile(path, make([]byte, 4*os.Getpagesize()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name       string
+		sc         faults.Syscall
+		advise     bool
+		wantErrors int
+	}{
+		{"mmap", faults.SysMmap, false, 0},
+		{"fadvise", faults.SysFadvise, true, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: tc.sc.String() + ".fail=1"}})
+			defer SetFaults(inj)()
+			// Pages 0 and 2 are separate runs, each requiring its own call.
+			adviseErrors, err := touchPages(path, []byte{0x05}, 4, tc.advise)
+			if err != nil || adviseErrors != tc.wantErrors {
+				t.Fatalf("touchPages = (%d, %v), want (%d, nil)", adviseErrors, err, tc.wantErrors)
+			}
+			if got := inj.Counts().Sys[tc.sc]; got != 2 {
+				t.Fatalf("%s gate asked %d times, want 2", tc.sc, got)
+			}
+		})
+	}
 }

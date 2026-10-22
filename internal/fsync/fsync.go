@@ -9,12 +9,11 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
-	"golang.org/x/sys/unix"
+	"github.com/jolynch/tx/internal/sysio"
 )
 
 const (
@@ -113,10 +112,7 @@ func (w *SyncWorker) SyncOutput(fd *os.File, offset int64) func() error {
 	}
 	return func() error {
 		if w.background != nil {
-			dupFD, err := -1, w.faults.Sys(faults.SysDup)
-			if err == nil {
-				dupFD, err = syscall.Dup(int(fd.Fd()))
-			}
+			dupFD, err := sysio.Dup(w.faults, int(fd.Fd()))
 			if err != nil {
 				return fdatasync(w.faults, int(fd.Fd()))
 			}
@@ -137,10 +133,7 @@ func (w *SyncWorker) SyncOutput(fd *os.File, offset int64) func() error {
 
 // fdatasync syncs fd behind inj's gate.
 func fdatasync(inj *faults.Injector, fd int) error {
-	if err := inj.Sys(faults.SysFdatasync); err != nil {
-		return err
-	}
-	return syscall.Fdatasync(fd)
+	return sysio.Fdatasync(inj, fd)
 }
 
 // SyncfsDir issues a best-effort syncfs against dir and returns when either
@@ -154,7 +147,7 @@ func SyncfsDir(ctx context.Context, dir string, progressInterval time.Duration, 
 	if absPath, err := filepath.Abs(dir); err == nil {
 		displayPath = absPath
 	}
-	fd, err := unix.Open(dir, unix.O_RDONLY, 0)
+	fd, err := sysio.OpenDir(dir) //nolint:forbidigo // Durability setup; the syncfs gate runs below.
 	if err != nil {
 		fmt.Fprintf(stderr, "final-syncfs: [%s] open failed: %v\n", displayPath, err)
 		return
@@ -177,7 +170,7 @@ func SyncfsDir(ctx context.Context, dir string, progressInterval time.Duration, 
 	}
 	select {
 	case err := <-done:
-		unix.Close(fd)
+		sysio.Close(fd)
 		elapsed := time.Since(start)
 		if err != nil {
 			fmt.Fprintf(stderr, "final-syncfs: [%s] filesystem sync failed after %s: %v\n", displayPath, elapsed.Round(time.Millisecond), err)
@@ -190,7 +183,7 @@ func SyncfsDir(ctx context.Context, dir string, progressInterval time.Duration, 
 			fmt.Fprintf(stderr, "final-syncfs: [%s] waiting %s outstanding=0 files\n", displayPath, elapsed.Round(time.Millisecond))
 			select {
 			case err := <-done:
-				unix.Close(fd)
+				sysio.Close(fd)
 				elapsed = time.Since(start)
 				if err != nil {
 					fmt.Fprintf(stderr, "final-syncfs: [%s] filesystem sync failed after %s: %v\n", displayPath, elapsed.Round(time.Millisecond), err)
@@ -200,7 +193,7 @@ func SyncfsDir(ctx context.Context, dir string, progressInterval time.Duration, 
 				return
 			case <-tick:
 			case <-ctx.Done():
-				unix.Close(fd)
+				sysio.Close(fd)
 				elapsed = time.Since(start)
 				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 					fmt.Fprintf(stderr, "WARNING: final-syncfs: [%s] filesystem sync timed out after %s. Data may not yet be durable on disk\n", displayPath, elapsed.Round(time.Millisecond))
@@ -211,7 +204,7 @@ func SyncfsDir(ctx context.Context, dir string, progressInterval time.Duration, 
 			}
 		}
 	case <-ctx.Done():
-		unix.Close(fd)
+		sysio.Close(fd)
 		elapsed := time.Since(start)
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			fmt.Fprintf(stderr, "WARNING: final-syncfs: [%s] filesystem sync timed out after %s. Data may not yet be durable on disk\n", displayPath, elapsed.Round(time.Millisecond))
@@ -226,7 +219,10 @@ type syncfsFuncType func(int) error
 var syncfsFunc atomic.Value
 
 func init() {
-	syncfsFunc.Store(syncfsFuncType(unix.Syncfs))
+	syncfsFunc.Store(syncfsFuncType(func(fd int) error {
+		// SyncfsDir gates the call before reaching this test hook.
+		return sysio.Syncfs(nil, fd)
+	}))
 }
 
 func loadSyncfsFunc() syncfsFuncType {
@@ -317,15 +313,11 @@ func (bs *backgroundSyncer) syncBatch(batch []syncRequest, stderr io.Writer) {
 	type fileKey struct{ dev, ino uint64 }
 	seen := make(map[fileKey]bool, len(batch))
 	for _, req := range batch {
-		var stat syscall.Stat_t
-		err := bs.faults.Sys(faults.SysFstat)
-		if err == nil {
-			err = syscall.Fstat(req.fd, &stat)
-		}
+		dev, ino, err := sysio.FileID(bs.faults, req.fd)
 		if err != nil {
 			bs.unsynced.Add(1)
 		} else {
-			key := fileKey{stat.Dev, stat.Ino}
+			key := fileKey{dev, ino}
 			if !seen[key] {
 				if err := fdatasync(bs.faults, req.fd); err != nil {
 					bs.unsynced.Add(1)
@@ -334,7 +326,7 @@ func (bs *backgroundSyncer) syncBatch(batch []syncRequest, stderr io.Writer) {
 				seen[key] = true
 			}
 		}
-		syscall.Close(req.fd)
+		sysio.Close(req.fd)
 		bs.pendingBytes.Add(-req.size)
 		bs.pendingFiles.Add(-1)
 		bs.synced.Add(req.size)
@@ -580,15 +572,11 @@ func maxAdaptiveThresholdForMemory(baseThreshold int64, mem int64) int64 {
 }
 
 func systemMemoryBytes() int64 {
-	var info unix.Sysinfo_t
-	if err := unix.Sysinfo(&info); err != nil {
+	total, err := sysio.TotalMemoryBytes()
+	if err != nil || total == 0 || uint64(total) > uint64(^uint(0)>>1) {
 		return 0
 	}
-	total := uint64(info.Totalram) * uint64(info.Unit)
-	if total == 0 || total > uint64(^uint(0)>>1) {
-		return 0
-	}
-	return int64(total)
+	return total
 }
 
 func updateMaxAtomic(dst *atomic.Int64, candidate int64) bool {
