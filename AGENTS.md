@@ -149,6 +149,8 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
   **Proposal**, **Rejected alternatives**, and **Verification**.
 
 ```sh
+make lint         # golangci-lint: raw IO stays behind the fault gates
+make lint-check   # proves each lint rule fires and each exclusion holds (~3 min, several cores)
 make test         # build + unit + acceptance
 make unit         # go test -race ./...
 make fuzz-short   # unit-test replacements; 5s each
@@ -198,6 +200,13 @@ go run ./cmd/tx-bench local -s 256MiB -n 1
   Every injected duration is a beta distribution from `internal/stats`.
   `Swarm` draws random fault sets, and the `PBT*` helpers serve the
   pbt-faults property tests (`make pbt-faults`).
+- `internal/sysio`: the raw system calls of the data path. Each one the
+  fault catalog can fault sits behind its gate: those functions take the
+  injector first. `make lint` rejects
+  `syscall` and `golang.org/x/sys/unix` imports elsewhere, outside the
+  harnesses, and raw opens, pipes, syncs, and dials in the data-path packages
+  without a `//nolint:forbidigo` reason naming their gate. Files whose calls
+  have not moved yet are listed in `.golangci.yml`'s Baseline.
 - `internal/stats`: the beta distribution, its fits from a mean and a
   percentile or from two percentiles, and its sampler.
 - `internal/memxfer`: whole transfers between a real server and client in one

@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+# Usage: scripts/lint-check
+#
+# Proves that the .golangci.yml rules and scripts/lint-nolint fire where they
+# should and stay quiet where they should. It copies the tree (tracked and
+# untracked files, minus ignored ones) into a temporary directory, so the
+# working tree is never touched. Each case writes one fixture file into that
+# copy, runs the check, and removes the fixture again, so cases do not
+# interfere. A case that expects a finding passes only when the check exits
+# nonzero and reports the named linter on the fixture's expected line; a case
+# that expects silence passes only when the check exits 0. The last cases run
+# `make lint` on the whole copy, with and without a fixture.
+#
+# GOLANGCI_LINT overrides the linter command; it defaults to the pinned
+# release the Makefile uses. Cases run one at a time. The script prints one
+# PASS or FAIL line per case and exits nonzero if any case fails.
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+read -r -a lint <<<"${GOLANGCI_LINT:-go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1}"
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/tx-lint-check.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+
+# Copy every file git would show: tracked and untracked, skipping ignored
+# files and tracked files deleted from the working tree.
+git -C "$root" ls-files -co --exclude-standard -z |
+	(cd "$root" && while IFS= read -r -d '' f; do
+		[ -e "$f" ] && printf '%s\0' "$f"
+	done) |
+	tar -C "$root" --null -T - -cf - | tar -C "$work" -xf -
+
+sysio_msg='use internal/sysio, so fault injection reaches the call'
+nolint_msg='lint: //nolint must'
+fixture=lintcheck_fixture
+failures=0
+out=$work/.lint-check.out
+
+pass() { printf 'PASS  %s\n' "$1"; }
+fail() {
+	printf 'FAIL  %s: %s\n' "$1" "$2"
+	sed 's/^/      | /' "$out"
+	failures=$((failures + 1))
+}
+
+# gosrc FILE IMPORTS BODY [HEAD]
+#
+# Prints a Go file for FILE's package: HEAD (comments above the package
+# clause), the package clause, an import block, and BODY. IMPORTS is a
+# space-separated list of paths, each optionally NAME=PATH. BODY and HEAD
+# take printf %b escapes such as \n and \t.
+gosrc() {
+	local file=$1 imports=$2 body=$3 head=${4:-} dir pkg imp
+	dir=$(dirname "$file")
+	case $dir in
+	.) pkg=tx ;;
+	cmd/*) pkg=main ;;
+	*) pkg=${dir##*/} ;;
+	esac
+	if [ -n "$head" ]; then printf '%b\n' "$head"; fi
+	printf 'package %s\n\n' "$pkg"
+	if [ -n "$imports" ]; then
+		printf 'import (\n'
+		for imp in $imports; do
+			case $imp in
+			*=*) printf '\t%s "%s"\n' "${imp%%=*}" "${imp#*=}" ;;
+			*) printf '\t"%s"\n' "$imp" ;;
+			esac
+		done
+		printf ')\n\n'
+	fi
+	printf '%b\n' "$body"
+}
+
+# check NAME WANT FILE LINTER AT [MSG] < fixture
+#
+# Writes the fixture from stdin to FILE (relative to the copy), creating its
+# directory if needed, and lints FILE's package. WANT is "fire" or "quiet".
+# For "fire", the output must hold at least CHECK_COUNT (default 1) LINTER
+# findings on FILE at the first line containing AT, each containing MSG when
+# given. CHECK_DIR (relative to the copy, default the copy itself) is where
+# the linter runs; findings may then name FILE relative to either directory.
+check() {
+	local name=$1 want=$2 file=$3 linter=$4 at=$5 msg=${6:-}
+	local dir=${CHECK_DIR:-.} count=${CHECK_COUNT:-1}
+	local path=$work/$file pkgdir=$work/$(dirname "$file") made=
+	local status=0 line rel found
+	if [ ! -d "$pkgdir" ]; then
+		mkdir -p "$pkgdir"
+		made=$pkgdir
+	fi
+	cat >"$path"
+	rel=$(realpath --relative-to="$work/$dir" "$path")
+	(cd "$work/$dir" && "${lint[@]}" run "./$(dirname "$rel")") >"$out" 2>&1 || status=$?
+	line=$(grep -nFm1 -- "$at" "$path" | cut -d: -f1)
+	rm -f "$path"
+	if [ -n "$made" ]; then rm -rf "$made"; fi
+
+	case $want in
+	quiet)
+		if [ "$status" -eq 0 ]; then
+			pass "$name"
+		else
+			fail "$name" "expected no findings, linter exited $status"
+		fi
+		;;
+	fire)
+		# rel is a suffix of file, so this matches either form.
+		found=$(grep -F -- "$rel:$line:" "$out" | grep -F -- "($linter)" | grep -cF -- "$msg" || true)
+		if [ "$status" -eq 0 ]; then
+			fail "$name" "expected a $linter finding, linter exited 0"
+		elif [ "$found" -ge "$count" ]; then
+			pass "$name"
+		else
+			fail "$name" "$found of $count $linter findings at $file:$line${msg:+ containing \"$msg\"}"
+		fi
+		;;
+	*)
+		echo "check: unknown expectation $want" >&2
+		exit 2
+		;;
+	esac
+}
+
+# run_table LINTER WANT MSG ROW...
+#
+# Runs one check per ROW, each NAME|FILE|IMPORTS|AT|BODY, where an @ in FILE
+# stands for the fixture's base name. The case is named "LINTER WANT: NAME".
+run_table() {
+	local linter=$1 want=$2 msg=$3 row name file imports at body
+	shift 3
+	for row in "$@"; do
+		IFS='|' read -r name file imports at body <<<"$row"
+		file=${file//@/$fixture}
+		check "$linter $want: $name" "$want" "$file" "$linter" "$at" "$msg" \
+			< <(gosrc "$file" "$imports" "$body")
+	done
+}
+
+# check_make NAME WANT [FILE [MSG [LINTER]]] < fixture
+#
+# Runs `make lint` in the copy, with the fixture from stdin written to FILE
+# when FILE is given. WANT is "fire" or "quiet". For "fire", make must exit
+# nonzero, and its output must hold MSG (default: lint-nolint's message) and
+# name FILE. LINTER replaces the golangci-lint command; `true` skips
+# golangci-lint, so only scripts/lint-nolint runs.
+check_make() {
+	local name=$1 want=$2 file=${3:-} msg=${4:-$nolint_msg} linter=${5:-${lint[*]}}
+	local status=0
+	if [ -n "$file" ]; then cat >"$work/$file"; fi
+	make -C "$work" --no-print-directory lint GOLANGCI_LINT="$linter" >"$out" 2>&1 || status=$?
+	if [ -n "$file" ]; then rm -f "$work/$file"; fi
+
+	case $want in
+	quiet)
+		if [ "$status" -eq 0 ]; then
+			pass "$name"
+		else
+			fail "$name" "expected make lint to pass, it exited $status"
+		fi
+		;;
+	fire)
+		if [ "$status" -eq 0 ]; then
+			fail "$name" "expected make lint to fail, it exited 0"
+		elif grep -qF -- "$msg" "$out" && grep -qF -- "$file:" "$out"; then
+			pass "$name"
+		else
+			fail "$name" "make lint exited $status without \"$msg\" naming $file"
+		fi
+		;;
+	esac
+}
+
+# check_nolint NAME WANT FILE SRC
+#
+# Writes SRC to FILE and runs the copy's scripts/lint-nolint twice: directly,
+# and through make with golangci-lint skipped. For "fire", each must exit
+# nonzero with lint-nolint's message and name FILE; for "quiet", each must
+# exit 0.
+check_nolint() {
+	local name=$1 want=$2 file=$3 src=$4 status=0
+	printf '%s\n' "$src" >"$work/$file"
+	"$work/scripts/lint-nolint" >"$out" 2>&1 || status=$?
+	rm -f "$work/$file"
+
+	case $want in
+	quiet)
+		if [ "$status" -eq 0 ]; then
+			pass "lint-nolint $want: $name"
+		else
+			fail "lint-nolint $want: $name" "expected lint-nolint to pass, it exited $status"
+		fi
+		;;
+	fire)
+		if [ "$status" -eq 0 ]; then
+			fail "lint-nolint $want: $name" "expected lint-nolint to fail, it exited 0"
+		elif grep -qF -- "$nolint_msg" "$out" && grep -qF -- "./$file:" "$out"; then
+			pass "lint-nolint $want: $name"
+		else
+			fail "lint-nolint $want: $name" "lint-nolint exited $status without \"$nolint_msg\" naming $file"
+		fi
+		;;
+	esac
+	check_make "make lint grep $want: $name, golangci-lint skipped" "$want" "$file" "$nolint_msg" true <<<"$src"
+}
+
+# depguard rule sysio: syscall and golang.org/x/sys/unix outside
+# internal/sysio. internal/events/target.go is exempt by name, not the whole
+# package, and a new file named like a baseline file is not on the baseline.
+unix=golang.org/x/sys/unix
+run_table depguard fire "$sysio_msg" \
+	"x/sys/unix in internal/filexfer/ftcp|internal/filexfer/ftcp/@.go|$unix|\"$unix\"|var _ = unix.Fdatasync" \
+	'syscall in the root package|@.go|syscall|"syscall"|var _ = syscall.EINTR' \
+	'syscall in internal/cliflags|internal/cliflags/@.go|syscall|"syscall"|var _ = syscall.EINTR' \
+	'syscall in cmd/tx outside main.go|cmd/tx/@.go|syscall|"syscall"|var _ = syscall.SIGTERM' \
+	"x/sys/unix in a new file named like a baseline file|internal/filexfer/ftcp/send_@.go|$unix|\"$unix\"|var _ = unix.EINTR" \
+	'syscall in a new internal/events file|internal/events/@.go|syscall|"syscall"|var _ = syscall.EINTR'
+
+run_table depguard quiet "" \
+	"x/sys/unix in internal/sysio|internal/sysio/@.go|$unix||var _ = unix.EINTR" \
+	'syscall in internal/faults|internal/faults/@.go|syscall||var _ = syscall.EINTR' \
+	"x/sys/unix in internal/bench/dataset|internal/bench/dataset/@.go|$unix||var _ = unix.EINTR" \
+	'syscall in internal/memxfer|internal/memxfer/@.go|syscall||var _ = syscall.EINTR' \
+	'syscall in cmd/tx-bench|cmd/tx-bench/@.go|syscall||var _ = syscall.EINTR' \
+	"x/sys/unix in an internal/filexfer/ftcp test file|internal/filexfer/ftcp/@_test.go|$unix||var _ = unix.EINTR"
+
+# depguard rule unused-io: io/ioutil, net/rpc, and net/smtp in every non-test
+# file, harness paths and internal/sysio included. Each spec is
+# IMPORT|SYMBOL|MSG|DATA-PATH FILE|HARNESS FILE.
+for spec in \
+	'io/ioutil|ioutil.Discard|deprecated; its ReadFile|internal/filexfer/store/@.go|internal/bench/dataset/@.go' \
+	'net/rpc|rpc.DefaultServer|dials without the NET fault gates|internal/filexfer/ftcp/@.go|cmd/tx-bench/@.go' \
+	'net/smtp|smtp.PlainAuth|dials without the NET fault gates|internal/fsync/@.go|internal/sysio/@.go'; do
+	IFS='|' read -r imp sym msg datapath harness <<<"$spec"
+	run_table depguard fire "$msg" \
+		"$imp in ${datapath%/@.go}|$datapath|$imp|\"$imp\"|var _ = $sym" \
+		"$imp in internal/cliflags|internal/cliflags/@.go|$imp|\"$imp\"|var _ = $sym" \
+		"$imp in ${harness%/@.go}, exempt from the sysio rule|$harness|$imp|\"$imp\"|var _ = $sym"
+	run_table depguard quiet "" \
+		"$imp in an internal/filexfer/ftcp test file|internal/filexfer/ftcp/@_test.go|$imp||var _ = $sym"
+done
+
+# forbidigo: opens, dials, and listens in the data-path packages, including
+# methods, renamed imports, and subpackages.
+cli=internal/cmd/filexfercli/@.go
+ftcp=internal/filexfer/ftcp/@.go
+store=internal/filexfer/store/@.go
+fsync=internal/fsync/@.go
+pc=internal/pagecache/@.go
+sysio=github.com/jolynch/tx/internal/sysio
+run_table forbidigo fire "" \
+	"os.Open in internal/cmd/filexfercli|$cli|os|os.Open(|func lintcheck(p string) (*os.File, error) { return os.Open(p) }" \
+	"os.OpenFile in internal/filexfer/store|$store|os|os.OpenFile(|func lintcheck(p string) (*os.File, error) { return os.OpenFile(p, os.O_RDONLY, 0) }" \
+	"os.Create in internal/fsync|$fsync|os|os.Create(|func lintcheck(p string) (*os.File, error) { return os.Create(p) }" \
+	"os.Pipe in internal/pagecache|$pc|os|os.Pipe(|func lintcheck() (*os.File, *os.File, error) { return os.Pipe() }" \
+	'net.Dial in the root package|@.go|net|net.Dial(|func lintcheck(a string) (net.Conn, error) { return net.Dial("tcp", a) }' \
+	"net.DialTimeout in internal/filexfer/ftcp|$ftcp|net|net.DialTimeout(|func lintcheck(a string) (net.Conn, error) { return net.DialTimeout(\"tcp\", a, 0) }" \
+	"net.Listen in internal/filexfer/ftcp|$ftcp|net|net.Listen(|func lintcheck(a string) (net.Listener, error) { return net.Listen(\"tcp\", a) }" \
+	'(&net.Dialer{}).DialContext in the root package|@.go|context net|.DialContext(|func lintcheck(ctx context.Context, a string) (net.Conn, error) { return (&net.Dialer{}).DialContext(ctx, "tcp", a) }' \
+	"DialContext on a net.Dialer value in internal/fsync|$fsync|context net|.DialContext(|func lintcheck(ctx context.Context, a string) (net.Conn, error) {\n\tvar d net.Dialer\n\treturn d.DialContext(ctx, \"tcp\", a)\n}" \
+	"os.Open through a renamed import in internal/filexfer/store|$store|stdos=os|stdos.Open(|func lintcheck(p string) (*stdos.File, error) { return stdos.Open(p) }" \
+	"net.Dial through a renamed import in internal/cmd/filexfercli|$cli|stdnet=net|stdnet.Dial(|func lintcheck(a string) (stdnet.Conn, error) { return stdnet.Dial(\"tcp\", a) }" \
+	'os.ReadFile in a new root package file|@.go|os|os.ReadFile(|func lintcheck(p string) ([]byte, error) { return os.ReadFile(p) }' \
+	"os.ReadFile in internal/filexfer/store|$store|os|os.ReadFile(|func lintcheck(p string) ([]byte, error) { return os.ReadFile(p) }" \
+	"os.WriteFile in internal/fsync|$fsync|os|os.WriteFile(|func lintcheck(p string) error { return os.WriteFile(p, nil, 0o600) }" \
+	"os.CreateTemp in internal/pagecache|$pc|os|os.CreateTemp(|func lintcheck() (*os.File, error) { return os.CreateTemp(\"\", \"x\") }" \
+	"os.NewFile in internal/filexfer/ftcp|$ftcp|os|os.NewFile(|func lintcheck(fd uintptr) *os.File { return os.NewFile(fd, \"x\") }" \
+	"os.OpenInRoot in internal/cmd/filexfercli|$cli|os|os.OpenInRoot(|func lintcheck(d, p string) (*os.File, error) { return os.OpenInRoot(d, p) }" \
+	'(*os.Root).Open in the root package|@.go|os|.Open(|func lintcheck(r *os.Root, p string) (*os.File, error) { return r.Open(p) }' \
+	"(*os.File).Sync in internal/filexfer/store|$store|os|.Sync(|func lintcheck(f *os.File) error { return f.Sync() }" \
+	"(*net.Dialer).DialTCP in internal/filexfer/ftcp|$ftcp|context net net/netip|.DialTCP(|func lintcheck(ctx context.Context, d *net.Dialer, a netip.AddrPort) (*net.TCPConn, error) {\n\treturn d.DialTCP(ctx, \"tcp\", netip.AddrPort{}, a)\n}" \
+	"net.DialUnix in internal/fsync|$fsync|net|net.DialUnix(|func lintcheck(a *net.UnixAddr) (*net.UnixConn, error) { return net.DialUnix(\"unix\", nil, a) }" \
+	"net.ListenTCP in internal/pagecache|$pc|net|net.ListenTCP(|func lintcheck(a *net.TCPAddr) (*net.TCPListener, error) { return net.ListenTCP(\"tcp\", a) }" \
+	'(*net.ListenConfig).Listen in the root package|@.go|context net|.Listen(|func lintcheck(ctx context.Context, a string) (net.Listener, error) {\n\tvar lc net.ListenConfig\n\treturn lc.Listen(ctx, "tcp", a)\n}' \
+	"os.DirFS in internal/filexfer/store|$store|io/fs os|os.DirFS(|func lintcheck(d string) fs.FS { return os.DirFS(d) }" \
+	"(*os.Root).FS in internal/fsync|$fsync|io/fs os|.FS()|func lintcheck(r *os.Root) fs.FS { return r.FS() }" \
+	"net.FilePacketConn in internal/pagecache|$pc|net os|net.FilePacketConn(|func lintcheck(f *os.File) (net.PacketConn, error) { return net.FilePacketConn(f) }" \
+	'tls.Dial in the root package|@.go|crypto/tls|tls.Dial(|func lintcheck(a string) (*tls.Conn, error) { return tls.Dial("tcp", a, nil) }' \
+	"tls.DialWithDialer in internal/filexfer/ftcp|$ftcp|crypto/tls net|tls.DialWithDialer(|func lintcheck(d *net.Dialer, a string) (*tls.Conn, error) { return tls.DialWithDialer(d, \"tcp\", a, nil) }" \
+	"tls.Listen in internal/cmd/filexfercli|$cli|crypto/tls net|tls.Listen(|func lintcheck(a string) (net.Listener, error) { return tls.Listen(\"tcp\", a, nil) }" \
+	"(*tls.Dialer).DialContext in internal/filexfer/store|$store|context crypto/tls net|.DialContext(|func lintcheck(ctx context.Context, a string) (net.Conn, error) {\n\td := &tls.Dialer{}\n\treturn d.DialContext(ctx, \"tcp\", a)\n}" \
+	'os.Open in a new internal/filexfer/ftcp subpackage|internal/filexfer/ftcp/lintchecksub/@.go|os|os.Open(|func lintcheck(p string) (*os.File, error) { return os.Open(p) }' \
+	"os.CopyFS in internal/filexfer/store|$store|io/fs os|os.CopyFS(|func lintcheck(d string, f fs.FS) error { return os.CopyFS(d, f) }" \
+	'http.Get in the root package|@.go|net/http|http.Get(|func lintcheck(u string) (*http.Response, error) { return http.Get(u) }' \
+	"http.Head in internal/filexfer/ftcp|$ftcp|net/http|http.Head(|func lintcheck(u string) (*http.Response, error) { return http.Head(u) }" \
+	"http.Post in internal/cmd/filexfercli|$cli|net/http|http.Post(|func lintcheck(u string) (*http.Response, error) { return http.Post(u, \"text/plain\", nil) }" \
+	"http.PostForm in internal/fsync|$fsync|net/http|http.PostForm(|func lintcheck(u string) (*http.Response, error) { return http.PostForm(u, nil) }" \
+	"http.ListenAndServe in internal/pagecache|$pc|net/http|http.ListenAndServe(|func lintcheck(a string) error { return http.ListenAndServe(a, nil) }" \
+	"http.Serve in internal/filexfer/store|$store|net net/http|http.Serve(|func lintcheck(l net.Listener) error { return http.Serve(l, nil) }" \
+	'(*http.Client).Do in the root package|@.go|net/http|.Do(|func lintcheck(c *http.Client, r *http.Request) (*http.Response, error) { return c.Do(r) }' \
+	"(*http.Client).Get in internal/filexfer/ftcp|$ftcp|net/http|.Get(|func lintcheck(c *http.Client, u string) (*http.Response, error) { return c.Get(u) }" \
+	"(*http.Server).ListenAndServe in internal/pagecache|$pc|net/http|.ListenAndServe(|func lintcheck(s *http.Server) error { return s.ListenAndServe() }" \
+	"(*http.Server).Serve in internal/filexfer/store|$store|net net/http|.Serve(|func lintcheck(s *http.Server, l net.Listener) error { return s.Serve(l) }" \
+	"(*http.Transport).RoundTrip in internal/cmd/filexfercli|$cli|net/http|.RoundTrip(|func lintcheck(t *http.Transport, r *http.Request) (*http.Response, error) { return t.RoundTrip(r) }" \
+	"RoundTrip on http.DefaultTransport, an http.RoundTripper, in internal/fsync|$fsync|net/http|.RoundTrip(|func lintcheck(r *http.Request) (*http.Response, error) { return http.DefaultTransport.RoundTrip(r) }" \
+	"RoundTrip on an http.RoundTripper parameter in internal/pagecache|$pc|net/http|.RoundTrip(|func lintcheck(rt http.RoundTripper, r *http.Request) (*http.Response, error) { return rt.RoundTrip(r) }" \
+	"sysio.OpenDir in internal/filexfer/ftcp|$ftcp|$sysio|sysio.OpenDir(|func lintcheck(p string) (int, error) { return sysio.OpenDir(p) }" \
+	"sysio.OpenNonblockingWriter in internal/cmd/filexfercli|$cli|os $sysio|sysio.OpenNonblockingWriter(|func lintcheck(p string) (*os.File, error) { return sysio.OpenNonblockingWriter(p, false) }"
+
+# exclusions.generated is disable, so a generated header does not exempt a
+# data-path file.
+check "forbidigo fire: os.Open in a generated internal/filexfer/store file" fire \
+	internal/filexfer/store/$fixture.go forbidigo 'os.Open(' < <(gosrc "$store" os \
+	'func lintcheck(p string) (*os.File, error) { return os.Open(p) }' \
+	'// Code generated by x. DO NOT EDIT.\n')
+
+# issues.uniq-by-line is false, so each call on a line is its own finding.
+CHECK_COUNT=2 check "forbidigo fire twice: os.ReadFile and os.DirFS on one line" fire \
+	internal/filexfer/ftcp/$fixture.go forbidigo 'os.ReadFile(' < <(gosrc "$ftcp" os \
+	'func lintcheck() { _, _ = os.ReadFile("x"); _ = os.DirFS("x") }')
+
+# run.relative-path-mode is cfg, so the path rules hold from a subdirectory:
+# forbidigo still covers ftcp, and the baseline still excludes send.go.
+CHECK_DIR=internal/filexfer check "forbidigo fire: os.Open in ftcp, linted from internal/filexfer" fire \
+	internal/filexfer/ftcp/$fixture.go forbidigo 'os.Open(' < <(gosrc "$ftcp" os \
+	'func lintcheck(p string) (*os.File, error) { return os.Open(p) }')
+CHECK_DIR=internal/filexfer check "forbidigo quiet: baseline, ftcp linted from internal/filexfer" quiet \
+	internal/filexfer/ftcp/$fixture.go forbidigo '' < <(gosrc "$ftcp" '' '')
+
+# The same raw calls are fine off the data path and in test files. The
+# patterns name functions and methods exactly, so the net and http types,
+# their fields, gated sysio calls, and harmless file methods stay usable.
+opens_and_dials='func lintcheckOpen(p string) (*os.File, error) { return os.Open(p) }\n\nfunc lintcheckDial(ctx context.Context, a string) (net.Conn, error) {\n\tif _, err := net.Dial("tcp", a); err != nil {\n\t\treturn nil, err\n\t}\n\treturn (&net.Dialer{}).DialContext(ctx, "tcp", a)\n}'
+types='func lintcheckTakeListener(l net.Listener) net.Addr { return l.Addr() }\n\nfunc lintcheckTakeDialer(d net.Dialer) time.Duration { return d.Timeout }\n\nfunc lintcheckTypes(l net.Listener, f *os.File) (os.FileInfo, error) {\n\td := net.Dialer{Timeout: time.Second}\n\t_ = d.Timeout\n\t_ = lintcheckTakeDialer(d)\n\t_ = lintcheckTakeListener(l)\n\treturn f.Stat()\n}'
+endpoint='type lintcheckEndpoint struct {\n\tlistener net.Listener\n\tdialer   *net.Dialer\n}\n\nfunc lintcheckNewEndpoint(l net.Listener, f *os.File) (lintcheckEndpoint, error) {\n\td := net.Dialer{Timeout: time.Second}\n\td.KeepAlive = time.Second\n\t_ = d.Timeout\n\tif _, err := f.Stat(); err != nil {\n\t\treturn lintcheckEndpoint{}, err\n\t}\n\treturn lintcheckEndpoint{listener: l, dialer: &d}, nil\n}'
+gated='func lintcheckGated(inj *faults.Injector) (*os.File, *os.File, error) {\n\tr, w, err := sysio.Pipe(inj)\n\tif err != nil {\n\t\treturn nil, nil, err\n\t}\n\tif err := sysio.Fdatasync(inj, int(w.Fd())); err != nil {\n\t\treturn nil, nil, err\n\t}\n\tif err := sysio.Fadvise(inj, r.Fd(), 0, 0, 0); err != nil {\n\t\treturn nil, nil, err\n\t}\n\treturn r, w, nil\n}'
+server='var lintcheckServer = http.Server{Addr: ":0"}\n\nfunc lintcheckNewServer() *http.Server {\n\ts := &http.Server{}\n\ts.Addr = lintcheckServer.Addr\n\treturn s\n}'
+transport='var lintcheckTransport = http.Transport{MaxIdleConns: 1}\n\nfunc lintcheckNewTransport() http.RoundTripper {\n\tt := &http.Transport{}\n\tt.MaxIdleConns = lintcheckTransport.MaxIdleConns\n\tt.DisableKeepAlives = true\n\tvar rt http.RoundTripper = t\n\treturn rt\n}'
+roundtrip='func lintcheckRoundTrip(t *http.Transport, r *http.Request) (*http.Response, error) { return t.RoundTrip(r) }'
+run_table forbidigo quiet "" \
+	"opens and dials in internal/cliflags|internal/cliflags/@.go|context net os||$opens_and_dials" \
+	"opens and dials in an internal/filexfer/ftcp test file|internal/filexfer/ftcp/@_test.go|context net os||$opens_and_dials" \
+	"opens and dials in a root package test file|@_test.go|context net os||$opens_and_dials" \
+	"net.Listener, net.Dialer, Dialer fields, and Stat in internal/filexfer/ftcp|$ftcp|net os time||$types" \
+	"net.Listener, net.Dialer, Dialer fields, and Stat in the root package|@.go|net os time||$endpoint" \
+	"gated sysio calls in internal/filexfer/ftcp|$ftcp|os github.com/jolynch/tx/internal/faults $sysio||$gated" \
+	"an http.Server value and its fields in internal/filexfer/ftcp|$ftcp|net/http||$server" \
+	"an http.Transport value and its fields, held as an http.RoundTripper, in internal/filexfer/store|$store|net/http||$transport" \
+	"(*http.Transport).RoundTrip in an internal/filexfer/ftcp test file|internal/filexfer/ftcp/@_test.go|net/http||$roundtrip" \
+	"(*http.Transport).RoundTrip in internal/cliflags|internal/cliflags/@.go|net/http||$roundtrip"
+
+# nolintlint: every //nolint names a linter and gives a reason, and is used.
+# forbidigo skips test files and non-data-path packages, so a //nolint there
+# is reported as unused, its one finding for that directive.
+open_with='func lintcheck(p string) (*os.File, error) {\n\treturn os.Open(p) '
+run_table nolintlint quiet "" \
+	"//nolint:forbidigo with a reason|$cli|os||$open_with//nolint:forbidigo // gated: lint-check fixture\n}"
+run_table nolintlint fire 'explanation' \
+	"//nolint:forbidigo without a reason|$cli|os|os.Open(|$open_with//nolint:forbidigo\n}"
+run_table nolintlint fire 'specific linter' \
+	"//nolint without a linter name|$cli|os|os.Open(|$open_with//nolint // gated: lint-check fixture\n}"
+run_table nolintlint fire 'is unused' \
+	"//nolint:forbidigo in a test file|internal/filexfer/ftcp/@_test.go|os|os.Open(|$open_with//nolint:forbidigo\n}" \
+	"//nolint:forbidigo with a reason off the data path|internal/cliflags/@.go|os|os.Open(|$open_with//nolint:forbidigo // gated: lint-check fixture\n}"
+
+# scripts/lint-nolint rejects a //nolint naming depguard, all, or nolintlint,
+# matching names without regard to case or spacing as golangci-lint does, and
+# a bare //nolint, alone or followed by its reason. Prose that starts with the
+# word, and a reason that names those linters, pass.
+for directive in \
+	'//nolint:DEPGUARD // lint-check fixture' \
+	'//nolint:Depguard // lint-check fixture' \
+	'//nolint: depguard // lint-check fixture' \
+	'//nolint:forbidigo, depguard // lint-check fixture' \
+	'//nolint:forbidigo,ALL // lint-check fixture' \
+	'//nolint:nolintlint // lint-check fixture' \
+	'//nolint:NOLINTLINT // lint-check fixture' \
+	'//nolint: nolintlint // lint-check fixture' \
+	'//nolint:forbidigo, NolintLint // lint-check fixture' \
+	'//nolint' \
+	'//nolint // lint-check fixture' \
+	'// nolint' \
+	'// nolint // lint-check fixture'; do
+	check_nolint "$directive" fire "internal/filexfer/ftcp/$fixture.go" \
+		"$(printf 'package ftcp\n\nimport "syscall" %s\n\nvar _ = syscall.EINTR' "$directive")"
+done
+for prose in '// nolint comments need a reason.' '// nolintlint is enabled below.'; do
+	check_nolint "prose comment \"$prose\"" quiet "internal/filexfer/ftcp/$fixture.go" \
+		"$(printf 'package ftcp\n\n%s\nvar _ = 0' "$prose")"
+done
+check_nolint "//nolint:forbidigo with a reason naming depguard, all, and nolintlint" quiet \
+	"internal/cmd/filexfercli/$fixture.go" \
+	"$(gosrc "$cli" os "$open_with//nolint:forbidigo // gated: reason that mentions depguard, all, and nolintlint\n}")"
+
+# make lint with the real linter. A lone //nolint:all fails nolintlint's
+# require-specific before lint-nolint runs. A list directive on one line would
+# leave forbidigo unused, which nolintlint already rejects, so the list cases
+# put the directive above the package clause, covering a file that trips both
+# linters.
+f=internal/filexfer/ftcp/$fixture.go
+both='var _ = syscall.EINTR\n\nfunc lintcheck(p string) (*os.File, error) { return os.Open(p) }'
+check_make "make lint fire: //nolint:depguard on a syscall import" fire "$f" \
+	< <(gosrc "$f" '' 'import "syscall" //nolint:depguard // lint-check fixture\n\nvar _ = syscall.EINTR')
+check_make "make lint fire: //nolint:Depguard on a syscall import" fire "$f" \
+	< <(gosrc "$f" '' 'import "syscall" //nolint:Depguard // lint-check fixture\n\nvar _ = syscall.EINTR')
+check_make "make lint fire: //nolint:all on a syscall import" fire "$f" 'should mention specific linter' \
+	< <(gosrc "$f" '' 'import "syscall" //nolint:all // lint-check fixture\n\nvar _ = syscall.EINTR')
+check_make "make lint grep fire: //nolint:all, golangci-lint skipped" fire "$f" "$nolint_msg" true \
+	< <(gosrc "$f" '' 'import "syscall" //nolint:all // lint-check fixture\n\nvar _ = syscall.EINTR')
+check_make "make lint fire: depguard in a //nolint list" fire "$f" \
+	< <(gosrc "$f" 'os syscall' "$both" '//nolint:forbidigo,depguard // lint-check fixture')
+check_make "make lint fire: all in a //nolint list" fire "$f" \
+	< <(gosrc "$f" 'os syscall' "$both" '//nolint:forbidigo,all // lint-check fixture')
+
+# The bypass: //nolint:nolintlint above the package clause silences the
+# check that rejects a bare //nolint, and the bare //nolint then silences
+# depguard. golangci-lint alone reports nothing, so make lint must fail in
+# lint-nolint, after golangci-lint passes.
+check_make "make lint fire: //nolint:nolintlint file directive plus a bare //nolint" fire "$f" \
+	< <(gosrc "$f" '' 'import "golang.org/x/sys/unix" //nolint // y\n\nfunc lintcheck(fd int) error { return unix.Fdatasync(fd) }' '//nolint:nolintlint // x')
+
+check_make "make lint quiet: //nolint:forbidigo with a reason" quiet "internal/cmd/filexfercli/$fixture.go" \
+	< <(gosrc "$cli" os "$open_with//nolint:forbidigo // gated: lint-check fixture, mentions depguard and all\n}")
+
+# Every fixture is gone again, so the copy matches the tree as it stands.
+check_make "make lint passes on the current tree" quiet
+
+if [ "$failures" -gt 0 ]; then
+	echo "$failures case(s) failed"
+	exit 1
+fi
+echo "all cases passed"

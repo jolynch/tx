@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Usage: scripts/lint-nolint
+#
+# Fails when a .go file has a //nolint directive that could switch the
+# syscall ban off: one naming depguard, all, or nolintlint (which would
+# silence the check that rejects a bare //nolint), or a bare //nolint
+# naming no linter. nolintlint cannot forbid a particular linter, so this
+# check does. golangci-lint matches linter names without regard to case or
+# surrounding spaces, so this does too. make lint and CI both run it.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+status=0
+if grep -rniE --include='*.go' 'nolint:[[:space:][:alnum:],_-]*\b(depguard|all|nolintlint)\b' . ; then
+	status=1
+fi
+# A bare directive is //nolint alone or followed by its // reason; prose
+# that merely starts with the word, such as "// nolint comments need a
+# reason.", is not one.
+if grep -rniE --include='*.go' '//[[:space:]]*nolint[[:space:]]*($|//)' . ; then
+	status=1
+fi
+if [ "$status" -ne 0 ]; then
+	echo "lint: //nolint must name its linters and must not switch off depguard or nolintlint; move the call into internal/sysio" >&2
+	exit 1
+fi

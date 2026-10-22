@@ -1,0 +1,117 @@
+version: "2"
+
+# Exclusion paths below are relative to this file, wherever the linter runs
+# from; forbidigo's path-except would otherwise match nothing and go silent.
+run:
+  relative-path-mode: cfg
+
+# Keeps raw IO behind the fault gates (docs/arch/FAULTS.md). Only these
+# linters run, so the config brings no unrelated findings.
+linters:
+  default: none
+  enable:
+    - depguard
+    - forbidigo
+    - nolintlint
+  settings:
+    # Raw syscalls live in internal/sysio, whose functions take the injector
+    # and gate each call.
+    depguard:
+      rules:
+        sysio:
+          list-mode: lax
+          files:
+            - $all
+            - "!$test"
+            - "!**/internal/sysio/**"
+            - "!**/internal/faults/**"
+            # Harnesses, not tx's data path.
+            - "!**/internal/bench/**"
+            - "!**/cmd/tx-bench/**"
+            - "!**/internal/memxfer/**"
+            # Signal numbers only.
+            - "!**/cmd/tx/main.go"
+            # The event sink. internal/faults depends on internal/events,
+            # so events cannot use sysio; its FIFO open is not the data
+            # path.
+            - "!**/internal/events/target.go"
+          deny:
+            - pkg: syscall$
+              desc: use internal/sysio, so fault injection reaches the call (docs/arch/FAULTS.md)
+            - pkg: golang.org/x/sys/unix
+              desc: use internal/sysio, so fault injection reaches the call (docs/arch/FAULTS.md)
+        # Packages that open, write, or dial behind calls forbidigo bans, and
+        # that tx has no use for.
+        unused-io:
+          list-mode: lax
+          files:
+            - $all
+            - "!$test"
+          deny:
+            - pkg: io/ioutil
+              desc: deprecated; its ReadFile, WriteFile, and TempFile are the os calls forbidigo bans on the data path
+            - pkg: net/rpc
+              desc: dials without the NET fault gates
+            - pkg: net/smtp
+              desc: dials without the NET fault gates
+    # Opens and dials on the data path need a fault gate; each sanctioned
+    # call says which with a //nolint:forbidigo reason.
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: ^os\.(Open\w*|Create\w*|ReadFile|WriteFile|NewFile|Pipe|CopyFS)$
+          msg: gate data-path opens (faults OpenErr and WrapReaderAt or WrapWriter, or sysio.Pipe) and say which in a //nolint:forbidigo reason
+        - pattern: ^os\.Root\.(Open\w*|Create|ReadFile|WriteFile|FS)$
+          pkg: ^os$
+          msg: gate data-path opens and say which in a //nolint:forbidigo reason
+        - pattern: ^os\.DirFS$
+          msg: gate data-path opens and say which in a //nolint:forbidigo reason
+        # An unwrapped fsync skips the fdatasync gate.
+        - pattern: ^os\.File\.Sync$
+          pkg: ^os$
+          msg: sync outputs through internal/fsync or sysio.Fdatasync, which apply the fdatasync gate
+        # Functions and methods by name, so the net.Dialer and net.Listener
+        # types and their fields stay usable.
+        - pattern: ^net\.(Dial(Timeout|TCP|UDP|Unix|IP)?|Listen(TCP|UDP|Unix|Unixgram|IP|Packet|MulticastUDP)?|FileConn|FileListener|FilePacketConn)$
+          msg: dial and listen through the client's dialTCP or ftcp.Serve, which apply the NET gates
+        - pattern: ^net\.(Dialer\.Dial(Context|TCP|UDP|Unix|IP)?|ListenConfig\.Listen(Packet)?)$
+          pkg: ^net$
+          msg: dial and listen through the client's dialTCP or ftcp.Serve, which apply the NET gates
+        - pattern: ^tls\.(Dial|DialWithDialer|Listen|Dialer\.(Dial|DialContext))$
+          pkg: ^crypto/tls$
+          msg: dial and listen through the client's dialTCP or ftcp.Serve, which apply the NET gates
+        - pattern: ^http\.(Get|Head|Post|PostForm|ListenAndServe(TLS)?|Serve(TLS)?|Client\.(Do|Get|Head|Post|PostForm)|(Transport|RoundTripper)\.RoundTrip|Server\.(ListenAndServe(TLS)?|Serve(TLS)?))$
+          pkg: ^net/http$
+          msg: dial and listen through the client's dialTCP or ftcp.Serve, which apply the NET gates
+        # sysio's own opens have no fault gate either.
+        - pattern: ^sysio\.(OpenDir|OpenNonblockingWriter)$
+          pkg: /internal/sysio$
+          msg: an ungated open; say why the data path may skip the gate in a //nolint:forbidigo reason
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+  exclusions:
+    # A data-path file headed "Code generated ... DO NOT EDIT." is still
+    # checked.
+    generated: disable
+    rules:
+      # forbidigo covers the data-path packages only: the root client, the
+      # server, the store, the CLI's transfer code, fsync, and the page cache.
+      - linters: [forbidigo]
+        path-except: ^([^/]+\.go|internal/(filexfer/(ftcp|store)|cmd/filexfercli|fsync|pagecache)/.+\.go)$
+      - linters: [forbidigo]
+        path: _test\.go$
+      # Baseline: raw calls not yet moved behind sysio or annotated. Each
+      # migration removes its files; nothing may be added.
+      - linters: [depguard]
+        path: ^(client_auth|client_pool)\.go$|^internal/(aead/credential|filexfer/progress|fsync/fsync|pagecache/syscall_linux|cmd/filexfercli/cli_local_copyrange_linux|filexfer/encoding/(frame|manifest)|filexfer/ftcp/(send|tcpinfo_linux|txfer))\.go$
+      - linters: [forbidigo]
+        path: ^(client|client_tcp)\.go$|^internal/(cmd/filexfercli/(cli|cli_local|cli_transfer|cli_verify)|filexfer/ftcp/(send|txfer)|filexfer/store/store|pagecache/syscall_linux)\.go$
+
+# Report every violation: the caps would hide repeats of the same raw call.
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  # Two raw calls on one line are two findings.
+  uniq-by-line: false
