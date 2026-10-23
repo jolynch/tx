@@ -556,3 +556,37 @@ func TestManifestEntryPreservesTrailingWhitespace(t *testing.T) {
 		}
 	}
 }
+
+func TestWalkManifestEntriesDistinctHardlinkGroups(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a", "b"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("same contents"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		for _, suffix := range []string{"1", "2"} {
+			if err := os.Link(filepath.Join(root, name), filepath.Join(root, name+suffix)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var entries []ManifestEntry
+	if err := WalkManifestEntries(root, func(r WalkResult) error { entries = append(entries, r.Entry); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 6 {
+		t.Fatalf("entries %v, want two groups of three", entries)
+	}
+	for i, e := range entries {
+		first := i / 3 * 3
+		if i%3 == 0 {
+			if e.Type != EntryTypeFile || e.Size != 13 || e.Mtime == 0 || e.LinkTarget != -1 {
+				t.Errorf("first group member %+v", e)
+			}
+		} else if e.Type != EntryTypeHard || e.Size != 0 || e.Mtime != 0 || e.LinkTarget != int64(entries[first].ID) {
+			t.Errorf("hardlink %+v, want target %d", e, entries[first].ID)
+		}
+		if e.Mode != 0o640 {
+			t.Errorf("mode %o, want 640", e.Mode)
+		}
+	}
+}

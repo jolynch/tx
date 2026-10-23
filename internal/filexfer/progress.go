@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
-	"golang.org/x/sys/unix"
+	"github.com/jolynch/tx/internal/sysio"
 )
 
 type ProgressFormat string
@@ -129,17 +129,10 @@ func StartProgressFileWriter(ctx context.Context, targets []ProgressTarget, inte
 		}
 
 		for _, path := range pendingPaths {
-			flags := unix.O_WRONLY | unix.O_CREAT | unix.O_NONBLOCK
-			if !wroteFile[path] {
-				flags |= unix.O_TRUNC
-			} else {
-				flags |= unix.O_APPEND
-			}
-			fd, err := unix.Open(path, flags, 0644)
+			f, err := sysio.OpenNonblockingWriter(path, !wroteFile[path])
 			if err != nil {
 				continue
 			}
-			f := os.NewFile(uintptr(fd), path)
 			fmt.Fprint(f, pendingOutput[path])
 			f.Close()
 			wroteFile[path] = true

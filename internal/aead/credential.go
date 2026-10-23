@@ -14,10 +14,10 @@ import (
 	"os"
 	"path"
 	"strings"
-	"syscall"
 	"time"
 
 	"filippo.io/age"
+	"github.com/jolynch/tx/internal/sysio"
 )
 
 // Credential modes, as they appear in the AUTH preface.
@@ -398,7 +398,7 @@ func LoadOrGenerateAgeIdentity(dir string, isDefault bool) (identity *age.X25519
 	}
 	published, err := publishKeyFile(dir, identity)
 	if err != nil {
-		if isDefault && (errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.EROFS)) {
+		if isDefault && (errors.Is(err, fs.ErrPermission) || errors.Is(err, sysio.EROFS)) {
 			return ephemeralIdentity()
 		}
 		return nil, false, err

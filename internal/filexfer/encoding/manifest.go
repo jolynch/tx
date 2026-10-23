@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 
+	"github.com/jolynch/tx/internal/sysio"
 	"github.com/jolynch/tx/internal/utils"
 )
 
@@ -392,7 +392,7 @@ func WalkManifestEntries(root string, fn func(WalkResult) error) error {
 			entry.Size = 0
 			entry.LinkPath = target
 		default:
-			if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+			if st, ok := sysio.StatOf(info); ok && st.Nlink > 1 {
 				dev := uint64(st.Dev)
 				ino := st.Ino
 				devMap, ok := inodeSeen[dev]
