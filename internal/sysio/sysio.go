@@ -5,9 +5,9 @@
 // TCPByteCounts, PeekAlive, OpenDir, OpenNonblockingWriter, Close, Munmap,
 // and TotalMemoryBytes. golangci-lint (make lint) rejects
 // imports of syscall and golang.org/x/sys/unix outside this package,
-// internal/faults, the harnesses, and cmd/tx/main.go (signals), except in the
-// files its Baseline still lists until their calls move here. See
-// docs/arch/FAULTS.md.
+// internal/faults, the harnesses, signal setup, and the events target writer,
+// except in test files. The events writer cannot import sysio because
+// faults depends on events. See docs/arch/FAULTS.md.
 package sysio
 
 import (

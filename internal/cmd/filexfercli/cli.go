@@ -35,7 +35,7 @@ func startTracing(path string, stderr io.Writer) (stop func()) {
 	if path == "" {
 		return func() {}
 	}
-	tf, err := os.Create(path)
+	tf, err := os.Create(path) //nolint:forbidigo // Diagnostic trace, outside file-content fault gates.
 	if err != nil {
 		fmt.Fprintf(stderr, "trace: failed to create file %s: %v\n", path, err)
 		return func() {}
@@ -1024,7 +1024,7 @@ func openDownloadOutput(entry tx.ManifestEntry, offset int64, destPath string, s
 		err error
 	)
 	if resumeBase > 0 {
-		fd, err = os.OpenFile(destPath, os.O_RDWR, 0)
+		fd, err = os.OpenFile(destPath, os.O_RDWR, 0) //nolint:forbidigo // Output writes use WrapWriter below; OpenErr gates source opens only.
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil, nil, fmt.Errorf("resume requested at offset %d but output file is missing", resumeBase)
@@ -1041,12 +1041,12 @@ func openDownloadOutput(entry tx.ManifestEntry, offset int64, destPath string, s
 			return nil, nil, fmt.Errorf("resume requested at offset %d but output file has only %d bytes", resumeBase, stat.Size())
 		}
 	} else if offset > 0 {
-		fd, err = os.OpenFile(destPath, os.O_RDWR|os.O_CREATE, 0o644)
+		fd, err = os.OpenFile(destPath, os.O_RDWR|os.O_CREATE, 0o644) //nolint:forbidigo // Output writes use WrapWriter below; OpenErr gates source opens only.
 		if err != nil {
 			return nil, nil, fmt.Errorf("open output file for sparse write: %w", err)
 		}
 	} else {
-		fd, err = os.Create(destPath)
+		fd, err = os.Create(destPath) //nolint:forbidigo // Output writes use WrapWriter below; OpenErr gates source opens only.
 		if err != nil {
 			return nil, nil, fmt.Errorf("create output file: %w", err)
 		}
@@ -1166,7 +1166,7 @@ const progressFingerprintHeaderPrefix = "# manifest-fingerprint xxh128:"
 // header in the progress file, or "" if the file is missing or the
 // header is absent. Errors only when the file exists but cannot be read.
 func loadProgressFingerprint(progressPath string) (string, error) {
-	fd, err := os.Open(progressPath)
+	fd, err := os.Open(progressPath) //nolint:forbidigo // .tx resume state, outside file-content fault gates.
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", nil
@@ -1196,7 +1196,7 @@ func loadProgressFingerprint(progressPath string) (string, error) {
 
 func loadProgressState(progressPath string) (map[uint64]tx.ManifestProgress, error) {
 	state := make(map[uint64]tx.ManifestProgress)
-	fd, err := os.Open(progressPath)
+	fd, err := os.Open(progressPath) //nolint:forbidigo // .tx resume state, outside file-content fault gates.
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return state, nil
@@ -1262,7 +1262,7 @@ func saveProgressState(progressPath string, fingerprint string, state map[uint64
 		}
 	}
 	tmpPath := progressPath + ".tmp"
-	fd, err := os.Create(tmpPath)
+	fd, err := os.Create(tmpPath) //nolint:forbidigo // .tx resume state, outside file-content fault gates.
 	if err != nil {
 		return err
 	}
@@ -1674,7 +1674,7 @@ func applyTrailerMetadataToPath(path string, meta *tx.FileTrailerMetadata) error
 	if meta == nil {
 		return nil
 	}
-	fd, err := os.OpenFile(path, os.O_RDONLY, 0)
+	fd, err := os.OpenFile(path, os.O_RDONLY, 0) //nolint:forbidigo // Metadata apply only; downloaded content uses WrapWriter in openDownloadOutput.
 	if err != nil {
 		return fmt.Errorf("open destination for metadata apply: %w", err)
 	}

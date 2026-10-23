@@ -36,21 +36,39 @@ read or write.
 | File opens  | `OpenErr` gate                      | SEND and CXSUM, before `Deps.OpenFileRef`                    |
 | File reads  | `WrapReaderAt`                      | SEND buffered frames, CXSUM, client `--verify`               |
 | File writes | `WrapWriter`                        | client download outputs (`openDownloadOutput`)               |
-| Syscalls    | `Sys` gate and syscall wrappers     | see below                                                    |
+| Syscalls    | `internal/sysio`, `Sys`, and syscall wrappers | see below                                           |
 
-Gated syscalls, through the `Sys` gate or, for calls passed as functions, the
-`WrapSplice`, `WrapTee`, `WrapPoll`, and `WrapCopyFileRange` wrappers:
+Raw data-path syscalls live in `internal/sysio`. Its faultable functions take
+the injector first and apply `Sys` or the short-call wrappers
+(`WrapSplice`, `WrapTee`, `WrapPoll`, and `WrapCopyFileRange`). Existing FTCP
+helpers retain their gates where they wrap test-supplied operations or keep
+an ungated helper signature. SEND and CXSUM gate `os.File.Stat` at their
+call sites, and socket setters keep their `setsockopt` gate there too.
 
-| Syscall                                 | Sites                                                            |
-| --------------------------------------- | ---------------------------------------------------------------- |
-| `splice`, `tee`, `poll`                 | the zero-copy SEND loop, through its per-call `zeroCopySyscalls` |
-| `pipe`, `fcntl` (`F_SETPIPE_SZ`), `dup` | zero-copy SEND setup                                             |
-| `fadvise`, `readahead`                  | SEND sequential hints and frame readahead                        |
-| `fstat`                                 | SEND and CXSUM file stats, the background fsync batch            |
-| `fdatasync`, `syncfs`, `dup`            | the fsync worker (`fsync.WithFaults`) and `SyncfsDir`            |
-| `copy_file_range`                       | daemonless local copies                                          |
-| `mmap`, `mincore`, `fadvise`            | the page-cache probe, restore, and eviction                      |
-| `setsockopt`                            | `SetNoDelay` and socket buffer sizes on dial and accept          |
+| Syscall | Adapter or gate | Sites |
+| ------- | --------------- | ----- |
+| `splice`, `tee`, `poll` | `sysio.ZeroCopyCalls`, FTCP fault wrappers | zero-copy SEND loop |
+| `pipe`, `fcntl` (`F_SETPIPE_SZ`), `dup` | `sysio.Pipe`, `SetPipeSize`, `DupConn` | zero-copy SEND setup |
+| `fadvise`, `readahead` | `sysio.Fadvise`, `Readahead` | SEND sequential hints and frame readahead |
+| `fstat` | `Sys` before `os.File.Stat`, or `sysio.FileID` | SEND and CXSUM file stats, background fsync batch |
+| `fdatasync`, `syncfs`, `dup` | `sysio.Fdatasync`, `Syncfs`, `Dup` | fsync worker (`fsync.WithFaults`) and `SyncfsDir` |
+| `copy_file_range` | `sysio.CopyFileRange` | daemonless local copies |
+| `mmap`, `mincore`, `fadvise` | `sysio.Mmap`, `Mincore`, `Fadvise` | page-cache probe, restore, and eviction |
+| `setsockopt` | `Sys` before TCP socket setters | `SetNoDelay` and socket buffer sizes on dial and accept |
+
+Ungated adapters cover TCP byte counts, idle-socket peeks, descriptor close,
+unmapping, system memory, metadata extraction, and directory or progress
+opens. The events target writer keeps its own FIFO open: faults depends on
+events, so events cannot import sysio.
+
+`make lint` rejects raw `syscall` and `golang.org/x/sys/unix` imports outside
+sysio, fault shims, harnesses, signal setup, and the events target writer;
+test files are exempt. Opens and dials in the data-path packages require a
+`//nolint:forbidigo` reason naming the gate or explaining an ungated
+exception. Manifest and resume state, diagnostic output, and local-copy
+setup remain outside the DISK gates. These exceptions are explicit at their
+call sites; the deferred filesystem boundary is listed in
+[Ideas](../IDEAS.md#code-health).
 
 Advisory syscalls (fadvise, readahead, pipe resize, page cache, setsockopt)
 are best-effort: an injected failure skips them as a real one would.

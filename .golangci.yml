@@ -102,9 +102,6 @@ linters:
         path-except: ^([^/]+\.go|internal/(filexfer/(ftcp|store)|cmd/filexfercli|fsync|pagecache)/.+\.go)$
       - linters: [forbidigo]
         path: _test\.go$
-      # Baseline: opens and dials not yet annotated. Nothing may be added.
-      - linters: [forbidigo]
-        path: ^(client|client_tcp)\.go$|^internal/(cmd/filexfercli/(cli|cli_local|cli_transfer|cli_verify)|filexfer/store/store)\.go$
 
 # Report every violation: the caps would hide repeats of the same raw call.
 issues:

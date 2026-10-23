@@ -692,12 +692,12 @@ func localCopyTree(ctx context.Context, dstBase, srcRoot string, srcRootInfo os.
 func copyLocalRegularFile(dst string, le localEntry, w localWrite) error {
 	w.cache.snapshot(le.srcPath, dst)
 
-	src, err := os.Open(le.srcPath)
+	src, err := os.Open(le.srcPath) //nolint:forbidigo // Local copy has a copy_file_range gate; its opens and buffered fallback are ungated.
 	if err != nil {
 		return fmt.Errorf("open %s: %w", le.entry.Path, err)
 	}
 	defer src.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:forbidigo // Local copy has a copy_file_range gate; its opens and buffered fallback are ungated.
 	if err != nil {
 		return fmt.Errorf("create %s: %w", le.entry.Path, err)
 	}
@@ -814,12 +814,12 @@ func discardLocalFile(le localEntry, w localWrite) error {
 	if le.entry.Size == 0 {
 		return nil
 	}
-	src, err := os.Open(le.srcPath)
+	src, err := os.Open(le.srcPath) //nolint:forbidigo // Local copy has a copy_file_range gate; its opens and buffered fallback are ungated.
 	if err != nil {
 		return fmt.Errorf("open %s: %w", le.entry.Path, err)
 	}
 	defer src.Close()
-	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0) //nolint:forbidigo // Discard target; localCopyFile gates copy_file_range before its buffered fallback.
 	if err != nil {
 		return fmt.Errorf("open /dev/null: %w", err)
 	}
@@ -1093,7 +1093,7 @@ func runLocalGetCLI(a localGetArgs, stdout, stderr io.Writer) int {
 		}
 	}
 
-	src, err := os.Open(a.srcPath) // follows symlinks
+	src, err := os.Open(a.srcPath) //nolint:forbidigo // Follows symlinks; file outputs use the copy_file_range gate, stdout is ungated.
 	if err != nil {
 		fmt.Fprintf(stderr, "get failed: %v\n", err)
 		return 1
@@ -1121,7 +1121,7 @@ func runLocalGetCLI(a localGetArgs, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	out, err := os.OpenFile(a.outputPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	out, err := os.OpenFile(a.outputPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:forbidigo // Local copy has a copy_file_range gate; its opens and buffered fallback are ungated.
 	if err != nil {
 		fmt.Fprintf(stderr, "get failed: %v\n", err)
 		return 1

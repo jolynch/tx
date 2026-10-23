@@ -14,6 +14,8 @@
 # GOLANGCI_LINT overrides the linter command; it defaults to the pinned
 # release the Makefile uses. Cases run one at a time. The script prints one
 # PASS or FAIL line per case and exits nonzero if any case fails.
+# LINT_CHECK_FILTER selects case names by Bash regular expression, for
+# focused checks without running the full suite.
 set -euo pipefail
 
 root=$(git rev-parse --show-toplevel)
@@ -34,6 +36,7 @@ sysio_msg='use internal/sysio, so fault injection reaches the call'
 nolint_msg='lint: //nolint must'
 fixture=lintcheck_fixture
 failures=0
+checks=0
 out=$work/.lint-check.out
 
 pass() { printf 'PASS  %s\n' "$1"; }
@@ -84,7 +87,16 @@ check() {
 	local name=$1 want=$2 file=$3 linter=$4 at=$5 msg=${6:-}
 	local dir=${CHECK_DIR:-.} count=${CHECK_COUNT:-1}
 	local path=$work/$file pkgdir=$work/$(dirname "$file") made=
-	local status=0 line rel found
+	local status=0 line rel found saved=
+	if [ -n "${LINT_CHECK_FILTER:-}" ] && [[ ! $name =~ $LINT_CHECK_FILTER ]]; then
+		cat >/dev/null
+		return
+	fi
+	checks=$((checks + 1))
+	if [ -f "$path" ]; then
+		saved=$work/.lint-check.original
+		cp "$path" "$saved"
+	fi
 	if [ ! -d "$pkgdir" ]; then
 		mkdir -p "$pkgdir"
 		made=$pkgdir
@@ -93,7 +105,7 @@ check() {
 	rel=$(realpath --relative-to="$work/$dir" "$path")
 	(cd "$work/$dir" && "${lint[@]}" run "./$(dirname "$rel")") >"$out" 2>&1 || status=$?
 	line=$(grep -nFm1 -- "$at" "$path" | cut -d: -f1)
-	rm -f "$path"
+	if [ -n "$saved" ]; then mv "$saved" "$path"; else rm -f "$path"; fi
 	if [ -n "$made" ]; then rm -rf "$made"; fi
 
 	case $want in
@@ -147,6 +159,11 @@ run_table() {
 check_make() {
 	local name=$1 want=$2 file=${3:-} msg=${4:-$nolint_msg} linter=${5:-${lint[*]}}
 	local status=0
+	if [ -n "${LINT_CHECK_FILTER:-}" ] && [[ ! $name =~ $LINT_CHECK_FILTER ]]; then
+		if [ -n "$file" ]; then cat >/dev/null; fi
+		return
+	fi
+	checks=$((checks + 1))
 	if [ -n "$file" ]; then cat >"$work/$file"; fi
 	make -C "$work" --no-print-directory lint GOLANGCI_LINT="$linter" >"$out" 2>&1 || status=$?
 	if [ -n "$file" ]; then rm -f "$work/$file"; fi
@@ -179,6 +196,8 @@ check_make() {
 # exit 0.
 check_nolint() {
 	local name=$1 want=$2 file=$3 src=$4 status=0
+	if [ -n "${LINT_CHECK_FILTER:-}" ] && [[ ! "lint-nolint $want: $name" =~ $LINT_CHECK_FILTER ]]; then return; fi
+	checks=$((checks + 1))
 	printf '%s\n' "$src" >"$work/$file"
 	"$work/scripts/lint-nolint" >"$out" 2>&1 || status=$?
 	rm -f "$work/$file"
@@ -206,14 +225,14 @@ check_nolint() {
 
 # depguard rule sysio: syscall and golang.org/x/sys/unix outside
 # internal/sysio. internal/events/target.go is exempt by name, not the whole
-# package, and a new file named like a baseline file is not on the baseline.
+# package. Exact former Baseline paths are checked below.
 unix=golang.org/x/sys/unix
 run_table depguard fire "$sysio_msg" \
 	"x/sys/unix in internal/filexfer/ftcp|internal/filexfer/ftcp/@.go|$unix|\"$unix\"|var _ = unix.Fdatasync" \
 	'syscall in the root package|@.go|syscall|"syscall"|var _ = syscall.EINTR' \
 	'syscall in internal/cliflags|internal/cliflags/@.go|syscall|"syscall"|var _ = syscall.EINTR' \
 	'syscall in cmd/tx outside main.go|cmd/tx/@.go|syscall|"syscall"|var _ = syscall.SIGTERM' \
-	"x/sys/unix in a new file named like a baseline file|internal/filexfer/ftcp/send_@.go|$unix|\"$unix\"|var _ = unix.EINTR" \
+	"x/sys/unix in a new file named like send.go|internal/filexfer/ftcp/send_@.go|$unix|\"$unix\"|var _ = unix.EINTR" \
 	'syscall in a new internal/events file|internal/events/@.go|syscall|"syscall"|var _ = syscall.EINTR'
 
 run_table depguard quiet "" \
@@ -223,6 +242,38 @@ run_table depguard quiet "" \
 	'syscall in internal/memxfer|internal/memxfer/@.go|syscall||var _ = syscall.EINTR' \
 	'syscall in cmd/tx-bench|cmd/tx-bench/@.go|syscall||var _ = syscall.EINTR' \
 	"x/sys/unix in an internal/filexfer/ftcp test file|internal/filexfer/ftcp/@_test.go|$unix||var _ = unix.EINTR"
+
+# Append a fixture to an existing file without dropping its declarations.
+# check saves and restores that exact path in the scratch tree.
+existing_gosrc() {
+	local file=$1 imp=$2 body=$3
+	awk -v imp="$imp" '{ print; if ($1 == "package") print "\nimport " imp "\n" }' "$work/$file"
+	printf '\n%b\n' "$body"
+}
+
+# Former Baseline paths must reject raw imports in the files themselves.
+# Nearby new-file fixtures cannot detect an exclusion left on an old path.
+for file in \
+	client_auth.go client_pool.go \
+	internal/fsync/fsync.go internal/pagecache/syscall_linux.go \
+	internal/filexfer/ftcp/send.go internal/filexfer/ftcp/tcpinfo_linux.go internal/filexfer/ftcp/txfer.go \
+	internal/cmd/filexfercli/cli_local_copyrange_linux.go \
+	internal/filexfer/encoding/frame.go internal/filexfer/encoding/manifest.go \
+	internal/filexfer/progress.go internal/aead/credential.go; do
+	src=$(existing_gosrc "$file" 'lintchecksys "syscall"' 'var _ = lintchecksys.EINTR')
+	check "retired Baseline depguard: $file" fire "$file" depguard 'import lintchecksys "syscall"' "$sysio_msg" <<<"$src"
+done
+src=$(existing_gosrc internal/events/target.go 'lintchecksys "syscall"' 'var _ = lintchecksys.EINTR')
+check "permanent events target exemption" quiet internal/events/target.go depguard '' <<<"$src"
+
+# The annotated data-path files still reject a new, unannotated open.
+for file in client.go client_tcp.go \
+	internal/cmd/filexfercli/cli.go internal/cmd/filexfercli/cli_local.go \
+	internal/cmd/filexfercli/cli_transfer.go internal/cmd/filexfercli/cli_verify.go \
+	internal/filexfer/store/store.go; do
+	src=$(existing_gosrc "$file" 'lintcheckos "os"' 'func lintcheckOpenExisting(p string) (*lintcheckos.File, error) { return lintcheckos.Open(p) }')
+	check "retired Baseline forbidigo: $file" fire "$file" forbidigo 'return lintcheckos.Open(p)' <<<"$src"
+done
 
 # depguard rule unused-io: io/ioutil, net/rpc, and net/smtp in every non-test
 # file, harness paths and internal/sysio included. Each spec is
@@ -310,11 +361,11 @@ CHECK_COUNT=2 check "forbidigo fire twice: os.ReadFile and os.DirFS on one line"
 	'func lintcheck() { _, _ = os.ReadFile("x"); _ = os.DirFS("x") }')
 
 # run.relative-path-mode is cfg, so the path rules hold from a subdirectory:
-# forbidigo still covers ftcp, and the baseline still excludes send.go.
+# forbidigo still covers ftcp from a subdirectory.
 CHECK_DIR=internal/filexfer check "forbidigo fire: os.Open in ftcp, linted from internal/filexfer" fire \
 	internal/filexfer/ftcp/$fixture.go forbidigo 'os.Open(' < <(gosrc "$ftcp" os \
 	'func lintcheck(p string) (*os.File, error) { return os.Open(p) }')
-CHECK_DIR=internal/filexfer check "forbidigo quiet: baseline, ftcp linted from internal/filexfer" quiet \
+CHECK_DIR=internal/filexfer check "forbidigo quiet: empty fixture, ftcp linted from internal/filexfer" quiet \
 	internal/filexfer/ftcp/$fixture.go forbidigo '' < <(gosrc "$ftcp" '' '')
 
 # The same raw calls are fine off the data path and in test files. The
@@ -415,6 +466,10 @@ check_make "make lint quiet: //nolint:forbidigo with a reason" quiet "internal/c
 # Every fixture is gone again, so the copy matches the tree as it stands.
 check_make "make lint passes on the current tree" quiet
 
+if [ "$checks" -eq 0 ]; then
+	echo "no cases matched LINT_CHECK_FILTER" >&2
+	exit 1
+fi
 if [ "$failures" -gt 0 ]; then
 	echo "$failures case(s) failed"
 	exit 1

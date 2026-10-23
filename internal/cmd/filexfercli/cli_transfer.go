@@ -148,7 +148,7 @@ func runTransfer(serverURL string, cfg transferArgs, stdout io.Writer, stderr io
 		return 1
 	}
 	tmpManifestPath := ps.ServerManifestPath + ".tmp"
-	tmpFile, err := os.Create(tmpManifestPath)
+	tmpFile, err := os.Create(tmpManifestPath) //nolint:forbidigo // .tx manifest state, outside file-content fault gates.
 	if err != nil {
 		fmt.Fprintf(stderr, "create manifest tmp failed: %v\n", err)
 		return 1

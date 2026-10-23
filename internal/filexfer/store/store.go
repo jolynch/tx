@@ -1186,7 +1186,7 @@ func (s *Store) RegisterTransferFileState(txferID string, updatesCh <-chan Trans
 
 // OpenFileRef opens a file that GetFileRef or GetFileRefs resolved.
 func (s *Store) OpenFileRef(ref FileRef) (*os.File, error) {
-	fd, err := os.Open(ref.Path)
+	fd, err := os.Open(ref.Path) //nolint:forbidigo // SEND and CXSUM apply OpenErr before this call and WrapReaderAt or splice afterward.
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, &FileLookupError{Code: http.StatusNotFound, Msg: "file not found"}
