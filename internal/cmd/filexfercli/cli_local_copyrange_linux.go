@@ -5,10 +5,9 @@ package filexfercli
 import (
 	"errors"
 	"os"
-	"syscall"
 
 	"github.com/jolynch/tx/internal/faults"
-	"golang.org/x/sys/unix"
+	"github.com/jolynch/tx/internal/sysio"
 )
 
 // localCopyFile copies size bytes from src to dst using copy_file_range(2),
@@ -20,12 +19,11 @@ import (
 // (EINVAL). The fallback only triggers before any bytes are copied; a mid-copy
 // error on a single fd pair is a genuine I/O error and propagates.
 func localCopyFile(inj *faults.Injector, dst, src *os.File, size int64, onBytes func(int64)) (int64, error) {
-	copyFileRange := inj.WrapCopyFileRange(unix.CopyFileRange)
 	var copied int64
 	for copied < size {
-		n, err := copyFileRange(int(src.Fd()), nil, int(dst.Fd()), nil, int(size-copied), 0)
+		n, err := sysio.CopyFileRange(inj, dst, src, int(size-copied))
 		if err != nil {
-			if errors.Is(err, syscall.EINTR) {
+			if errors.Is(err, sysio.EINTR) {
 				continue
 			}
 			if copied == 0 && isCopyFileRangeUnsupported(err) {
@@ -45,16 +43,16 @@ func localCopyFile(inj *faults.Injector, dst, src *os.File, size int64, onBytes 
 }
 
 func isCopyFileRangeUnsupported(err error) bool {
-	return errors.Is(err, unix.ENOSYS) ||
-		errors.Is(err, unix.EOPNOTSUPP) ||
-		errors.Is(err, unix.EXDEV) ||
-		errors.Is(err, unix.EINVAL)
+	return errors.Is(err, sysio.ENOSYS) ||
+		errors.Is(err, sysio.EOPNOTSUPP) ||
+		errors.Is(err, sysio.EXDEV) ||
+		errors.Is(err, sysio.EINVAL)
 }
 
 // localFileOwner extracts the numeric uid/gid from a file's stat result.
 func localFileOwner(info os.FileInfo) (uid, gid int, ok bool) {
-	if st, o := info.Sys().(*syscall.Stat_t); o {
-		return int(st.Uid), int(st.Gid), true
+	if st, ok := sysio.StatOf(info); ok {
+		return int(st.UID), int(st.GID), true
 	}
 	return 0, 0, false
 }

@@ -102,10 +102,7 @@ linters:
         path-except: ^([^/]+\.go|internal/(filexfer/(ftcp|store)|cmd/filexfercli|fsync|pagecache)/.+\.go)$
       - linters: [forbidigo]
         path: _test\.go$
-      # Baseline: raw calls not yet moved behind sysio or annotated. Each
-      # migration removes its files; nothing may be added.
-      - linters: [depguard]
-        path: ^internal/(aead/credential|filexfer/progress|cmd/filexfercli/cli_local_copyrange_linux|filexfer/encoding/(frame|manifest))\.go$
+      # Baseline: opens and dials not yet annotated. Nothing may be added.
       - linters: [forbidigo]
         path: ^(client|client_tcp)\.go$|^internal/(cmd/filexfercli/(cli|cli_local|cli_transfer|cli_verify)|filexfer/store/store)\.go$
 

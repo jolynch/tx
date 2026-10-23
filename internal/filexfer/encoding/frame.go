@@ -9,9 +9,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
+	"github.com/jolynch/tx/internal/sysio"
 	"github.com/zeebo/xxh3"
 )
 
@@ -62,9 +62,9 @@ func CollectFileFrameMetadata(path string, info os.FileInfo) FileFrameMetadata {
 		User:    "unknown",
 		Group:   "unknown",
 	}
-	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		meta.UID = strconv.FormatUint(uint64(st.Uid), 10)
-		meta.GID = strconv.FormatUint(uint64(st.Gid), 10)
+	if st, ok := sysio.StatOf(info); ok {
+		meta.UID = strconv.FormatUint(uint64(st.UID), 10)
+		meta.GID = strconv.FormatUint(uint64(st.GID), 10)
 		meta.User = lookupUserName(meta.UID)
 		meta.Group = lookupGroupName(meta.GID)
 	}
