@@ -96,6 +96,11 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
 - Never commit. Leave finished work staged (`git add`) for review; the
   maintainer writes the commit. Do not amend, squash, or rewrite existing
   commits unless asked.
+- Raw data-path syscalls live in `internal/sysio`. Opens and dials on the
+  data path need a fault gate and a `//nolint:forbidigo` reason naming it.
+  Sanctioned ungated calls must explain the exception in that reason.
+  `make lint` enforces the syscall boundary and requires reasons at
+  sanctioned calls.
 - Avoid allocating on hot paths: per record, frame, file, item, or command.
   Prefer fixed-size buffers held in a long-lived struct, or reuse from an
   existing pool, to a fresh `make` or `new` per call:
@@ -205,8 +210,10 @@ go run ./cmd/tx-bench local -s 256MiB -n 1
   injector first. `make lint` rejects
   `syscall` and `golang.org/x/sys/unix` imports elsewhere, outside the
   harnesses, and raw opens, pipes, syncs, and dials in the data-path packages
-  without a `//nolint:forbidigo` reason naming their gate. Files whose calls
-  have not moved yet are listed in `.golangci.yml`'s Baseline.
+  without a `//nolint:forbidigo` reason naming their gate or explaining an
+  ungated exception. Test files, fault shims, harnesses, signal setup, and
+  the events target writer are exempt from the import rule. The events
+  writer cannot import sysio because faults depends on events.
 - `internal/stats`: the beta distribution, its fits from a mean and a
   percentile or from two percentiles, and its sampler.
 - `internal/memxfer`: whole transfers between a real server and client in one

@@ -937,7 +937,7 @@ func SaveManifest(path string, manifest *Manifest) error {
 		}
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil { //nolint:forbidigo // Manifest state, outside file-content fault gates.
 		return fmt.Errorf("write manifest: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
@@ -959,7 +959,7 @@ func LoadManifest(path string) (*Manifest, error) {
 	if path == "" {
 		return nil, errors.New("missing path")
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) //nolint:forbidigo // Manifest state, outside file-content fault gates.
 	if err != nil {
 		return nil, fmt.Errorf("read manifest: %w", err)
 	}

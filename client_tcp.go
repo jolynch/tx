@@ -384,7 +384,7 @@ func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
 	var err error
 	if dialer == nil {
 		d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-		conn, err = d.DialContext(ctx, "tcp", addr)
+		conn, err = d.DialContext(ctx, "tcp", addr) //nolint:forbidigo // DialErr above; WrapConn below gates connection IO.
 	} else {
 		conn, err = dialer(ctx, addr)
 	}

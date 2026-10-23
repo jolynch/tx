@@ -360,7 +360,7 @@ func hashItems(ctx context.Context, items []verifyItem, src bool, inj *faults.In
 			if src {
 				path = it.file.srcPath
 			}
-			if fd, err = os.Open(path); err != nil {
+			if fd, err = os.Open(path); err != nil { //nolint:forbidigo // Reads use WrapReaderAt below; OpenErr applies to SEND and CXSUM.
 				return nil, err
 			}
 		}

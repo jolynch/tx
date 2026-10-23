@@ -283,13 +283,15 @@ instead of widening the current change; remove an entry when it ships.
   injected `EAGAIN` and reaches `waitSocketWritable` only on a real one.
   `EAGAIN` is real only at the splice into the nonblocking socket, not the
   one from the file, so it needs an errno set per call site.
-- **Fault shims do not reach the manifest walk or `.tx/` state.** TXFER and
+- **Fault shims do not reach all filesystem IO.** TXFER and
   SYNC walk the tree with `filepath.WalkDir` and `Lstat`, and the client
   writes `.tx/` manifests and progress through `os` directly. Faulting them
   needs a filesystem seam on a per-file path, so measure its cost first.
+  Local copies gate `copy_file_range`, but their opens, buffered fallback,
+  and stdout reads do not use DISK gates.
 - **Untested failure paths.** `mapLookupError` (every `ACK`, `CXSUM`, and
   `SEND` file-lookup failure), `checkTransferDeadline` (gentle-mode
-  `TOO_SLOW`), `isDirectIOReadError`, and `EnqueueCacheRestoreBatch` have no
+  `TOO_SLOW`), and `EnqueueCacheRestoreBatch` have no
   coverage, and `internal/cliflags` and `internal/metrics` have no tests.
 - **CLI tests reimplement the server.** `serveFTCPConn` in `cli_test.go`
   reimplements AUTH handling, `PROBE`, and `SYNC` framing instead of running
@@ -317,6 +319,14 @@ instead of widening the current change; remove an entry when it ships.
   `internal/filexfer` or `internal/filexfer/encoding`, where the manifest walk
   lives. The lint guards against raw IO added by accident; review still has to
   catch these.
+- **A full filesystem boundary needs a file wrapper.** sysio gates raw
+  calls, but `*os.File` still exposes reads, writes, syncs, and descriptors.
+  A wrapped file type could enforce DISK and SYS gates across those paths.
+  Measure its cost before extending the boundary.
+- **Unify injector plumbing.** The injector travels through client and
+  server options, request contexts, `fsync.WithFaults`, and the process-wide
+  `pagecache.SetFaults`. Give each server or client one explicit owner so
+  independent instances can inject faults without sharing page-cache state.
 - **The pool's liveness peek allocates on every borrow.** `sysio.PeekAlive`'s
   closure, byte buffer, and result escape to the heap: 3 allocations per
   borrow. Pass them through a small reusable struct, and lock the path in with
