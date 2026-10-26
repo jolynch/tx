@@ -24,6 +24,7 @@ import (
 	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/pagecache"
+	"github.com/jolynch/tx/internal/sysio"
 	"github.com/jolynch/tx/internal/utils"
 )
 
@@ -83,7 +84,7 @@ type ServerOptions struct {
 	DisableZeroCopy         bool                      // force buffered send path even when zero-copy is available
 	TargetIODepth           int                       // target IO depth per CPU advertised in PROBE (default 4)
 	ExitAfter               time.Duration             // 0 = disabled; exit this long after last transfer completes
-	KeepAliveTimeout        time.Duration             // idle window for kept-alive connections; 0 = keep-alive disabled (close after every verb)
+	KeepAliveTimeout        time.Duration             // idle window for kept-alive connections and read progress deadline for every request (60s when 0); 0 = keep-alive disabled (close after every verb)
 	Events                  *events.Sink              // nil disables the event timeline; also handed to the store Serve creates
 	// Faults wraps every accepted connection and gates the server's file and
 	// syscall sites; nil, the default, disables fault injection.
@@ -378,6 +379,7 @@ func tuneServerSocket(conn net.Conn, inj *faults.Injector, writeBufferBytes int)
 		return
 	}
 	_ = tc.SetNoDelay(true)
+	_ = sysio.SetTCPUserTimeout(tc, DeadPeerTimeout)
 	if writeBufferBytes > 0 {
 		_ = tc.SetWriteBuffer(writeBufferBytes)
 	}
@@ -474,8 +476,49 @@ func isAuthLine(line []byte) bool {
 	return len(line) == 4 || line[4] == ' ' || line[4] == '\t' || line[4] == '\r' || line[4] == '\n'
 }
 
+// progressReader gives each read from conn a deadline d from its start, so
+// a peer that sends nothing, or stops sending mid-request, is cut off while
+// one that keeps sending, however slowly, is not. Zero leaves conn's own
+// deadlines alone.
+type progressReader struct {
+	conn net.Conn
+	d    time.Duration
+}
+
+// connReader is a connection's buffered reader and the progressReader under
+// it, allocated together so the deadline costs the connection no allocation.
+type connReader struct {
+	br bufio.Reader
+	pr progressReader
+}
+
+func (r *progressReader) Read(p []byte) (int, error) {
+	if r.d > 0 {
+		_ = r.conn.SetReadDeadline(time.Now().Add(r.d))
+	}
+	return r.conn.Read(p)
+}
+
+// readProgressTimeout is how long a command or request read waits for the
+// peer's next bytes, in plaintext and authenticated sessions alike.
+func (s *connSession) readProgressTimeout() time.Duration {
+	if s.keepAliveTimeout > 0 {
+		return s.keepAliveTimeout
+	}
+	return defaultReadProgressTimeout
+}
+
 func (s *connSession) run() error {
-	br := bufio.NewReader(s.conn)
+	// Plaintext sessions read every command line and request body under a
+	// progress deadline, as the Noise record layer does for authenticated
+	// ones; AUTH sessions use that layer's deadline instead.
+	cr := &connReader{pr: progressReader{conn: s.conn}}
+	pr := &cr.pr
+	if !s.auth.required {
+		pr.d = s.readProgressTimeout()
+	}
+	br := &cr.br
+	br.Reset(pr)
 	lineLimit := maxCommandLineBytes
 	if s.auth.required {
 		// One absolute deadline from accept, for reads and writes, so a peer
@@ -489,9 +532,15 @@ func (s *connSession) run() error {
 		if errors.Is(err, utils.ErrLineTooLarge) {
 			return protocolErr{code: "BAD_REQUEST", message: "command line too large"}
 		}
+		if isBenignDisconnect(err) {
+			// A peer that leaves or stalls before its first command gets
+			// no reply, as on a kept-alive connection.
+			return nil
+		}
 		return err
 	}
 	if isAuthLine(line) {
+		pr.d = 0
 		return s.runAuth(br, line)
 	}
 	if s.auth.required {

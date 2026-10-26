@@ -169,9 +169,13 @@ type Session struct {
 	conn net.Conn
 	br   *bufio.Reader
 
-	// readProgress, when positive, sets a read deadline before each record
-	// header read, so every record received extends it.
+	// readProgress, when positive, sets a read deadline before each read
+	// that has to wait, so every byte received extends it.
 	readProgress time.Duration
+	// writeProgress, when positive, writes records in pieces of
+	// progressWriteBytes, each under a fresh write deadline, so a socket
+	// that keeps taking bytes is never cut off mid-batch.
+	writeProgress time.Duration
 
 	wmu     sync.Mutex
 	send    *recordCipher
@@ -228,13 +232,30 @@ func newSession(conn net.Conn, br *bufio.Reader, alg Algorithm, send, recv *nois
 	return s, nil
 }
 
-// SetReadProgressDeadline makes every record read wait at most d for its
-// header. Zero disables it; the connection's own deadlines then apply.
+// SetReadProgressDeadline makes every read wait at most d for the peer's
+// next bytes, so a record still arriving is progress. Zero stops re-arming
+// it but leaves the last deadline set on the connection; clear that with
+// SetReadDeadline before reusing the connection.
 func (s *Session) SetReadProgressDeadline(d time.Duration) {
 	s.rmu.Lock()
 	s.readProgress = d
 	s.rmu.Unlock()
 }
+
+// SetWriteProgressDeadline makes every progressWriteBytes of records written
+// wait at most d for the socket to take them. Zero stops re-arming it but
+// leaves the last deadline set on the connection; clear that with
+// SetWriteDeadline before reusing the connection.
+func (s *Session) SetWriteProgressDeadline(d time.Duration) {
+	s.wmu.Lock()
+	s.writeProgress = d
+	s.wmu.Unlock()
+}
+
+// progressWriteBytes is the piece a write progress deadline covers. A
+// piece must fit under the sender's TCP_NOTSENT_LOWAT, when one is set, so
+// that it is accepted as bytes leave rather than after a backlog drains.
+const progressWriteBytes = 16 << 10
 
 // Failed reports whether the session is poisoned.
 func (s *Session) Failed() bool { return s.failed.Load() }
@@ -504,11 +525,26 @@ func (s *Session) writeQueuedLocked() error {
 	if s.woff == 0 {
 		return nil
 	}
-	if err := writeAll(s.conn, s.wbuf[:s.woff]); err != nil {
+	if err := s.writeConnLocked(s.wbuf[:s.woff]); err != nil {
 		return s.fail(fmt.Errorf("write records: %w", err))
 	}
 	s.woff = 0
 	s.sealed = 0
+	return nil
+}
+
+func (s *Session) writeConnLocked(p []byte) error {
+	if s.writeProgress <= 0 {
+		return writeAll(s.conn, p)
+	}
+	for len(p) > 0 {
+		n := min(len(p), progressWriteBytes)
+		_ = s.conn.SetWriteDeadline(time.Now().Add(s.writeProgress))
+		if err := writeAll(s.conn, p[:n]); err != nil {
+			return err
+		}
+		p = p[n:]
+	}
 	return nil
 }
 
@@ -708,6 +744,10 @@ func (s *Session) fillLocked(need, want int) error {
 		s.rend += m
 		if err != nil && s.rend-s.roff < need {
 			return err
+		}
+		if m > 0 && s.readProgress > 0 && s.rend-s.roff < need {
+			// Part of the record arrived; wait afresh for the rest.
+			_ = s.conn.SetReadDeadline(time.Now().Add(s.readProgress))
 		}
 	}
 	return nil

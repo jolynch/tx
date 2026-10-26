@@ -1,18 +1,25 @@
 package ftcp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/zeebo/xxh3"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/filexfer/store"
 )
 
 func TestHandleACKLogsCompleteAfterFinalProgress(t *testing.T) {
@@ -402,5 +409,75 @@ func TestHandleACKRevivesMissingFile(t *testing.T) {
 	}
 	if status.DownloadStatus.Done != 2 || status.DownloadStatus.Missing != 0 || status.Done != 2 {
 		t.Fatalf("STATUS reports %+v done=%d, want both files done and none missing", status.DownloadStatus, status.Done)
+	}
+}
+
+// BenchmarkServePlaintextACKBody sends one plaintext ACK whose identity
+// framed body lists 100,000 files, about 6 MiB, over loopback TCP to a real
+// server, and waits for its OK. Every item acknowledges its file missing, so
+// the work is reading, parsing, and validating the body rather than updating
+// the store. Each op dials a connection, as a client without keep-alive does.
+func BenchmarkServePlaintextACKBody(b *testing.B) {
+	const files = 100_000
+	const root = "/bench-ack"
+	logOut := log.Writer()
+	log.SetOutput(io.Discard)
+	b.Cleanup(func() { log.SetOutput(logOut) })
+
+	st := store.NewStore()
+	b.Cleanup(st.Close)
+	transfer, err := st.NewTransfer(root, files, 0)
+	if err != nil {
+		b.Fatalf("NewTransfer: %v", err)
+	}
+	updates := make([]TransferFileStateUpdate, files)
+	var body bytes.Buffer
+	fmt.Fprintf(&body, "ACK %s\r\n", transfer.ID)
+	w := encoding.NewFramedBodyWriter(&body, "none", encoding.DefaultBodyChunkSize, 0)
+	for i := range files {
+		path := fmt.Sprintf("%s/d%03d/file-%07d.bin", root, i%256, i+1)
+		updates[i] = TransferFileStateUpdate{FileID: uint64(i + 1), PathHash: xxh3.Hash128([]byte(path)), FileSize: 1024}
+		if _, err := fmt.Fprintf(w, "fd=%d %q ack-token=-1\n", i+1, path); err != nil {
+			b.Fatalf("write item: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		b.Fatalf("close body: %v", err)
+	}
+	st.RegisterTransferFileStates(transfer.ID, updates, TransferStateRunning)
+	wire := body.Bytes()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("listen: %v", err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- Serve(ln, ServerOptions{Deps: NewRuntimeDeps(st, WithRoot("/"))}) }()
+	b.Cleanup(func() {
+		_ = ln.Close()
+		<-served
+	})
+
+	ack := func() {
+		conn, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			b.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+		if _, err := conn.Write(wire); err != nil {
+			b.Fatalf("write ACK: %v", err)
+		}
+		line, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil || !strings.HasPrefix(line, "OK") {
+			b.Fatalf("ACK reply %q: %v", line, err)
+		}
+	}
+	ack() // mark every file missing; later ACKs leave the store unchanged
+	b.SetBytes(int64(len(wire)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ack()
 	}
 }

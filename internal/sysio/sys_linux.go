@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -217,6 +218,34 @@ func TCPByteCounts(conn *net.TCPConn) (received, sent int64) {
 		}
 	})
 	return received, sent
+}
+
+// SetTCPUserTimeout sets TCP_USER_TIMEOUT on conn: the kernel closes the
+// connection once data it sent, or a keepalive probe, goes unacknowledged
+// for d, or the peer's receive window stays closed for d.
+func SetTCPUserTimeout(conn *net.TCPConn, d time.Duration) error {
+	return setTCPInt(conn, unix.TCP_USER_TIMEOUT, int(d.Milliseconds()))
+}
+
+// SetTCPNotSentLowat sets TCP_NOTSENT_LOWAT on conn: a write waits while
+// more than n bytes are queued but not yet sent, so writes return at about
+// the rate bytes leave.
+func SetTCPNotSentLowat(conn *net.TCPConn, n int) error {
+	return setTCPInt(conn, unix.TCP_NOTSENT_LOWAT, n)
+}
+
+func setTCPInt(conn *net.TCPConn, opt, value int) error {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var serr error
+	if err := raw.Control(func(fd uintptr) {
+		serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, opt, value)
+	}); err != nil {
+		return err
+	}
+	return serr
 }
 
 // PeekAlive reports whether raw's socket is still open and holds no unread

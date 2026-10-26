@@ -55,8 +55,11 @@ one for large (potentially slow) data transfers, and one for quick commands.
 `concurrency` is the probe's suggestion, or `--concurrency` when set, clamped
 to `[2, 256]`. Both pools work the same way and differ only in growth:
 
-- **Warm.** Each pool opens `concurrency` connections up front, during the
-  probe, so the first `SEND` and `ACK` requests find a connection ready.
+- **Warm.** With keep-alive, each pool opens `concurrency` connections up
+  front, during the probe, so the first `SEND` and `ACK` requests find a
+  connection ready. Without it, a connection serves one command and cannot
+  be heartbeated, and the server closes one that sends nothing for its idle
+  timeout, so the pools dial on demand instead.
 - **Most recently used first.** Idle connections form a stack. A borrower
   always gets the most recently used one, so steady traffic reuses the same
   connections and the unused ones sink to the bottom.
@@ -89,12 +92,17 @@ background loop heartbeats each pooled connection idle for that long with a
 zero-payload PROBE round trip (a failed heartbeat closes the connection and
 starts a replacement, and borrowers peek for a pending EOF before reuse), and
 the server independently reaps connections that send nothing for the keep-alive
-window (`--idle-timeout`, default 60s).
+window (`--idle-timeout`, default 60s). Both ends set `TCP_USER_TIMEOUT` to
+30s, so the kernel closes a connection whose sent data goes unacknowledged
+that long, or whose peer stops reading that long, and the work on it fails
+and is retried. `tx recv get` to stdout cannot resume, so a consumer that
+pauses for 30s fails it.
 
-Against servers without keep-alive, or when a response is not read through
+Against servers without keep-alive, a connection is closed after one use and
+the next request dials its own. When a kept-alive response is not read through
 its terminal `OK` line (an `ERR`, a malformed or truncated stream, a cancelled
-request, or a caller that stops early), a connection is closed after one use
-and a background goroutine opens and authenticates a replacement. Replacements
+request, or a caller that stops early), the connection is closed and a
+background goroutine opens and authenticates a replacement. Replacements
 restore a pool only to the size it last scaled to, and fill a slot the
 closed connection freed, so they never push a pool past its size or undo a
 scale-down.

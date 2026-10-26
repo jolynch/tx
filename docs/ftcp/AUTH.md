@@ -415,8 +415,9 @@ connection that cannot get a permit receives `ERR BUSY`, written with a 10 ms
 deadline; the server then half-closes, reads at most 354 bytes of the client's
 opening (an `AUTH` line and message 1) for at most 200 ms, and closes. The accept loop never waits for a permit or a refusal.
 
-The cap bounds sockets, memory, and descriptors. It deliberately does not track
-CPU count: a small cap would let a few idle sockets exclude every client. It
+The cap bounds sockets, memory, and descriptors until `FINISH`; after it, the
+idle timeout bounds how long a silent session lives. It deliberately does not
+track CPU count: a small cap would let a few idle sockets exclude every client. It
 does not bound handshake CPU or connection floods. Every opening costs the
 server one X25519 operation and one HMAC per allowlist entry of its mode before
 the tag can match, and an opening whose tag matches costs several more X25519
@@ -425,15 +426,15 @@ operations before `FINISH`.
 One absolute deadline, five seconds from accept, covers the discovery reply,
 handshake, and `FINISH`. On a server that requires authentication it also
 covers reading the first line, which is limited to 256 bytes. A server without
-flags reads the first line as it reads any plaintext command, with no deadline
-or size beyond the command-line limit, and applies the deadline once that line
-is an `AUTH` form.
+flags reads the first line as it reads any plaintext command, under the idle
+progress deadline and the command-line limit, and applies the five-second
+deadline once that line is an `AUTH` form.
 
-After `FINISH`, each record read has a progress deadline equal to the server's
+After `FINISH`, each socket read has a progress deadline equal to the server's
 idle timeout (`--idle-timeout`, default 60 s; 60 s when keep-alive is
 disabled). It covers the first command, the time between commands, and the
-time between records of one request, so a large request that keeps arriving is
-never cut off.
+time between bytes of one request, even within a record, so a large request
+that keeps arriving is never cut off, while a silent session is closed.
 
 ### Client
 

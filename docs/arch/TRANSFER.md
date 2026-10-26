@@ -67,7 +67,7 @@ sequenceDiagram
     S-->>C: Capabilities + RTT timestamps
     C->>S: PROBE throughput (parallel across server CPUs)
     S-->>C: Echo payloads for aggregate link estimate
-    Note over C: Compute concurrency = server_cpu × io_depth<br/>Warm authenticated data + control pools<br/>Plan batch size from concurrency, window and link
+    Note over C: Compute concurrency = server_cpu × io_depth<br/>Size data + control pools (warm with keep-alive)<br/>Plan batch size from concurrency, window and link
     C->>S: TXFER mode=fast link-mbps=N concurrency=C
     Note right of S: Walk source tree
     S-->>C: FM/1 manifest frames

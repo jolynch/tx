@@ -291,8 +291,14 @@ PROBE -> TXFER (FM/1 manifest) -> SEND (FX/1 frames) -> ACK -> STATUS
 - Connections are normally single-command. `PROBE keep-alive=auto` can grant
   `keep-alive-ms`; the client then pools sessions, heartbeats at one quarter of
   the window, checks pooled connections before reuse, and evicts dead ones.
-  Server idle timeout defaults to 60s (`0` disables); heartbeats do not count
-  toward `--exit-after` activity.
+  Server idle timeout defaults to 60s (`0` disables keep-alive); every
+  command and request read, plaintext or authenticated, waits at most that
+  long (60s when disabled) for the peer's next bytes, from accept or
+  `FINISH`, so a client keeps idle connections only as heartbeated sessions.
+  Heartbeats do not count toward `--exit-after` activity. Client and server
+  sockets set `TCP_USER_TIMEOUT` to `ftcp.DeadPeerTimeout` (30s), so a peer
+  that is dead or stops reading that long fails the work on its connection,
+  to be retried.
 
 ### Server and state
 
@@ -379,8 +385,9 @@ session belongs to the connection (`noiseConn`). Without an identity the
 client generates one in-memory key pair. `WithContextDialer` supplies custom
 connections. `client_pool.go`
 keeps two TCP pools that never share connections, one for SEND/CXSUM and one
-for ACK/STATUS/TXFER/SYNC. Both open the concurrency (`WithConcurrency`, else
-the probe's suggestion) up front, lend the most recently used idle connection,
+for ACK/STATUS/TXFER/SYNC. With keep-alive, both open the concurrency
+(`WithConcurrency`, else the probe's suggestion) up front; without it they
+dial on demand. They lend the most recently used idle connection,
 and once per heartbeat interval scale down to peak use plus a quarter. Only the
 control pool grows past its size; a full data pool makes callers wait. Refills
 restore a pool only to the size it last scaled to, and the data pool's
@@ -389,7 +396,7 @@ at most one SEND slot per data connection and splits batches and large files
 only into free slots, so its SENDs never wait for a connection. `tx recv copy`
 shares one client across its phases. Dials made because a pool had no idle
 connection increment `SyncConnectionCount`; without keep-alive, connections are
-single-use. Add counters in `internal/metrics`; exported `tx.ClientMetrics`
+single-use, and every request's dial increments it. Add counters in `internal/metrics`; exported `tx.ClientMetrics`
 aliases the snapshot type. `tx.ClientMetricCounters` is the shared counter set
 for `WithClientMetrics`. `tx.NewClientEventSink` and `tx.ClientEvent` make
 `WithEventSink` usable outside this module for the client event timeline

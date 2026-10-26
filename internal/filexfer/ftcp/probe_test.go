@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log"
+	"net"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHandlePROBERoundTrip(t *testing.T) {
@@ -262,4 +265,271 @@ func TestHandlePROBEFastTransferHasNoLimiter(t *testing.T) {
 	if got := probe(); got == "0" {
 		t.Fatalf("gentle limiter not advertised")
 	}
+}
+
+// serveOneConn serves one real TCP connection with handleConn. It returns the
+// client end and a channel closed when handleConn returns, so a test can
+// tell that the server let go of the connection rather than only that the
+// socket closed.
+func serveOneConn(t *testing.T, opts ServerOptions) (net.Conn, <-chan struct{}) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	auth, err := newAuthPolicy(opts)
+	if err != nil {
+		t.Fatalf("newAuthPolicy: %v", err)
+	}
+	deps := opts.Deps
+	if deps == nil {
+		deps = realDeps(t, "/")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		handleConn(conn, opts, auth, nil, deps, nil, nil)
+	}()
+	// Runs after the client end closes below, so no handler outlives the test.
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Errorf("handleConn still running after the client closed")
+		}
+	})
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+	return conn, done
+}
+
+// A plaintext request that stops arriving mid-way must not hold the
+// connection open: once no byte arrives for the session's read-progress
+// timeout (KeepAliveTimeout here), the read fails, the handler returns, and
+// the server closes the connection without answering the request. It may
+// report at most one ERR line; a stalled command line, which has no request
+// to answer yet, closes silently.
+func TestServePlaintextStalledRequestCloses(t *testing.T) {
+	const idle = 200 * time.Millisecond
+	const closeWithin = 2 * time.Second
+
+	ackBody, err := io.ReadAll(framedItemBody(t, `fd=1 6:/a/b/c ack-token=1:0`))
+	if err != nil {
+		t.Fatalf("build ACK body: %v", err)
+	}
+	payload := bytes.Repeat([]byte{0x5a}, 4096)
+
+	cases := []struct {
+		name string
+		// prelude runs complete commands before the stalled one.
+		prelude func(t *testing.T, conn net.Conn, br *bufio.Reader)
+		stalled []byte
+		// silent cases must close without writing anything.
+		silent bool
+	}{
+		{
+			// The fault-run hang: a PROBE payload truncated by a dropped
+			// segment leaves drainProbePayload waiting forever.
+			name:    "PROBE payload",
+			stalled: append([]byte("PROBE cpu=1 probe-bytes=1048576 cts0=1\r\n"), payload...),
+		},
+		{
+			name:    "PROBE payload before its first byte",
+			stalled: []byte("PROBE cpu=1 probe-bytes=1048576 cts0=1\r\n"),
+		},
+		{
+			// readCommand clears its deadline once the command line is read;
+			// the body that follows must still be bounded.
+			name: "PROBE payload on a kept-alive connection",
+			prelude: func(t *testing.T, conn net.Conn, br *bufio.Reader) {
+				if _, err := conn.Write([]byte("PROBE cpu=1 probe-bytes=0 cts0=1 keep-alive=auto\r\n")); err != nil {
+					t.Fatalf("write keep-alive PROBE: %v", err)
+				}
+				readLineOrFatal(t, br, "keep-alive PROBE response")
+				if ok := readLineOrFatal(t, br, "keep-alive PROBE status"); !strings.HasPrefix(ok, "OK") {
+					t.Fatalf("expected OK after keep-alive PROBE, got %q", ok)
+				}
+			},
+			stalled: append([]byte("PROBE cpu=1 probe-bytes=1048576 cts0=2\r\n"), payload...),
+		},
+		{
+			name:    "ACK framed body",
+			stalled: append([]byte("ACK tx123\r\n"), ackBody[:len(ackBody)/2]...),
+		},
+		{
+			name:    "first command line",
+			stalled: []byte("PROBE cpu=1 probe-by"),
+			silent:  true,
+		},
+		{
+			name: "command line on a kept-alive connection",
+			prelude: func(t *testing.T, conn net.Conn, br *bufio.Reader) {
+				if _, err := conn.Write([]byte("PROBE cpu=1 probe-bytes=0 cts0=1 keep-alive=auto\r\n")); err != nil {
+					t.Fatalf("write keep-alive PROBE: %v", err)
+				}
+				readLineOrFatal(t, br, "keep-alive PROBE response")
+				if ok := readLineOrFatal(t, br, "keep-alive PROBE status"); !strings.HasPrefix(ok, "OK") {
+					t.Fatalf("expected OK after keep-alive PROBE, got %q", ok)
+				}
+			},
+			stalled: []byte("PROBE cpu=1 probe-by"),
+			silent:  true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, done := serveOneConn(t, ServerOptions{KeepAliveTimeout: idle})
+			br := bufio.NewReader(conn)
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			if tc.prelude != nil {
+				tc.prelude(t, conn, br)
+			}
+			if _, err := conn.Write(tc.stalled); err != nil {
+				t.Fatalf("write stalled request: %v", err)
+			}
+
+			// Bound the client's own wait past closeWithin, so a server that
+			// never closes fails here instead of hanging the test.
+			start := time.Now()
+			_ = conn.SetReadDeadline(start.Add(closeWithin + time.Second))
+			got, err := io.ReadAll(br)
+			elapsed := time.Since(start)
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				t.Fatalf("server held the stalled request open for %v without closing the connection (read %q)", elapsed, got)
+			}
+			if elapsed > closeWithin {
+				t.Fatalf("server took %v to close a request stalled for %v", elapsed, idle)
+			}
+			if bytes.HasPrefix(got, []byte("PROBE ")) || bytes.HasPrefix(got, []byte("OK")) {
+				t.Fatalf("server answered a request it never received in full: %q", got)
+			}
+			if tc.silent && len(got) > 0 {
+				t.Fatalf("server wrote %q before closing a stalled command line, want nothing", got)
+			}
+			if bytes.Contains(got, []byte("ERR ERR")) || bytes.Count(got, []byte("\n")) > 1 {
+				t.Fatalf("server reported the stall more than once: %q", got)
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("handleConn did not return after the server closed the connection")
+			}
+		})
+	}
+}
+
+// The read-progress timeout bounds each gap between bytes, not the whole
+// request: a PROBE payload that keeps trickling in, each gap shorter than the
+// timeout but the whole request several times longer, still succeeds.
+func TestServePlaintextTrickledProbeSucceeds(t *testing.T) {
+	const idle = 200 * time.Millisecond
+	const gap = 40 * time.Millisecond
+	const chunks = 16
+	const chunkBytes = 1024
+	const total = chunks * chunkBytes
+
+	conn, _ := serveOneConn(t, ServerOptions{KeepAliveTimeout: idle})
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	start := time.Now()
+	if _, err := conn.Write([]byte("PROBE cpu=1 probe-bytes=" + strconv.Itoa(total) + " cts0=1\r\n")); err != nil {
+		t.Fatalf("write PROBE: %v", err)
+	}
+	chunk := bytes.Repeat([]byte{0x5a}, chunkBytes)
+	for range chunks {
+		time.Sleep(gap)
+		if _, err := conn.Write(chunk); err != nil {
+			t.Fatalf("write payload chunk after %v: %v", time.Since(start), err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed <= 2*idle {
+		t.Fatalf("payload took only %v; the test needs a request longer than the %v timeout", elapsed, idle)
+	}
+
+	br := bufio.NewReader(conn)
+	resp := readLineOrFatal(t, br, "PROBE response")
+	if !strings.HasPrefix(resp, "PROBE ") || !strings.Contains(resp, " probe-bytes="+strconv.Itoa(total)) {
+		t.Fatalf("expected a PROBE response for %d bytes, got %q", total, resp)
+	}
+	if _, err := io.CopyN(io.Discard, br, total); err != nil {
+		t.Fatalf("read PROBE echo: %v", err)
+	}
+	if ok := readLineOrFatal(t, br, "PROBE status"); !strings.HasPrefix(ok, "OK") {
+		t.Fatalf("expected OK after PROBE, got %q", ok)
+	}
+}
+
+// A client must begin its first command within the read-progress timeout
+// (KeepAliveTimeout here), counted from accept. A connection that stays
+// silent is closed at that timeout without a reply; one whose first command
+// starts inside the timeout is served. Clients keep idle pooled connections
+// open with keep-alive PROBEs instead.
+func TestServePlaintextFirstCommandDeadline(t *testing.T) {
+	const idle = 200 * time.Millisecond
+	const closeWithin = time.Second
+
+	t.Run("silent connection closes", func(t *testing.T) {
+		conn, done := serveOneConn(t, ServerOptions{KeepAliveTimeout: idle})
+		// Bound the client's own wait past closeWithin, so a server that
+		// never closes fails here instead of hanging the test.
+		start := time.Now()
+		_ = conn.SetReadDeadline(start.Add(closeWithin + time.Second))
+		got, err := io.ReadAll(conn)
+		elapsed := time.Since(start)
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			t.Fatalf("server held a connection that sent nothing open for %v (timeout %v)", elapsed, idle)
+		}
+		if elapsed < idle/2 {
+			t.Fatalf("server closed a silent connection after %v, before its %v timeout", elapsed, idle)
+		}
+		if elapsed > closeWithin {
+			t.Fatalf("server took %v to close a connection silent for its %v timeout", elapsed, idle)
+		}
+		if len(got) > 0 {
+			t.Fatalf("server wrote %q before closing a silent connection, want nothing", got)
+		}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("handleConn did not return after the server closed the connection")
+		}
+	})
+
+	t.Run("command inside the timeout is served", func(t *testing.T) {
+		conn, _ := serveOneConn(t, ServerOptions{KeepAliveTimeout: idle})
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		time.Sleep(idle / 2)
+		if _, err := conn.Write([]byte("PROBE cpu=1 probe-bytes=16 cts0=1\r\n")); err != nil {
+			t.Fatalf("write PROBE after %v idle: %v", idle/2, err)
+		}
+		if _, err := conn.Write(bytes.Repeat([]byte{0x5a}, 16)); err != nil {
+			t.Fatalf("write PROBE payload: %v", err)
+		}
+		br := bufio.NewReader(conn)
+		resp, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("server closed a connection whose first command began %v after accept (timeout %v): %v", idle/2, idle, err)
+		}
+		if !strings.HasPrefix(resp, "PROBE ") || !strings.Contains(resp, " probe-bytes=16") {
+			t.Fatalf("expected a PROBE response for 16 bytes, got %q", resp)
+		}
+		if _, err := io.CopyN(io.Discard, br, 16); err != nil {
+			t.Fatalf("read PROBE echo: %v", err)
+		}
+		if ok := readLineOrFatal(t, br, "PROBE status"); !strings.HasPrefix(ok, "OK") {
+			t.Fatalf("expected OK after PROBE, got %q", ok)
+		}
+	})
 }

@@ -940,21 +940,28 @@ func TestTCPConnHelpersSeeThroughFaultWrapper(t *testing.T) {
 // socketBuffer returns a socket's SO_SNDBUF or SO_RCVBUF.
 func socketBuffer(t *testing.T, tc *net.TCPConn, opt int) int {
 	t.Helper()
+	return sockopt(t, tc, unix.SOL_SOCKET, opt)
+}
+
+// sockopt returns a socket's option opt at level.
+func sockopt(t *testing.T, tc *net.TCPConn, level, opt int) int {
+	t.Helper()
 	raw, err := tc.SyscallConn()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var size int
+	var v int
 	var sockErr error
-	if err := raw.Control(func(fd uintptr) { size, sockErr = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, opt) }); err != nil || sockErr != nil {
+	if err := raw.Control(func(fd uintptr) { v, sockErr = unix.GetsockoptInt(int(fd), level, opt) }); err != nil || sockErr != nil {
 		t.Fatal(err, sockErr)
 	}
-	return size
+	return v
 }
 
 // TestTuneServerSocketThroughFaultWrapper checks the server's socket options
 // reach the socket under a fault wrapper whose gate passes, and are skipped
-// only when no socket is there.
+// only when no socket is there. Every accepted connection gets
+// TCP_USER_TIMEOUT, so a dead client fails its work after DeadPeerTimeout.
 func TestTuneServerSocketThroughFaultWrapper(t *testing.T) {
 	const want = 24 << 10 // Linux reports twice the size set
 	for _, inj := range []*faults.Injector{nil, faults.New(faults.Config{Seed: 1})} {
@@ -962,6 +969,9 @@ func TestTuneServerSocketThroughFaultWrapper(t *testing.T) {
 		tuneServerSocket(inj.WrapConn(server, faults.Server), inj, want)
 		if got := socketBuffer(t, server, unix.SO_SNDBUF); got != 2*want {
 			t.Fatalf("injector %v: SO_SNDBUF = %d, want %d", inj != nil, got, 2*want)
+		}
+		if got, want := sockopt(t, server, unix.IPPROTO_TCP, unix.TCP_USER_TIMEOUT), int(DeadPeerTimeout.Milliseconds()); got != want {
+			t.Fatalf("injector %v: TCP_USER_TIMEOUT = %dms, want %dms", inj != nil, got, want)
 		}
 		_ = server.Close()
 		_ = client.Close()

@@ -210,7 +210,7 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 	cf.IntVar(&targetIODepth, "", "target-io-depth", 4, "Target IO depth per CPU advertised in PROBE")
 	cf.BoolVar(&disableZeroCopy, "", "disable-zero-copy", false, "Force buffered send path (for benchmarking)")
 	cf.StringVar(&exitAfterRaw, "", "exit-after", "60s", "Exit duration after transfer completes; 'never' to run forever (e.g. 5s, 1m)")
-	cf.StringVar(&idleTimeoutRaw, "", "idle-timeout", "60s", "Close kept-alive connections idle for this duration; 0 disables keep-alive (e.g. 10s, 1m)")
+	cf.StringVar(&idleTimeoutRaw, "", "idle-timeout", "60s", "Close kept-alive connections idle for this duration, and any connection that sends nothing or stalls mid-request this long (60s if 0); 0 disables keep-alive (e.g. 10s, 1m)")
 	cf.StringVar(&traceFile, "", "trace", "", "Write runtime/trace output to this file")
 	cf.StringSliceVar(&progressPaths, "p", "progress-path", "Progress output target; repeatable, use - for stdout")
 	cf.StringSliceVar(&progressFormats, "f", "progress-format", "Progress format: json|int|events; 1 applies to all targets, or one per target (default json)")

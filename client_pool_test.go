@@ -20,6 +20,7 @@ import (
 
 	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/faults"
+	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	intftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	"github.com/jolynch/tx/internal/filexfer/store"
 )
@@ -48,25 +49,59 @@ func waitForTCPPoolsReady(t *testing.T, client *Client, data, control int) {
 		data, control, describe(client.tcpPool(poolData)), describe(client.tcpPool(poolControl)))
 }
 
-func TestProbeLinkWarmsTCPPool(t *testing.T) {
-	var probeCPU atomic.Int64
-	probeCPU.Store(2)
-	handler := func(req intftcp.Request, out io.Writer) error {
+// singleUseHandler answers PROBE with cpu CPUs and no keep-alive grant, and
+// STATUS and CXSUM with fixed responses. Its pools hold single-use
+// connections.
+func singleUseHandler(cpu *atomic.Int64) func(intftcp.Request, io.Writer) error {
+	return func(req intftcp.Request, out io.Writer) error {
 		switch req.Verb {
 		case intftcp.VerbPROBE:
 			n, err := strconv.ParseInt(strings.TrimSpace(req.Params[0]["probe-bytes"]), 10, 64)
 			if err != nil {
 				return err
 			}
-			return writeProbeResponse(out, int(probeCPU.Load()), n)
+			return writeProbeResponse(out, int(cpu.Load()), n)
 		case intftcp.VerbSTATUS:
 			_, err := io.WriteString(out, "OK {\"transfer_id\":\"tx123\"}\r\n")
+			return err
+		case intftcp.VerbCXSUM:
+			_, err := io.WriteString(out, "FX/1 1 offset=0 size=0 wsize=0 comp=none ts=1\n")
 			return err
 		default:
 			return fmt.Errorf("unexpected verb: %v", req.Verb)
 		}
 	}
-	dialer := newCountingPipeDialer(handler)
+}
+
+// assertNoPoolDials waits long enough for a background fill to start, then
+// checks that the dialer saw exactly want attempts and that neither pool
+// holds or is filling an idle connection.
+func assertNoPoolDials(t *testing.T, client *Client, dialer *countingPipeDialer, want int, after string) {
+	t.Helper()
+	time.Sleep(100 * time.Millisecond)
+	if got := dialer.AttemptCount(); got != want {
+		t.Fatalf("after %s: %d dial attempts, want %d (a pool without keep-alive must not dial ahead)", after, got, want)
+	}
+	for _, class := range []tcpPoolClass{poolData, poolControl} {
+		p := client.tcpPool(class)
+		if p == nil {
+			t.Fatalf("after %s: pool %v not initialized", after, class)
+		}
+		if idle, filling := len(p.ready), p.refilling.Load(); idle != 0 || filling != 0 {
+			t.Fatalf("after %s: pool %v holds %d idle connections and %d fills, want none without keep-alive", after, class, idle, filling)
+		}
+	}
+}
+
+// TestTCPPoolWithoutKeepAliveDialsOnDemand checks pools the server granted no
+// keep-alive. The server closes a connection that sends no command within
+// its idle timeout, so ProbeLink sizes the pools but dials nothing ahead,
+// each request dials its own single-use connection, and neither a finished
+// response nor a closed stream starts a background replacement.
+func TestTCPPoolWithoutKeepAliveDialsOnDemand(t *testing.T) {
+	var probeCPU atomic.Int64
+	probeCPU.Store(2)
+	dialer := newCountingPipeDialer(singleUseHandler(&probeCPU))
 	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
 	defer client.Close()
 
@@ -80,131 +115,50 @@ func TestProbeLinkWarmsTCPPool(t *testing.T) {
 	if probe.WarmConnectionPoolSize != 2 {
 		t.Fatalf("expected data pool size 2, got %d", probe.WarmConnectionPoolSize)
 	}
-
-	waitForDialSuccessCount(t, dialer, 5)
-	waitForTCPPoolsReady(t, client, 2, 2)
-
-	pool := client.tcpPool(poolData)
-	if pool == nil {
-		t.Fatal("expected data pool to be initialized")
+	if pool := client.tcpPool(poolData); pool == nil || pool.opts.limit != 2 {
+		t.Fatalf("expected a data pool limited to 2, got %+v", pool)
 	}
-	if pool.opts.limit != 2 {
-		t.Fatalf("expected data pool limit 2, got %d", pool.opts.limit)
-	}
-}
+	assertNoPoolDials(t, client, dialer, 1, "ProbeLink")
 
-func TestTCPPoolUsesWarmedConnectionForStatus(t *testing.T) {
-	var probeCPU atomic.Int64
-	probeCPU.Store(2)
-	handler := func(req intftcp.Request, out io.Writer) error {
-		switch req.Verb {
-		case intftcp.VerbPROBE:
-			n, err := strconv.ParseInt(strings.TrimSpace(req.Params[0]["probe-bytes"]), 10, 64)
-			if err != nil {
-				return err
-			}
-			return writeProbeResponse(out, int(probeCPU.Load()), n)
-		case intftcp.VerbSTATUS:
-			_, err := io.WriteString(out, "OK {\"transfer_id\":\"tx123\"}\r\n")
-			return err
-		default:
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-	}
-	dialer := newCountingPipeDialer(handler)
-	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
-	defer client.Close()
-
-	if _, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
-		t.Fatalf("ProbeLink failed: %v", err)
-	}
-	waitForDialSuccessCount(t, dialer, 5)
-	waitForTCPPoolsReady(t, client, 2, 2)
-
-	dialer.SetSuccessLimit(5)
 	statusResp, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"})
 	if err != nil {
-		t.Fatalf("GetStatus failed using warmed connection: %v", err)
+		t.Fatalf("GetStatus failed: %v", err)
 	}
 	if statusResp.Status == nil || statusResp.Status.TransferID != "tx123" {
 		t.Fatalf("unexpected status response: %+v", statusResp.Status)
 	}
-	if got := dialer.SuccessCount(); got != 5 {
-		t.Fatalf("expected no new successful dial for warmed status request, got %d", got)
-	}
-}
+	assertNoPoolDials(t, client, dialer, 2, "GetStatus")
 
-func TestTCPPoolRefillsAfterShortResponse(t *testing.T) {
-	var probeCPU atomic.Int64
-	probeCPU.Store(2)
-	handler := func(req intftcp.Request, out io.Writer) error {
-		switch req.Verb {
-		case intftcp.VerbPROBE:
-			n, err := strconv.ParseInt(strings.TrimSpace(req.Params[0]["probe-bytes"]), 10, 64)
-			if err != nil {
-				return err
-			}
-			return writeProbeResponse(out, int(probeCPU.Load()), n)
-		case intftcp.VerbSTATUS:
-			_, err := io.WriteString(out, "OK {\"transfer_id\":\"tx123\"}\r\n")
-			return err
-		default:
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
+	resp, err := client.GetChecksum(context.Background(), GetChecksumRequest{
+		TransferID: "tx123",
+		Targets:    []ChecksumTarget{{FileID: 1, FullPath: "/tmp/file"}},
+	})
+	if err != nil {
+		t.Fatalf("GetChecksum failed: %v", err)
 	}
-	dialer := newCountingPipeDialer(handler)
-	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
-	defer client.Close()
+	if err := resp.Reader.Close(); err != nil {
+		t.Fatalf("close checksum reader: %v", err)
+	}
+	assertNoPoolDials(t, client, dialer, 3, "closing a CXSUM stream")
 
-	if _, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
-		t.Fatalf("ProbeLink failed: %v", err)
+	if got := client.MetricSnapshot().SyncConnectionCount; got != 2 {
+		t.Fatalf("SyncConnectionCount = %d, want 2 (one on-demand dial per request)", got)
 	}
-	waitForDialSuccessCount(t, dialer, 5)
-	waitForTCPPoolsReady(t, client, 2, 2)
-
-	dialer.SetSuccessLimit(6)
-	if _, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"}); err != nil {
-		t.Fatalf("GetStatus failed: %v", err)
-	}
-	waitForDialSuccessCount(t, dialer, 6)
-	waitForTCPPoolsReady(t, client, 2, 2)
 }
 
 // TestTCPPoolsIsolateDataFromControl fills the data pool with open CXSUM
 // streams. Another data request waits rather than dialing, while STATUS still
-// runs on the control pool, which dials once it has no idle connection.
+// runs on the control pool, which dials on demand.
 func TestTCPPoolsIsolateDataFromControl(t *testing.T) {
 	var probeCPU atomic.Int64
 	probeCPU.Store(2)
-	handler := func(req intftcp.Request, out io.Writer) error {
-		switch req.Verb {
-		case intftcp.VerbPROBE:
-			n, err := strconv.ParseInt(strings.TrimSpace(req.Params[0]["probe-bytes"]), 10, 64)
-			if err != nil {
-				return err
-			}
-			return writeProbeResponse(out, int(probeCPU.Load()), n)
-		case intftcp.VerbSTATUS:
-			_, err := io.WriteString(out, "OK {\"transfer_id\":\"tx123\"}\r\n")
-			return err
-		case intftcp.VerbCXSUM:
-			_, err := io.WriteString(out, "FX/1 1 offset=0 size=0 wsize=0 comp=none ts=1\n")
-			return err
-		default:
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-	}
-	dialer := newCountingPipeDialer(handler)
+	dialer := newCountingPipeDialer(singleUseHandler(&probeCPU))
 	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
 	defer client.Close()
 
 	if _, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
 		t.Fatalf("ProbeLink failed: %v", err)
 	}
-	waitForDialSuccessCount(t, dialer, 5)
-	waitForTCPPoolsReady(t, client, 2, 2)
-
-	dialer.SetSuccessLimit(5)
 	readers := make([]io.ReadCloser, 0, 2)
 	defer func() {
 		for _, reader := range readers {
@@ -224,39 +178,30 @@ func TestTCPPoolsIsolateDataFromControl(t *testing.T) {
 		}
 		readers = append(readers, resp.Reader)
 	}
+	if got := dialer.SuccessCount(); got != 3 {
+		t.Fatalf("expected the probe and one dial per open CXSUM stream, got %d successful dials", got)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	if _, err := checksum(ctx, 3); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("GetChecksum on a full data pool = %v, want context.DeadlineExceeded", err)
 	}
+	if got := dialer.AttemptCount(); got != 3 {
+		t.Fatalf("a data request waiting on a full pool dialed: %d dial attempts, want 3", got)
+	}
 
-	getStatus := func() {
-		t.Helper()
-		resp, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"})
-		if err != nil {
-			t.Fatalf("GetStatus with a full data pool: %v", err)
-		}
-		if resp.Status == nil || resp.Status.TransferID != "tx123" {
-			t.Fatalf("unexpected status response: %+v", resp.Status)
-		}
+	resp, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"})
+	if err != nil {
+		t.Fatalf("GetStatus with a full data pool: %v", err)
 	}
-	// Both warm control connections serve a STATUS each. They are single-use,
-	// so wait for their blocked replacement fills; the third STATUS then has
-	// to dial on demand.
-	for i := 0; i < 2; i++ {
-		getStatus()
-		waitForDialAttemptCount(t, dialer, 6+i)
+	if resp.Status == nil || resp.Status.TransferID != "tx123" {
+		t.Fatalf("unexpected status response: %+v", resp.Status)
 	}
-	if got := dialer.SuccessCount(); got != 5 {
-		t.Fatalf("expected no dial for the warm control connections, got %d successful dials", got)
-	}
-	dialer.SetSuccessLimit(6)
-	getStatus()
-	if got := dialer.SuccessCount(); got != 6 {
+	if got := dialer.SuccessCount(); got != 4 {
 		t.Fatalf("expected one on-demand control dial, got %d successful dials", got)
 	}
-	if got := client.MetricSnapshot().SyncConnectionCount; got != 1 {
-		t.Fatalf("SyncConnectionCount = %d, want 1 (the control dial; the waiting data request never dials)", got)
+	if got := client.MetricSnapshot().SyncConnectionCount; got != 3 {
+		t.Fatalf("SyncConnectionCount = %d, want 3 (two data dials and one control dial; the waiting data request never dials)", got)
 	}
 
 	// Close wakes a waiting data request with an error instead of a dial.
@@ -275,102 +220,25 @@ func TestTCPPoolsIsolateDataFromControl(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("waiting GetChecksum never returned after Close")
 	}
-	if got := dialer.SuccessCount(); got != 6 {
-		t.Fatalf("Close set off %d dials, want none", got-6)
-	}
-}
-
-func TestTCPPoolRefillsAfterStreamClose(t *testing.T) {
-	var probeCPU atomic.Int64
-	probeCPU.Store(2)
-	handler := func(req intftcp.Request, out io.Writer) error {
-		switch req.Verb {
-		case intftcp.VerbPROBE:
-			n, err := strconv.ParseInt(strings.TrimSpace(req.Params[0]["probe-bytes"]), 10, 64)
-			if err != nil {
-				return err
-			}
-			return writeProbeResponse(out, int(probeCPU.Load()), n)
-		case intftcp.VerbSTATUS:
-			_, err := io.WriteString(out, "OK {\"transfer_id\":\"tx123\"}\r\n")
-			return err
-		case intftcp.VerbCXSUM:
-			_, err := io.WriteString(out, "FX/1 1 offset=0 size=0 wsize=0 comp=none ts=1\n")
-			return err
-		default:
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-	}
-	dialer := newCountingPipeDialer(handler)
-	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
-	defer client.Close()
-
-	if _, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
-		t.Fatalf("ProbeLink failed: %v", err)
-	}
-	waitForDialSuccessCount(t, dialer, 5)
-	waitForTCPPoolsReady(t, client, 2, 2)
-
-	dialer.SetSuccessLimit(6)
-	resp, err := client.GetChecksum(context.Background(), GetChecksumRequest{
-		TransferID: "tx123",
-		Targets: []ChecksumTarget{{
-			FileID:   1,
-			FullPath: "/tmp/file",
-		}},
-	})
-	if err != nil {
-		t.Fatalf("GetChecksum failed: %v", err)
-	}
-	if err := resp.Reader.Close(); err != nil {
-		t.Fatalf("close checksum reader: %v", err)
-	}
-	waitForDialSuccessCount(t, dialer, 6)
-	waitForTCPPoolsReady(t, client, 2, 2)
-
-	dialer.SetSuccessLimit(6)
-	statusResp, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"})
-	if err != nil {
-		t.Fatalf("GetStatus failed using refilled pool: %v", err)
-	}
-	if statusResp.Status == nil || statusResp.Status.TransferID != "tx123" {
-		t.Fatalf("unexpected status response: %+v", statusResp.Status)
-	}
-	if got := client.MetricSnapshot().SyncConnectionCount; got != 0 {
-		t.Fatalf("expected no sync fallbacks after pool refill, got %d", got)
+	if got := dialer.AttemptCount(); got != 4 {
+		t.Fatalf("Close set off %d dials, want none", got-4)
 	}
 }
 
 func TestProbeLinkDoesNotResizeTCPPoolOnLaterMiniProbe(t *testing.T) {
 	var probeCPU atomic.Int64
 	probeCPU.Store(2)
-	handler := func(req intftcp.Request, out io.Writer) error {
-		switch req.Verb {
-		case intftcp.VerbPROBE:
-			n, err := strconv.ParseInt(strings.TrimSpace(req.Params[0]["probe-bytes"]), 10, 64)
-			if err != nil {
-				return err
-			}
-			return writeProbeResponse(out, int(probeCPU.Load()), n)
-		default:
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-	}
-	dialer := newCountingPipeDialer(handler)
+	dialer := newCountingPipeDialer(singleUseHandler(&probeCPU))
 	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
 	defer client.Close()
 
 	if _, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
 		t.Fatalf("ProbeLink failed: %v", err)
 	}
-	waitForDialSuccessCount(t, dialer, 5)
-	waitForTCPPoolsReady(t, client, 2, 2)
-
 	probeCPU.Store(4)
 	if _, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
 		t.Fatalf("second ProbeLink failed: %v", err)
 	}
-	waitForDialSuccessCount(t, dialer, 6)
 	time.Sleep(100 * time.Millisecond)
 
 	pool := client.tcpPool(poolData)
@@ -380,38 +248,24 @@ func TestProbeLinkDoesNotResizeTCPPoolOnLaterMiniProbe(t *testing.T) {
 	if pool.opts.limit != 2 {
 		t.Fatalf("expected one-shot data pool limit 2, got %d", pool.opts.limit)
 	}
-	if got := dialer.SuccessCount(); got != 6 {
-		t.Fatalf("expected only the second probe dial to be added, got %d successful dials", got)
+	if got := dialer.SuccessCount(); got != 2 {
+		t.Fatalf("expected only the two probe dials, got %d successful dials", got)
 	}
 }
 
 func TestClientCloseStopsTCPPoolAndAllowsDirectDialLater(t *testing.T) {
 	var probeCPU atomic.Int64
 	probeCPU.Store(2)
-	handler := func(req intftcp.Request, out io.Writer) error {
-		switch req.Verb {
-		case intftcp.VerbPROBE:
-			n, err := strconv.ParseInt(strings.TrimSpace(req.Params[0]["probe-bytes"]), 10, 64)
-			if err != nil {
-				return err
-			}
-			return writeProbeResponse(out, int(probeCPU.Load()), n)
-		case intftcp.VerbSTATUS:
-			_, err := io.WriteString(out, "OK {\"transfer_id\":\"tx123\"}\r\n")
-			return err
-		default:
-			return fmt.Errorf("unexpected verb: %v", req.Verb)
-		}
-	}
-	dialer := newCountingPipeDialer(handler)
+	dialer := newCountingPipeDialer(singleUseHandler(&probeCPU))
 	client := NewClient("ignored:0", WithContextDialer(dialer.DialContext))
 	defer client.Close()
 
 	if _, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1}); err != nil {
 		t.Fatalf("ProbeLink failed: %v", err)
 	}
-	waitForDialSuccessCount(t, dialer, 5)
-	waitForTCPPoolsReady(t, client, 2, 2)
+	if client.tcpPool(poolData) == nil || client.tcpPool(poolControl) == nil {
+		t.Fatal("expected ProbeLink to create both pools")
+	}
 
 	if err := client.Close(); err != nil {
 		t.Fatalf("client.Close failed: %v", err)
@@ -427,12 +281,13 @@ func TestClientCloseStopsTCPPoolAndAllowsDirectDialLater(t *testing.T) {
 		t.Fatalf("ensureTCPPools after Close = %d, pools started again", n)
 	}
 
-	dialer.SetSuccessLimit(5)
+	base := dialer.SuccessCount()
+	dialer.SetSuccessLimit(base)
 	if _, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"}); err == nil {
 		t.Fatal("expected GetStatus to fail after Close when new dials are blocked")
 	}
 
-	dialer.SetSuccessLimit(6)
+	dialer.SetSuccessLimit(base + 1)
 	statusResp, err := client.GetStatus(context.Background(), GetStatusRequest{TransferID: "tx123"})
 	if err != nil {
 		t.Fatalf("GetStatus failed after allowing one direct dial: %v", err)
@@ -440,8 +295,8 @@ func TestClientCloseStopsTCPPoolAndAllowsDirectDialLater(t *testing.T) {
 	if statusResp.Status == nil || statusResp.Status.TransferID != "tx123" {
 		t.Fatalf("unexpected status response: %+v", statusResp.Status)
 	}
-	if got := dialer.SuccessCount(); got != 6 {
-		t.Fatalf("expected one direct dial after client.Close, got %d successful dials", got)
+	if got := dialer.SuccessCount(); got != base+1 {
+		t.Fatalf("expected one direct dial after client.Close, got %d successful dials", got-base)
 	}
 }
 
@@ -848,6 +703,111 @@ func TestClientKeepAliveMetadataRecycling(t *testing.T) {
 	}
 }
 
+// TestTCPPoolOutlastsServerIdleTimeout pauses a client against a real server
+// for longer than the server's idle timeout, past which the server closes a
+// connection that has not sent a command. Without keep-alive the pools must
+// not dial ahead, so each request dials its own connection and none goes
+// stale; with keep-alive the pools stay warm and heartbeats keep their
+// sessions open through the pause.
+func TestTCPPoolOutlastsServerIdleTimeout(t *testing.T) {
+	const (
+		serverIdle = 400 * time.Millisecond
+		pause      = time.Second
+	)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := store.NewStore()
+	t.Cleanup(st.Close)
+	addr := startRealKeepAliveServer(t, intftcp.ServerOptions{
+		KeepAliveTimeout: serverIdle,
+		Deps:             intftcp.NewRuntimeDeps(st, intftcp.WithRoot(root)),
+	})
+	for _, keepAlive := range []bool{false, true} {
+		name := "keep-alive disabled"
+		if keepAlive {
+			name = "keep-alive"
+		}
+		t.Run(name, func(t *testing.T) {
+			dialer := &trackingDialer{}
+			client := NewClient(addr, WithContextDialer(dialer.DialContext), WithConcurrency(2))
+			client.DisableKeepAlive = !keepAlive
+			defer client.Close()
+			ctx := context.Background()
+
+			if _, err := client.ProbeLink(ctx, ProbeRequest{ProbeBytes: 1}); err != nil {
+				t.Fatalf("ProbeLink: %v", err)
+			}
+			if keepAlive {
+				waitForTCPPoolsReady(t, client, 2, 2)
+			}
+			time.Sleep(pause)
+			if !keepAlive {
+				if got := dialer.dials.Load(); got != 1 {
+					t.Fatalf("%d dials after ProbeLink and a %v pause, want only the probe's: a pool without keep-alive must not dial ahead", got, pause)
+				}
+			}
+
+			manifestResp, err := client.GetManifest(ctx, GetManifestRequest{Directory: "/", Mode: "fast", LinkMbps: 100, Concurrency: 2})
+			if err != nil {
+				t.Fatalf("GetManifest after a %v pause (server idle timeout %v): %v", pause, serverIdle, err)
+			}
+			var fileIDs []uint64
+			for _, entry := range manifestResp.Manifest.Entries {
+				if entry.Type == intencoding.EntryTypeFile {
+					fileIDs = append(fileIDs, entry.ID)
+				}
+			}
+			if len(fileIDs) != 1 {
+				t.Fatalf("expected one file in the manifest, got %d", len(fileIDs))
+			}
+			var mu sync.Mutex
+			var body bytes.Buffer
+			got, err := client.GetFiles(ctx, GetFilesRequest{
+				Manifest: manifestResp.Manifest,
+				FileIDs:  fileIDs,
+				OutputWriter: func(ManifestEntry, int64) (io.WriteCloser, func() error, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					return noOpWriteCloser{Writer: &body}, func() error { return nil }, nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("GetFiles after a %v pause (server idle timeout %v): %v", pause, serverIdle, err)
+			}
+			mu.Lock()
+			data := body.String()
+			mu.Unlock()
+			if len(got.Files) != 1 || data != "hello" {
+				t.Fatalf("GetFiles returned %d files with body %q, want 1 file with body %q", len(got.Files), data, "hello")
+			}
+
+			snap := client.MetricSnapshot()
+			if keepAlive {
+				if snap.HeartbeatCount == 0 || snap.HeartbeatFailureCount != 0 {
+					t.Fatalf("over a %v pause: %d heartbeats, %d failed; want heartbeats and no failures", pause, snap.HeartbeatCount, snap.HeartbeatFailureCount)
+				}
+				if snap.SyncConnectionCount != 0 {
+					t.Fatalf("SyncConnectionCount = %d, want 0: heartbeated sessions should serve every request", snap.SyncConnectionCount)
+				}
+				return
+			}
+			// Let any background fill start before counting dials.
+			time.Sleep(100 * time.Millisecond)
+			if dials := dialer.dials.Load(); dials != 1+snap.SyncConnectionCount {
+				t.Fatalf("%d dials for the probe and %d on-demand dials: a pool without keep-alive dialed %d connections ahead",
+					dials, snap.SyncConnectionCount, dials-1-snap.SyncConnectionCount)
+			}
+			for _, class := range []tcpPoolClass{poolData, poolControl} {
+				if idle := len(client.tcpPool(class).ready); idle != 0 {
+					t.Fatalf("pool %v holds %d idle connections, want none without keep-alive", class, idle)
+				}
+			}
+		})
+	}
+}
+
 func TestProbeLinkSizesDataPoolFromExplicitConcurrency(t *testing.T) {
 	handler := func(req intftcp.Request, out io.Writer) error {
 		if req.Verb != intftcp.VerbPROBE {
@@ -873,7 +833,15 @@ func TestProbeLinkSizesDataPoolFromExplicitConcurrency(t *testing.T) {
 	if probe.WarmConnectionPoolSize != 5 {
 		t.Fatalf("data pool size = %d, want the explicit concurrency 5", probe.WarmConnectionPoolSize)
 	}
-	waitForTCPPoolsReady(t, client, 5, 5)
+	// Without a keep-alive grant the pools dial on demand, so check their
+	// sizes rather than waiting for them to fill.
+	data, control := client.tcpPool(poolData), client.tcpPool(poolControl)
+	if data == nil || control == nil {
+		t.Fatal("expected ProbeLink to create both pools")
+	}
+	if data.opts.limit != 5 || control.opts.size != 5 {
+		t.Fatalf("data pool limit %d, control pool size %d; want the explicit concurrency 5 for both", data.opts.limit, control.opts.size)
+	}
 }
 
 // trackingDialer dials real TCP connections and records how many it opened
@@ -1236,6 +1204,107 @@ func TestPoolScalesDownToActivePlusQuarter(t *testing.T) {
 	}
 }
 
+// TestPoolRefillCountsProbedConnections returns a connection dirty while a
+// heartbeat probe holds the pool's only idle session. The probed session is
+// still open, so the refill the dirty return starts may restore the pool only
+// to its target, counting that session: once the probe puts it back, the pool
+// holds exactly its target, not one more.
+func TestPoolRefillCountsProbedConnections(t *testing.T) {
+	for _, limit := range []int{0, 4} {
+		t.Run(fmt.Sprintf("limit=%d", limit), func(t *testing.T) {
+			dialer := &keepAlivePipeDialer{
+				holdHeartbeats: make(chan struct{}),
+				heartbeats:     make(chan struct{}, 4),
+			}
+			var releaseOnce sync.Once
+			releaseProbes := func() { releaseOnce.Do(func() { close(dialer.holdHeartbeats) }) }
+			c := &Client{FileAddr: "pipe", contextDialer: dialer.DialContext}
+			pool := newTCPConnPool(tcpAuthState{}, tcpPoolOptions{size: 4, limit: limit}, 5000)
+			// Release the probes first: stop must not wait on a held one.
+			defer pool.stop()
+			defer releaseProbes()
+			settle := func() {
+				t.Helper()
+				deadline := time.Now().Add(2 * time.Second)
+				for range 2 {
+					for pool.refilling.Load() != 0 {
+						if time.Now().After(deadline) {
+							t.Fatalf("fills never finished: %d in flight", pool.refilling.Load())
+						}
+						time.Sleep(time.Millisecond)
+					}
+					// A finishing fill may chain another; look again.
+					time.Sleep(20 * time.Millisecond)
+				}
+			}
+
+			pool.triggerRefill(c)
+			settle()
+			if got := dialer.Open(); got != 4 {
+				t.Fatalf("%d open after the initial fill, want 4", got)
+			}
+			borrowed, err := pool.acquire(context.Background(), c)
+			if err != nil {
+				t.Fatalf("acquire: %v", err)
+			}
+
+			// One borrowed at peak keeps 1 + a quarter = 2: the tick lowers
+			// the target to 2, closes two idle sessions, and probes the third.
+			heartbeatDone := make(chan struct{})
+			go func() {
+				defer close(heartbeatDone)
+				pool.heartbeatIdleConns(c, 0)
+			}()
+			select {
+			case <-dialer.heartbeats:
+			case <-time.After(2 * time.Second):
+				t.Fatal("heartbeat never probed the idle session")
+			}
+			target := int(pool.target.Load())
+			if target != 2 {
+				t.Fatalf("target %d after the tick, want 2", target)
+			}
+			if got := dialer.Open(); got != 2 {
+				t.Fatalf("%d open while the probe is held, want 2 (1 probed + 1 borrowed)", got)
+			}
+
+			// The dirty return closes the borrowed connection and refills
+			// while the probed session is out of the idle stack.
+			if err := c.releaseManagedTCPConn(borrowed, pool); err != nil {
+				t.Fatalf("release: %v", err)
+			}
+			settle()
+			releaseProbes()
+			select {
+			case <-heartbeatDone:
+			case <-time.After(2 * time.Second):
+				t.Fatal("heartbeat did not finish")
+			}
+			settle()
+
+			open, idle := dialer.Open(), len(pool.ready)
+			if open > target {
+				t.Fatalf("%d open after the probe returned, want at most the target %d: the refill did not count the probed session", open, target)
+			}
+			if open != target {
+				t.Fatalf("%d open after the dirty return, want the target %d", open, target)
+			}
+			if b := pool.borrowed.Load(); b != 0 || open != idle {
+				t.Fatalf("%d open, but %d idle + %d borrowed", open, idle, b)
+			}
+			pool.idleMu.Lock()
+			stacked := len(pool.idle)
+			pool.idleMu.Unlock()
+			if stacked != idle {
+				t.Fatalf("idle stack holds %d, but %d idle tokens", stacked, idle)
+			}
+			if limit > 0 && len(pool.slots) != open {
+				t.Fatalf("%d slots held for %d open connections", len(pool.slots), open)
+			}
+		})
+	}
+}
+
 // TestPoolConnReturnedAfterCloseIsClosed returns a borrowed connection after
 // Client.Close stopped its pool: it must close and free its slot.
 func TestPoolConnReturnedAfterCloseIsClosed(t *testing.T) {
@@ -1270,13 +1339,19 @@ func TestPoolConnReturnedAfterCloseIsClosed(t *testing.T) {
 
 // keepAlivePipeDialer hands out net.Pipe connections whose peer answers every
 // PROBE, granting keep-alive unless withdrawn, and counts connections still
-// open. While failing is set, dials fail.
+// open. While failing is set, dials fail. When holdHeartbeats is set before
+// the first dial, every PROBE after a connection's first (a heartbeat, not the
+// keep-alive upgrade) is reported on heartbeats and answered only once
+// holdHeartbeats closes.
 type keepAlivePipeDialer struct {
 	mu        sync.Mutex
 	open      int
 	peers     []net.Conn
 	failing   atomic.Bool
 	withdrawn atomic.Bool
+
+	holdHeartbeats chan struct{}
+	heartbeats     chan struct{}
 }
 
 func (d *keepAlivePipeDialer) DialContext(context.Context, string) (net.Conn, error) {
@@ -1291,12 +1366,16 @@ func (d *keepAlivePipeDialer) DialContext(context.Context, string) (net.Conn, er
 	go func() {
 		defer serverSide.Close()
 		br := bufio.NewReader(serverSide)
-		for {
+		for probes := 0; ; {
 			line, err := br.ReadString('\n')
 			if err != nil {
 				return
 			}
 			if strings.HasPrefix(line, "PROBE ") {
+				if probes++; probes > 1 && d.holdHeartbeats != nil {
+					d.heartbeats <- struct{}{}
+					<-d.holdHeartbeats
+				}
 				grant := " keep-alive-ms=5000"
 				if d.withdrawn.Load() {
 					grant = ""
@@ -1342,14 +1421,18 @@ func (c *pipeOpenConn) Close() error {
 // FuzzTCPConnPool drives one pool, in session or single-use mode, through
 // random sequences of acquires, returns, heartbeat ticks (which scale the pool
 // down), dead peers, failing dials, keep-alive withdrawal, refills, and stop,
-// checking after
-// every step that each open connection is idle or borrowed, that a bounded
-// pool never exceeds its limit and holds exactly one slot per connection, and
-// that nothing stays open once the pool stops and every borrower returns.
+// checking after every step that each open connection is idle or borrowed,
+// that a bounded pool never exceeds its limit and holds exactly one slot per
+// connection, and that a single-use pool never holds an idle connection. It
+// also checks that nothing stays open once the pool stops and every borrower
+// returns.
 func FuzzTCPConnPool(f *testing.F) {
 	f.Add([]byte{4, 4, 4, 4, 0, 0, 0, 0, 0, 1, 2, 3, 0, 0})
 	f.Add([]byte{0, 2, 1, 1, 0, 0, 0, 0, 9, 17, 25, 3, 3, 4})
 	f.Add([]byte{2, 2, 2, 2, 0, 0, 0, 5, 3, 7, 0, 6, 0, 1})
+	// Single-use mode (data[1]&0x80): acquires, clean and dirty returns,
+	// refills, and a tick, none of which may leave an idle connection.
+	f.Add([]byte{1, 0x83, 0, 0, 0, 0, 1, 6, 0, 2, 6, 3, 0, 1})
 	f.Fuzz(func(t *testing.T, data []byte) { fuzzTCPConnPool(t, data, nil) })
 }
 
@@ -1447,6 +1530,11 @@ func fuzzTCPConnPool(t *testing.T, data []byte, inj *faults.Injector) {
 		pool.idleMu.Unlock()
 		if stacked != idle {
 			t.Fatalf("step %d: idle stack holds %d, but %d idle tokens", step, stacked, idle)
+		}
+		// A pool without a keep-alive grant dials only for a borrower: the
+		// server would close an idle single-use connection at its timeout.
+		if sessionMS <= 0 && idle > 0 {
+			t.Fatalf("step %d: single-use pool holds %d idle connections, want none", step, idle)
 		}
 		if target := int(pool.target.Load()); target > opts.size {
 			t.Fatalf("step %d: target %d above size %d", step, target, opts.size)
