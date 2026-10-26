@@ -70,16 +70,51 @@ instead of widening the current change; remove an entry when it ships.
   error for the files they held, so a caller that checks only `Errors`
   takes an unfinished transfer for a finished one. Report the context's
   error, or count the skipped files as failed.
-- **A truncated PROBE hangs both ends.** Neither `probeTCP` nor the
-  server's `drainProbePayload` sets a deadline, so when the probe payload
-  arrives short, the server waits for the rest and the client waits for the
-  response, forever. In plaintext a dropped span does it; any peer that
-  stalls mid-probe would too, and a flipped digit in `probe-bytes=` probably
-  does the same (untested). pbt-faults finds it as a copy still running
-  after 90s: `TX_PBT_FAULTS=1 TX_PBT_FAULTS_SEED=9 TX_FAULTS_SEED=2
-  TX_FAULTS_NET='flip=0.01, drop=0.01, dup=0.01, reorder=0.01' go test -run
-  TestTreeCopyUnderFaults ./internal/cmd/filexfercli`. Bound the probe by a
-  deadline on both sides.
+- **A trickling peer can hold a connection.** The server's read progress
+  deadline re-arms on every read, so a peer that sends one byte just inside
+  the idle timeout keeps a command line or request body open for as long as
+  its size allows. Cap the total time to read one command line.
+- **Heartbeats run every half window, not every quarter.** `takeStale`
+  probes a session only when its age reaches the interval, but a session
+  probed at one tick is a round trip younger than that at the next, so it is
+  skipped. At an `--idle-timeout` of about 200ms or less, sessions can die
+  between heartbeats. Compare against the previous tick. The heartbeat loop
+  also keeps running after keep-alive is withdrawn, and re-enqueues a
+  session whose probe came back without a grant; discard it instead.
+- **Requests without keep-alive dial inline.** A pool without keep-alive no
+  longer pre-dials, since its single-use connections cannot be heartbeated,
+  so every SEND, ACK, and CXSUM pays a dial, and a Noise handshake when
+  encrypted. `BenchmarkTransferInMemoryModes` puts it at +6.5% wall time
+  for encrypted 4 KiB files, with CPU per GiB unchanged, and within noise
+  for plaintext or 1 MiB files. If it matters, pre-dial at most a few
+  connections and evict any older than a fraction of the server's idle
+  timeout.
+- **The cost-ratio benchmark never uses the pools.** `startMemTransfer`
+  builds its client after the probe, so `BenchmarkTransferInMemory` and
+  `TestTransferCostRatio` dial every request directly, and their `+ka` modes
+  measure no keep-alive. `BenchmarkTransferInMemoryModes` probes first;
+  move the cost grid onto it.
+- **Fast-mode probes open one connection per server CPU.** `probeLink` runs
+  `probeParallel` with no cap, so a probe to a 192-core server uploads
+  192 MiB at the default probe size. Cap the fan-out, for example at 16, if
+  the measurement holds up.
+- **Measure the probe's send-queue cap on a fast link.** Probe connections
+  set `TCP_NOTSENT_LOWAT` to 16 KiB, so on a 10 Gbps link the writer is
+  woken every few microseconds of data, and sealing an encrypted batch no
+  longer overlaps sending. Probe throughput may read low there, hardest for
+  the single-connection `probeLinear`. Loopback shows no difference; A/B it
+  between two hosts, and raise the cap (any value that drains well within
+  30s works) if it costs throughput.
+- **A buffering proxy hides probe progress.** The probe client's writes
+  keep pace with the bytes its peer acknowledges, so a proxy that
+  acknowledges the whole upload early, then forwards it slower than 30s
+  allows, fails a working probe. Only the server sees that progress; a
+  client allowance sized by the bytes in flight would cover it.
+- **Request-body errors leak internal text onto the wire.** A stalled ACK
+  body is answered `ERR BAD_REQUEST invalid ACK request body: read frame
+  payload: read tcp <addr>->...: i/o timeout`, which carries socket addresses
+  and Go error strings. Map read errors to a fixed message, and log the
+  detail on the server.
 - **`StartFromManifest` ignores its entries' progress.** It passes only file
   IDs to `GetFiles`, which looks each entry up in `Manifest`, so
   `StartFromManifestRequest.Entries[i].Progress` never takes effect and a
@@ -335,6 +370,9 @@ instead of widening the current change; remove an entry when it ships.
   block in `store.go`, so `TransferStateStarted` is 1 and `Missing` is 4,
   against the rule that keeps unrelated constants out of `iota` blocks. Give
   the states their own block, and check what reads the numeric values.
+- **`internal/aead/session_test.go` is past the size rule.** It holds about
+  1,300 lines. Split it by area: handshake, record framing and batching, and
+  the progress deadlines.
 - **`store_test.go` is past the size rule.** It holds about 1,700 lines.
   Fold overlapping state-transition cases into `FuzzStoreStateCounts` and
   `FuzzAckMissingRevival`, then split by area.

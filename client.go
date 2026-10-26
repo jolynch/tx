@@ -627,7 +627,7 @@ type ProbeResponse struct {
 	AggregateMbps          int64 // sum across parallel conns (== LinkMbps in fast, equal to PerConnMbps in gentle)
 	ParallelConns          int   // connections used in the throughput phase
 	SuggestedConcurrency   int
-	WarmConnectionPoolSize int // connections each pool opens, set at the client's first probe
+	WarmConnectionPoolSize int // connections each pool opens with keep-alive (none without), set at the client's first probe
 	ServerSendBufBytes     int64
 	SuggestedCipher        string // resolved cipher suggested for this connection (e.g. "aes", "chacha20", or "" if none)
 	ServerLimiterBps       int64  // server's current rate limiter in bytes/sec (0 = unlimited)

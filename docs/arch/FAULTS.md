@@ -54,7 +54,7 @@ call sites, and socket setters keep their `setsockopt` gate there too.
 | `fdatasync`, `syncfs`, `dup` | `sysio.Fdatasync`, `Syncfs`, `Dup` | fsync worker (`fsync.WithFaults`) and `SyncfsDir` |
 | `copy_file_range` | `sysio.CopyFileRange` | daemonless local copies |
 | `mmap`, `mincore`, `fadvise` | `sysio.Mmap`, `Mincore`, `Fadvise` | page-cache probe, restore, and eviction |
-| `setsockopt` | `Sys` before TCP socket setters | `SetNoDelay` and socket buffer sizes on dial and accept |
+| `setsockopt` | `Sys` before TCP socket setters | `SetNoDelay`, socket buffer sizes, and `TCP_USER_TIMEOUT` on dial and accept; `TCP_NOTSENT_LOWAT` on probes |
 
 Ungated adapters cover TCP byte counts, idle-socket peeks, descriptor close,
 unmapping, system memory, metadata extraction, and directory or progress

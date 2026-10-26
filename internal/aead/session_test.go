@@ -3,19 +3,23 @@ package aead
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"filippo.io/age"
 	"github.com/flynn/noise"
 	"golang.org/x/crypto/curve25519"
+	"golang.org/x/sys/unix"
 )
 
 // bufConn is an in-memory net.Conn: writes append to a buffer that a reader
@@ -59,6 +63,23 @@ func (c *bufConn) SetWriteDeadline(time.Time) error { return nil }
 // in-memory buffer, keyed by an in-memory NN handshake.
 func sessionPair(tb testing.TB, alg Algorithm) (*Session, *Session, *bufConn) {
 	tb.Helper()
+	i1, i2, r1, r2 := nnCipherStates(tb, alg)
+	wire := &bufConn{}
+	w, err := newSession(wire, bufio.NewReader(wire), alg, i1, i2)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	r, err := newSession(&bufConn{}, bufio.NewReader(wire), alg, r2, r1)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return w, r, wire
+}
+
+// nnCipherStates runs an in-memory NN handshake and returns the initiator's
+// send and receive states, then the responder's.
+func nnCipherStates(tb testing.TB, alg Algorithm) (i1, i2, r1, r2 *noise.CipherState) {
+	tb.Helper()
 	cs, err := cipherSuite(alg)
 	if err != nil {
 		tb.Fatal(err)
@@ -70,20 +91,11 @@ func sessionPair(tb testing.TB, alg Algorithm) (*Session, *Session, *bufConn) {
 		tb.Fatal(err)
 	}
 	m2, r1, r2, _ := hr.WriteMessage(nil, nil)
-	_, i1, i2, err := hi.ReadMessage(nil, m2)
+	_, i1, i2, err = hi.ReadMessage(nil, m2)
 	if err != nil {
 		tb.Fatal(err)
 	}
-	wire := &bufConn{}
-	w, err := newSession(wire, bufio.NewReader(wire), alg, i1, i2)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	r, err := newSession(&bufConn{}, bufio.NewReader(wire), alg, r2, r1)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	return w, r, wire
+	return i1, i2, r1, r2
 }
 
 func readMessage(tb testing.TB, s *Session) ([]byte, error) {
@@ -1025,4 +1037,281 @@ func TestSessionCloseOnTCPIsQuiet(t *testing.T) {
 	if err := res.s.Close(); err != nil {
 		t.Fatalf("Close after failure = %v", err)
 	}
+}
+
+// pacedStream moves bytes chunk at a time, sleeping gap before each chunk.
+// With stallAfter > 0 it stops for good once it has moved that many bytes,
+// closing stalled and recording when, until stop closes.
+type pacedStream struct {
+	chunk      int
+	gap        time.Duration
+	stallAfter int
+}
+
+// stallRecord reports when a pacedStream stalled.
+type stallRecord struct {
+	stalled chan struct{}
+	at      time.Time // set before stalled closes
+}
+
+func newStallRecord() *stallRecord { return &stallRecord{stalled: make(chan struct{})} }
+
+func (r *stallRecord) stall() {
+	r.at = time.Now()
+	close(r.stalled)
+}
+
+// since reports how long ago the stream stalled, or false if it has not.
+func (r *stallRecord) since() (time.Duration, bool) {
+	select {
+	case <-r.stalled:
+		return time.Since(r.at), true
+	default:
+		return 0, false
+	}
+}
+
+// step waits out one gap. It reports false once stop closes.
+func (p pacedStream) step(stop <-chan struct{}) bool {
+	select {
+	case <-time.After(p.gap):
+		return true
+	case <-stop:
+		return false
+	}
+}
+
+// A read progress deadline bounds each wait for the peer's next bytes, not
+// a whole record: a 64 KiB record arriving 4 KiB every 25ms takes four
+// deadlines in all and is read whole. A record that stops arriving halfway
+// fails within a few deadlines of the stall.
+func TestReadProgressDeadlineCountsPartialRecords(t *testing.T) {
+	const d = 100 * time.Millisecond
+	for _, tc := range []struct {
+		name string
+		pace pacedStream
+	}{
+		{"record keeps arriving", pacedStream{chunk: 4 << 10, gap: 25 * time.Millisecond}},
+		{"record stops halfway", pacedStream{chunk: 4 << 10, gap: 25 * time.Millisecond, stallAfter: 32 << 10}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			i1, i2, r1, r2 := nnCipherStates(t, AlgorithmAES)
+			wire := &bufConn{}
+			w, err := newSession(wire, bufio.NewReader(wire), AlgorithmAES, i1, i2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data := make([]byte, maxEmitPayload)
+			rand.Read(data)
+			mw := w.Writer(false)
+			if _, err := mw.Write(data); err != nil {
+				t.Fatal(err)
+			}
+			if err := mw.End(); err != nil {
+				t.Fatal(err)
+			}
+			sealed := bytes.Clone(wire.buf.Bytes())
+
+			local, remote := net.Pipe()
+			r, err := newSession(local, bufio.NewReader(local), AlgorithmAES, r2, r1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.SetReadProgressDeadline(d)
+			stop := make(chan struct{})
+			stall := newStallRecord()
+			var wg sync.WaitGroup
+			t.Cleanup(func() {
+				close(stop)
+				_ = local.Close()
+				_ = remote.Close()
+				wg.Wait()
+			})
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for off := 0; off < len(sealed); {
+					if !tc.pace.step(stop) {
+						return
+					}
+					n := min(tc.pace.chunk, len(sealed)-off)
+					if _, err := remote.Write(sealed[off : off+n]); err != nil {
+						return
+					}
+					off += n
+					if tc.pace.stallAfter > 0 && off >= tc.pace.stallAfter {
+						stall.stall()
+						<-stop
+						return
+					}
+				}
+			}()
+
+			start := time.Now()
+			got, err := readMessage(t, r)
+			elapsed := time.Since(start)
+			if tc.pace.stallAfter == 0 {
+				if err != nil {
+					t.Fatalf("steadily arriving record failed after %v under a %v read progress deadline: %v", elapsed, d, err)
+				}
+				if !bytes.Equal(got, data) {
+					t.Fatalf("read %d bytes, want the %d written", len(got), len(data))
+				}
+				if elapsed < 2*d {
+					t.Fatalf("record arrived in %v; the test needs one slower than two %v deadlines", elapsed, d)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("read a record that stopped arriving")
+			}
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("stalled read failed with %v, want a deadline error", err)
+			}
+			if since, ok := stall.since(); ok && since > 5*d {
+				t.Fatalf("stalled read gave up %v after the stall, want within %v", since, 5*d)
+			}
+		})
+	}
+}
+
+// A write progress deadline bounds each 16 KiB piece of a batch, not the
+// whole batch: a 256 KiB batch to a peer that reads 4 KiB every 10ms takes
+// several deadlines and arrives whole. A peer that stops reading fails the
+// write within a few deadlines of the stall. Both sockets have small
+// buffers, so the writer blocks on the reader's pace.
+func TestWriteProgressDeadlineCoversEachPiece(t *testing.T) {
+	const d = 150 * time.Millisecond
+	for _, tc := range []struct {
+		name string
+		pace pacedStream
+	}{
+		{"peer reads steadily", pacedStream{chunk: 4 << 10, gap: 10 * time.Millisecond}},
+		{"peer stops reading", pacedStream{chunk: 4 << 10, gap: 10 * time.Millisecond, stallAfter: 64 << 10}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, server := smallBufferTCPPair(t, 16<<10)
+			i1, i2, r1, r2 := nnCipherStates(t, AlgorithmAES)
+			w, err := newSession(client, bufio.NewReader(client), AlgorithmAES, i1, i2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.SetWriteProgressDeadline(d)
+
+			stop := make(chan struct{})
+			stall := newStallRecord()
+			received := make(chan []byte, 1)
+			var wg sync.WaitGroup
+			t.Cleanup(func() {
+				close(stop)
+				_ = client.Close()
+				_ = server.Close()
+				wg.Wait()
+			})
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var got []byte
+				defer func() { received <- got }()
+				buf := make([]byte, tc.pace.chunk)
+				for tc.pace.step(stop) {
+					n, err := server.Read(buf)
+					got = append(got, buf[:n]...)
+					if tc.pace.stallAfter > 0 && len(got) >= tc.pace.stallAfter {
+						stall.stall()
+						<-stop
+						return
+					}
+					if err != nil {
+						return
+					}
+				}
+			}()
+
+			data := make([]byte, writeBatchRecords*maxEmitPayload)
+			rand.Read(data)
+			start := time.Now()
+			mw := w.Writer(false)
+			_, err = mw.Write(data)
+			if err == nil {
+				err = mw.End()
+			}
+			elapsed := time.Since(start)
+			if tc.pace.stallAfter == 0 {
+				if err != nil {
+					t.Fatalf("write to a steadily reading peer failed after %v under a %v write progress deadline: %v", elapsed, d, err)
+				}
+				if elapsed < 2*d {
+					t.Fatalf("batch left in %v; the test needs one slower than two %v deadlines", elapsed, d)
+				}
+				_ = client.CloseWrite()
+				sealed := <-received
+				wire := &bufConn{}
+				wire.buf.Write(sealed)
+				r, err := newSession(&bufConn{}, bufio.NewReader(wire), AlgorithmAES, r2, r1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, err := readMessage(t, r); err != nil || !bytes.Equal(got, data) {
+					t.Fatalf("peer read back %d of %d bytes: %v", len(got), len(data), err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("write to a peer that stopped reading succeeded")
+			}
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("stalled write failed with %v, want a deadline error", err)
+			}
+			since, ok := stall.since()
+			if !ok {
+				t.Fatalf("write failed before the peer stopped reading: %v", err)
+			}
+			if since > 5*d {
+				t.Fatalf("stalled write gave up %v after the stall, want within %v", since, 5*d)
+			}
+		})
+	}
+}
+
+// smallBufferTCPPair returns both ends of a loopback TCP connection whose
+// client send buffer and server receive buffer are about size bytes. The
+// listener sets the receive buffer, so the server's first advertised window
+// already fits it.
+func smallBufferTCPPair(t *testing.T, size int) (client, server *net.TCPConn) {
+	t.Helper()
+	lc := net.ListenConfig{Control: func(_, _ string, rc syscall.RawConn) error {
+		var serr error
+		if err := rc.Control(func(fd uintptr) {
+			serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, size)
+		}); err != nil {
+			return err
+		}
+		return serr
+	}}
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, _ := ln.Accept()
+		accepted <- c
+	}()
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := <-accepted
+	if s == nil {
+		c.Close()
+		t.Fatal("accept failed")
+	}
+	t.Cleanup(func() { c.Close(); s.Close() })
+	client = c.(*net.TCPConn)
+	if err := client.SetWriteBuffer(size); err != nil {
+		t.Fatal(err)
+	}
+	return client, s.(*net.TCPConn)
 }

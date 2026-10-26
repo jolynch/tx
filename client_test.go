@@ -3,6 +3,7 @@ package tx
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -230,33 +231,10 @@ func (d *countingPipeDialer) AttemptCount() int {
 	return d.attemptCount
 }
 
-func waitForDialAttemptCount(t *testing.T, d *countingPipeDialer, want int) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for d.AttemptCount() < want {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %d dial attempts, got %d", want, d.AttemptCount())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
 func (d *countingPipeDialer) SuccessCount() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.successCount
-}
-
-func waitForDialSuccessCount(t *testing.T, d *countingPipeDialer, want int) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if d.SuccessCount() >= want {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %d successful dials, got %d", want, d.SuccessCount())
 }
 
 func writeProbeResponse(out io.Writer, cpu int, probeBytes int64) error {
@@ -367,6 +345,673 @@ func TestProbeCancellation(t *testing.T) {
 				t.Fatal("probe ignored cancellation")
 			}
 		})
+	}
+}
+
+// setProbeTimeout replaces probeTCP's progress bound for one test.
+func setProbeTimeout(t *testing.T, floor time.Duration) {
+	t.Helper()
+	old := probeTimeoutFloor
+	probeTimeoutFloor = floor
+	t.Cleanup(func() { probeTimeoutFloor = old })
+}
+
+// fakeProbePace shapes a fake plaintext PROBE server. It reads the request
+// at once. With chunk > 0 it writes the echoed payload chunk bytes at a time,
+// sleeping gap before each chunk and before the response and status lines.
+// stall picks where it stops answering instead.
+type fakeProbePace struct {
+	chunk int64
+	gap   time.Duration
+	stall fakeProbeStall
+}
+
+type fakeProbeStall int
+
+const (
+	fakeProbeAnswers fakeProbeStall = iota
+	// fakeProbeStallBeforeResponse reads the whole request, then sends nothing.
+	fakeProbeStallBeforeResponse
+	// fakeProbeStallAfterResponseLine sends the response line, then nothing.
+	fakeProbeStallAfterResponseLine
+)
+
+// serveFakeProbe answers one PROBE on conn as pace says. It returns when the
+// exchange ends, conn fails, or stop closes.
+func serveFakeProbe(conn net.Conn, pace fakeProbePace, stop <-chan struct{}) {
+	defer conn.Close()
+	go func() {
+		<-stop
+		_ = conn.Close()
+	}()
+	wait := func() bool {
+		if pace.gap <= 0 {
+			return true
+		}
+		select {
+		case <-time.After(pace.gap):
+			return true
+		case <-stop:
+			return false
+		}
+	}
+	br := bufio.NewReader(conn)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return
+	}
+	var probeBytes int64
+	cts0 := "0"
+	for _, field := range strings.Fields(line) {
+		if v, ok := strings.CutPrefix(field, "probe-bytes="); ok {
+			probeBytes, _ = strconv.ParseInt(v, 10, 64)
+		}
+		if v, ok := strings.CutPrefix(field, "cts0="); ok {
+			cts0 = v
+		}
+	}
+	if _, err := io.CopyN(io.Discard, br, probeBytes); err != nil {
+		return
+	}
+	chunk := pace.chunk
+	if chunk <= 0 {
+		chunk = max(probeBytes, 1)
+	}
+	if pace.stall == fakeProbeStallBeforeResponse || !wait() {
+		<-stop
+		return
+	}
+	resp := fmt.Sprintf("PROBE cpu=1 io-depth=1 cts0=%s sts0=1 sts1=1 probe-bytes=%d\n", cts0, probeBytes)
+	if _, err := io.WriteString(conn, resp); err != nil {
+		return
+	}
+	if pace.stall == fakeProbeStallAfterResponseLine {
+		<-stop
+		return
+	}
+	for left := probeBytes; left > 0; left -= min(chunk, left) {
+		if !wait() {
+			return
+		}
+		if _, err := io.CopyN(conn, zeroReader{}, min(chunk, left)); err != nil {
+			return
+		}
+	}
+	if !wait() {
+		return
+	}
+	_, _ = io.WriteString(conn, "OK\n")
+}
+
+// startFakeProbeServer serves serveFakeProbe on a real TCP listener.
+func startFakeProbeServer(t *testing.T, pace fakeProbePace) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		close(stop)
+		_ = ln.Close()
+		wg.Wait()
+	})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				serveFakeProbe(conn, pace, stop)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+// A probe whose peer stops making progress fails within about
+// probeTimeoutFloor even under a context with no deadline: the CLI probes
+// with context.Background, and a truncated PROBE once hung it for good.
+func TestProbeLinkTimesOutWithoutResponse(t *testing.T) {
+	const floor = 200 * time.Millisecond
+	const failWithin = 2 * time.Second
+	cases := []struct {
+		name string
+		opts func(t *testing.T) (string, []ClientOption)
+	}{
+		{
+			name: "server reads the PROBE and never answers",
+			opts: func(t *testing.T) (string, []ClientOption) {
+				return startFakeProbeServer(t, fakeProbePace{stall: fakeProbeStallBeforeResponse}), nil
+			},
+		},
+		{
+			name: "server stalls after the response line",
+			opts: func(t *testing.T) (string, []ClientOption) {
+				return startFakeProbeServer(t, fakeProbePace{stall: fakeProbeStallAfterResponseLine}), nil
+			},
+		},
+		{
+			name: "dial never completes",
+			opts: func(t *testing.T) (string, []ClientOption) {
+				return "unused", []ClientOption{WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+					<-ctx.Done()
+					return nil, ctx.Err()
+				})}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setProbeTimeout(t, floor)
+			addr, opts := tc.opts(t)
+			client := NewClient(addr, append([]ClientOption{WithEncryptMode("none")}, opts...)...)
+			defer client.Close()
+
+			start := time.Now()
+			done := make(chan error, 1)
+			go func() {
+				_, err := client.ProbeLink(context.Background(), ProbeRequest{ProbeBytes: 1})
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				elapsed := time.Since(start)
+				if err == nil {
+					t.Fatal("ProbeLink succeeded without a complete PROBE response")
+				}
+				var netErr net.Error
+				if !errors.Is(err, context.DeadlineExceeded) && !(errors.As(err, &netErr) && netErr.Timeout()) {
+					t.Fatalf("ProbeLink failed with %v, want a deadline or timeout error", err)
+				}
+				if elapsed > failWithin {
+					t.Fatalf("ProbeLink took %v to give up, want about %v", elapsed, floor)
+				}
+			case <-time.After(failWithin + time.Second):
+				t.Fatalf("ProbeLink still blocked after %v with a %v probe timeout", failWithin+time.Second, floor)
+			}
+		})
+	}
+}
+
+// probeTrickle returns a probe's echo in 1 KiB steps 50ms apart, a quarter
+// of the 200ms floor, so the whole exchange takes about 500ms: more than two
+// floors in total, yet never a floor without progress.
+var probeTrickle = fakeProbePace{chunk: 1 << 10, gap: 50 * time.Millisecond}
+
+const (
+	probeTrickleFloor = 200 * time.Millisecond
+	probeTrickleBytes = 8 << 10
+)
+
+// The probe timeout bounds each wait for progress, not the whole exchange:
+// a peer that returns the echo slowly but steadily keeps the probe alive
+// however long it takes in total.
+func TestProbeTCPSucceedsWhileProgressing(t *testing.T) {
+	setProbeTimeout(t, probeTrickleFloor)
+	client := NewClient(startFakeProbeServer(t, probeTrickle), WithEncryptMode("none"))
+	defer client.Close()
+
+	start := time.Now()
+	resp, err := client.probeTCP(context.Background(), ProbeRequest{}, probeTrickleBytes)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("steadily progressing probe failed after %v under a %v floor: %v", elapsed, probeTrickleFloor, err)
+	}
+	if resp.ProbeBytes != probeTrickleBytes {
+		t.Fatalf("probe-bytes = %d, want %d", resp.ProbeBytes, probeTrickleBytes)
+	}
+	if elapsed < 2*probeTrickleFloor {
+		t.Fatalf("probe took only %v; the test needs an exchange longer than the %v floor", elapsed, probeTrickleFloor)
+	}
+}
+
+// probeParallel runs its probes at once over one link, so each can take far
+// longer than it would alone. Probes that keep progressing must all succeed.
+func TestProbeParallelSucceedsWhileProgressing(t *testing.T) {
+	const n = 8
+	setProbeTimeout(t, probeTrickleFloor)
+	client := NewClient(startFakeProbeServer(t, probeTrickle), WithEncryptMode("none"))
+	defer client.Close()
+
+	start := time.Now()
+	got, err := client.probeParallel(context.Background(), ProbeRequest{}, probeTrickleBytes, n)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("%d steadily progressing parallel probes failed after %v under a %v floor: %v", n, elapsed, probeTrickleFloor, err)
+	}
+	if got.conns != n {
+		t.Fatalf("probeParallel reported %d connections, want %d", got.conns, n)
+	}
+	if elapsed < 2*probeTrickleFloor {
+		t.Fatalf("probes took only %v; the test needs exchanges longer than the %v floor", elapsed, probeTrickleFloor)
+	}
+}
+
+// proxyPace shapes one direction of a throttleProxy connection. Each step
+// waits gap, then forwards what one read returns, at most chunk bytes. With
+// stallAfter > 0 the connection stops moving bytes in both directions once
+// this direction has forwarded that many, and stays open until the test ends.
+type proxyPace struct {
+	chunk      int
+	gap        time.Duration
+	stallAfter int64
+}
+
+// proxyUnthrottled forwards as fast as the sockets allow.
+var proxyUnthrottled = proxyPace{chunk: 64 << 10}
+
+// throttleProxy relays each accepted connection to upstream, pacing the
+// client-to-server direction by up and the reverse by down. It throttles by
+// reading slowly from a socket with a small receive buffer, so the bytes it
+// holds back stay queued in the sender's kernel, where the sender sees them
+// drain at the paced rate.
+type throttleProxy struct {
+	addr      string
+	stalled   chan struct{}
+	stallOnce sync.Once
+	stalledAt atomic.Int64
+}
+
+// proxyReceiveBuffer is the SO_RCVBUF of the proxy's accepted sockets: small,
+// so a slow upload backs up into the client's send buffer, and the proxy's
+// receive window reopens in small steps, so the client's socket sees bytes
+// leave at the paced rate rather than in bursts far apart. The listener sets
+// it, so the window the proxy advertises in its SYN-ACK already fits it.
+const proxyReceiveBuffer = 8 << 10
+
+func startThrottleProxy(t *testing.T, upstream string, up, down proxyPace) *throttleProxy {
+	t.Helper()
+	lc := net.ListenConfig{Control: func(_, _ string, rc syscall.RawConn) error {
+		var serr error
+		if err := rc.Control(func(fd uintptr) {
+			serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, proxyReceiveBuffer)
+		}); err != nil {
+			return err
+		}
+		return serr
+	}}
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	p := &throttleProxy{addr: ln.Addr().String(), stalled: make(chan struct{})}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		close(stop)
+		_ = ln.Close()
+		wg.Wait()
+	})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			client, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			server, err := net.Dial("tcp", upstream)
+			if err != nil {
+				_ = client.Close()
+				continue
+			}
+			halt := make(chan struct{})
+			var haltOnce sync.Once
+			stall := func() {
+				haltOnce.Do(func() { close(halt) })
+				p.stallOnce.Do(func() {
+					p.stalledAt.Store(time.Now().UnixNano())
+					close(p.stalled)
+				})
+			}
+			wg.Add(3)
+			go func() {
+				defer wg.Done()
+				<-stop
+				_ = client.Close()
+				_ = server.Close()
+			}()
+			go func() {
+				defer wg.Done()
+				p.forward(server, client, up, halt, stop, stall)
+			}()
+			go func() {
+				defer wg.Done()
+				p.forward(client, server, down, halt, stop, stall)
+			}()
+		}
+	}()
+	return p
+}
+
+// forward copies src to dst as pace says until either side fails, stop
+// closes, or the connection stalls.
+func (p *throttleProxy) forward(dst, src net.Conn, pace proxyPace, halt, stop <-chan struct{}, stall func()) {
+	buf := make([]byte, pace.chunk)
+	var moved int64
+	for {
+		if pace.gap > 0 {
+			select {
+			case <-time.After(pace.gap):
+			case <-halt:
+				return
+			case <-stop:
+				return
+			}
+		}
+		n := len(buf)
+		if pace.stallAfter > 0 {
+			n = int(min(int64(n), pace.stallAfter-moved))
+		}
+		n, err := src.Read(buf[:n])
+		select {
+		case <-halt:
+			return
+		default:
+		}
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				err = werr
+			}
+			moved += int64(n)
+		}
+		if pace.stallAfter > 0 && moved >= pace.stallAfter {
+			stall()
+			return
+		}
+		if err != nil {
+			_ = src.Close()
+			_ = dst.Close()
+			return
+		}
+	}
+}
+
+// stalledFor reports how long ago the proxy stalled, or false if it has not.
+func (p *throttleProxy) stalledFor() (time.Duration, bool) {
+	select {
+	case <-p.stalled:
+		return time.Since(time.Unix(0, p.stalledAt.Load())), true
+	default:
+		return 0, false
+	}
+}
+
+// probeSendBuffer is the SO_SNDBUF the throttled probe tests ask for. A
+// probe connection's TCP_NOTSENT_LOWAT keeps its writes paced to the bytes
+// leaving, however large the buffer. The buffer is large so that a client
+// without that bound would queue most of the payload and start waiting for
+// the response while the upload still drains, which the tests then catch.
+// The probe passes with any buffer the kernel grants.
+const probeSendBuffer = 1 << 20
+
+// probeDials records every connection a throttled probe client dials, so a
+// test can inspect its socket.
+type probeDials struct {
+	mu    sync.Mutex
+	conns []*net.TCPConn
+}
+
+// last returns the most recent connection, or nil.
+func (d *probeDials) last() *net.TCPConn {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.conns) == 0 {
+		return nil
+	}
+	return d.conns[len(d.conns)-1]
+}
+
+// dialWithSendBuffer dials with SO_SNDBUF set to bytes and records each
+// dial in got.
+func dialWithSendBuffer(bytes int, got *probeDials) func(context.Context, string) (net.Conn, error) {
+	d := net.Dialer{Control: func(_, _ string, rc syscall.RawConn) error {
+		var serr error
+		if err := rc.Control(func(fd uintptr) {
+			serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, bytes)
+		}); err != nil {
+			return err
+		}
+		return serr
+	}}
+	return func(ctx context.Context, addr string) (net.Conn, error) {
+		conn, err := d.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			got.mu.Lock()
+			got.conns = append(got.conns, conn.(*net.TCPConn))
+			got.mu.Unlock()
+		}
+		return conn, err
+	}
+}
+
+// throttledProbe describes one probe through a throttleProxy in front of a
+// real FTCP server. Every pace below steps at most 25ms apart, an eighth of
+// the 200ms floor, so no healthy exchange goes a floor without moving bytes.
+type throttledProbe struct {
+	encrypted  bool
+	up, down   proxyPace
+	probeBytes int64
+	// floor replaces probeTrickleFloor when set.
+	floor time.Duration
+}
+
+// probeUploadDrain moves the upload 8 KiB per 12ms step, about 670 KiB/s,
+// so a 512 KiB payload takes about 800ms (four floors) to reach the server.
+// The client's writes keep pace with it, and its last write returns with
+// about 8 KiB still unsent and up to the proxy's receive buffer still to be
+// read, roughly 40ms of draining before the server replies. Measured at the
+// client's socket, no gap without bytes moving exceeds about 25ms, an eighth
+// of the floor.
+var probeUploadDrain = proxyPace{chunk: 8 << 10, gap: 12 * time.Millisecond}
+
+const probeUploadDrainBytes = 512 << 10
+
+// probeRecordTrickle moves the response 4 KiB per 25ms step, 160 KiB/s, so
+// one 64 KiB Noise record takes about 400ms (two floors) to arrive.
+var probeRecordTrickle = proxyPace{chunk: 4 << 10, gap: 25 * time.Millisecond}
+
+const probeRecordTrickleBytes = 96 << 10
+
+// run starts the server, proxy, and client, then probes in the background,
+// by default under the 200ms floor. It returns the proxy, the client's dials,
+// and a channel that delivers the probe's result.
+func (tp throttledProbe) run(t *testing.T) (*throttleProxy, *probeDials, <-chan error) {
+	t.Helper()
+	setProbeTimeout(t, cmp.Or(tp.floor, probeTrickleFloor))
+	server := intftcp.ServerOptions{}
+	mode := "none"
+	if tp.encrypted {
+		server.RequireAuth = true
+		mode = "chacha20"
+	}
+	proxy := startThrottleProxy(t, startRealKeepAliveServer(t, server), tp.up, tp.down)
+	dials := &probeDials{}
+	client := NewClient(proxy.addr, WithEncryptMode(mode), WithContextDialer(dialWithSendBuffer(probeSendBuffer, dials)))
+	t.Cleanup(func() { client.Close() })
+	done := make(chan error, 1)
+	go func() {
+		resp, err := client.probeTCP(context.Background(), ProbeRequest{}, tp.probeBytes)
+		if err == nil && resp.ProbeBytes != tp.probeBytes {
+			err = fmt.Errorf("probe-bytes = %d, want %d", resp.ProbeBytes, tp.probeBytes)
+		}
+		done <- err
+	}()
+	return proxy, dials, done
+}
+
+// A probe fails only after a floor without progress at the socket. Upload
+// bytes still draining from the client's kernel after its last write are
+// progress, and so are the bytes of a Noise record that has not fully
+// arrived.
+func TestProbeTCPSucceedsThroughThrottledLink(t *testing.T) {
+	cases := []struct {
+		name string
+		tp   throttledProbe
+	}{
+		{"plaintext upload drains after the last write",
+			throttledProbe{up: probeUploadDrain, down: proxyUnthrottled, probeBytes: probeUploadDrainBytes}},
+		{"encrypted upload drains after the last write",
+			throttledProbe{encrypted: true, up: probeUploadDrain, down: proxyUnthrottled, probeBytes: probeUploadDrainBytes}},
+		{"encrypted response records arrive slower than the floor",
+			throttledProbe{encrypted: true, up: proxyUnthrottled, down: probeRecordTrickle, probeBytes: probeRecordTrickleBytes}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			start := time.Now()
+			_, _, done := tc.tp.run(t)
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("probe still running after 10s")
+			}
+			elapsed := time.Since(start)
+			if err != nil {
+				t.Fatalf("steadily progressing probe failed after %v under a %v floor: %v", elapsed, probeTrickleFloor, err)
+			}
+			if elapsed < 3*probeTrickleFloor {
+				t.Fatalf("probe took only %v; the test needs an exchange of at least three %v floors", elapsed, probeTrickleFloor)
+			}
+		})
+	}
+}
+
+// A probe whose link stops moving bytes, partway through the upload or the
+// response, fails within a few floors of the stall rather than hanging.
+func TestProbeTCPFailsWhenThrottledLinkStalls(t *testing.T) {
+	const failWithin = 5 * probeTrickleFloor
+	stallUpload := probeUploadDrain
+	stallUpload.stallAfter = probeUploadDrainBytes / 2
+	// 32 KiB is the middle of the first 64 KiB record.
+	stallResponse := probeRecordTrickle
+	stallResponse.stallAfter = 32 << 10
+	cases := []struct {
+		name string
+		tp   throttledProbe
+	}{
+		{"plaintext upload stalls",
+			throttledProbe{up: stallUpload, down: proxyUnthrottled, probeBytes: probeUploadDrainBytes}},
+		{"encrypted upload stalls",
+			throttledProbe{encrypted: true, up: stallUpload, down: proxyUnthrottled, probeBytes: probeUploadDrainBytes}},
+		{"plaintext response stalls",
+			throttledProbe{up: proxyUnthrottled, down: stallResponse, probeBytes: probeRecordTrickleBytes}},
+		{"encrypted response stalls mid-record",
+			throttledProbe{encrypted: true, up: proxyUnthrottled, down: stallResponse, probeBytes: probeRecordTrickleBytes}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			proxy, _, done := tc.tp.run(t)
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("probe still blocked 5s after start with a %v floor", probeTrickleFloor)
+			}
+			if err == nil {
+				t.Fatal("probe succeeded over a link that stalls")
+			}
+			// Failing before the stall does not hang either; the success
+			// tests above catch a probe that gives up too early.
+			since, stalled := proxy.stalledFor()
+			if !stalled {
+				t.Logf("failed before the link stalled: %v", err)
+				return
+			}
+			if since > failWithin {
+				t.Fatalf("probe gave up %v after the stall, want within %v of a %v floor: %v", since, failWithin, probeTrickleFloor, err)
+			}
+			t.Logf("failed %v after the stall: %v", since.Round(time.Millisecond), err)
+		})
+	}
+}
+
+// tcpSockopt returns conn's IPPROTO_TCP option opt.
+func tcpSockopt(t *testing.T, conn *net.TCPConn, opt int) int {
+	t.Helper()
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v int
+	var serr error
+	if err := raw.Control(func(fd uintptr) { v, serr = unix.GetsockoptInt(int(fd), unix.IPPROTO_TCP, opt) }); err != nil {
+		t.Fatalf("socket closed before its options were read: %v", err)
+	}
+	if serr != nil {
+		t.Fatalf("getsockopt %d: %v", opt, serr)
+	}
+	return v
+}
+
+// Every client dial sets TCP_USER_TIMEOUT to the dead-peer bound. A probe's
+// connection also sets TCP_NOTSENT_LOWAT, under a Noise session too, so its
+// writes return about as fast as the upload leaves. The test reads both
+// options while the probe is in flight: the proxy stalls the upload after
+// 32 KiB, past the handshake and the PROBE line, and the 1s floor keeps the
+// connection open meanwhile.
+func TestProbeConnSocketOptions(t *testing.T) {
+	stall := probeUploadDrain
+	stall.stallAfter = 32 << 10
+	for _, encrypted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
+			proxy, dials, done := throttledProbe{
+				encrypted: encrypted, up: stall, down: proxyUnthrottled,
+				probeBytes: probeUploadDrainBytes, floor: time.Second,
+			}.run(t)
+			select {
+			case <-proxy.stalled:
+			case err := <-done:
+				t.Fatalf("probe ended before the link stalled: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("link did not stall within 5s")
+			}
+			conn := dials.last()
+			if got, want := tcpSockopt(t, conn, unix.TCP_USER_TIMEOUT), int(intftcp.DeadPeerTimeout.Milliseconds()); got != want {
+				t.Errorf("TCP_USER_TIMEOUT = %dms, want %dms", got, want)
+			}
+			if got := tcpSockopt(t, conn, unix.TCP_NOTSENT_LOWAT); got != probeNotSentLowat {
+				t.Errorf("TCP_NOTSENT_LOWAT = %d, want %d", got, probeNotSentLowat)
+			}
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("probe succeeded over a stalled link")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("probe still blocked 5s after the stall with a 1s floor")
+			}
+		})
+	}
+}
+
+// A client connection outside a probe gets TCP_USER_TIMEOUT from dialTCP.
+func TestDialTCPSetsUserTimeout(t *testing.T) {
+	dials := &probeDials{}
+	client := NewClient(startRealKeepAliveServer(t, intftcp.ServerOptions{}), WithEncryptMode("none"),
+		WithContextDialer(dialWithSendBuffer(probeSendBuffer, dials)))
+	defer client.Close()
+	conn, err := client.dialTCP(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if got, want := tcpSockopt(t, dials.last(), unix.TCP_USER_TIMEOUT), int(intftcp.DeadPeerTimeout.Milliseconds()); got != want {
+		t.Fatalf("TCP_USER_TIMEOUT = %dms, want %dms", got, want)
 	}
 }
 
@@ -3760,6 +4405,13 @@ func TestChecksumReusesKeepAliveConnections(t *testing.T) {
 					target = ChecksumTarget{FileID: entry.ID, FullPath: filepath.Join(manifestResp.Manifest.Root, entry.Path), Size: entry.Size, Algo: "xxh128"}
 				}
 			}
+			// The probe's own connection sets read deadlines too, then
+			// closes; count only the deadlines CXSUM responses set from here.
+			mu.Lock()
+			for _, c := range conns {
+				c.resetSets()
+			}
+			mu.Unlock()
 			const requests = 10
 			for i := 0; i < requests; i++ {
 				err := client.VisitChecksumBatches(ctx, GetChecksumRequest{TransferID: manifestResp.Manifest.TransferID, Targets: []ChecksumTarget{target}}, ChecksumBatchOptions{HashTimeout: time.Hour},
@@ -3800,8 +4452,8 @@ func TestChecksumReusesKeepAliveConnections(t *testing.T) {
 }
 
 // deadlineConn records the read deadline a connection carries, how many
-// read-only deadlines it was given (only a CXSUM response sets one), and
-// whether it was closed. It embeds *net.TCPConn so the pool can still peek
+// read-only deadlines it was given since resetSets (a CXSUM response sets
+// one, and so does each read of a probe), and whether it was closed. It embeds *net.TCPConn so the pool can still peek
 // idle connections through syscall.Conn.
 type deadlineConn struct {
 	*net.TCPConn
@@ -3833,6 +4485,12 @@ func (c *deadlineConn) Close() error {
 	c.closed = true
 	c.mu.Unlock()
 	return c.TCPConn.Close()
+}
+
+func (c *deadlineConn) resetSets() {
+	c.mu.Lock()
+	c.sets = 0
+	c.mu.Unlock()
 }
 
 func (c *deadlineConn) state() (sets int, deadline time.Time, closed bool) {

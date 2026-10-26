@@ -21,9 +21,16 @@ const (
 	// FINISH. It is deliberately large: a cap sized to CPU count would let a
 	// few idle sockets exclude every legitimate client.
 	defaultMaxUnauthenticatedConns = 1024
-	// defaultAuthIdleTimeout is the progress deadline on authenticated
-	// connections when keep-alive is disabled.
-	defaultAuthIdleTimeout = 60 * time.Second
+	// defaultReadProgressTimeout is the read progress deadline on every
+	// connection, plaintext or authenticated, when keep-alive is disabled.
+	defaultReadProgressTimeout = 60 * time.Second
+	// DeadPeerTimeout is the TCP_USER_TIMEOUT of client and server
+	// sockets: the kernel closes a connection whose sent data or keepalive
+	// probes go unacknowledged this long, or whose peer keeps its receive
+	// window closed this long, because it is dead or has stopped reading.
+	// The work on it then fails, to be retried, rather than waiting on a
+	// longer deadline.
+	DeadPeerTimeout = 30 * time.Second
 	// busyWriteTimeout bounds the BUSY reply write.
 	busyWriteTimeout = 10 * time.Millisecond
 	// busyDrainTimeout and busyDrainBytes bound reading the refused
@@ -248,11 +255,7 @@ func (s *connSession) runAuth(br *bufio.Reader, line []byte) error {
 	s.emitAuth(peer.Mode, true)
 	defer sess.Close()
 
-	idle := s.keepAliveTimeout
-	if idle <= 0 {
-		idle = defaultAuthIdleTimeout
-	}
-	sess.SetReadProgressDeadline(idle)
+	sess.SetReadProgressDeadline(s.readProgressTimeout())
 	return s.runNoiseCommands()
 }
 

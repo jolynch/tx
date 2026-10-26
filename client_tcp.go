@@ -24,6 +24,7 @@ import (
 	ftcp "github.com/jolynch/tx/internal/filexfer/ftcp"
 	intlimit "github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/metrics"
+	"github.com/jolynch/tx/internal/sysio"
 	"github.com/jolynch/tx/internal/utils"
 )
 
@@ -396,6 +397,7 @@ func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
 	// skips them as a real one would.
 	if tc, ok := conn.(*net.TCPConn); ok && c.faults.Sys(faults.SysSetsockopt) == nil {
 		_ = tc.SetNoDelay(true)
+		_ = sysio.SetTCPUserTimeout(tc, ftcp.DeadPeerTimeout)
 		if c.SocketReadBufferBytes > 0 {
 			_ = tc.SetReadBuffer(c.SocketReadBufferBytes)
 		}
@@ -938,16 +940,57 @@ func readSENDFirstLine(m *metrics.ClientMetrics, br *bufio.Reader) (string, erro
 	return firstLine, nil
 }
 
-func (c *Client) probeTCP(ctx context.Context, req ProbeRequest, probeBytes int64) (probeResponse, error) {
+// probeTimeoutFloor bounds a probe's dial and handshake, and then each read
+// or write of the exchange: a probe fails once its peer makes no progress
+// for this long, however long the whole exchange takes. Writes go in pieces
+// of probeWriteBytes and return about as fast as bytes leave
+// (probeNotSentLowat), and an encrypted read counts each part of a record,
+// so a socket still moving bytes makes progress. Concurrent probes
+// share one link, so a bound on the total would fail a slow but working one.
+// Without a bound, a peer that stalls mid-probe hangs the caller, whose
+// context is often Background.
+var probeTimeoutFloor = 30 * time.Second
+
+const (
+	// probeNotSentLowat caps the probe upload's bytes queued but not yet
+	// sent, so the response deadline starts about when the upload has left
+	// rather than when it entered the kernel's send buffer. It is
+	// best-effort: on a transport without a TCP socket underneath, or when
+	// the option fails, the response deadline starts at the last local
+	// write, and a slow link can fail the probe.
+	probeNotSentLowat = 16 << 10
+	// probeWriteBytes is the piece of a plaintext probe upload that one
+	// write deadline covers; aead's progressWriteBytes does the same for an
+	// encrypted one. Both stay at or below probeNotSentLowat, so each piece
+	// is accepted as bytes leave.
+	probeWriteBytes = 16 << 10
+)
+
+func (c *Client) probeTCP(ctx context.Context, req ProbeRequest, probeBytes int64) (resp probeResponse, err error) {
 	if probeBytes <= 0 {
 		return probeResponse{}, errors.New("probe bytes must be > 0")
 	}
-	conn, state, err := c.dialAndAuth(ctx)
+	// When ctx ends, the connection is closed under the read, which reports
+	// only that; name the cancellation behind it.
+	defer func() {
+		if err != nil && ctx.Err() != nil && !errors.Is(err, ctx.Err()) {
+			err = fmt.Errorf("%w: %w", ctx.Err(), err)
+		}
+	}()
+	dialCtx, cancelDial := context.WithTimeout(ctx, probeTimeoutFloor)
+	conn, state, err := c.dialAndAuth(dialCtx)
+	cancelDial()
 	if err != nil {
 		return probeResponse{}, err
 	}
 	defer conn.Close()
 	defer watchManagedTCPConnContext(ctx, conn)()
+	if tc := tcpConnOf(conn); tc != nil && c.faults.Sys(faults.SysSetsockopt) == nil {
+		_ = sysio.SetTCPNotSentLowat(tc, probeNotSentLowat)
+	}
+	if sess := noiseSessionOf(conn); sess != nil {
+		sess.SetReadProgressDeadline(probeTimeoutFloor)
+	}
 
 	cts0 := time.Now().UnixMilli()
 	localCPU := runtime.NumCPU()
@@ -961,7 +1004,7 @@ func (c *Client) probeTCP(ctx context.Context, req ProbeRequest, probeBytes int6
 			cmd += " obs-link-mbps=" + strconv.FormatInt(req.ObservedLinkMbps, 10)
 		}
 	}
-	if err := c.sendTCPProbe(conn, state, cmd, probeBytes); err != nil {
+	if err := c.sendTCPProbe(conn, state, cmd, probeBytes, probeTimeoutFloor); err != nil {
 		return probeResponse{}, fmt.Errorf("send PROBE: %w", err)
 	}
 
@@ -969,7 +1012,7 @@ func (c *Client) probeTCP(ctx context.Context, req ProbeRequest, probeBytes int6
 	if err != nil {
 		return probeResponse{}, fmt.Errorf("initialize PROBE response stream: %w", err)
 	}
-	capture := &firstReadTimestampReader{reader: responseReader}
+	capture := &firstReadTimestampReader{reader: &progressDeadlineReader{r: responseReader, conn: conn, d: probeTimeoutFloor}}
 	br := bufio.NewReader(capture)
 	line, err := readTCPLine(br, maxTCPLineBytes)
 	if err != nil {
@@ -1004,10 +1047,17 @@ func (c *Client) probeTCP(ctx context.Context, req ProbeRequest, probeBytes int6
 	return probeResp, nil
 }
 
-func (c *Client) sendTCPProbe(conn net.Conn, state tcpAuthState, cmd string, probeBytes int64) error {
+// sendTCPProbe writes the PROBE request, giving each piece of it d to
+// leave.
+func (c *Client) sendTCPProbe(conn net.Conn, state tcpAuthState, cmd string, probeBytes int64, d time.Duration) error {
 	w, closeRequest, err := c.newTCPRequestWriter(conn, state)
 	if err != nil {
 		return err
+	}
+	if sess := noiseSessionOf(conn); sess != nil {
+		sess.SetWriteProgressDeadline(d)
+	} else {
+		w = &progressDeadlineWriter{w: w, conn: conn, d: d}
 	}
 	if err := writeTCPLine(w, cmd); err != nil {
 		_ = closeRequest()
@@ -1018,6 +1068,57 @@ func (c *Client) sendTCPProbe(conn net.Conn, state tcpAuthState, cmd string, pro
 		return err
 	}
 	return closeRequest()
+}
+
+// tcpConnOf returns the TCP connection under conn's wrappers, or nil.
+func tcpConnOf(conn net.Conn) *net.TCPConn {
+	for {
+		switch c := conn.(type) {
+		case *net.TCPConn:
+			return c
+		case *noiseConn:
+			conn = c.Conn
+		case interface{ Unwrap() net.Conn }:
+			conn = c.Unwrap()
+		default:
+			return nil
+		}
+	}
+}
+
+// progressDeadlineReader and progressDeadlineWriter re-arm conn's read or
+// write deadline to d before each read and each probeWriteBytes written, so
+// a stream fails only when its peer stops making progress.
+type progressDeadlineReader struct {
+	r    io.Reader
+	conn net.Conn
+	d    time.Duration
+}
+
+func (p *progressDeadlineReader) Read(b []byte) (int, error) {
+	_ = p.conn.SetReadDeadline(time.Now().Add(p.d))
+	return p.r.Read(b)
+}
+
+type progressDeadlineWriter struct {
+	w    io.Writer
+	conn net.Conn
+	d    time.Duration
+}
+
+func (p *progressDeadlineWriter) Write(b []byte) (int, error) {
+	written := 0
+	for len(b) > 0 {
+		n := min(len(b), probeWriteBytes)
+		_ = p.conn.SetWriteDeadline(time.Now().Add(p.d))
+		m, err := p.w.Write(b[:n])
+		written += m
+		if err != nil {
+			return written, err
+		}
+		b = b[n:]
+	}
+	return written, nil
 }
 
 type firstReadTimestampReader struct {

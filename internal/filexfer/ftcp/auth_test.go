@@ -63,6 +63,14 @@ func clientKey(t *testing.T) (aead.KeyPair, string) {
 // noiseDial connects and authenticates.
 func noiseDial(t *testing.T, addr string, cfg aead.ClientConfig) (*aead.Session, error) {
 	t.Helper()
+	s, _, err := noiseDialConn(t, addr, cfg)
+	return s, err
+}
+
+// noiseDialConn is noiseDial that also returns the underlying connection, so
+// a test can bound its own waits on the session.
+func noiseDialConn(t *testing.T, addr string, cfg aead.ClientConfig) (*aead.Session, net.Conn, error) {
+	t.Helper()
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -71,11 +79,11 @@ func noiseDial(t *testing.T, addr string, cfg aead.ClientConfig) (*aead.Session,
 	s, err := aead.ClientHandshake(conn, cfg)
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, nil, err
 	}
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	t.Cleanup(func() { s.Close() })
-	return s, nil
+	return s, conn, nil
 }
 
 // noiseCommand sends one message and returns the response's lines.
@@ -278,22 +286,181 @@ func TestServeNoiseRequestCompletion(t *testing.T) {
 	}
 }
 
-func TestServeAuthenticatedIdleDeadline(t *testing.T) {
-	// Without keep-alive, the first command after FINISH still has a
-	// deadline; KeepAliveTimeout bounds it when set.
-	addr, pub := authServer(t, ServerOptions{RequireAuth: true, KeepAliveTimeout: 200 * time.Millisecond})
+// noiseIdleClosed waits for the server to close s and reports how long that
+// took. It fails the test if the server answers instead.
+func noiseIdleClosed(t *testing.T, s *aead.Session, what string) time.Duration {
+	t.Helper()
+	start := time.Now()
+	mr, err := s.Reader()
+	if err == nil {
+		_, err = io.ReadAll(mr)
+	}
+	if err == nil {
+		t.Fatalf("%s: server answered instead of closing", what)
+	}
+	return time.Since(start)
+}
+
+// An authenticated client must begin its first command within the
+// read-progress timeout, counted from FINISH: a session that stays silent
+// after the handshake is closed at that timeout. Clients keep idle pooled
+// sessions open with keep-alive PROBEs instead.
+func TestServeAuthenticatedSilentSessionCloses(t *testing.T) {
+	const idle = 200 * time.Millisecond
+	const closeWithin = time.Second
+	addr, pub := authServer(t, ServerOptions{RequireAuth: true, KeepAliveTimeout: idle})
+	kp, _ := clientKey(t)
+	s, conn, err := noiseDialConn(t, addr, aead.ClientConfig{Mode: aead.ModeAge, Cipher: aead.AlgorithmAES, Static: kp, ServerKey: pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Bound the client's own wait past closeWithin, so a server that never
+	// closes fails here instead of at the 10s dial deadline.
+	_ = conn.SetDeadline(time.Now().Add(closeWithin + time.Second))
+	elapsed := noiseIdleClosed(t, s, "session silent after FINISH")
+	if elapsed < idle/2 {
+		t.Fatalf("silent session closed after %v, before its %v timeout", elapsed, idle)
+	}
+	if elapsed > closeWithin {
+		t.Fatalf("silent session lived %v after FINISH (timeout %v)", elapsed, idle)
+	}
+}
+
+// finishCoalescingConn holds the client's first write after message 2
+// arrives, FINISH, and sends it in one write with the next one, the first
+// command, so both reach the server together.
+type finishCoalescingConn struct {
+	net.Conn
+	gotMsg2   bool
+	held      []byte
+	coalesced bool
+}
+
+func (c *finishCoalescingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.gotMsg2 = true
+	}
+	return n, err
+}
+
+func (c *finishCoalescingConn) Write(p []byte) (int, error) {
+	switch {
+	case !c.gotMsg2 || c.coalesced:
+		return c.Conn.Write(p)
+	case c.held == nil:
+		c.held = append([]byte{}, p...)
+		return len(p), nil
+	}
+	c.coalesced = true
+	if _, err := c.Conn.Write(append(c.held, p...)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// The first command can arrive with FINISH and be read ahead into the
+// session along with it. The server must serve it from there instead of
+// waiting on the socket for bytes the client will not send until it gets
+// a response.
+func TestServeAuthenticatedFirstCommandWithFinishIsServed(t *testing.T) {
+	const idle = 200 * time.Millisecond
+	addr, pub := authServer(t, ServerOptions{RequireAuth: true, KeepAliveTimeout: idle})
+	kp, _ := clientKey(t)
+	raw, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &finishCoalescingConn{Conn: raw}
+	_ = conn.SetDeadline(time.Now().Add(aead.HandshakeTimeout))
+	s, err := aead.ClientHandshake(conn, aead.ClientConfig{Mode: aead.ModeAge, Cipher: aead.AlgorithmAES, Static: kp, ServerKey: pub})
+	if err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	// A hung server fails at this deadline instead of the test's.
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	start := time.Now()
+	lines, err := noiseCommand(t, s, heartbeat)
+	elapsed := time.Since(start)
+	if !conn.coalesced {
+		t.Fatal("FINISH and the first command were not sent in one write")
+	}
+	if err != nil {
+		t.Fatalf("first command sent with FINISH was not served after %v: %v", elapsed, err)
+	}
+	if len(lines) != 2 || !strings.HasPrefix(lines[0], "PROBE ") || lines[1] != "OK" {
+		t.Fatalf("PROBE sent with FINISH = %q", lines)
+	}
+	if elapsed > 3*idle {
+		t.Fatalf("first command sent with FINISH took %v (timeout %v)", elapsed, idle)
+	}
+}
+
+// Once a kept-alive session has served a command, the gap before the next
+// one is bounded by the read-progress deadline.
+func TestServeAuthenticatedIdleBetweenCommandsCloses(t *testing.T) {
+	const idle = 200 * time.Millisecond
+	addr, pub := authServer(t, ServerOptions{RequireAuth: true, KeepAliveTimeout: idle})
 	kp, _ := clientKey(t)
 	s, err := noiseDial(t, addr, aead.ClientConfig{Mode: aead.ModeAge, Cipher: aead.AlgorithmAES, Static: kp, ServerKey: pub})
 	if err != nil {
 		t.Fatal(err)
 	}
-	start := time.Now()
-	mr, _ := s.Reader()
-	if _, err := io.ReadAll(mr); err == nil {
-		t.Fatal("silent authenticated connection was not closed")
+	lines, err := noiseCommand(t, s, heartbeat)
+	if err != nil || len(lines) != 2 || !strings.Contains(lines[0], "keep-alive-ms=200") || lines[1] != "OK" {
+		t.Fatalf("first PROBE = (%q, %v)", lines, err)
 	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Fatalf("silent connection lived %v", elapsed)
+	elapsed := noiseIdleClosed(t, s, "idle kept-alive session")
+	if elapsed < idle/2 {
+		t.Fatalf("kept-alive session closed after %v, before its %v idle window", elapsed, idle)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("idle kept-alive session lived %v (timeout %v)", elapsed, idle)
+	}
+}
+
+// A request whose first record arrived and whose rest never does is closed
+// at the read-progress deadline: right after FINISH, after a pause shorter
+// than the timeout, or on a kept-alive session after a served command.
+func TestServeAuthenticatedStalledRequestCloses(t *testing.T) {
+	const idle = 200 * time.Millisecond
+	addr, pub := authServer(t, ServerOptions{RequireAuth: true, KeepAliveTimeout: idle})
+	kp, _ := clientKey(t)
+	cfg := aead.ClientConfig{Mode: aead.ModeAge, Cipher: aead.AlgorithmAES, Static: kp, ServerKey: pub}
+	for _, tc := range []struct {
+		name   string
+		before func(t *testing.T, s *aead.Session)
+	}{
+		{"stall right after FINISH", func(*testing.T, *aead.Session) {}},
+		{"stall after a pause inside the timeout", func(*testing.T, *aead.Session) { time.Sleep(idle / 2) }},
+		{"stall after a served command", func(t *testing.T, s *aead.Session) {
+			lines, err := noiseCommand(t, s, heartbeat)
+			if err != nil || len(lines) != 2 || lines[1] != "OK" {
+				t.Fatalf("keep-alive PROBE = (%q, %v)", lines, err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := noiseDial(t, addr, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.before(t, s)
+			// The command line and half of its 16-byte PROBE payload, in
+			// one record; the rest and the END never come.
+			w := s.Writer(false)
+			if _, err := io.WriteString(w, "PROBE cpu=1 probe-bytes=16 cts0=1\r\n"+strings.Repeat("z", 8)); err != nil {
+				t.Fatalf("write partial PROBE: %v", err)
+			}
+			if err := w.Flush(); err != nil {
+				t.Fatalf("flush partial PROBE: %v", err)
+			}
+			if elapsed := noiseIdleClosed(t, s, "stalled PROBE body"); elapsed > 3*time.Second {
+				t.Fatalf("stalled request held the connection for %v (timeout %v)", elapsed, idle)
+			}
+		})
 	}
 }
 

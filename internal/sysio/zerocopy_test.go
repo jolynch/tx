@@ -297,6 +297,50 @@ func TestTCPByteCounts(t *testing.T) {
 	}
 }
 
+// tcpOption returns conn's IPPROTO_TCP option opt.
+func tcpOption(t *testing.T, conn *net.TCPConn, opt int) int {
+	t.Helper()
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v int
+	var serr error
+	if err := raw.Control(func(fd uintptr) { v, serr = unix.GetsockoptInt(int(fd), unix.IPPROTO_TCP, opt) }); err != nil {
+		t.Fatal(err)
+	}
+	if serr != nil {
+		t.Fatalf("getsockopt %d: %v", opt, serr)
+	}
+	return v
+}
+
+// TestTCPSocketOptions checks SetTCPUserTimeout sets TCP_USER_TIMEOUT in
+// milliseconds and SetTCPNotSentLowat sets TCP_NOTSENT_LOWAT in bytes, as
+// getsockopt reads them back, and that both report a closed connection.
+func TestTCPSocketOptions(t *testing.T) {
+	client, _ := tcpPair(t)
+	if err := SetTCPUserTimeout(client, 2500*time.Millisecond); err != nil {
+		t.Fatalf("SetTCPUserTimeout: %v", err)
+	}
+	if got := tcpOption(t, client, unix.TCP_USER_TIMEOUT); got != 2500 {
+		t.Fatalf("TCP_USER_TIMEOUT = %d, want 2500 (milliseconds)", got)
+	}
+	if err := SetTCPNotSentLowat(client, 24<<10); err != nil {
+		t.Fatalf("SetTCPNotSentLowat: %v", err)
+	}
+	if got := tcpOption(t, client, unix.TCP_NOTSENT_LOWAT); got != 24<<10 {
+		t.Fatalf("TCP_NOTSENT_LOWAT = %d, want %d", got, 24<<10)
+	}
+	_ = client.Close()
+	if err := SetTCPUserTimeout(client, time.Second); err == nil {
+		t.Fatal("SetTCPUserTimeout on a closed connection succeeded")
+	}
+	if err := SetTCPNotSentLowat(client, 1<<10); err == nil {
+		t.Fatal("SetTCPNotSentLowat on a closed connection succeeded")
+	}
+}
+
 // TestPeekAlive checks PeekAlive reports an idle open connection alive, and
 // a connection whose peer closed or reset it, or that holds unread bytes,
 // not alive, without consuming those bytes. Each case waits until the

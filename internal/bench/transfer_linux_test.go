@@ -419,6 +419,52 @@ func BenchmarkTransferInMemory(b *testing.B) {
 	}
 }
 
+// BenchmarkTransferInMemoryModes copies 256 MiB per op of 4 KiB and 1 MiB
+// files in each session mode: cipher none or aes, with or without a
+// keep-alive grant (+ka). Unlike startMemTransfer's client, which never
+// probes and so dials every request directly, it probes first so the client
+// opens its connection pools as tx recv copy does. dials/op counts every TCP
+// dial the client makes.
+func BenchmarkTransferInMemoryModes(b *testing.B) {
+	for _, mode := range []string{"none", "aes", "none+ka", "aes+ka"} {
+		cipher, keepAlive := parseThroughputMode(mode)
+		for _, sz := range []struct {
+			name string
+			size int64
+		}{{"4KiB", 4 << 10}, {"1MiB", 1 << 20}} {
+			b.Run(mode+"/"+sz.name, func(b *testing.B) {
+				cfg := memTransferConfig{fileSize: sz.size, totalBytes: 256 << 20, encrypt: cipher, keepAlive: keepAlive}
+				env := startMemTransfer(b, cfg)
+				defer env.close()
+				if _, err := env.client.ProbeLink(context.Background(), tx.ProbeRequest{ProbeBytes: 1}); err != nil {
+					b.Fatalf("probe: %v", err)
+				}
+				env.copyOnce(b) // warm the connection pools
+				b.SetBytes(int64(cfg.files()) * cfg.fileSize)
+				var cpuNS int64
+				dials0 := env.client.MetricSnapshot().DialCount
+				b.ResetTimer()
+				for b.Loop() {
+					b.StopTimer()
+					manifest := env.register(b)
+					b.StartTimer()
+					cpu0 := processCPUNS()
+					env.download(b, manifest)
+					cpuNS += processCPUNS() - cpu0
+					b.StopTimer()
+					env.store.DeleteTransfer(manifest.TransferID)
+					b.StartTimer()
+				}
+				b.StopTimer()
+				gib := float64(b.N) * float64(cfg.files()) * float64(cfg.fileSize) / (1 << 30)
+				b.ReportMetric(float64(cpuNS)/1e9/gib, "core-s/GiB")
+				b.ReportMetric(float64(b.N)*float64(cfg.files())/b.Elapsed().Seconds(), "files/s")
+				b.ReportMetric(float64(env.client.MetricSnapshot().DialCount-dials0)/float64(b.N), "dials/op")
+			})
+		}
+	}
+}
+
 // TestTransferCostRatio measures copies of the same bytes as files from 4 KiB
 // to 16 MiB, for each server CPU count in TX_BENCH_THROUGHPUT_CPUS and each
 // session encryption in TX_BENCH_THROUGHPUT_ENCRYPT. It reports two goals:

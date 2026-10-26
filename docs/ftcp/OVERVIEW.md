@@ -183,7 +183,7 @@ instead request connection reuse via PROBE:
   `END` record, and pooled commands perform no further key exchange.
 - Any handler error still writes `ERR ...` and closes the connection.
 
-Two guardrails keep silently dead connections from lingering:
+Three guardrails keep silently dead connections from lingering:
 
 1. **Client heartbeats**: clients probe every idle kept-alive connection at
    one quarter of the granted window (`keep-alive-ms / 4`) with a minimal
@@ -194,13 +194,25 @@ Two guardrails keep silently dead connections from lingering:
    EOF before reusing a pooled connection.
 2. **Server idle reaping**: the server closes a kept-alive connection that
    receives no bytes for the keep-alive window (`--idle-timeout`, default
-   60s; `0` disables keep-alive entirely). Authenticated connections always
-   run under this deadline, 60s when keep-alive is disabled: it bounds the
-   first command after `FINISH`, the time between commands, and the time
-   between records of a request. Every completed command —
-   heartbeats included — extends the connection by a fresh window, but
-   heartbeats do not count as activity for `--exit-after`, so a lingering
-   idle client cannot block server shutdown.
+   60s; `0` disables keep-alive entirely). Every connection, plaintext or
+   authenticated, reads under this deadline, 60s when keep-alive is
+   disabled, from accept (from `FINISH` when authenticated): it bounds the
+   wait for the first command, the time between commands, and the time
+   between bytes or records of a request, so a silent peer or one that
+   stalls mid-request is cut off. A client therefore keeps an idle
+   connection only as a heartbeated keep-alive session; without keep-alive
+   it dials per request. Every completed
+   command — heartbeats included — extends the connection by a fresh
+   window, but heartbeats do not count as activity for `--exit-after`, so a
+   lingering idle client cannot block server shutdown.
+3. **Unacknowledged data**: client and server sockets set
+   `TCP_USER_TIMEOUT` to 30s, so the kernel closes a connection whose sent
+   data goes unacknowledged that long, or whose peer keeps its receive
+   window closed that long. A dead peer, or one that stops reading for 30s
+   (a suspended `tx`, a stalled stdout consumer), then fails the work on the
+   connection, which is retried, rather than holding it until a longer
+   deadline. A side that is only receiving notices a dead peer through
+   keepalive probes, after about 60s.
 
 ## Token Encoding
 
@@ -609,6 +621,12 @@ server's observed link estimate for gentle limiting.
 `PROBE cpu=<client-cpu> probe-bytes=<n> cts0=<unix-ms> [txferid=<id>] [obs-link-mbps=<int>] [keep-alive=auto]`
 
 - request line is followed by exactly `probe-bytes` raw bytes.
+- the client gives the dial and handshake 30s, then each 16 KiB written and
+  each read of the exchange 30s to make progress, counting the bytes of a
+  record still arriving. It caps the upload's unsent bytes at 16 KiB
+  (`TCP_NOTSENT_LOWAT`), so its writes keep pace with the link and the wait
+  for the response starts about when the upload has left. A probe cut short
+  fails instead of waiting forever, while a slow one completes.
 - `probe-bytes` must be `<= 32 MiB`; `0` is valid and makes the probe a pure
   latency round trip (the keep-alive heartbeat form).
 - `txferid` is optional and scopes periodic reprobe updates to an existing transfer.

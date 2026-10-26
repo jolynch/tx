@@ -141,6 +141,9 @@ type tcpConnPool struct {
 	sessionMS atomic.Int64
 	// refilling counts background fills in flight; each holds a slot.
 	refilling atomic.Int64
+	// probing counts idle sessions out for a heartbeat probe. They are in
+	// neither the idle stack nor borrowed, but still open.
+	probing atomic.Int64
 	// waits counts acquires that found the pool full and had to wait.
 	waits atomic.Int64
 	// borrowed counts connections handed out by acquire and not yet returned;
@@ -346,9 +349,15 @@ func (p *tcpConnPool) takeStale(interval time.Duration) []*sessionTCPConn {
 	kept := p.idle[:0]
 	for i, conn := range p.idle {
 		sc, isSession := conn.(*sessionTCPConn)
-		if isSession && time.Since(sc.lastActive) >= interval && p.claimIdle() {
-			stale = append(stale, sc)
-			continue
+		if isSession && time.Since(sc.lastActive) >= interval {
+			// Count the probe before claiming, so the session stays
+			// counted throughout.
+			p.probing.Add(1)
+			if p.claimIdle() {
+				stale = append(stale, sc)
+				continue
+			}
+			p.probing.Add(-1)
 		}
 		kept = append(kept, p.idle[i])
 	}
@@ -511,22 +520,33 @@ func (c *Client) dialPoolConn(ctx context.Context, p *tcpConnPool) (net.Conn, er
 	return sc, nil
 }
 
-// openCount is the pool's idle, borrowed, and filling connections.
+// openCount is the pool's idle, borrowed, filling, and probing connections.
+// A connection mid-dial on demand, or between a borrow or return and its
+// counter update, is briefly missed; a refill decided then can overshoot the
+// target until the next tick trims it, which is accepted.
 func (p *tcpConnPool) openCount() int {
-	return len(p.ready) + int(p.borrowed.Load()) + int(p.refilling.Load())
+	return len(p.ready) + int(p.borrowed.Load()) + int(p.refilling.Load()) + int(p.probing.Load())
 }
 
 // triggerRefill starts background fills until the pool's open connections
 // reach its target. Each fill holds a slot, so refills never push the pool
 // past its limit, and a scale-down lowers the target so replacement fills
 // never undo it.
-func (p *tcpConnPool) triggerRefill(c *Client) {
-	if p == nil || c == nil {
+func (p *tcpConnPool) triggerRefill(c *Client) { p.refill(c, 0) }
+
+// refill is triggerRefill for a caller holding refilling counts that no
+// longer stand for a pending connection: a finishing fill, whose connection
+// is already idle, passes held=1.
+func (p *tcpConnPool) refill(c *Client, held int) {
+	// Without keep-alive a connection serves one command and cannot be
+	// heartbeated, and the server closes one that sends nothing for its
+	// idle timeout, so such a pool dials on demand rather than keeping any.
+	if p == nil || c == nil || p.sessionMS.Load() <= 0 {
 		return
 	}
 	for !p.stopped.Load() {
 		p.refilling.Add(1)
-		if p.openCount() > int(p.target.Load()) || !p.takeSlot() {
+		if p.openCount()-held > int(p.target.Load()) || !p.takeSlot() {
 			p.refilling.Add(-1)
 			return
 		}
@@ -541,15 +561,24 @@ func (p *tcpConnPool) triggerRefill(c *Client) {
 func (c *Client) fillTCPPoolConn(p *tcpConnPool) {
 	filled := false
 	defer func() {
-		p.refilling.Add(-1)
 		// A failed fill does not retry: the next acquire dials on demand
-		// instead of this loop hammering an unreachable server.
-		if filled && !p.stopped.Load() && p.openCount() < int(p.target.Load()) {
-			p.triggerRefill(c)
+		// instead of this loop hammering an unreachable server. A filled one
+		// starts the next fill while it still counts as in flight, so the
+		// pool never looks settled between the two; the check is refill's
+		// own first one, done here to skip the call.
+		if filled && !p.stopped.Load() && p.openCount()-1 < int(p.target.Load()) {
+			p.refill(c, 1)
 		}
+		p.refilling.Add(-1)
 	}()
 	conn, err := c.dialPoolConn(p.ctx, p)
 	if err != nil {
+		return
+	}
+	if _, isSession := conn.(*sessionTCPConn); !isSession {
+		// Keep-alive was withdrawn while this fill dialed: a single-use
+		// connection cannot be heartbeated, so it must not sit idle.
+		_ = p.discard(c, conn, "single_use")
 		return
 	}
 	if !p.enqueue(conn) {
@@ -614,6 +643,7 @@ func (p *tcpConnPool) heartbeatIdleConns(c *Client, interval time.Duration) {
 		if p.ctx.Err() != nil {
 			// Stopping: probing would only send a PROBE to discard.
 			_ = p.discard(c, sc, "stopped")
+			p.probing.Add(-1)
 			continue
 		}
 		wg.Add(1)
@@ -621,6 +651,9 @@ func (p *tcpConnPool) heartbeatIdleConns(c *Client, interval time.Duration) {
 		go func(sc *sessionTCPConn) {
 			defer wg.Done()
 			defer func() { <-p.hbSem }()
+			// Runs after the connection is back in the idle stack or
+			// closed, so it stays counted until then.
+			defer p.probing.Add(-1)
 			// Stopping the pool closes a probe's connection, so stop never
 			// waits out a probe's timeout.
 			stopWatch := watchManagedTCPConnContext(p.ctx, sc)
