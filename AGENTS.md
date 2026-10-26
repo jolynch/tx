@@ -328,7 +328,8 @@ command, file, window, and ACK events. A nil sink costs one nil check.
 `Store` is a `sync.Map` of transfers with **no process-wide instance**:
 whoever runs a server owns one and closes it. Each transfer has an RWMutex
 over its state and a separate mutex for window hashes. Per-file state is
-`Started -> Running -> Done` (or `Missing` for 404), and `StateCounts` keeps
+`Started -> Running -> Done` (or `Missing` for 404, which a later ACK of its
+bytes revives, since an `ENOENT` can be transient), and `StateCounts` keeps
 per-state totals current so status needs no scan.
 - **Hot paths are O(1) per file.** Per-request and per-file code uses
   `GetTransferSummary` (scalars only), never `GetTransfer`, which copies every

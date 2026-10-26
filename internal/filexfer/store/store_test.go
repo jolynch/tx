@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1302,6 +1303,313 @@ func TestAcknowledgeZeroByteFileCompletesTransfer(t *testing.T) {
 	assertDone("repeated missing ack", 3)
 	s.AcknowledgeTransferFile(transfer.ID, 3, -1)
 	assertDone("missing ack for directory", 3)
+}
+
+// checkDoneInvariant fails the test unless Done counts exactly the regular
+// files that are Done or Missing, StateCounts matches a recount of regular
+// files and sums to NumFiles, DoneSize sums AckedSize, and the transfer
+// counts as complete exactly when every regular file is terminal.
+func checkDoneInvariant(t *testing.T, s *Store, txferID string, step string) Transfer {
+	t.Helper()
+	got, ok := s.GetTransfer(txferID)
+	if !ok {
+		t.Fatalf("%s: transfer not found", step)
+	}
+	var counts [TransferStateMissing + 1]int
+	var doneSize int64
+	allTerminal := true
+	for i, st := range got.State {
+		doneSize += got.AckedSize[i]
+		if !isRegularFileEntryType(got.EntryType[i]) {
+			continue
+		}
+		counts[st]++
+		if st != TransferStateDone && st != TransferStateMissing {
+			allTerminal = false
+		}
+	}
+	if got.StateCounts != counts {
+		t.Fatalf("%s: StateCounts=%v, recount=%v (states=%v)", step, got.StateCounts, counts, got.State)
+	}
+	sum := 0
+	for _, n := range counts {
+		sum += n
+	}
+	if sum != got.NumFiles {
+		t.Fatalf("%s: StateCounts sum to %d, NumFiles=%d", step, sum, got.NumFiles)
+	}
+	if want := uint64(counts[TransferStateDone] + counts[TransferStateMissing]); got.Done != want {
+		t.Fatalf("%s: Done=%d, want %d Done+Missing regular files (states=%v)", step, got.Done, want, got.State)
+	}
+	if got.DoneSize != doneSize {
+		t.Fatalf("%s: DoneSize=%d, AckedSize sums to %d", step, got.DoneSize, doneSize)
+	}
+	if complete := got.Done == uint64(got.NumFiles); complete != allTerminal {
+		t.Fatalf("%s: Done==NumFiles is %v but every regular file terminal is %v (states=%v)", step, complete, allTerminal, got.State)
+	}
+	return got
+}
+
+// TestAcknowledgeMissingFileRevives covers a file the client marked Missing
+// (ACK -1 after a SEND 404) that a later SEND delivers after all: the
+// ENOENT was transient. A later ACK of real bytes must take the file out of
+// Missing and apply as it would to a Running file, so the file is counted
+// once, as Done, when fully acknowledged.
+func TestAcknowledgeMissingFileRevives(t *testing.T) {
+	const (
+		ten, empty, dir, link, other = 1, 2, 3, 4, 5
+	)
+	type ack struct {
+		fid   uint64
+		bytes int64
+	}
+	cases := []struct {
+		name      string
+		acks      []ack
+		fid       uint64
+		wantState uint8
+		wantAcked int64
+	}{
+		{"missing then full", []ack{{ten, -1}, {ten, 10}}, ten, TransferStateDone, 10},
+		{"missing then oversized", []ack{{ten, -1}, {ten, 12}}, ten, TransferStateDone, 10},
+		{"missing then partial", []ack{{ten, -1}, {ten, 4}}, ten, TransferStateRunning, 4},
+		{"missing then partial then full", []ack{{ten, -1}, {ten, 4}, {ten, 10}}, ten, TransferStateDone, 10},
+		{"partial then missing then full", []ack{{ten, 4}, {ten, -1}, {ten, 10}}, ten, TransferStateDone, 10},
+		{"partial then missing then larger partial", []ack{{ten, 3}, {ten, -1}, {ten, 7}}, ten, TransferStateRunning, 7},
+		{"missing then missing", []ack{{ten, -1}, {ten, -1}}, ten, TransferStateMissing, 0},
+		{"missing then full twice", []ack{{ten, -1}, {ten, 10}, {ten, 10}}, ten, TransferStateDone, 10},
+		{"empty file missing then full", []ack{{empty, -1}, {empty, 0}}, empty, TransferStateDone, 0},
+		{"empty file missing twice then full", []ack{{empty, -1}, {empty, -1}, {empty, 0}, {empty, 0}}, empty, TransferStateDone, 0},
+		{"directory missing then acked", []ack{{dir, -1}, {dir, 0}, {dir, 5}}, dir, 0, 0},
+		{"symlink missing then acked", []ack{{link, -1}, {link, 0}, {link, 5}}, link, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			tr, err := s.NewTransfer("/r", 0, 0)
+			if err != nil {
+				t.Fatalf("NewTransfer: %v", err)
+			}
+			s.RegisterTransferFileStates(tr.ID, []TransferFileStateUpdate{
+				{FileID: encoding.RootFileID, EntryType: encoding.EntryTypeDir, PathHash: xxh3.Hash128([]byte("/r")), FileSize: 0},
+				{FileID: ten, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/r/ten")), FileSize: 10},
+				{FileID: empty, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/r/empty")), FileSize: 0},
+				{FileID: dir, EntryType: encoding.EntryTypeDir, PathHash: xxh3.Hash128([]byte("/r/dir")), FileSize: 0},
+				{FileID: link, EntryType: encoding.EntryTypeSymlink, PathHash: xxh3.Hash128([]byte("/r/link")), FileSize: 0},
+				{FileID: other, EntryType: encoding.EntryTypeFile, PathHash: xxh3.Hash128([]byte("/r/other")), FileSize: 4},
+			}, TransferStateStarted)
+			s.ClipTransfer(tr.ID)
+			// A SEND marks every regular file Running before any ACK.
+			s.SetTransferFilesState(tr.ID, []uint64{ten, empty, other}, TransferStateRunning)
+			managed, _ := s.getManagedTransfer(tr.ID)
+
+			for i, a := range tc.acks {
+				step := fmt.Sprintf("ack %d (fid %d, %d bytes)", i, a.fid, a.bytes)
+				before, _ := s.GetTransfer(tr.ID)
+				expired := time.Now().Add(-time.Second)
+				managed.mu.Lock()
+				managed.transfer.ExpiresAt = expired
+				managed.mu.Unlock()
+				if !s.AcknowledgeTransferFile(tr.ID, a.fid, a.bytes) {
+					t.Fatalf("%s: AcknowledgeTransferFile returned false", step)
+				}
+				after := checkDoneInvariant(t, s, tr.ID, step)
+				if after.AckedSize[a.fid] > before.AckedSize[a.fid] && !after.ExpiresAt.After(expired) {
+					t.Fatalf("%s: acknowledged bytes grew from %d to %d without refreshing the TTL", step, before.AckedSize[a.fid], after.AckedSize[a.fid])
+				}
+				if a.bytes == -1 && isRegularFileEntryType(after.EntryType[a.fid]) && after.State[a.fid] != TransferStateMissing {
+					t.Fatalf("%s: state %d after a missing ACK, want Missing", step, after.State[a.fid])
+				}
+			}
+
+			got := checkDoneInvariant(t, s, tr.ID, "after acks")
+			if isRegularFileEntryType(got.EntryType[tc.fid]) && got.State[tc.fid] != tc.wantState {
+				t.Fatalf("fid %d state %d, want %d (states=%v)", tc.fid, got.State[tc.fid], tc.wantState, got.State)
+			}
+			if got.AckedSize[tc.fid] != tc.wantAcked {
+				t.Fatalf("fid %d AckedSize %d, want %d", tc.fid, got.AckedSize[tc.fid], tc.wantAcked)
+			}
+			if s.MaybeLogTransferComplete(tr.ID) {
+				t.Fatalf("transfer complete while fid %d is still unacknowledged", other)
+			}
+
+			// Finish every regular file. Each ends Done and counted once,
+			// whatever its history, and the transfer completes.
+			for _, a := range []ack{{ten, 10}, {empty, 0}, {other, 4}} {
+				s.AcknowledgeTransferFile(tr.ID, a.fid, a.bytes)
+			}
+			got = checkDoneInvariant(t, s, tr.ID, "after final acks")
+			if got.Done != 3 || got.StateCounts[TransferStateDone] != 3 || got.StateCounts[TransferStateMissing] != 0 {
+				t.Fatalf("after final acks: Done=%d StateCounts=%v, want 3 Done and none Missing", got.Done, got.StateCounts)
+			}
+			if got.DoneSize != 14 {
+				t.Fatalf("after final acks: DoneSize=%d, want 14", got.DoneSize)
+			}
+			if !s.MaybeLogTransferComplete(tr.ID) {
+				t.Fatal("transfer not complete after every regular file was fully acknowledged")
+			}
+		})
+	}
+}
+
+// FuzzAckMissingRevival drives regular files, a directory, and a symlink
+// through SENDs and ACKs of -1 (missing), partial, full, and oversized byte
+// counts, in any order, and checks each step against a model: -1 makes a
+// regular file Missing, a byte ACK revives a Missing file, and a full ACK
+// makes it Done. After every step Done must count exactly the Done and
+// Missing regular files, and the transfer completes exactly when every
+// regular file is terminal.
+func FuzzAckMissingRevival(f *testing.F) {
+	// Sizes of the four regular files, then ops of (op, fid, arg).
+	f.Add([]byte{5, 3, 0, 2, 0, 0, 0, 0, 0, 2})
+	f.Add([]byte{5, 3, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 2, 2, 0})
+	f.Add([]byte{5, 3, 0, 2, 0, 2, 0, 0, 2, 2, 0, 0, 2, 0, 1, 2, 0, 3, 2, 0, 0, 2, 0})
+	f.Add([]byte{4, 4, 4, 4, 0, 0, 2, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 4, 0, 0, 5, 2})
+	f.Fuzz(func(t *testing.T, ops []byte) {
+		if len(ops) > 600 {
+			ops = ops[:600]
+		}
+		next := func() byte {
+			if len(ops) == 0 {
+				return 0
+			}
+			b := ops[0]
+			ops = ops[1:]
+			return b
+		}
+		const regular, entries = 4, 6 // fids 0-3 regular, 4 a directory, 5 a symlink
+		s := newTestStore(t)
+		tr, err := s.NewTransfer("/r", 0, 0)
+		if err != nil {
+			t.Fatalf("NewTransfer: %v", err)
+		}
+		var size [entries]int64
+		updates := make([]TransferFileStateUpdate, entries)
+		for fid := range updates {
+			entryType := byte(encoding.EntryTypeFile)
+			switch fid {
+			case 4:
+				entryType = encoding.EntryTypeDir
+			case 5:
+				entryType = encoding.EntryTypeSymlink
+			default:
+				size[fid] = int64(next() % 6)
+			}
+			updates[fid] = TransferFileStateUpdate{
+				FileID:    uint64(fid),
+				EntryType: entryType,
+				PathHash:  xxh3.Hash128([]byte(fmt.Sprintf("/r/%d", fid))),
+				FileSize:  size[fid],
+			}
+		}
+		managed, _ := s.getManagedTransfer(tr.ID)
+		oldFlags, oldWriter := log.Flags(), log.Writer()
+		log.SetFlags(0)
+		log.SetOutput(lockFreeLogWriter{t: t, m: managed})
+		defer func() {
+			log.SetFlags(oldFlags)
+			log.SetOutput(oldWriter)
+		}()
+		s.RegisterTransferFileStates(tr.ID, updates, TransferStateStarted)
+		s.ClipTransfer(tr.ID)
+
+		var state [regular]uint8
+		for i := range state {
+			state[i] = TransferStateStarted
+		}
+		var acked [regular]int64
+		logged := false
+		for step := 0; len(ops) > 0; step++ {
+			op, fid := next()%3, int(next()%entries)
+			var desc string
+			// adopt lists regular files whose next state the contract
+			// leaves open; the model takes the store's answer if allowed.
+			adopt := map[int][]uint8{}
+			switch op {
+			case 0: // ACK
+				var n int64
+				switch next() % 4 {
+				case 0:
+					n = -1
+				case 1:
+					if size[fid] > 0 {
+						n = int64(next()) % size[fid]
+					}
+				case 2:
+					n = size[fid]
+				case 3:
+					n = size[fid] + 1 + int64(next()%3)
+				}
+				desc = fmt.Sprintf("step %d: ACK fid %d (size %d) with %d", step, fid, size[fid], n)
+				if !s.AcknowledgeTransferFile(tr.ID, uint64(fid), n) {
+					t.Fatalf("%s: AcknowledgeTransferFile returned false", desc)
+				}
+				if fid >= regular {
+					break
+				}
+				if n == -1 {
+					state[fid] = TransferStateMissing
+					break
+				}
+				target := min(n, size[fid])
+				wasMissing := state[fid] == TransferStateMissing
+				if wasMissing {
+					state[fid] = TransferStateRunning
+				}
+				acked[fid] = max(acked[fid], target)
+				if target == size[fid] && state[fid] < TransferStateDone {
+					state[fid] = TransferStateDone
+				}
+				if wasMissing && state[fid] == TransferStateRunning && acked[fid] == size[fid] {
+					// A partial ACK revives a file whose bytes were all
+					// acknowledged before it went Missing; Running and
+					// Done both satisfy the contract.
+					adopt[fid] = []uint8{TransferStateRunning, TransferStateDone}
+				}
+			case 1: // SEND marks its files Running
+				ids := []uint64{uint64(fid), uint64(next() % entries)}
+				desc = fmt.Sprintf("step %d: SEND %v", step, ids)
+				s.SetTransferFilesState(tr.ID, ids, TransferStateRunning)
+				for _, id := range ids {
+					if id >= regular {
+						continue
+					}
+					switch state[id] {
+					case TransferStateStarted:
+						state[id] = TransferStateRunning
+					case TransferStateMissing:
+						// The contract revives at ACK; reviving at SEND is
+						// also allowed.
+						adopt[int(id)] = []uint8{TransferStateMissing, TransferStateRunning}
+					}
+				}
+			case 2:
+				desc = fmt.Sprintf("step %d: completion check", step)
+			}
+
+			got := checkDoneInvariant(t, s, tr.ID, desc)
+			for i := 0; i < regular; i++ {
+				if allowed, ok := adopt[i]; ok && slices.Contains(allowed, got.State[i]) {
+					state[i] = got.State[i]
+				}
+				if got.State[i] != state[i] || got.AckedSize[i] != acked[i] {
+					t.Fatalf("%s: fid %d state=%d acked=%d, model state=%d acked=%d (states=%v)",
+						desc, i, got.State[i], got.AckedSize[i], state[i], acked[i], got.State)
+				}
+			}
+			if op == 2 {
+				allTerminal := got.Done == uint64(got.NumFiles)
+				complete := s.MaybeLogTransferComplete(tr.ID)
+				if allTerminal && !complete {
+					t.Fatalf("%s: every regular file terminal but not complete", desc)
+				}
+				if !allTerminal && !logged && complete {
+					t.Fatalf("%s: complete with regular files still pending (states=%v)", desc, got.State)
+				}
+				logged = logged || complete
+			}
+		}
+	})
 }
 
 // TestSetTransferFilesState checks the batched state change: in-range files

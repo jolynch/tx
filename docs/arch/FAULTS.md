@@ -160,8 +160,8 @@ in-memory transfer still finishes with correct bytes within a few resume
 rounds; `TestBadDayCompletes` in `internal/memxfer` holds it to that in every
 session mode, each with its own seed. It leaves out `read.flip`,
 `write.lost`, and `write.flip`, which no layer detects without `--verify`, so
-a run could succeed with wrong data, and `open.enoent`, after which the file
-is correctly reported missing for good. Its per-file kinds stay near
+a run could succeed with wrong data, and `open.enoent`, after which a file
+stays missing until a later round delivers it. Its per-file kinds stay near
 0.1–0.3%: one fault fails a whole SEND batch, so a batch of small files must
 usually get through.
 
@@ -187,7 +187,7 @@ tests check it.
 | MSG    | `dup`                        | each client ACK: sent twice                                          | idempotent server state                                                      |
 | MSG    | `delay` ⏱                    | each client request                                                  | requests on other connections overtake it                                    |
 | MSG    | `busy`                       | each accept, on a server requiring auth                              | `ERR BUSY`; the client retries the handshake                                 |
-| DISK   | `open.enoent`, `open.eio`    | each SEND and CXSUM open                                             | the file is missing (404) or the open fails loudly                           |
+| DISK   | `open.enoent`, `open.eio`    | each SEND and CXSUM open                                             | 404 until a later round delivers it; or a loud error                          |
 | DISK   | `read.eio`, `read.latency` ⏱ | each buffered SEND, CXSUM, and verify read                           | loud error; liveness. Spliced frames: SYS `splice`                           |
 | DISK   | `read.flip`                  | each SEND, CXSUM, and verify read: one bit                           | none without `--verify`: the server hashes what it read                      |
 | DISK   | `write.eio`, `write.enospc`  | each 64 KiB block of a client output                                 | loud error at the block; resume repairs                                      |

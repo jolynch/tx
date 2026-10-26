@@ -510,6 +510,10 @@ Rules:
 
 - non-`-1` ack must include hash token.
 - hash is validated against stored window hash at ack offset.
+- `-1` marks the file missing. A missing file is counted as finished, but an
+  `ENOENT` can be transient, so a later hash-validated ack for it applies as
+  for any running file and counts it again once its bytes are all
+  acknowledged.
 
 ### Response
 
