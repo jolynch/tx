@@ -678,6 +678,7 @@ func (r *receiver) oneRun(ctx context.Context, label string, measured, first boo
 	haveStats := readJSON(statsPath, &st) == nil
 	if haveStats {
 		run.TID = st.TID
+		run.Warnings = st.Warnings
 		run.WallNS = st.WallNS
 		run.ProbeNS, run.ManifestNS, run.DataNS, run.FinalizeNS = st.Phases.Probe, st.Phases.Manifest, st.Phases.Data, st.Phases.Finalize
 		run.Files, run.Bytes, run.LogicalBytes, run.WireBytes, run.Windows = st.Files, st.Bytes, st.LogicalBytes, st.WireBytes, st.Windows

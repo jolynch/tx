@@ -137,7 +137,7 @@ type Env struct {
 
 	openedMu sync.Mutex
 	opened   map[uint64][]int64 // where the last round opened each file's outputs
-	unsynced int64              // outputs the last round's sync worker gave up on
+	unsynced int64              // files the last round's sync worker failed to sync
 }
 
 const root = "/memxfer"
@@ -341,7 +341,7 @@ func (e *Env) Pending() []uint64 {
 
 // Round downloads every pending file once, resuming each from the bytes
 // the server last acknowledged, as a resumed tx recv copy does.
-func (e *Env) Round(ctx context.Context) (tx.StartFromManifestResponse, error) {
+func (e *Env) Round(ctx context.Context) (resp tx.StartFromManifestResponse, err error) {
 	e.unsynced = 0
 	tr, ok := e.st.GetTransfer(e.transferID)
 	if !ok {
@@ -360,8 +360,12 @@ func (e *Env) Round(ctx context.Context) (tx.StartFromManifestResponse, error) {
 		return tx.StartFromManifestResponse{}, nil
 	}
 	worker, stop := fsync.StartSyncWorker(1<<20, false, 0, io.Discard, fsync.WithFaults(e.cfg.Faults))
+	// A failed background sync surfaces only at stop, after every ACK, as
+	// it does at the end of tx recv copy.
 	defer func() {
-		stop(context.WithoutCancel(ctx))
+		if syncErr := stop(context.WithoutCancel(ctx)); syncErr != nil {
+			resp.Errors = append(resp.Errors, syncErr)
+		}
 		e.unsynced = worker.Unsynced()
 	}()
 	e.openedMu.Lock()
@@ -384,7 +388,7 @@ func (e *Env) Round(ctx context.Context) (tx.StartFromManifestResponse, error) {
 			e.openedMu.Lock()
 			e.opened[entry.ID] = append(e.opened[entry.ID], offset)
 			e.openedMu.Unlock()
-			return countingWriter{WriteCloser: w, e: e}, worker.SyncOutput(fd, offset), nil
+			return countingWriter{WriteCloser: w, e: e}, worker.SyncOutput(fd, offset, fmt.Sprintf("file %d", entry.ID)), nil
 		},
 		Concurrency:        e.conc,
 		BatchMaxBytes:      1 << 20,
@@ -400,8 +404,8 @@ func (e *Env) Opened(id uint64) []int64 {
 	return slices.Clone(e.opened[id])
 }
 
-// Unsynced returns how many outputs the last round's background syncs gave
-// up on, by a failed fdatasync or fstat, which no writer hears about.
+// Unsynced returns how many files the last round's background syncs failed
+// to sync. Round also reports them in its response's Errors.
 func (e *Env) Unsynced() int64 { return e.unsynced }
 
 // AckedBytes returns how many of file id's bytes the server has

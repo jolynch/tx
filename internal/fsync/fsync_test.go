@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,7 +20,9 @@ import (
 
 func TestStartSyncWorkerDisabled(t *testing.T) {
 	worker, stop := StartSyncWorker(1024, true, time.Second, ioDiscard{})
-	stop(context.Background())
+	if err := stop(context.Background()); err != nil {
+		t.Fatalf("stop() error = %v, want nil", err)
+	}
 	if worker == nil {
 		t.Fatal("StartSyncWorker returned nil worker")
 	}
@@ -31,7 +34,7 @@ func TestStartSyncWorkerDisabled(t *testing.T) {
 	if _, err := f.WriteString("hello"); err != nil {
 		t.Fatalf("WriteString: %v", err)
 	}
-	if err := worker.SyncOutput(f, 0)(); err != nil {
+	if err := worker.SyncOutput(f, 0, f.Name())(); err != nil {
 		t.Fatalf("SyncOutput() error = %v, want nil", err)
 	}
 }
@@ -47,7 +50,7 @@ func TestSyncOutputInlineReturnsFdatasyncError(t *testing.T) {
 	if _, err := f.WriteString("hello"); err != nil {
 		t.Fatalf("WriteString: %v", err)
 	}
-	syncOutput := worker.SyncOutput(f, 0)
+	syncOutput := worker.SyncOutput(f, 0, f.Name())
 	if err := f.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -64,7 +67,7 @@ func TestSyncOutputBackgroundStopDrains(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateTemp: %v", err)
 	}
-	syncOutput := worker.SyncOutput(f, 0)
+	syncOutput := worker.SyncOutput(f, 0, f.Name())
 	if _, err := f.WriteString("hello"); err != nil {
 		t.Fatalf("WriteString: %v", err)
 	}
@@ -75,7 +78,9 @@ func TestSyncOutputBackgroundStopDrains(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	stop(context.Background())
+	if err := stop(context.Background()); err != nil {
+		t.Fatalf("stop() error = %v, want nil after every sync succeeded", err)
+	}
 
 	if !strings.Contains(stderr.String(), "background-fsync: drained") {
 		t.Fatalf("stop output = %q, want background drain summary", stderr.String())
@@ -96,7 +101,7 @@ func TestSyncOutputBackgroundDupFallbackReturnsError(t *testing.T) {
 	if _, err := f.WriteString("hello"); err != nil {
 		t.Fatalf("WriteString: %v", err)
 	}
-	syncOutput := worker.SyncOutput(f, 0)
+	syncOutput := worker.SyncOutput(f, 0, f.Name())
 	if err := f.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -407,12 +412,14 @@ func TestSyncSyscallsGoThroughFaults(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			inj := faults.New(faults.Config{Seed: 1})
 			worker, stop := StartSyncWorker(tc.interval, false, 0, io.Discard, WithFaults(inj))
-			if err := worker.SyncOutput(f, 0)(); err != nil {
+			if err := worker.SyncOutput(f, 0, f.Name())(); err != nil {
 				t.Fatal(err)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			stop(ctx)
+			if err := stop(ctx); err != nil {
+				t.Fatalf("stop() error = %v, want nil", err)
+			}
 			for _, sc := range tc.want {
 				if inj.Counts().Sys[sc] == 0 {
 					t.Fatalf("syscall %d skipped its gate: %+v", sc, inj.Counts().Sys)
@@ -441,45 +448,334 @@ func TestBackgroundSyncBatchSyncsEveryFile(t *testing.T) {
 		if _, err := f.WriteString(name); err != nil {
 			t.Fatal(err)
 		}
-		if err := worker.SyncOutput(f, 0)(); err != nil {
+		if err := worker.SyncOutput(f, 0, f.Name())(); err != nil {
 			t.Fatal(err)
 		}
 		defer f.Close()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	stop(ctx)
+	if err := stop(ctx); err != nil {
+		t.Fatalf("stop() error = %v, want nil", err)
+	}
 	if got := inj.Counts().Sys[faults.SysFdatasync]; got != 2 {
 		t.Fatalf("fdatasync gate asked %d times for two files in one batch, want 2", got)
 	}
 }
 
-// TestBackgroundSyncCountsUnsynced checks Unsynced counts each file a
-// background batch gave up on, by a failed fdatasync or a failed fstat
-// before it, and nothing when every sync succeeds.
-func TestBackgroundSyncCountsUnsynced(t *testing.T) {
-	for spec, want := range map[string]int64{"": 0, "fdatasync.fail=1": 1, "fstat.fail=1": 1} {
-		var inj *faults.Injector
-		if spec != "" {
-			inj = faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: spec}})
+// TestBackgroundSyncReportsFailedFiles checks the background syncer's
+// failure contract, for three files in one batch and in a batch each:
+//
+//   - A failed fdatasync is not retried. It counts in Unsynced, and stop
+//     returns an error that wraps ErrSyncFailed, not ErrDrainIncomplete,
+//     and names each failed file's path and the count.
+//   - A failed fstat costs only deduplication: the file is still synced, so
+//     with fdatasync healthy nothing is unsynced and stop returns nil.
+//   - The sync callback returns nil either way, since the file's writer
+//     has moved on by the time its batch runs.
+func TestBackgroundSyncReportsFailedFiles(t *testing.T) {
+	const files = 3
+	for _, tc := range []struct {
+		spec string
+		fail bool
+	}{
+		{"", false},
+		{"fdatasync.fail=1", true},
+		{"fstat.fail=1", false},
+		{"fstat.fail=1,fdatasync.fail=1", true},
+	} {
+		for _, interval := range []int64{1, 1 << 30} {
+			t.Run(fmt.Sprintf("%q/interval=%d", tc.spec, interval), func(t *testing.T) {
+				inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: tc.spec}})
+				var stderr bytes.Buffer
+				worker, stop := StartSyncWorker(interval, false, 0, &stderr, WithFaults(inj))
+				dir := t.TempDir()
+				var paths []string
+				for i := range files {
+					path := fmt.Sprintf("%s/out-%c.bin", dir, 'a'+i)
+					f, err := os.Create(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := f.WriteString("hello"); err != nil {
+						t.Fatal(err)
+					}
+					if err := worker.SyncOutput(f, 0, path)(); err != nil {
+						t.Fatalf("background SyncOutput(%s) = %v, want nil", path, err)
+					}
+					if err := f.Close(); err != nil {
+						t.Fatal(err)
+					}
+					paths = append(paths, path)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				err := stop(ctx)
+
+				if got := inj.Counts().Sys[faults.SysFdatasync]; got != files {
+					t.Fatalf("fdatasync gate asked %d times for %d files, want one each: no skip, no retry", got, files)
+				}
+				var wantUnsynced int64
+				if tc.fail {
+					wantUnsynced = files
+				}
+				if got := worker.Unsynced(); got != wantUnsynced {
+					t.Fatalf("Unsynced() = %d, want %d", got, wantUnsynced)
+				}
+				if !tc.fail {
+					if err != nil {
+						t.Fatalf("stop() = %v, want nil when every file synced", err)
+					}
+					return
+				}
+				if err == nil {
+					t.Fatalf("stop() = nil, want an error naming %d unsynced files; stderr %q", files, stderr.String())
+				}
+				if !errors.Is(err, ErrSyncFailed) {
+					t.Fatalf("stop() = %v, want it to wrap ErrSyncFailed", err)
+				}
+				if errors.Is(err, ErrDrainIncomplete) {
+					t.Fatalf("stop() = %v wraps ErrDrainIncomplete, but the drain finished", err)
+				}
+				msg := err.Error()
+				rest := msg
+				for _, path := range paths {
+					if !strings.Contains(msg, path) {
+						t.Fatalf("stop() error %q does not name unsynced file %s", msg, path)
+					}
+					rest = strings.ReplaceAll(rest, path, "")
+				}
+				if !regexp.MustCompile(fmt.Sprintf(`\b%d\b`, files)).MatchString(rest) {
+					t.Fatalf("stop() error %q does not give the count %d", msg, files)
+				}
+			})
 		}
-		worker, stop := StartSyncWorker(1, false, time.Second, ioDiscard{}, WithFaults(inj))
-		f, err := os.CreateTemp(t.TempDir(), "sync-unsynced-*")
+	}
+}
+
+// slowFdatasync is the latency of a slow fdatasync: long enough that a stop
+// whose context is already done cannot see its batch finish, short enough
+// that the abandoned batch ends soon after the test.
+const slowFdatasync = "β(1s,1100ms,1400ms,1500ms)"
+
+// fastThenSlowSeed returns a seed under which, with fdatasync latency firing
+// at rate, the first fdatasync does not sleep and the second does. A
+// fault's decision depends on the seed, kind, rate, and operation number,
+// not its distribution, so a probe with a negligible latency predicts the
+// real injector.
+func fastThenSlowSeed(t *testing.T, rate string) uint64 {
+	t.Helper()
+	for seed := uint64(1); seed <= 256; seed++ {
+		probe := faults.New(faults.Config{Seed: seed, Specs: map[faults.Family]string{
+			faults.FamilySys: "fdatasync.latency=" + rate + ":β(1us,2us,3us,4us)",
+		}})
+		var slow []bool
+		for range 2 {
+			before := probe.Counts().InjectedByKind()["sys.fdatasync.latency"]
+			_ = probe.Sys(faults.SysFdatasync)
+			slow = append(slow, probe.Counts().InjectedByKind()["sys.fdatasync.latency"] > before)
+		}
+		if !slow[0] && slow[1] {
+			return seed
+		}
+	}
+	t.Fatal("no seed in 1..256 makes the first fdatasync fast and the second slow")
+	return 0
+}
+
+// TestStopDrainCutShort checks stop's error when its context is done before
+// the background drain finishes: it wraps ErrDrainIncomplete, and it wraps
+// ErrSyncFailed only when a file failed to sync before the cut, in which
+// case both hold. Stop returns without waiting for the slow sync. Its
+// batch cannot finish before stop looks, since every slow fdatasync sleeps
+// at least a second.
+func TestStopDrainCutShort(t *testing.T) {
+	// enqueue writes a 4 KiB file, a power of two, so a 1-byte interval
+	// sends it as a batch of its own unless other bytes are pending.
+	enqueue := func(t *testing.T, worker *SyncWorker, path string) {
+		t.Helper()
+		f, err := os.Create(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		syncOutput := worker.SyncOutput(f, 0)
-		if _, err := f.WriteString("hello"); err != nil {
+		t.Cleanup(func() { f.Close() })
+		if _, err := f.Write(make([]byte, 4096)); err != nil {
 			t.Fatal(err)
 		}
-		if err := syncOutput(); err != nil {
-			t.Fatalf("%q: SyncOutput: %v", spec, err)
+		if err := worker.SyncOutput(f, 0, path)(); err != nil {
+			t.Fatalf("background SyncOutput(%s) = %v, want nil", path, err)
 		}
-		_ = f.Close()
-		stop(context.Background())
-		if got := worker.Unsynced(); got != want {
-			t.Fatalf("%q: Unsynced %d, want %d", spec, got, want)
+	}
+	stopNow := func(stop func(context.Context) error) error {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return stop(ctx)
+	}
+
+	t.Run("pending only", func(t *testing.T) {
+		inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{
+			faults.FamilySys: "fdatasync.latency=1:" + slowFdatasync,
+		}})
+		worker, stop := StartSyncWorker(1, false, 0, io.Discard, WithFaults(inj))
+		enqueue(t, worker, t.TempDir()+"/pending.bin")
+		start := time.Now()
+		err := stopNow(stop)
+		if elapsed := time.Since(start); elapsed >= time.Second {
+			t.Fatalf("stop took %s with a done context, want it to return without the drain", elapsed)
 		}
+		if !errors.Is(err, ErrDrainIncomplete) {
+			t.Fatalf("stop() = %v, want it to wrap ErrDrainIncomplete", err)
+		}
+		if errors.Is(err, ErrSyncFailed) {
+			t.Fatalf("stop() = %v wraps ErrSyncFailed, but no fdatasync failed", err)
+		}
+	})
+	t.Run("pending and failed", func(t *testing.T) {
+		const rate = "0.5"
+		inj := faults.New(faults.Config{Seed: fastThenSlowSeed(t, rate), Specs: map[faults.Family]string{
+			faults.FamilySys: "fdatasync.fail=1,fdatasync.latency=" + rate + ":" + slowFdatasync,
+		}})
+		worker, stop := StartSyncWorker(1, false, 0, io.Discard, WithFaults(inj))
+		dir := t.TempDir()
+		failed := dir + "/failed.bin"
+		enqueue(t, worker, failed)
+		deadline := time.Now().Add(time.Second)
+		for worker.Unsynced() == 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("the first fdatasync, which takes no latency, did not fail within 1s")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		enqueue(t, worker, dir+"/pending.bin")
+		start := time.Now()
+		err := stopNow(stop)
+		if elapsed := time.Since(start); elapsed >= time.Second {
+			t.Fatalf("stop took %s with a done context, want it to return without the drain", elapsed)
+		}
+		if !errors.Is(err, ErrDrainIncomplete) {
+			t.Fatalf("stop() = %v, want it to wrap ErrDrainIncomplete", err)
+		}
+		if !errors.Is(err, ErrSyncFailed) {
+			t.Fatalf("stop() = %v, want it to wrap ErrSyncFailed too", err)
+		}
+		if !strings.Contains(err.Error(), failed) {
+			t.Fatalf("stop() = %v, want it to name %s, which failed to sync", err, failed)
+		}
+	})
+}
+
+// TestSyncfsDirReturnsError checks SyncfsDir returns nil only when syncfs
+// completes: a failed syncfs, a timeout, and a cancellation each return an
+// error, whether or not it reports progress while waiting. A blocked syncfs
+// stands in for a slow one, so the context always ends first.
+func TestSyncfsDirReturnsError(t *testing.T) {
+	prev := loadSyncfsFunc()
+	defer syncfsFunc.Store(prev)
+	for _, progress := range []time.Duration{0, 5 * time.Millisecond} {
+		t.Run(fmt.Sprintf("progress=%s", progress), func(t *testing.T) {
+			t.Run("healthy", func(t *testing.T) {
+				syncfsFunc.Store(prev)
+				inj := faults.New(faults.Config{Seed: 1})
+				if err := SyncfsDir(context.Background(), t.TempDir(), progress, io.Discard, WithFaults(inj)); err != nil {
+					t.Fatalf("SyncfsDir = %v, want nil", err)
+				}
+			})
+			t.Run("injected failure", func(t *testing.T) {
+				syncfsFunc.Store(prev)
+				inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: "syncfs.fail=1"}})
+				var stderr bytes.Buffer
+				if err := SyncfsDir(context.Background(), t.TempDir(), progress, &stderr, WithFaults(inj)); err == nil {
+					t.Fatalf("SyncfsDir = nil after syncfs failed; stderr %q", stderr.String())
+				}
+				if !strings.Contains(stderr.String(), "filesystem sync failed") {
+					t.Fatalf("SyncfsDir output = %q, want the failure on stderr", stderr.String())
+				}
+			})
+			t.Run("slow failure", func(t *testing.T) {
+				// The error arrives after a progress tick, when progress is on.
+				syncfsFunc.Store(syncfsFuncType(func(int) error {
+					time.Sleep(20 * time.Millisecond)
+					return syscall.EIO
+				}))
+				if err := SyncfsDir(context.Background(), t.TempDir(), progress, io.Discard); err == nil {
+					t.Fatal("SyncfsDir = nil after syncfs returned EIO")
+				}
+			})
+			for _, tc := range []struct {
+				name string
+				ctx  func() (context.Context, context.CancelFunc)
+				want string
+			}{
+				{"expired", func() (context.Context, context.CancelFunc) {
+					return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				}, "timed out"},
+				{"times out waiting", func() (context.Context, context.CancelFunc) {
+					return context.WithTimeout(context.Background(), 30*time.Millisecond)
+				}, "timed out"},
+				{"canceled", func() (context.Context, context.CancelFunc) {
+					ctx, cancel := context.WithCancel(context.Background())
+					cancel()
+					return ctx, cancel
+				}, "canceled"},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					release := make(chan struct{})
+					defer close(release)
+					syncfsFunc.Store(syncfsFuncType(func(int) error {
+						<-release
+						return nil
+					}))
+					ctx, cancel := tc.ctx()
+					defer cancel()
+					var stderr bytes.Buffer
+					if err := SyncfsDir(ctx, t.TempDir(), progress, &stderr); err == nil {
+						t.Fatalf("SyncfsDir = nil though its context ended first; stderr %q", stderr.String())
+					}
+					if got := stderr.String(); !strings.Contains(got, "WARNING: final-syncfs") || !strings.Contains(got, tc.want) {
+						t.Fatalf("SyncfsDir output = %q, want a WARNING saying %q", got, tc.want)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestStopReturnsNilWithoutBackgroundSyncer checks the modes with no
+// background syncer return a stop that reports nothing, even when every
+// fdatasync fails: inline sync returns its error from the callback instead,
+// and the other modes never call fdatasync per file.
+func TestStopReturnsNilWithoutBackgroundSyncer(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		interval   int64
+		noSync     bool
+		wantSyncFn bool // the callback returns the injected error
+	}{
+		{"inline", 0, false, true},
+		{"disabled", -1, false, false},
+		{"no-sync", 1, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: "fdatasync.fail=1"}})
+			worker, stop := StartSyncWorker(tc.interval, tc.noSync, 0, io.Discard, WithFaults(inj))
+			f, err := os.CreateTemp(t.TempDir(), "out")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			if _, err := f.WriteString("hello"); err != nil {
+				t.Fatal(err)
+			}
+			if err := worker.SyncOutput(f, 0, f.Name())(); (err != nil) != tc.wantSyncFn {
+				t.Fatalf("SyncOutput() = %v, want error %t", err, tc.wantSyncFn)
+			}
+			if err := stop(context.Background()); err != nil {
+				t.Fatalf("stop() = %v, want nil", err)
+			}
+			if got := worker.Unsynced(); got != 0 {
+				t.Fatalf("Unsynced() = %d, want 0", got)
+			}
+		})
 	}
 }
 
@@ -502,7 +798,7 @@ func TestSyncOutputInjectedFailure(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer f.Close()
-			err = worker.SyncOutput(f, 0)()
+			err = worker.SyncOutput(f, 0, f.Name())()
 			if !errors.Is(err, syscall.EIO) && !errors.Is(err, syscall.ENOSPC) {
 				t.Fatalf("SyncOutput = %v, want injected fdatasync error", err)
 			}

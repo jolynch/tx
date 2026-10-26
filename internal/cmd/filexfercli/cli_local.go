@@ -21,6 +21,7 @@ import (
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/fsync"
 	"github.com/jolynch/tx/internal/pagecache"
+	"github.com/jolynch/tx/internal/txstats"
 )
 
 const localCopyBufferBytes = 1 << 20
@@ -217,7 +218,9 @@ func runLocalCopyCLI(srcRoot, dstRoot string, cfg copyCLIConfig, stdout, stderr 
 
 	if !cfg.skipFsync {
 		syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
-		fsync.SyncfsDir(syncCtx, staging, progressInterval, stderr, fsync.WithFaults(inj))
+		if err := fsync.SyncfsDir(syncCtx, staging, progressInterval, stderr, fsync.WithFaults(inj)); err != nil {
+			cfg.stats.Warn(err.Error())
+		}
 		cancel()
 	}
 
@@ -347,7 +350,9 @@ func runLocalSync(srcRoot, dstRoot string, srcInfo os.FileInfo, cfg copyCLIConfi
 
 		if !cfg.skipFsync {
 			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
-			fsync.SyncfsDir(syncCtx, dstRoot, progressInterval, stderr, fsync.WithFaults(cfg.auth.faults))
+			if err := fsync.SyncfsDir(syncCtx, dstRoot, progressInterval, stderr, fsync.WithFaults(cfg.auth.faults)); err != nil {
+				cfg.stats.Warn(err.Error())
+			}
 			cancel()
 		}
 	}
@@ -1061,6 +1066,7 @@ type localGetArgs struct {
 	cacheLoadEnabled bool
 	cacheLoadBudget  time.Duration
 	progressInterval time.Duration
+	stats            *txstats.Recorder // may be nil
 }
 
 // runLocalGetCLI copies a single local file to outputPath with copy_file_range.
@@ -1149,7 +1155,9 @@ func runLocalGetCLI(a localGetArgs, stdout, stderr io.Writer) int {
 		}
 		if !a.skipFsync {
 			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
-			fsync.SyncfsDir(syncCtx, filepath.Dir(a.outputPath), a.progressInterval, stderr, fsync.WithFaults(inj))
+			if err := fsync.SyncfsDir(syncCtx, filepath.Dir(a.outputPath), a.progressInterval, stderr, fsync.WithFaults(inj)); err != nil {
+				a.stats.Warn(err.Error())
+			}
 			cancel()
 		}
 		if srcCE != nil {

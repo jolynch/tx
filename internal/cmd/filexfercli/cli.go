@@ -1057,7 +1057,7 @@ func openDownloadOutput(entry tx.ManifestEntry, offset int64, destPath string, s
 			return nil, nil, fmt.Errorf("seek output file for resume: %w", err)
 		}
 	}
-	syncOutput := syncWorker.SyncOutput(fd, offset)
+	syncOutput := syncWorker.SyncOutput(fd, offset, destPath)
 	return inj.WrapWriter(faults.SiteOutputWrite, entry.ID, offset, fd), syncOutput, nil
 }
 
@@ -2063,6 +2063,36 @@ func failf(stderr io.Writer, stats *txstats.Recorder, format string, args ...any
 	msg := fmt.Sprintf(format, args...)
 	fmt.Fprintln(stderr, msg)
 	stats.Fail(msg)
+}
+
+// finishSyncError applies a sync worker's stop error to a run's exit code.
+// A drain cut short only leaves durability unconfirmed, which stop has
+// already warned about, so it is recorded as a --stats warning; anything else,
+// such as a failed fdatasync, fails the run. rewrite adjusts each message for
+// display, or is nil.
+func finishSyncError(stderr io.Writer, stats *txstats.Recorder, err error, rewrite func(string) string, code int) int {
+	parts := []error{err}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		parts = joined.Unwrap()
+	}
+	for _, part := range parts {
+		if part == nil {
+			continue
+		}
+		msg := part.Error()
+		if rewrite != nil {
+			msg = rewrite(msg)
+		}
+		if errors.Is(part, fsync.ErrDrainIncomplete) {
+			stats.Warn(msg)
+			continue
+		}
+		failf(stderr, stats, "error: %s", msg)
+		if code == 0 {
+			code = 1
+		}
+	}
+	return code
 }
 
 // lastLineWriter forwards to w and remembers the last non-empty line, which

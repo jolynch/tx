@@ -186,6 +186,7 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 			cacheLoadEnabled: cacheLoadEnabled,
 			cacheLoadBudget:  cacheLoadBudget,
 			progressInterval: progressInterval,
+			stats:            stats,
 		}, stdout, stderr)
 	}
 
@@ -272,12 +273,16 @@ func runGetCLI(args []string, stdout io.Writer, stderr io.Writer) (code int) {
 	syncWorker, stopSync := fsync.StartSyncWorker(fsyncInterval, skipFsync, progressInterval, stderr, fsync.WithFaults(auth.faults))
 	defer func() {
 		stopCtx, cancelStop := context.WithTimeout(context.Background(), defaultFsyncTimeout)
-		stopSync(stopCtx)
+		if err := stopSync(stopCtx); err != nil {
+			code = finishSyncError(stderr, stats, err, nil, code)
+		}
 		cancelStop()
 		if !skipFsync && outputPath != "-" && outputPath != os.DevNull {
 			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
 			defer cancel()
-			fsync.SyncfsDir(syncCtx, filepath.Dir(outputPath), progressInterval, stderr, fsync.WithFaults(auth.faults))
+			if err := fsync.SyncfsDir(syncCtx, filepath.Dir(outputPath), progressInterval, stderr, fsync.WithFaults(auth.faults)); err != nil {
+				stats.Warn(err.Error())
+			}
 		}
 	}()
 

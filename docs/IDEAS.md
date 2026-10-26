@@ -34,21 +34,18 @@ instead of widening the current change; remove an entry when it ships.
   and never reaches the end. Walk the file list with the seeded coprime step
   as well, but only under a budget, so `--verify full` stays sequential.
 
-- **A background fsync batch skips a file whose `fstat` fails.** `syncBatch`
-  fstats each descriptor to dedupe by inode, and on an error it closes the
-  descriptor without `fdatasync` and without reporting anything, so the file
-  is acknowledged but never synced. Fall back to `fdatasync` on the
-  descriptor, or count and report the failure. pbt-faults finds it as a
-  round that reports success though a sync was skipped: `TX_PBT_FAULTS=1
-  TX_FAULTS_SEED=3 TX_FAULTS_SYS='fstat.fail=0.3' go test -run
-  'FuzzMemTransferUnderFaults/seed#10' ./internal/memxfer`.
-
-- **A failed background `fdatasync` still reports success.** `syncBatch`
-  prints the error and counts the file as synced, so `tx recv copy` exits 0
-  with data that may not be durable. pbt-faults confirms it:
-  `TX_PBT_FAULTS=1 TX_FAULTS_SEED=7 TX_FAULTS_SYS='fdatasync.fail=0.5' go test
-  -run 'FuzzMemTransferUnderFaults/seed#0' ./internal/memxfer`. Fail the
-  file's ACK, or the run, when its sync fails.
+- **A failed background sync is reported, not repaired.** A file's ACK
+  precedes its background `fdatasync`, so when the sync fails, `tx recv copy`
+  exits 1 naming the file, but the server and `.tx/` state already count it
+  done. A rerun takes the sync path, sees matching metadata, and exits 0
+  without fetching it again. Mark such files unsynced in the client's `.tx/`
+  state so the next sync or resume fetches them again.
+- **Unconfirmed durability exits 0.** A background drain that
+  `defaultFsyncTimeout` cuts short, and a failed or timed-out final `syncfs`,
+  are `--stats` warnings, not failures. With `--fsync-interval -1`, `syncfs`
+  is the only durability signal. Decide whether either should fail the run,
+  and report the files whose durability is unknown. `tx-bench report` and
+  the `run_end` event do not show the warnings yet.
 - **Bytes changed after hashing pass without `--verify`.** The server hashes
   what it read and the client hashes the buffer before writing it, so a
   flipped read on the server (`read.flip`) or a lost or flipped write on the
