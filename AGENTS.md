@@ -67,13 +67,15 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
     transfers under the `internal/faults` catalog. Model:
     `FuzzMemTransferUnderFaults`. They begin with `faults.SkipUnlessPBT`, so
     they run only under `make pbt-faults`, and they sit outside `acceptance`
-    because they fail until the bugs they find are fixed. Go's fuzzer stops
-    any input past 10s without a message, so keep each input's budget near
-    8s; a property that cannot bound its steps that tightly sweeps seeds in
-    a plain test instead, as `TestTreeCopyUnderFaults` does. Record each
-    failure in IDEAS.md with its repro line, keeping a failing input as an
-    `f.Add` seed since the repository ignores fuzz corpora; move a property
-    to `fuzz-long` once it passes.
+    because they fail until the bugs they find are fixed. CI's
+    `fault-injection` job runs `make -k pbt-faults PBT_EXCLUDE=known`, so
+    remove a kind from `PBT_KNOWN` once its bugs are fixed, and CI keeps it
+    fixed. Go's fuzzer stops any input past 10s without a message, so keep
+    each input's budget near 8s; a property that cannot bound its steps that
+    tightly sweeps seeds in a plain test instead, as `TestTreeCopyUnderFaults`
+    does. Record each failure in IDEAS.md with its repro line, keeping a
+    failing input as an `f.Add` seed since the repository ignores fuzz
+    corpora; move a property to `fuzz-long` once it passes.
   - The tiers are a budget, not a ranking. Fuzzing exists to discover
     interesting behavior, not to finish quickly: a test that keeps finding new
     states is the better test. Never narrow one to make it fit `fuzz-short`.

@@ -298,7 +298,10 @@ tightly: it may wait out tx's own timeouts, such as 15s for an ACK. So
 The tests never touch a disk: memxfer keeps files in memfds, and the tree
 copy runs on tmpfs (`/dev/shm`, or `TX_PBT_TMPFS`), skipping when neither
 is tmpfs. They sit outside `acceptance`, because they fail until the bugs
-they find are fixed; each moves to `fuzz-long` once it passes.
+they find are fixed; each moves to `fuzz-long` once it passes. CI's
+`fault-injection` job runs `make -k pbt-faults PBT_EXCLUDE=known`: every
+kind except the `PBT_KNOWN` ones behind recorded failures, so a kind
+removed from that list once fixed stays fixed.
 
 | Variable                  | Effect                                                                                                         |
 | ------------------------- | -------------------------------------------------------------------------------------------------------------- |

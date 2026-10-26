@@ -47,6 +47,18 @@ jobs:
       - name: Run acceptance tests
         run: make acceptance
 
+  fault-injection:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: "**/go.sum"
+      - name: Run fault-injection properties
+        run: make -k pbt-faults PBT_EXCLUDE=known
+
   bench:
     runs-on: ubuntu-latest
     steps:

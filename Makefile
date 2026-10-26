@@ -19,7 +19,7 @@ PBTCACHE ?= $(CURDIR)/.pbt-fuzzcache
 # or in the list, stands for PBT_KNOWN, the kinds behind the failures
 # docs/IDEAS.md records.
 PBT_EXCLUDE ?=
-PBT_KNOWN := disk.read.flip,disk.write.lost,disk.write.flip,disk.open.enoent,sys.fdatasync.fail,sys.fstat.fail,net.drop
+PBT_KNOWN := disk.read.flip,disk.write.lost,disk.write.flip
 # Fuzzes one target for a time budget, ending it with SIGINT rather than
 # -fuzztime (see scripts/fuzz): [-race] PACKAGE TARGET DURATION DEADLINE.
 FUZZ := ./scripts/fuzz
@@ -110,11 +110,13 @@ fuzz-long:
 
 # Fault-injection properties (docs/arch/FAULTS.md). They are not part of
 # acceptance: they fail until the bugs they find are fixed, and each moves to
-# fuzz-long once it passes. They skip unless TX_PBT_FAULTS is set, so their
-# seeds never fail make unit. TestTreeCopyUnderFaults sweeps random seeds for
-# PBTTIME instead of fuzzing, since its CLI copies can outlast the fuzzer's
-# 10s limit per input. Each property is its own target, so make -k
-# pbt-faults runs every one past a failing one, and still fails.
+# fuzz-long once it passes. CI's fault-injection job runs them with
+# PBT_EXCLUDE=known, so a kind fixed and removed from PBT_KNOWN stays fixed.
+# They skip unless TX_PBT_FAULTS is set, so their seeds never fail make unit.
+# TestTreeCopyUnderFaults sweeps random seeds for PBTTIME instead of fuzzing,
+# since its CLI copies can outlast the fuzzer's 10s limit per input. Each
+# property is its own target, so make -k pbt-faults runs every one past a
+# failing one, and still fails.
 pbt-faults: pbt-memxfer pbt-tree pbt-pool
 pbt-faults pbt-memxfer pbt-tree pbt-pool: export TX_PBT_FAULTS := 1
 pbt-faults pbt-memxfer pbt-tree pbt-pool: export TX_PBT_FAULTS_EXCLUDE := $(subst known,$(PBT_KNOWN),$(PBT_EXCLUDE))
