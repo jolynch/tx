@@ -174,15 +174,18 @@ type Phases struct {
 
 // Client is the one object tx recv copy and tx recv get write with --stats.
 type Client struct {
-	Command  string `json:"command"`
-	TID      string `json:"tid,omitempty"`
-	Status   string `json:"status"` // ok or error
-	Error    string `json:"error,omitempty"`
-	ExitCode int    `json:"exit_code"`
-	Start    int64  `json:"start"` // unix nanoseconds
-	End      int64  `json:"end"`
-	WallNS   int64  `json:"wall_ns"`
-	Phases   Phases `json:"phases_ns"`
+	Command string `json:"command"`
+	TID     string `json:"tid,omitempty"`
+	Status  string `json:"status"` // ok or error
+	Error   string `json:"error,omitempty"`
+	// Warnings are conditions that did not fail the run, such as
+	// durability that could not be confirmed; at most maxWarnings.
+	Warnings []string `json:"warnings,omitempty"`
+	ExitCode int      `json:"exit_code"`
+	Start    int64    `json:"start"` // unix nanoseconds
+	End      int64    `json:"end"`
+	WallNS   int64    `json:"wall_ns"`
+	Phases   Phases   `json:"phases_ns"`
 
 	Files        int64            `json:"files"`
 	Bytes        int64            `json:"bytes"`
@@ -287,6 +290,22 @@ func (r *Recorder) Fail(reason string) {
 	r.mu.Lock()
 	if r.failure == "" {
 		r.failure = reason
+	}
+	r.mu.Unlock()
+}
+
+// maxWarnings caps Client.Warnings; the first ones are kept.
+const maxWarnings = 8
+
+// Warn records a condition that did not fail the run. It changes neither the
+// status nor the exit code.
+func (r *Recorder) Warn(msg string) {
+	if r == nil || msg == "" {
+		return
+	}
+	r.mu.Lock()
+	if len(r.stats.Warnings) < maxWarnings {
+		r.stats.Warnings = append(r.stats.Warnings, msg)
 	}
 	r.mu.Unlock()
 }

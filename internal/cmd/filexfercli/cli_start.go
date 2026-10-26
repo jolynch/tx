@@ -276,7 +276,7 @@ func runStartCLI(serverURL string, args []string, stdout io.Writer, stderr io.Wr
 	}, stdout, stderr)
 }
 
-func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Writer) int {
+func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Writer) (code int) {
 	outputMu := &sync.Mutex{}
 	stdout = &synchronizedWriter{mu: outputMu, w: stdout}
 	stderr = &synchronizedWriter{mu: outputMu, w: stderr}
@@ -401,14 +401,27 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 	)
 	completed += completedNow
 	syncWorker, stopSync := fsync.StartSyncWorker(cfg.fsyncInterval, cfg.noSync, cfg.progressInterval, stderr, fsync.WithFaults(cfg.auth.faults))
+	// renamed records that the staging tree became the target, so a sync
+	// failure names where the files are now.
+	renamed := false
 	defer func() {
 		stopCtx, cancelStop := context.WithTimeout(context.Background(), defaultFsyncTimeout)
-		stopSync(stopCtx)
+		if err := stopSync(stopCtx); err != nil {
+			var rewrite func(string) string
+			if renamed {
+				rewrite = func(msg string) string {
+					return strings.ReplaceAll(msg, ps.StagingDir+string(filepath.Separator), ps.TargetDir+string(filepath.Separator))
+				}
+			}
+			code = finishSyncError(stderr, cfg.stats, err, rewrite, code)
+		}
 		cancelStop()
 		if !cfg.noSync && !cfg.discard {
 			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
 			defer cancel()
-			fsync.SyncfsDir(syncCtx, filepath.Dir(ps.TargetDir), cfg.progressInterval, stderr, fsync.WithFaults(cfg.auth.faults))
+			if err := fsync.SyncfsDir(syncCtx, filepath.Dir(ps.TargetDir), cfg.progressInterval, stderr, fsync.WithFaults(cfg.auth.faults)); err != nil {
+				cfg.stats.Warn(err.Error())
+			}
 		}
 	}()
 
@@ -579,6 +592,7 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 		fmt.Fprintf(stderr, "rename staging to target failed: %v\n", err)
 		return 1
 	}
+	renamed = true
 	if err := tx.SaveManifest(ps.ManifestPath, manifest); err != nil {
 		fmt.Fprintf(stderr, "save local manifest failed: %v\n", err)
 		return 1

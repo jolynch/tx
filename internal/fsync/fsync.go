@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,10 +21,31 @@ const (
 	backgroundSyncMemoryCapPercent       = 80
 	backgroundSyncMaxBatchFiles          = 4096
 	backgroundSyncFallbackCapBytes int64 = 8 << 30
-	fsyncProgressCountWidth              = 6
-	fsyncProgressBytesWidth              = 10
-	fsyncProgressDurationWidth           = 5
+	// maxReportedSyncFailures caps the paths stop's error names; the
+	// per-file stderr line names every one.
+	maxReportedSyncFailures    = 20
+	fsyncProgressCountWidth    = 6
+	fsyncProgressBytesWidth    = 10
+	fsyncProgressDurationWidth = 5
 )
+
+// ErrSyncFailed marks stop's error when a background fdatasync failed: those
+// files may not be durable. ErrDrainIncomplete marks it when ctx ended the
+// drain first, so the durability of the files still queued is unknown.
+var (
+	ErrSyncFailed      = errors.New("background fdatasync failed")
+	ErrDrainIncomplete = errors.New("background fdatasync drain incomplete")
+)
+
+// markedError reads as msg and matches mark under errors.Is, so a sentinel
+// classifies an error without adding its own text to the message.
+type markedError struct {
+	msg  string
+	mark error
+}
+
+func (e *markedError) Error() string        { return e.msg }
+func (e *markedError) Is(target error) bool { return target == e.mark }
 
 // SyncWorker manages per-file durability work after writes complete.
 type SyncWorker struct {
@@ -63,7 +85,11 @@ type SyncSnapshot struct {
 // StartSyncWorker starts a background sync worker. The returned stop function
 // must be called when the operation completes; it closes the enqueue path,
 // drains pending syncs until either the worker finishes or ctx is canceled, and
-// logs a summary to stderr.
+// logs a summary to stderr. Stop returns an error wrapping ErrSyncFailed that
+// names the files a background batch failed to sync. A file's ACK precedes its
+// background sync, so this error is the only report of the failure. A drain
+// that ctx cuts short warns, and returns ErrDrainIncomplete joined with the
+// failures recorded before then.
 //
 // fsyncInterval controls behavior:
 //   - 0: inline fdatasync (the sync callback blocks until fdatasync completes)
@@ -71,27 +97,27 @@ type SyncSnapshot struct {
 //   - <0: no per-file fdatasync
 //
 // If noSync is true, all per-file syncing is disabled and stop is a no-op.
-func StartSyncWorker(fsyncInterval int64, noSync bool, progressInterval time.Duration, stderr io.Writer, opts ...Option) (*SyncWorker, func(context.Context)) {
+func StartSyncWorker(fsyncInterval int64, noSync bool, progressInterval time.Duration, stderr io.Writer, opts ...Option) (*SyncWorker, func(context.Context) error) {
 	o := applyOptions(opts)
 	worker := &SyncWorker{faults: o.faults}
+	noop := func(context.Context) error { return nil }
 	if noSync {
-		return worker, func(context.Context) {}
+		return worker, noop
 	}
 	switch {
 	case fsyncInterval == 0:
 		worker.inlineSync = true
-		return worker, func(context.Context) {}
+		return worker, noop
 	case fsyncInterval > 0:
 		worker.background = newBackgroundSyncer(fsyncInterval, stderr, o.faults)
-		return worker, func(ctx context.Context) { worker.background.stop(ctx, progressInterval, stderr) }
+		return worker, func(ctx context.Context) error { return worker.background.stop(ctx, progressInterval, stderr) }
 	default:
-		return worker, func(context.Context) {}
+		return worker, noop
 	}
 }
 
-// Unsynced returns how many files background batches gave up syncing, by a
-// failed fdatasync or a failed fstat before it. Neither is reported to the
-// file's writer, so a caller that must know checks this after stop.
+// Unsynced returns how many distinct paths background batches failed to
+// sync. Stop reports them too; this count is for callers that check after it.
 func (w *SyncWorker) Unsynced() int64 {
 	if w == nil || w.background == nil {
 		return 0
@@ -106,7 +132,8 @@ func (w *SyncWorker) Unsynced() int64 {
 // be valid and positioned at the final write offset for this output. offset
 // must be the starting write offset for the same output segment, because the
 // background sync path uses currentPosition-offset to account for written bytes.
-func (w *SyncWorker) SyncOutput(fd *os.File, offset int64) func() error {
+// path names the output in stop's error if its background sync fails.
+func (w *SyncWorker) SyncOutput(fd *os.File, offset int64, path string) func() error {
 	if w == nil || fd == nil {
 		return func() error { return nil }
 	}
@@ -121,7 +148,7 @@ func (w *SyncWorker) SyncOutput(fd *os.File, offset int64) func() error {
 			if written < 0 {
 				written = 0
 			}
-			w.background.enqueue(dupFD, written)
+			w.background.enqueue(dupFD, written, path)
 			return nil
 		}
 		if w.inlineSync {
@@ -137,8 +164,10 @@ func fdatasync(inj *faults.Injector, fd int) error {
 }
 
 // SyncfsDir issues a best-effort syncfs against dir and returns when either
-// syncfs completes or ctx is done.
-func SyncfsDir(ctx context.Context, dir string, progressInterval time.Duration, stderr io.Writer, opts ...Option) {
+// syncfs completes or ctx is done. It prints the outcome to stderr and
+// returns an error carrying the same text when the sync failed, timed out,
+// or was canceled, so a caller can record that durability is unconfirmed.
+func SyncfsDir(ctx context.Context, dir string, progressInterval time.Duration, stderr io.Writer, opts ...Option) error {
 	inj := applyOptions(opts).faults
 	if ctx == nil {
 		ctx = context.Background()
@@ -149,68 +178,56 @@ func SyncfsDir(ctx context.Context, dir string, progressInterval time.Duration, 
 	}
 	fd, err := sysio.OpenDir(dir) //nolint:forbidigo // Durability setup; the syncfs gate runs below.
 	if err != nil {
-		fmt.Fprintf(stderr, "final-syncfs: [%s] open failed: %v\n", displayPath, err)
-		return
+		msg := fmt.Sprintf("final-syncfs: [%s] open failed: %v", displayPath, err)
+		fmt.Fprintln(stderr, msg)
+		return errors.New(msg)
 	}
 	start := time.Now()
 	done := make(chan error, 1)
+	// The goroutine owns fd: closing it here on a timeout could let a late
+	// syncfs run on a reused descriptor.
 	go func() {
+		defer sysio.Close(fd)
 		if err := inj.Sys(faults.SysSyncfs); err != nil {
 			done <- err
 			return
 		}
 		done <- loadSyncfsFunc()(fd)
 	}()
+	finished := func(err error) error {
+		elapsed := time.Since(start).Round(time.Millisecond)
+		if err == nil {
+			fmt.Fprintf(stderr, "final-syncfs: [%s] filesystem sync completed in %s\n", displayPath, elapsed)
+			return nil
+		}
+		msg := fmt.Sprintf("final-syncfs: [%s] filesystem sync failed after %s: %v", displayPath, elapsed, err)
+		fmt.Fprintln(stderr, msg)
+		return errors.New(msg)
+	}
+	ended := func() error {
+		elapsed := time.Since(start).Round(time.Millisecond)
+		msg := fmt.Sprintf("final-syncfs: [%s] filesystem sync canceled after %s: %v", displayPath, elapsed, ctx.Err())
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			msg = fmt.Sprintf("final-syncfs: [%s] filesystem sync timed out after %s. Data may not yet be durable on disk", displayPath, elapsed)
+		}
+		fmt.Fprintln(stderr, "WARNING: "+msg)
+		return errors.New(msg)
+	}
 	var tick <-chan time.Time
-	var ticker *time.Ticker
 	if progressInterval > 0 {
-		ticker = time.NewTicker(progressInterval)
+		ticker := time.NewTicker(progressInterval)
 		defer ticker.Stop()
 		tick = ticker.C
 	}
-	select {
-	case err := <-done:
-		sysio.Close(fd)
-		elapsed := time.Since(start)
-		if err != nil {
-			fmt.Fprintf(stderr, "final-syncfs: [%s] filesystem sync failed after %s: %v\n", displayPath, elapsed.Round(time.Millisecond), err)
-		} else {
-			fmt.Fprintf(stderr, "final-syncfs: [%s] filesystem sync completed in %s\n", displayPath, elapsed.Round(time.Millisecond))
+	for {
+		select {
+		case err := <-done:
+			return finished(err)
+		case <-ctx.Done():
+			return ended()
+		case <-tick:
+			fmt.Fprintf(stderr, "final-syncfs: [%s] waiting %s outstanding=0 files\n", displayPath, time.Since(start).Round(time.Millisecond))
 		}
-	case <-tick:
-		for {
-			elapsed := time.Since(start)
-			fmt.Fprintf(stderr, "final-syncfs: [%s] waiting %s outstanding=0 files\n", displayPath, elapsed.Round(time.Millisecond))
-			select {
-			case err := <-done:
-				sysio.Close(fd)
-				elapsed = time.Since(start)
-				if err != nil {
-					fmt.Fprintf(stderr, "final-syncfs: [%s] filesystem sync failed after %s: %v\n", displayPath, elapsed.Round(time.Millisecond), err)
-				} else {
-					fmt.Fprintf(stderr, "final-syncfs: [%s] filesystem sync completed in %s\n", displayPath, elapsed.Round(time.Millisecond))
-				}
-				return
-			case <-tick:
-			case <-ctx.Done():
-				sysio.Close(fd)
-				elapsed = time.Since(start)
-				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-					fmt.Fprintf(stderr, "WARNING: final-syncfs: [%s] filesystem sync timed out after %s. Data may not yet be durable on disk\n", displayPath, elapsed.Round(time.Millisecond))
-					return
-				}
-				fmt.Fprintf(stderr, "WARNING: final-syncfs: [%s] filesystem sync canceled after %s: %v\n", displayPath, elapsed.Round(time.Millisecond), ctx.Err())
-				return
-			}
-		}
-	case <-ctx.Done():
-		sysio.Close(fd)
-		elapsed := time.Since(start)
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			fmt.Fprintf(stderr, "WARNING: final-syncfs: [%s] filesystem sync timed out after %s. Data may not yet be durable on disk\n", displayPath, elapsed.Round(time.Millisecond))
-			return
-		}
-		fmt.Fprintf(stderr, "WARNING: final-syncfs: [%s] filesystem sync canceled after %s: %v\n", displayPath, elapsed.Round(time.Millisecond), ctx.Err())
 	}
 }
 
@@ -250,15 +267,20 @@ type backgroundSyncer struct {
 	peakFiles     atomic.Int64
 	currentBatch  atomic.Int64
 	peakBatch     atomic.Int64
-	// unsynced counts files a batch gave up on: an fdatasync that failed,
-	// or an fstat that failed, after which the file is not synced.
-	unsynced atomic.Int64
-	faults   *faults.Injector
+	// unsynced counts the distinct paths whose fdatasync failed; a split
+	// file syncs one descriptor per window, so it can fail more than once.
+	// failedPaths keeps the first maxReportedSyncFailures for stop's error.
+	unsynced    atomic.Int64
+	failedMu    sync.Mutex
+	failedSeen  map[string]struct{}
+	failedPaths []string
+	faults      *faults.Injector
 }
 
 type syncRequest struct {
 	fd   int
 	size int64
+	path string
 }
 
 func newBackgroundSyncer(threshold int64, stderr io.Writer, inj *faults.Injector) *backgroundSyncer {
@@ -313,16 +335,18 @@ func (bs *backgroundSyncer) syncBatch(batch []syncRequest, stderr io.Writer) {
 	type fileKey struct{ dev, ino uint64 }
 	seen := make(map[fileKey]bool, len(batch))
 	for _, req := range batch {
-		dev, ino, err := sysio.FileID(bs.faults, req.fd)
-		if err != nil {
-			bs.unsynced.Add(1)
-		} else {
-			key := fileKey{dev, ino}
-			if !seen[key] {
-				if err := fdatasync(bs.faults, req.fd); err != nil {
-					bs.unsynced.Add(1)
-					fmt.Fprintf(stderr, "background fdatasync: %v\n", err)
-				}
+		// Dedupe by inode when fstat works; without it, sync the descriptor
+		// anyway rather than skip a file that may share no inode.
+		dev, ino, statErr := sysio.FileID(bs.faults, req.fd)
+		key := fileKey{dev, ino}
+		if statErr != nil || !seen[key] {
+			// No retry: after a failed fdatasync the kernel may have dropped
+			// the dirty pages, so a second call can succeed without the data.
+			if err := fdatasync(bs.faults, req.fd); err != nil {
+				bs.recordFailure(req.path)
+				fmt.Fprintf(stderr, "background fdatasync: %s: %v\n", req.path, err)
+			}
+			if statErr == nil {
 				seen[key] = true
 			}
 		}
@@ -334,12 +358,47 @@ func (bs *backgroundSyncer) syncBatch(batch []syncRequest, stderr io.Writer) {
 	}
 }
 
-func (bs *backgroundSyncer) enqueue(fd int, size int64) {
+func (bs *backgroundSyncer) recordFailure(path string) {
+	bs.failedMu.Lock()
+	defer bs.failedMu.Unlock()
+	if _, dup := bs.failedSeen[path]; dup {
+		return
+	}
+	if bs.failedSeen == nil {
+		bs.failedSeen = make(map[string]struct{})
+	}
+	bs.failedSeen[path] = struct{}{}
+	bs.unsynced.Add(1)
+	if len(bs.failedPaths) < maxReportedSyncFailures {
+		bs.failedPaths = append(bs.failedPaths, path)
+	}
+}
+
+// failedErr returns an error naming the files whose sync failed, or nil.
+func (bs *backgroundSyncer) failedErr() error {
+	bs.failedMu.Lock()
+	defer bs.failedMu.Unlock()
+	n := len(bs.failedSeen)
+	if n == 0 {
+		return nil
+	}
+	noun := "files"
+	if n == 1 {
+		noun = "file"
+	}
+	list := strings.Join(bs.failedPaths, ", ")
+	if more := n - len(bs.failedPaths); more > 0 {
+		list += fmt.Sprintf(", and %d more (see the background fdatasync lines above)", more)
+	}
+	return &markedError{msg: fmt.Sprintf("%d %s failed to sync and may not be durable: %s", n, noun, list), mark: ErrSyncFailed}
+}
+
+func (bs *backgroundSyncer) enqueue(fd int, size int64, path string) {
 	pendingBytes := bs.pendingBytes.Add(size)
 	pendingFiles := bs.pendingFiles.Add(1)
 	updateMaxAtomic(&bs.peakBytes, pendingBytes)
 	updateMaxAtomic(&bs.peakFiles, pendingFiles)
-	bs.ch <- syncRequest{fd: fd, size: size}
+	bs.ch <- syncRequest{fd: fd, size: size, path: path}
 }
 
 func (bs *backgroundSyncer) snapshot() SyncSnapshot {
@@ -351,7 +410,7 @@ func (bs *backgroundSyncer) snapshot() SyncSnapshot {
 	}
 }
 
-func (bs *backgroundSyncer) stop(ctx context.Context, progressInterval time.Duration, stderr io.Writer) {
+func (bs *backgroundSyncer) stop(ctx context.Context, progressInterval time.Duration, stderr io.Writer) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -360,13 +419,14 @@ func (bs *backgroundSyncer) stop(ctx context.Context, progressInterval time.Dura
 	elapsed, err := waitForBackgroundSyncDrain(ctx, bs.done, bs.snapshot, progressInterval, stderr, start)
 	if err != nil {
 		snap := bs.snapshot()
-		fmt.Fprintf(stderr, "WARNING: background-fsync: drain canceled after %s: %v pending=%s/%d files synced=%s\n",
+		msg := fmt.Sprintf("background-fsync: drain canceled after %s: %v pending=%s/%d files synced=%s",
 			elapsed.Round(time.Millisecond),
 			err,
 			encoding.HumanBytes(snap.PendingBytes),
 			snap.PendingFiles,
 			encoding.HumanBytes(snap.SyncedBytes))
-		return
+		fmt.Fprintln(stderr, "WARNING: "+msg)
+		return errors.Join(bs.failedErr(), &markedError{msg: msg, mark: ErrDrainIncomplete})
 	}
 	fmt.Fprintf(stderr, "background-fsync: drained in %s, synced=%s pending=%s/%d files peak=%s/%d files batch=%s peak-batch=%s cap=%s\n",
 		elapsed.Round(time.Millisecond),
@@ -378,6 +438,7 @@ func (bs *backgroundSyncer) stop(ctx context.Context, progressInterval time.Dura
 		encoding.HumanBytes(bs.currentBatch.Load()),
 		encoding.HumanBytes(bs.peakBatch.Load()),
 		encoding.HumanBytes(bs.maxThreshold))
+	return bs.failedErr()
 }
 
 func waitForBackgroundSyncDrain(ctx context.Context, done <-chan struct{}, snapshot func() SyncSnapshot, progressInterval time.Duration, stderr io.Writer, start time.Time) (time.Duration, error) {

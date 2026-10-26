@@ -299,12 +299,16 @@ accumulates requests; when the accumulated bytes reach the threshold (512 MiB by
 default, raised under backlog) or 4096 files, it spawns a worker goroutine that:
 
 1. Groups requests by `(dev, ino)` via `fstat` — hardlinked files are synced
-   once.
+   once. A descriptor whose `fstat` fails is synced on its own.
 2. Calls `fdatasync` on each unique inode.
 3. Closes the dup'd file descriptors.
 
 Because the sync callback returns immediately after enqueue, the download and
-ACK path is never blocked by disk flushes.
+ACK path is never blocked by disk flushes. The cost is that a file's ACK
+precedes its sync. A failed `fdatasync` is not retried, since after an `EIO`
+the kernel may have dropped the dirty pages and a second call can succeed
+without the data. Instead, `tx recv copy` and `tx recv get` finish the
+transfer, then exit 1 and name the files that failed to sync.
 
 ### Inline fdatasync
 
@@ -321,6 +325,7 @@ final filesystem sync.
 
 After all downloads complete and the background batcher drains, `tx` calls
 `syncfs` on the target filesystem with a 10-second timeout. This catches any
-writes the OS hasn't flushed yet and ensures the entire transfer is durable
-before reporting success. `--skip-fsync` disables both per-file and final
-syncing.
+writes the OS hasn't flushed yet. A failed or timed-out `syncfs`, like a
+background drain that its timeout cuts short, leaves durability unconfirmed:
+it prints a warning and adds it to `--stats` `warnings`, but does not change
+the exit code. `--skip-fsync` disables both per-file and final syncing.

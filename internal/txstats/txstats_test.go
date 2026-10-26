@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -100,4 +101,74 @@ func TestRecorderNilAndPhases(t *testing.T) {
 		c.Phases.Data <= 0 || c.Windows["lz4"] != 1 || c.WireBytes != 5 || c.AckRetries != 1 || c.WallNS <= 0 {
 		t.Fatalf("client stats %+v", c)
 	}
+}
+
+// TestRecorderWarnings checks Warn: it is nil-safe, keeps the first 8
+// warnings in order, writes them as warnings only when there are any, and
+// never changes status, error, or exit_code.
+func TestRecorderWarnings(t *testing.T) {
+	var nilRec *Recorder
+	nilRec.Warn("ignored")
+
+	finish := func(t *testing.T, r *Recorder, path string, code int) (Client, map[string]any) {
+		t.Helper()
+		if err := r.Finish(code, ""); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var c Client
+		var raw map[string]any
+		if err := json.Unmarshal(data, &c); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatal(err)
+		}
+		return c, raw
+	}
+
+	t.Run("none", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "c.json")
+		c, raw := finish(t, NewRecorder(path, "copy", nil), path, 0)
+		if _, ok := raw["warnings"]; ok || len(c.Warnings) != 0 {
+			t.Fatalf("stats without warnings have warnings: %v", raw["warnings"])
+		}
+	})
+	t.Run("ok run", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "c.json")
+		r := NewRecorder(path, "copy", nil)
+		var want []string
+		for i := range 10 {
+			msg := "WARNING: warning " + itoa(i)
+			r.Warn(msg)
+			if i < 8 {
+				want = append(want, msg)
+			}
+		}
+		c, raw := finish(t, r, path, 0)
+		if _, ok := raw["warnings"]; !ok {
+			t.Fatalf("stats have no warnings key: %v", raw)
+		}
+		if !slices.Equal(c.Warnings, want) {
+			t.Fatalf("warnings = %q, want the first 8: %q", c.Warnings, want)
+		}
+		if c.Status != "ok" || c.Error != "" || c.ExitCode != 0 {
+			t.Fatalf("warnings changed the outcome: status %q error %q exit_code %d", c.Status, c.Error, c.ExitCode)
+		}
+	})
+	t.Run("failed run", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "c.json")
+		r := NewRecorder(path, "get", nil)
+		r.Warn("WARNING: final-syncfs: timed out")
+		c, _ := finish(t, r, path, 1)
+		if c.Status != "error" || c.Error != "exit code 1" || c.ExitCode != 1 {
+			t.Fatalf("a warning replaced the failure: status %q error %q exit_code %d", c.Status, c.Error, c.ExitCode)
+		}
+		if !slices.Equal(c.Warnings, []string{"WARNING: final-syncfs: timed out"}) {
+			t.Fatalf("warnings = %q", c.Warnings)
+		}
+	})
 }

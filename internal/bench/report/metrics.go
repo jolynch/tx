@@ -75,10 +75,13 @@ type Run struct {
 	Measured bool   `json:"measured"`
 	Status   string `json:"status"`
 	Error    string `json:"error,omitempty"`
-	Stderr   string `json:"stderr,omitempty"`
-	TID      string `json:"tid,omitempty"`
-	ExitCode int    `json:"exit_code"`
-	Start    int64  `json:"start"` // unix nanoseconds
+	// Warnings are tx's --stats warnings: conditions, such as unconfirmed
+	// durability, that did not fail the run.
+	Warnings []string `json:"warnings,omitempty"`
+	Stderr   string   `json:"stderr,omitempty"`
+	TID      string   `json:"tid,omitempty"`
+	ExitCode int      `json:"exit_code"`
+	Start    int64    `json:"start"` // unix nanoseconds
 
 	WallNS     int64 `json:"wall_ns"`
 	ProbeNS    int64 `json:"probe_ns"`

@@ -364,7 +364,12 @@ func TestVerifyBudget(t *testing.T) {
 
 // TestUnsyncedCountsFailedSyncs checks Env.Unsynced, the durability signal
 // the fault property reads, counts outputs whose background sync failed,
-// and none when every sync succeeds.
+// and none when every sync succeeds; and that a round whose syncs failed
+// reports an error rather than success. Every file still arrives, since a
+// failed sync does not stop the transfer.
+//
+// A failed fstat in the sync batch is covered in internal/fsync: here the
+// injector faults both sides, and the server's SEND fstat shares its gate.
 func TestUnsyncedCountsFailedSyncs(t *testing.T) {
 	quiet(t)
 	for spec, failing := range map[string]bool{"": false, "fdatasync.fail=1": true} {
@@ -376,11 +381,18 @@ func TestUnsyncedCountsFailedSyncs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := e.Round(context.Background()); err != nil {
+		resp, err := e.Round(context.Background())
+		if err != nil {
 			t.Fatal(err)
 		}
 		if got := e.Unsynced(); (got > 0) != failing {
 			t.Fatalf("%q: Unsynced %d", spec, got)
+		}
+		if got := len(resp.Errors) > 0; got != failing {
+			t.Fatalf("%q: round reported errors %t, want %t: %v", spec, got, failing, resp.Errors)
+		}
+		if p := e.Pending(); len(p) > 0 {
+			t.Fatalf("%q: files %v pending, want every file copied despite failed syncs", spec, p)
 		}
 		e.Close()
 	}

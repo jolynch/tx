@@ -87,7 +87,7 @@ func confirmSyncProceed(stderr io.Writer, newCount int, staleCount int, rmCount 
 	return false
 }
 
-func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer) int {
+func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer) (code int) {
 	logPrefix := cfg.logPrefix
 	if logPrefix == "" {
 		logPrefix = "sync"
@@ -109,12 +109,16 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 	syncWorker, stopSync := fsync.StartSyncWorker(cfg.fsyncInterval, cfg.noSync, cfg.progressInterval, stderr, fsync.WithFaults(cfg.auth.faults))
 	defer func() {
 		stopCtx, cancelStop := context.WithTimeout(context.Background(), defaultFsyncTimeout)
-		stopSync(stopCtx)
+		if err := stopSync(stopCtx); err != nil {
+			code = finishSyncError(stderr, cfg.stats, err, nil, code)
+		}
 		cancelStop()
 		if !cfg.noSync {
 			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
 			defer cancel()
-			fsync.SyncfsDir(syncCtx, filepath.Dir(ps.TargetDir), cfg.progressInterval, stderr, fsync.WithFaults(cfg.auth.faults))
+			if err := fsync.SyncfsDir(syncCtx, filepath.Dir(ps.TargetDir), cfg.progressInterval, stderr, fsync.WithFaults(cfg.auth.faults)); err != nil {
+				cfg.stats.Warn(err.Error())
+			}
 		}
 	}()
 

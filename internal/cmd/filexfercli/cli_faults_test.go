@@ -3,6 +3,7 @@ package filexfercli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"math/rand/v2"
 	"net"
 	"os"
@@ -392,4 +393,230 @@ func TestVerifyReadFaultsNameTheirFile(t *testing.T) {
 	if file != 11 || offset != 1<<10 {
 		t.Fatalf("fault event named file %d offset %d, want file 11 offset %d", file, offset, 1<<10)
 	}
+}
+
+// syncFaultServer is a fault-free server rooted at os.TempDir, for tests
+// whose CLI side alone takes faults from TX_FAULTS_*.
+type syncFaultServer struct{ addr string }
+
+func startSyncFaultServer(t *testing.T) syncFaultServer {
+	t.Helper()
+	for _, env := range []string{faults.EnvSeed, faults.EnvProfile, faults.EnvNet, faults.EnvMsg, faults.EnvDisk, faults.EnvSys} {
+		t.Setenv(env, "")
+	}
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := store.NewStore()
+	served := make(chan error, 1)
+	go func() {
+		served <- intftcp.Serve(ln, intftcp.ServerOptions{
+			Deps:             intftcp.NewRuntimeDeps(st, intftcp.WithRoot(os.TempDir())),
+			ServerIdentity:   id,
+			KeepAliveTimeout: 5 * time.Second,
+		})
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		<-served
+		st.Close()
+	})
+	return syncFaultServer{addr: ln.Addr().String()}
+}
+
+// newTree writes a source tree under the server's root and returns its
+// path, its tx:// URL, and its files' contents.
+func (s syncFaultServer) newTree(t *testing.T) (string, string, map[string][]byte) {
+	t.Helper()
+	src := filepath.Join(t.TempDir(), "src")
+	files := map[string][]byte{
+		"small.txt":                    []byte("hello"),
+		filepath.Join("d", "mid.bin"):  bytes.Repeat([]byte("m"), 70<<10),
+		filepath.Join("d", "e", "big"): bytes.Repeat([]byte("b"), 2<<20),
+	}
+	for name, data := range files {
+		writeLocalTestFile(t, filepath.Join(src, name), data)
+	}
+	rel, err := filepath.Rel(os.TempDir(), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return src, "tx://" + s.addr + "/" + filepath.ToSlash(rel), files
+}
+
+func checkSyncFaultFiles(t *testing.T, dst string, files map[string][]byte) {
+	t.Helper()
+	for name, want := range files {
+		got, err := os.ReadFile(filepath.Join(dst, name))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("%s: %d bytes, err %v; want %d bytes", name, len(got), err, len(want))
+		}
+	}
+}
+
+// runWithSysFaults runs one command with TX_FAULTS_SYS set to sys (and a
+// seed, when sys is set) and returns its exit code and stderr.
+func runWithSysFaults(t *testing.T, sys string, args ...string) (int, string) {
+	t.Helper()
+	seed := ""
+	if sys != "" {
+		seed = "1"
+	}
+	t.Setenv(faults.EnvSeed, seed)
+	t.Setenv(faults.EnvSys, sys)
+	var stdout, stderr bytes.Buffer
+	code := RunCLI(args, &stdout, &stderr)
+	return code, stderr.String()
+}
+
+// TestCLIFailedBackgroundSyncExitsNonzero checks a copy or get whose
+// background fdatasyncs fail still writes every file, then exits nonzero and
+// names each file that failed to sync: a fresh copy, a copy into an existing
+// destination, and a get. The server runs without faults; the CLI's
+// injector, from TX_FAULTS_SYS, fails every fdatasync.
+func TestCLIFailedBackgroundSyncExitsNonzero(t *testing.T) {
+	srv := startSyncFaultServer(t)
+	const failSync = "fdatasync.fail=1"
+	// wantSyncFailure fails t unless the command exited nonzero and its
+	// stderr names each of names, which may be relative to the destination,
+	// since a fresh copy syncs files in its staging directory.
+	wantSyncFailure := func(t *testing.T, code int, stderr string, names ...string) {
+		t.Helper()
+		if code == 0 {
+			t.Fatalf("exit 0 though every fdatasync failed; stderr:\n%s", stderr)
+		}
+		for _, name := range names {
+			if !strings.Contains(stderr, name) {
+				t.Fatalf("stderr does not name unsynced file %s:\n%s", name, stderr)
+			}
+		}
+	}
+	copyArgs := func(remote, dst string) []string {
+		return []string{"copy", "-y", "--progress=false", "--verify", "none", "--fsync-interval", "1MiB", remote, dst}
+	}
+
+	t.Run("copy", func(t *testing.T) {
+		_, remote, files := srv.newTree(t)
+		dst := filepath.Join(t.TempDir(), "dst")
+		code, stderr := runWithSysFaults(t, failSync, copyArgs(remote, dst)...)
+		checkSyncFaultFiles(t, dst, files)
+		var names []string
+		for name := range files {
+			names = append(names, name)
+		}
+		wantSyncFailure(t, code, stderr, names...)
+	})
+	t.Run("copy-into-existing", func(t *testing.T) {
+		src, remote, files := srv.newTree(t)
+		dst := filepath.Join(t.TempDir(), "dst")
+		if code, stderr := runWithSysFaults(t, "", copyArgs(remote, dst)...); code != 0 {
+			t.Fatalf("first copy exit %d: %s", code, stderr)
+		}
+		files["small.txt"] = []byte("hello again")
+		writeLocalTestFile(t, filepath.Join(src, "small.txt"), files["small.txt"])
+		code, stderr := runWithSysFaults(t, failSync, copyArgs(remote, dst)...)
+		checkSyncFaultFiles(t, dst, files)
+		wantSyncFailure(t, code, stderr, filepath.Join(dst, "small.txt"))
+	})
+	t.Run("get", func(t *testing.T) {
+		_, remote, files := srv.newTree(t)
+		dst := filepath.Join(t.TempDir(), "out.bin")
+		code, stderr := runWithSysFaults(t, failSync, "get", "--progress=false", "--fsync-interval", "1MiB", remote+"/d/mid.bin", dst)
+		if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, files[filepath.Join("d", "mid.bin")]) {
+			t.Fatalf("get wrote %d bytes, err %v", len(got), err)
+		}
+		wantSyncFailure(t, code, stderr, dst)
+	})
+}
+
+// TestCLIFailedSyncfsWarns checks a final syncfs failure is a warning, not
+// a failure: the run still writes every file and exits 0, stderr carries
+// the WARNING, and the --stats object records it under warnings while
+// keeping status ok and exit_code 0. It covers a fresh copy with background
+// fdatasync and syncfs-only (--fsync-interval -1), a copy into an existing
+// destination, and a get. The server runs without faults; the CLI's
+// injector, from TX_FAULTS_SYS, fails every syncfs.
+func TestCLIFailedSyncfsWarns(t *testing.T) {
+	srv := startSyncFaultServer(t)
+	const failSyncfs = "syncfs.fail=1"
+	// wantWarning fails t unless the command exited 0, stderr reports the
+	// syncfs failure, and the stats file at path records a warning about
+	// syncfs without changing the outcome.
+	wantWarning := func(t *testing.T, code int, stderr, path string) {
+		t.Helper()
+		if code != 0 {
+			t.Fatalf("exit %d though only syncfs failed; stderr:\n%s", code, stderr)
+		}
+		if !strings.Contains(stderr, "final-syncfs:") || !strings.Contains(stderr, "failed") {
+			t.Fatalf("stderr does not report the syncfs failure:\n%s", stderr)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var stats struct {
+			Status   string   `json:"status"`
+			Error    string   `json:"error"`
+			ExitCode *int     `json:"exit_code"`
+			Warnings []string `json:"warnings"`
+		}
+		if err := json.Unmarshal(data, &stats); err != nil {
+			t.Fatalf("stats %q: %v", data, err)
+		}
+		if stats.Status != "ok" || stats.Error != "" || stats.ExitCode == nil || *stats.ExitCode != 0 {
+			t.Fatalf("stats outcome changed by a warning: %s", data)
+		}
+		if !slices.ContainsFunc(stats.Warnings, func(w string) bool { return strings.Contains(w, "syncfs") }) {
+			t.Fatalf("stats warnings %q do not name syncfs; stats %s", stats.Warnings, data)
+		}
+	}
+	copyArgs := func(stats, remote, dst string, extra ...string) []string {
+		args := append([]string{"copy", "-y", "--progress=false", "--verify", "none", "--stats", stats}, extra...)
+		return append(args, remote, dst)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		extra []string
+	}{
+		{"copy", []string{"--fsync-interval", "1MiB"}},
+		{"copy-syncfs-only", []string{"--fsync-interval", "-1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, remote, files := srv.newTree(t)
+			dst := filepath.Join(t.TempDir(), "dst")
+			stats := filepath.Join(t.TempDir(), "stats.json")
+			code, stderr := runWithSysFaults(t, failSyncfs, copyArgs(stats, remote, dst, tc.extra...)...)
+			checkSyncFaultFiles(t, dst, files)
+			wantWarning(t, code, stderr, stats)
+		})
+	}
+	t.Run("copy-into-existing", func(t *testing.T) {
+		src, remote, files := srv.newTree(t)
+		dst := filepath.Join(t.TempDir(), "dst")
+		if code, stderr := runWithSysFaults(t, "", copyArgs(filepath.Join(t.TempDir(), "first.json"), remote, dst)...); code != 0 {
+			t.Fatalf("first copy exit %d: %s", code, stderr)
+		}
+		files["small.txt"] = []byte("hello again")
+		writeLocalTestFile(t, filepath.Join(src, "small.txt"), files["small.txt"])
+		stats := filepath.Join(t.TempDir(), "stats.json")
+		code, stderr := runWithSysFaults(t, failSyncfs, copyArgs(stats, remote, dst)...)
+		checkSyncFaultFiles(t, dst, files)
+		wantWarning(t, code, stderr, stats)
+	})
+	t.Run("get", func(t *testing.T) {
+		_, remote, files := srv.newTree(t)
+		dst := filepath.Join(t.TempDir(), "out.bin")
+		stats := filepath.Join(t.TempDir(), "stats.json")
+		code, stderr := runWithSysFaults(t, failSyncfs, "get", "--progress=false", "--stats", stats, remote+"/d/mid.bin", dst)
+		if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, files[filepath.Join("d", "mid.bin")]) {
+			t.Fatalf("get wrote %d bytes, err %v", len(got), err)
+		}
+		wantWarning(t, code, stderr, stats)
+	})
 }

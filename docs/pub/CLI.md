@@ -616,7 +616,9 @@ wins.
 **`tx recv copy`** and **`tx recv get`** write one JSON object at exit:
 `command`, `tid`, `status` (`ok` or `error`), `error` (the failure that ended
 the run, for example `start failed with 748 errors; first: ...`, or the last
-line written to stderr when no step reported one), `exit_code`, `start`, `end`,
+line written to stderr when no step reported one), `warnings` (up to 8
+conditions that did not fail the run, such as a final `syncfs` that failed or
+timed out, or a background fsync drain cut short), `exit_code`, `start`, `end`,
 `wall_ns`, `phases_ns` (`probe`, `manifest`, `data`, `finalize`), `files` and
 `bytes` requested, `logical_bytes` and `wire_bytes` received, `windows` per
 codec, and the connection counters `dials`, `sync_fallbacks`, `reuses`,
