@@ -152,6 +152,23 @@ allocator without ever exceeding a limit.
 
 ## Connection Flow
 
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
+    Client->>Server: Connect
+    opt Authentication
+        Client->>Server: AUTH noise-v1 preface and handshake
+        Server-->>Client: Handshake reply
+        Client->>Server: FINISH
+    end
+    loop Each command (one, unless PROBE granted keep-alive)
+        Client->>Server: TXFER / SYNC / SEND / ACK / CXSUM / STATUS / PROBE
+        Server-->>Client: Response (optional body), then OK or ERR
+    end
+    Note over Client,Server: Either side closes: the server after one command without keep-alive, or after the idle timeout
+```
+
 1. Client connects.
 2. Client sends either:
    - a plaintext command line (`TXFER|SYNC|SEND|ACK|CXSUM|STATUS|PROBE`), or
