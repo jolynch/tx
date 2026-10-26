@@ -56,16 +56,15 @@ instead of widening the current change; remove an entry when it ships.
   'FuzzMemTransferUnderFaults/seed#0' ./internal/memxfer`. Rereading written
   ranges before the ACK would catch the client's; the server's needs a
   second read or a checksum from below the page cache.
-- **A transient open failure marks a file missing for good.** An `ENOENT`
-  from opening a file for SEND marks it Missing, a terminal state: a later
-  ACK for it returns success but changes nothing, so the client believes it
-  delivered the file while the server keeps reporting it missing, and a
-  resume of the same transfer reports success but never finishes it. Only
-  a file sent in a batch of its own can become Missing: one larger than the
-  batch size, or one a batch boundary or the end of the list leaves alone. pbt-faults finds it, kept
-  as a seed: `TX_PBT_FAULTS=1 go test -run
-  'FuzzMemTransferUnderFaults/seed#10' ./internal/memxfer`. Let a full ACK
-  move a Missing file to Done, or reject it loudly.
+- **A revived file can make a logged transfer incomplete again.** A file
+  acknowledged missing (`-1`) counts as finished, so a transfer whose last
+  pending file hits a transient `ENOENT` logs `txfer-complete` and emits
+  `transfer_done` before a later round delivers that file. Completion is
+  logged once, so `--stats` and the event timeline end at the early
+  completion. A late split-window ACK that the server applies after the
+  client's `-1` can also revive a file the client gave up on, leaving the
+  transfer incomplete until a resume. Hold completion while the client may
+  still retry a missing file, or emit a second record.
 - **`StartFromManifest` reports nothing for batches it never starts.** When
   its context ends, it stops submitting batches and returns without an
   error for the files they held, so a caller that checks only `Errors`
@@ -331,6 +330,14 @@ instead of widening the current change; remove an entry when it ships.
 - **`client_pool_test.go` is past the size rule.** It holds about 1,500
   lines. Fold the pool's overlapping unit cases into `FuzzTCPConnPool`, then
   split what remains by area: acquire and return, heartbeats, and refills.
+
+- **Transfer states start at 1.** `defaultTransferTTL` opens the `iota`
+  block in `store.go`, so `TransferStateStarted` is 1 and `Missing` is 4,
+  against the rule that keeps unrelated constants out of `iota` blocks. Give
+  the states their own block, and check what reads the numeric values.
+- **`store_test.go` is past the size rule.** It holds about 1,700 lines.
+  Fold overlapping state-transition cases into `FuzzStoreStateCounts` and
+  `FuzzAckMissingRevival`, then split by area.
 
 - **Split the oversized files.** `client.go` (about 3,850 lines: options,
   manifest model, download orchestration, probe math, ACK plumbing),

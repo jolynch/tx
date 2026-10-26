@@ -3,6 +3,7 @@ package ftcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -284,5 +285,122 @@ func TestHandleACKCompletesTransferWithEmptyFile(t *testing.T) {
 	}
 	if deps.VerifyTransferFileWindowHashes(txferID, []WindowHash{{FileID: emptyID, EndBytes: 0, HashToken: emptyHash}})[0] {
 		t.Fatalf("empty file's (fid, 0) window hash survived its ACK")
+	}
+}
+
+// A SEND that fails to open a file answers 404, and the client ACKs it with
+// -1, marking it Missing. The ENOENT can be transient: a later SEND of the
+// same file succeeds, and its ACK must pass hash validation and revive the
+// file, so the transfer completes with it Done rather than Missing.
+func TestHandleACKRevivesMissingFile(t *testing.T) {
+	root := t.TempDir()
+	content := map[string]string{"a.txt": "hello", "b.txt": "world!"}
+	for name, data := range content {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(data), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	deps := realDeps(t, "/")
+	ctx := context.Background()
+
+	req, err := ParseRequest([]byte(fmt.Sprintf("TXFER %q mode=fast link-mbps=1000 concurrency=8 comp=none", root)))
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	var manifest bytes.Buffer
+	var txferID string
+	if err := handleTXFERWithCallback(ctx, req, &manifest, deps, func(id string) { txferID = id }); err != nil {
+		t.Fatalf("TXFER: %v", err)
+	}
+	entries, _ := parseSYNCResponseEntries(unframeManifestWire(t, manifest.Bytes()), nil)
+	if len(entries) != 2 {
+		t.Fatalf("expected two manifest entries, got %d", len(entries))
+	}
+	ids := map[string]uint64{}
+	for _, e := range entries {
+		ids[filepath.Base(e.Path)] = e.ID
+	}
+	aPath, bPath := filepath.Join(root, "a.txt"), filepath.Join(root, "b.txt")
+	aID, bID := ids["a.txt"], ids["b.txt"]
+
+	send := func(fid uint64, path string) ([]decodedFrame, error) {
+		t.Helper()
+		sendReq, err := ParseRequest([]byte("SEND " + txferID))
+		if err != nil {
+			t.Fatalf("ParseRequest SEND: %v", err)
+		}
+		var out bytes.Buffer
+		err = handleSENDWithOptions(ctx, sendReq, framedItemBody(t, fmt.Sprintf("fd=%d %q", fid, path)), &out, deps, nil, defaultZeroCopyMinFrameBytes, 25)
+		frames, decodeErr := decodeFrameStream(out.Bytes())
+		if err == nil && decodeErr != nil {
+			t.Fatalf("decode SEND response: %v", decodeErr)
+		}
+		return frames, err
+	}
+	ack := func(items ...string) {
+		t.Helper()
+		ackReq, err := ParseRequest([]byte("ACK " + txferID))
+		if err != nil {
+			t.Fatalf("ParseRequest ACK: %v", err)
+		}
+		var out bytes.Buffer
+		if err := handleACKWithInput(ctx, ackReq, framedItemBody(t, items...), &out, deps); err != nil {
+			t.Fatalf("ACK %q: %v", items, err)
+		}
+	}
+
+	// The first SEND finds a.txt gone and answers 404; the client marks it
+	// Missing.
+	if err := os.Rename(aPath, aPath+".away"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if _, err := send(aID, aPath); err == nil {
+		t.Fatal("SEND of a vanished file succeeded")
+	}
+	ack(fmt.Sprintf("fd=%d %q ack-token=-1", aID, aPath))
+	if got, _ := deps.GetTransfer(txferID); got.State[aID] != TransferStateMissing || got.Done != 1 {
+		t.Fatalf("after missing ACK: state=%d Done=%d, want Missing and counted", got.State[aID], got.Done)
+	}
+
+	// The file is back, and a retry SEND delivers it whole.
+	if err := os.Rename(aPath+".away", aPath); err != nil {
+		t.Fatalf("rename back: %v", err)
+	}
+	frames, err := send(aID, aPath)
+	if err != nil || len(frames) == 0 {
+		t.Fatalf("retry SEND: frames=%d err=%v", len(frames), err)
+	}
+	aHash := frames[len(frames)-1].Trailer.FileHashToken
+	if aHash == "" {
+		t.Fatal("retry SEND returned no file hash")
+	}
+	bHash := "xxh128:0000000000000000000000000000000b"
+	if !deps.SetTransferFileWindowHashes(txferID, []WindowHash{{FileID: bID, EndBytes: int64(len(content["b.txt"])), HashToken: bHash}}) {
+		t.Fatal("SetTransferFileWindowHashes returned false")
+	}
+	ack(
+		fmt.Sprintf("fd=%d %q ack-token=%d@1@%s", aID, aPath, len(content["a.txt"]), aHash),
+		fmt.Sprintf("fd=%d %q ack-token=%d@1@%s", bID, bPath, len(content["b.txt"]), bHash),
+	)
+
+	got, _ := deps.GetTransfer(txferID)
+	if got.State[aID] != TransferStateDone || got.AckedSize[aID] != int64(len(content["a.txt"])) {
+		t.Fatalf("revived file: state=%d AckedSize=%d, want Done with every byte acknowledged", got.State[aID], got.AckedSize[aID])
+	}
+	if got.Done != 2 || !got.CompleteLogged || got.DoneSize != got.TotalSize {
+		t.Fatalf("transfer: Done=%d NumFiles=%d DoneSize=%d TotalSize=%d complete=%v", got.Done, got.NumFiles, got.DoneSize, got.TotalSize, got.CompleteLogged)
+	}
+
+	var out bytes.Buffer
+	statusReq := Request{Verb: VerbSTATUS, Params: []map[string]string{{"txferid": txferID}}}
+	if err := handleSTATUS(ctx, statusReq, &out, deps); err != nil {
+		t.Fatalf("STATUS: %v", err)
+	}
+	var status encoding.TransferStatus
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(strings.TrimSpace(out.String()), "OK ")), &status); err != nil {
+		t.Fatalf("decode STATUS %q: %v", out.String(), err)
+	}
+	if status.DownloadStatus.Done != 2 || status.DownloadStatus.Missing != 0 || status.Done != 2 {
+		t.Fatalf("STATUS reports %+v done=%d, want both files done and none missing", status.DownloadStatus, status.Done)
 	}
 }

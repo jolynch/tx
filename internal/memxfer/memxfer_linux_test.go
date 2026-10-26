@@ -437,7 +437,7 @@ func FuzzMemTransferUnderFaults(f *testing.F) {
 		f.Add(uint64(m+1), uint8(m), uint8(m*37), uint8(faults.PBTSwarm))
 	}
 	f.Add(uint64(99), uint8(0), uint8(0), uint8(faults.PBTBadDay))       // seed#9
-	f.Add(uint64(1), uint8(0), uint8(0x20), uint8(faults.PBTSwarm))      // seed#10: open.enoent leaves a file Missing (docs/IDEAS.md)
+	f.Add(uint64(1), uint8(0), uint8(0x20), uint8(faults.PBTSwarm))      // seed#10: a transient open.enoent whose file a later round delivers
 	f.Add(uint64(7), uint8(1), uint8(0x12), uint8(faults.PBTBenign))     // seed#11
 	f.Add(uint64(8), uint8(6), uint8(0b0110), uint8(faults.PBTBenign))   // seed#12
 	f.Add(uint64(24449), uint8(2), uint8(0x35), uint8(faults.PBTBenign)) // seed#13: the largest mix over one connection

@@ -863,7 +863,16 @@ func (s *Store) acknowledgeFileLocked(managed *managedTransfer, fileID uint64, a
 	currentState := managed.transfer.State[idx]
 
 	if currentState == TransferStateMissing {
-		return true
+		if ackBytes == -1 || !isRegularFileEntryType(managed.transfer.EntryType[idx]) {
+			return true
+		}
+		// An ENOENT can be transient, so a later SEND may deliver a file
+		// once acknowledged missing. Uncount it, and let this ACK apply as
+		// for a running file, which counts it again once it is complete.
+		managed.transfer.setState(idx, TransferStateRunning)
+		if managed.transfer.Done > 0 {
+			managed.transfer.Done--
+		}
 	}
 
 	if ackBytes == -1 {
@@ -903,8 +912,9 @@ func (s *Store) acknowledgeFileLocked(managed *managedTransfer, fileID uint64, a
 	// One completion rule for every size. State doubles as the "counted"
 	// marker: SEND never marks a regular file Done, so a file below Done has
 	// not been counted yet. This runs even when target did not advance,
-	// which is the only way an empty file is ever counted.
-	if target == maxAck && managed.transfer.State[idx] < TransferStateDone && isRegularFileEntryType(managed.transfer.EntryType[idx]) {
+	// which is the only way an empty file is ever counted, and the only way a
+	// revived file whose bytes were all acknowledged before is counted again.
+	if managed.transfer.AckedSize[idx] >= maxAck && managed.transfer.State[idx] < TransferStateDone && isRegularFileEntryType(managed.transfer.EntryType[idx]) {
 		managed.transfer.setState(idx, TransferStateDone)
 		managed.transfer.Done++
 		s.touchLocked(managed, now)
