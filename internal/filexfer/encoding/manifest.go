@@ -30,7 +30,7 @@ type ManifestEntry struct {
 	ID         uint64
 	Size       int64
 	Mtime      int64
-	Mode       os.FileMode
+	Mode       os.FileMode // Unix permission bits (0000–7777), not Go mode flags.
 	Path       string
 	LinkTarget int64  // H: target file ID; -1 otherwise
 	LinkPath   string // S: symlink target path; "" otherwise
@@ -464,7 +464,9 @@ func MarshalManifestEntry(entry ManifestEntry, prevPath string, prevMtime string
 		mtimeRaw = strconv.FormatInt(entry.Mtime, 10)
 	}
 
-	modeToken := FormatManifestMode(entry.Mode)
+	// Entries already hold Unix permission bits. FormatManifestMode converts
+	// Go's high-bit flags and would discard the entry's setuid/setgid/sticky bits.
+	modeToken := fmt.Sprintf("%04o", entry.Mode&0o7777)
 	mtimeToken, err := EncodeMtimeToken(prevMtime, mtimeRaw)
 	if err != nil {
 		return "", "", "", fmt.Errorf("encode manifest mtime id=%d: %w", entry.ID, err)
