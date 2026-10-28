@@ -440,7 +440,7 @@ type ManifestEntry struct {
 	ID         uint64
 	Size       int64
 	Mtime      int64
-	Mode       os.FileMode
+	Mode       os.FileMode // Unix permission bits (0000–7777), not Go mode flags.
 	Path       string
 	Progress   ManifestProgress
 	LinkTarget int64  // H: target file ID; -1 otherwise

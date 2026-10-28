@@ -30,6 +30,11 @@ server manifest captured during transfer. It checks:
 - regular files: size, nanosecond mtime, and mode bits
 - hardlinks: mode bits and link target identity
 - symlinks: mode bits and link path
+- directories: nanosecond mtime and mode bits
+
+Mode bits include setuid, setgid, and sticky. Directory metadata is applied
+after the tree is created, so inherited setgid is cleared when it is absent
+from the source and preserved when it is present.
 
 If any file is missing, stale, or unexpectedly present, the CLI reports:
 

@@ -286,8 +286,12 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 					fmt.Fprintf(stderr, "sync: rm %s: %v\n", localPath, err)
 				}
 			}
-			// Truncate local files for stale entries.
+			// Truncate stale regular files. Non-file entries are recreated or
+			// have their metadata applied after the file downloads.
 			for _, entry := range staleFiles {
+				if entry.Type != 0 && entry.Type != encoding.EntryTypeFile {
+					continue
+				}
 				localPath := filepath.Join(outRoot, filepath.FromSlash(entry.Path))
 				if err := os.Truncate(localPath, 0); err != nil && !os.IsNotExist(err) {
 					fmt.Fprintf(stderr, "sync: truncate %s: %v\n", localPath, err)
