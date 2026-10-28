@@ -2669,6 +2669,80 @@ func TestRunCLICopySyncPath(t *testing.T) {
 	}
 }
 
+func TestRunCLICopySetgidDirectories(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("requires Linux directory setgid inheritance")
+	}
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing=%v", existing), func(t *testing.T) {
+			src := t.TempDir()
+			writeLocalTestFile(t, filepath.Join(src, "plain", "nested", "data"), []byte("hello"))
+			writeLocalTestFile(t, filepath.Join(src, "shared", "data"), []byte("shared"))
+			if err := os.Chmod(filepath.Join(src, "shared"), os.ModeSetgid|0o755); err != nil {
+				t.Fatal(err)
+			}
+			parent := t.TempDir()
+			if err := os.Chmod(parent, os.ModeSetgid|0o775); err != nil {
+				t.Fatal(err)
+			}
+			dst := filepath.Join(parent, "dst")
+			if existing {
+				if err := os.MkdirAll(filepath.Join(dst, "plain", "nested"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				info, err := os.Stat(filepath.Join(dst, "plain", "nested"))
+				if err != nil || info.Mode()&os.ModeSetgid == 0 {
+					t.Fatalf("expected inherited setgid: info=%v err=%v", info, err)
+				}
+			}
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			st := store.NewStore()
+			served := make(chan error, 1)
+			go func() {
+				served <- intftcp.Serve(ln, intftcp.ServerOptions{
+					Deps: intftcp.NewRuntimeDeps(st, intftcp.WithRoot(src)),
+				})
+			}()
+			t.Cleanup(func() {
+				_ = ln.Close()
+				if err := <-served; err != nil {
+					t.Error(err)
+				}
+				st.Close()
+			})
+			var stdout, stderr bytes.Buffer
+			code := RunCLI([]string{"copy", "-y", "--skip-fsync", "--progress=false", "--concurrency=2", "--verify=full", "tx://" + ln.Addr().String() + "/", dst}, &stdout, &stderr)
+			if code != 0 {
+				t.Errorf("copy exit %d:\n%s", code, stderr.String())
+			}
+			if strings.Contains(stderr.String(), "sync: truncate") {
+				t.Errorf("sync tried to truncate a directory:\n%s", stderr.String())
+			}
+			for _, rel := range []string{".", "plain", "plain/nested", "shared"} {
+				want, err := os.Stat(filepath.Join(src, rel))
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := os.Stat(filepath.Join(dst, rel))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.Mode() != want.Mode() || !got.ModTime().Equal(want.ModTime()) {
+					t.Errorf("%s: got mode=%s mtime=%v, want mode=%s mtime=%v", rel, got.Mode(), got.ModTime(), want.Mode(), want.ModTime())
+				}
+			}
+			for _, check := range []string{"copy-verify-meta: [ok]", "copy-verify-data: [ok]"} {
+				if !strings.Contains(stderr.String(), check) {
+					t.Errorf("missing %q:\n%s", check, stderr.String())
+				}
+			}
+		})
+	}
+}
+
 // TestRunCLICopyResumeFromPriorStateUnchanged verifies that when an
 // interrupted copy left a populated .tx/<dst>/ but no LOCAL_DST, a
 // subsequent `tx recv copy` invocation refreshes the manifest via SYNC,
