@@ -455,7 +455,8 @@ func TestWalkManifestEntriesMixedTypes(t *testing.T) {
 // therefore self-delimiting. Readers split on '\n' before consulting that
 // prefix, so the two only agree if no encoded path can contain '\n'. The
 // invariant: either the encoder refuses the path, or the emitted line survives
-// a line split and decodes byte-exact — trailing whitespace included.
+// a line split and decodes byte-exact — trailing whitespace and Unix special
+// permission bits included.
 func FuzzManifestEntryRoundTrip(f *testing.F) {
 	f.Add("data/chunk-000", "", uint64(1), int64(4096), int64(1735771234000000000), uint32(0o644))
 	f.Add("trailing ", "", uint64(2), int64(0), int64(1), uint32(0o600))
@@ -465,6 +466,10 @@ func FuzzManifestEntryRoundTrip(f *testing.F) {
 	f.Add("link", "../escape", uint64(6), int64(0), int64(1), uint32(0o777))
 	f.Add(" leading", "", uint64(7), int64(1), int64(1), uint32(0o644))
 	f.Add("emoji😀/path", "", uint64(8), int64(9), int64(7), uint32(0o755))
+	f.Add("setgid", "", uint64(9), int64(0), int64(1), uint32(0o2755))
+	f.Add("setuid", "", uint64(10), int64(1), int64(1), uint32(0o4755))
+	f.Add("sticky", "", uint64(11), int64(0), int64(1), uint32(0o1755))
+	f.Add("all-special", "", uint64(12), int64(0), int64(1), uint32(0o7755))
 
 	f.Fuzz(func(t *testing.T, path string, linkPath string, id uint64, size int64, mtime int64, mode uint32) {
 		if size < 0 || mtime < 0 || id == RootFileID {
@@ -480,7 +485,7 @@ func FuzzManifestEntryRoundTrip(f *testing.F) {
 			ID:         id,
 			Size:       size,
 			Mtime:      mtime,
-			Mode:       NormalizeManifestMode(os.FileMode(mode & 0o7777)),
+			Mode:       os.FileMode(mode & 0o7777),
 			Path:       path,
 			LinkPath:   linkPath,
 			LinkTarget: -1,
@@ -508,7 +513,7 @@ func FuzzManifestEntryRoundTrip(f *testing.F) {
 			t.Fatalf("size round trip: got %d want %d", got.Size, entry.Size)
 		}
 		if got.Mode != entry.Mode {
-			t.Fatalf("mode round trip: got %v want %v", got.Mode, entry.Mode)
+			t.Fatalf("mode round trip: got %04o want %04o", got.Mode, entry.Mode)
 		}
 		if entryType == EntryTypeSymlink && got.LinkPath != entry.LinkPath {
 			t.Fatalf("link target round trip: got %q want %q", got.LinkPath, entry.LinkPath)
