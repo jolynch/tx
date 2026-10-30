@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,7 +36,7 @@ func TestStartSyncWorkerDisabled(t *testing.T) {
 	if _, err := f.WriteString("hello"); err != nil {
 		t.Fatalf("WriteString: %v", err)
 	}
-	if err := worker.SyncOutput(f, 0, f.Name())(); err != nil {
+	if err := worker.SyncOutput(f, 0, 1, f.Name())(); err != nil {
 		t.Fatalf("SyncOutput() error = %v, want nil", err)
 	}
 }
@@ -50,7 +52,7 @@ func TestSyncOutputInlineReturnsFdatasyncError(t *testing.T) {
 	if _, err := f.WriteString("hello"); err != nil {
 		t.Fatalf("WriteString: %v", err)
 	}
-	syncOutput := worker.SyncOutput(f, 0, f.Name())
+	syncOutput := worker.SyncOutput(f, 0, 1, f.Name())
 	if err := f.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -67,7 +69,7 @@ func TestSyncOutputBackgroundStopDrains(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateTemp: %v", err)
 	}
-	syncOutput := worker.SyncOutput(f, 0, f.Name())
+	syncOutput := worker.SyncOutput(f, 0, 1, f.Name())
 	if _, err := f.WriteString("hello"); err != nil {
 		t.Fatalf("WriteString: %v", err)
 	}
@@ -101,7 +103,7 @@ func TestSyncOutputBackgroundDupFallbackReturnsError(t *testing.T) {
 	if _, err := f.WriteString("hello"); err != nil {
 		t.Fatalf("WriteString: %v", err)
 	}
-	syncOutput := worker.SyncOutput(f, 0, f.Name())
+	syncOutput := worker.SyncOutput(f, 0, 1, f.Name())
 	if err := f.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -412,7 +414,7 @@ func TestSyncSyscallsGoThroughFaults(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			inj := faults.New(faults.Config{Seed: 1})
 			worker, stop := StartSyncWorker(tc.interval, false, 0, io.Discard, WithFaults(inj))
-			if err := worker.SyncOutput(f, 0, f.Name())(); err != nil {
+			if err := worker.SyncOutput(f, 0, 1, f.Name())(); err != nil {
 				t.Fatal(err)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -448,7 +450,7 @@ func TestBackgroundSyncBatchSyncsEveryFile(t *testing.T) {
 		if _, err := f.WriteString(name); err != nil {
 			t.Fatal(err)
 		}
-		if err := worker.SyncOutput(f, 0, f.Name())(); err != nil {
+		if err := worker.SyncOutput(f, 0, 1, f.Name())(); err != nil {
 			t.Fatal(err)
 		}
 		defer f.Close()
@@ -500,7 +502,7 @@ func TestBackgroundSyncReportsFailedFiles(t *testing.T) {
 					if _, err := f.WriteString("hello"); err != nil {
 						t.Fatal(err)
 					}
-					if err := worker.SyncOutput(f, 0, path)(); err != nil {
+					if err := worker.SyncOutput(f, 0, uint64(i+1), path)(); err != nil {
 						t.Fatalf("background SyncOutput(%s) = %v, want nil", path, err)
 					}
 					if err := f.Close(); err != nil {
@@ -602,7 +604,7 @@ func TestStopDrainCutShort(t *testing.T) {
 		if _, err := f.Write(make([]byte, 4096)); err != nil {
 			t.Fatal(err)
 		}
-		if err := worker.SyncOutput(f, 0, path)(); err != nil {
+		if err := worker.SyncOutput(f, 0, 1, path)(); err != nil {
 			t.Fatalf("background SyncOutput(%s) = %v, want nil", path, err)
 		}
 	}
@@ -766,7 +768,7 @@ func TestStopReturnsNilWithoutBackgroundSyncer(t *testing.T) {
 			if _, err := f.WriteString("hello"); err != nil {
 				t.Fatal(err)
 			}
-			if err := worker.SyncOutput(f, 0, f.Name())(); (err != nil) != tc.wantSyncFn {
+			if err := worker.SyncOutput(f, 0, 1, f.Name())(); (err != nil) != tc.wantSyncFn {
 				t.Fatalf("SyncOutput() = %v, want error %t", err, tc.wantSyncFn)
 			}
 			if err := stop(context.Background()); err != nil {
@@ -798,7 +800,7 @@ func TestSyncOutputInjectedFailure(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer f.Close()
-			err = worker.SyncOutput(f, 0, f.Name())()
+			err = worker.SyncOutput(f, 0, 1, f.Name())()
 			if !errors.Is(err, syscall.EIO) && !errors.Is(err, syscall.ENOSPC) {
 				t.Fatalf("SyncOutput = %v, want injected fdatasync error", err)
 			}
@@ -879,5 +881,88 @@ func TestBackgroundSyncBatchDeduplicatesAndCloses(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestBackgroundSyncFailedListsEveryID checks Failed returns each file ID
+// whose sync failed exactly once, however many there are and however many of
+// its windows failed, while stop's error still names at most
+// maxReportedSyncFailures paths.
+func TestBackgroundSyncFailedListsEveryID(t *testing.T) {
+	inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: "fdatasync.fail=1"}})
+	worker, stop := StartSyncWorker(1<<30, false, 0, io.Discard, WithFaults(inj))
+	dir := t.TempDir()
+	syncFile := func(id uint64, path string) {
+		t.Helper()
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if _, err := f.WriteString("hello"); err != nil {
+			t.Fatal(err)
+		}
+		if err := worker.SyncOutput(f, 0, id, path)(); err != nil {
+			t.Fatalf("SyncOutput(%s) = %v", path, err)
+		}
+	}
+	const n = maxReportedSyncFailures + 5
+	var want []uint64
+	for i := range n {
+		id := uint64(i)*7 + 3
+		syncFile(id, fmt.Sprintf("%s/out-%02d.bin", dir, i))
+		want = append(want, id)
+	}
+	// A second output for one ID: a file split into windows.
+	syncFile(want[3], fmt.Sprintf("%s/out-03-window.bin", dir))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := stop(ctx)
+	if !errors.Is(err, ErrSyncFailed) {
+		t.Fatalf("stop() = %v, want ErrSyncFailed", err)
+	}
+	failed := worker.Failed()
+	got := slices.Collect(failed.All())
+	if !slices.Equal(got, want) {
+		t.Fatalf("Failed() = %d IDs %v, want the %d distinct IDs %v", len(got), got, len(want), want)
+	}
+	if failed.Len() != n {
+		t.Fatalf("Failed().Len() = %d, want %d", failed.Len(), n)
+	}
+	if u := worker.Unsynced(); u != n {
+		t.Fatalf("Unsynced() = %d, want %d", u, n)
+	}
+	if c := strings.Count(err.Error(), "out-"); c != maxReportedSyncFailures {
+		t.Fatalf("stop() error names %d paths, want %d: %v", c, maxReportedSyncFailures, err)
+	}
+}
+
+// TestRecordFailureMemoryBound records 1,000,000 distinct failed IDs through
+// the failure path and requires the heap to grow by under 4 MiB. Dense IDs
+// need about 122 KiB as a bitmap, and even 16 bytes per ID is 15 MiB, so the
+// bound rules out per-failure path strings or map entries (tens of MiB) while
+// leaving room for the set's growth slack. The test calls recordFailure
+// directly: driving a million real fdatasync calls is too slow.
+func TestRecordFailureMemoryBound(t *testing.T) {
+	const n = 1_000_000
+	bs := newBackgroundSyncer(1<<30, io.Discard, nil)
+	heap := func() uint64 {
+		runtime.GC()
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		return m.HeapAlloc
+	}
+	before := heap()
+	for i := uint64(1); i <= n; i++ {
+		bs.recordFailure(i, "out.bin")
+	}
+	after := heap()
+	runtime.KeepAlive(bs)
+	if got := bs.unsynced.Load(); got != n {
+		t.Fatalf("unsynced = %d, want %d", got, n)
+	}
+	if grew := int64(after) - int64(before); grew > 4<<20 {
+		t.Fatalf("recording %d failures grew the heap by %d bytes, want under 4 MiB", n, grew)
 	}
 }

@@ -301,6 +301,79 @@ func TestVerifyCopyDataSamplesBudget(t *testing.T) {
 	}
 }
 
+// TestVerifyCopyMismatchCompleteness checks when VerifyCopy returns a bare
+// *MismatchError: only when every planned sample was checked, so its IDs name
+// every wrong file. A budget cut or another batch's failure leaves files
+// unexamined, and the error then only wraps one (errors.As still finds it).
+func TestVerifyCopyMismatchCompleteness(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		files   int
+		size    int64
+		wrong   []uint64 // IDs whose local bytes differ
+		missing []uint64 // IDs whose local file is removed
+		budget  time.Duration
+		delay   time.Duration // the first CXSUM request waits this long
+		bare    bool
+		want    []uint64
+	}{
+		{name: "complete in one batch", files: 3, size: 1 << 20, wrong: []uint64{1, 3}, bare: true, want: []uint64{1, 3}},
+		// Each file fills a batch, so the mismatches merge across batches.
+		{name: "complete across batches", files: 3, size: verifyBatchBytes, wrong: []uint64{3, 1}, bare: true, want: []uint64{1, 3}},
+		{name: "budget cut", files: 4, size: verifyBatchBytes, wrong: []uint64{1}, budget: 100 * time.Millisecond,
+			delay: 300 * time.Millisecond, want: []uint64{1}},
+		{name: "failure in another batch", files: 2, size: verifyBatchBytes, wrong: []uint64{1}, missing: []uint64{2}, want: []uint64{1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			manifest := &tx.Manifest{TransferID: "txverify-complete", Root: "/remote"}
+			for i := range tc.files {
+				name := fmt.Sprintf("f%d.bin", i+1)
+				path := filepath.Join(dir, name)
+				writeSparseFile(t, path, tc.size)
+				id := uint64(i + 1)
+				if slices.Contains(tc.wrong, id) {
+					if err := os.WriteFile(path, []byte{9}, 0o644); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Truncate(path, tc.size); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if slices.Contains(tc.missing, id) {
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+				}
+				manifest.Entries = append(manifest.Entries, tx.ManifestEntry{ID: id, Size: tc.size, Path: name})
+			}
+			zeros := zeroChecksumHandler(t, nil, nil)
+			var requests atomic.Int64
+			srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+				if req.Verb == intftcp.VerbCXSUM && requests.Add(1) == 1 {
+					time.Sleep(tc.delay)
+				}
+				return zeros(req, out)
+			})
+			defer srv.Close()
+			client := tx.NewClient(srv.URL)
+			defer client.Close()
+			err := VerifyCopy(client, manifest, func(e tx.ManifestEntry) string { return filepath.Join(dir, e.Path) },
+				VerifyCopyOptions{Workers: 1, Budget: tc.budget, Grace: 2 * time.Second})
+			if err == nil {
+				t.Fatal("VerifyCopy() = nil, want a mismatch")
+			}
+			var found *MismatchError
+			if !errors.As(err, &found) || !slices.Equal(found.IDs, tc.want) {
+				t.Fatalf("errors.As(%v) = %+v, want IDs %v", err, found, tc.want)
+			}
+			if _, bare := err.(*MismatchError); bare != tc.bare {
+				t.Fatalf("err = %T (%v), bare *MismatchError = %v, want %v", err, err, bare, tc.bare)
+			}
+		})
+	}
+}
+
 // TestRunVerifyCancellation checks what a check that returns after the run was
 // cancelled means. The budget and grace period cancel the run while the check
 // waits, so no timing decides the outcome: a mismatch is a finding and fails
@@ -311,7 +384,7 @@ func TestRunVerifyCancellation(t *testing.T) {
 		after        func(ctx context.Context) error
 		wantMismatch bool
 	}{
-		{name: "mismatch fails", after: func(context.Context) error { return mismatchError{errors.New("data differs")} }, wantMismatch: true},
+		{name: "mismatch fails", after: func(context.Context) error { return mismatchError{error: errors.New("data differs")} }, wantMismatch: true},
 		{name: "cancellation does not", after: context.Context.Err},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -994,5 +1067,40 @@ func TestVerifyCopyDataSamplesNegotiatedWorkers(t *testing.T) {
 				t.Fatalf("err=%v partial=%v requests=%d want=%d", err, result.partial, requests.Load(), want)
 			}
 		})
+	}
+}
+
+// TestInvalidateForRefetch checks that the stale mark differs from the source
+// mtime, and that a symlink is never followed.
+func TestInvalidateForRefetch(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "f")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, remote := range []int64{1_700_000_000_000_000_000, 0, 1_000_000_000} {
+		if err := invalidateForRefetch(file, remote); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d := info.ModTime().UnixNano() - remote; d > -int64(2*time.Second) && d < int64(2*time.Second) {
+			t.Fatalf("mtime %d is within 2s of source mtime %d", info.ModTime().UnixNano(), remote)
+		}
+	}
+	link := filepath.Join(dir, "l")
+	if err := os.Symlink(file, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(file, time.Unix(100, 0), time.Unix(100, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := invalidateForRefetch(link, 1_700_000_000_000_000_000); err == nil {
+		t.Fatal("invalidateForRefetch followed a symlink")
+	}
+	if info, _ := os.Stat(file); info.ModTime().Unix() != 100 {
+		t.Fatalf("symlink target mtime changed to %v", info.ModTime())
 	}
 }

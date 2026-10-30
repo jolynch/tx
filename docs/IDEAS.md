@@ -33,19 +33,15 @@ instead of widening the current change; remove an entry when it ships.
   order, so a run that keeps hitting its budget re-checks the start of the tree
   and never reaches the end. Walk the file list with the seeded coprime step
   as well, but only under a budget, so `--verify full` stays sequential.
-
-- **A failed background sync is reported, not repaired.** A file's ACK
-  precedes its background `fdatasync`, so when the sync fails, `tx recv copy`
-  exits 1 naming the file, but the server and `.tx/` state already count it
-  done. A rerun takes the sync path, sees matching metadata, and exits 0
-  without fetching it again. Mark such files unsynced in the client's `.tx/`
-  state so the next sync or resume fetches them again.
 - **Unconfirmed durability exits 0.** A background drain that
   `defaultFsyncTimeout` cuts short, and a failed or timed-out final `syncfs`,
   are `--stats` warnings, not failures. With `--fsync-interval -1`, `syncfs`
   is the only durability signal. Decide whether either should fail the run,
   and report the files whose durability is unknown. `tx-bench report` and
-  the `run_end` event do not show the warnings yet.
+  the `run_end` event do not show the warnings yet. A sync-path copy drains
+  its sync worker after every round, so a drain the timeout cuts short can
+  leave that round's worker syncing while the next round runs, and failures
+  it records afterwards are never marked for refetch.
 - **Bytes changed after hashing pass without `--verify`.** The server hashes
   what it read and the client hashes the buffer before writing it, so a
   flipped read on the server (`read.flip`) or a lost or flipped write on the
@@ -140,6 +136,9 @@ instead of widening the current change; remove an entry when it ships.
   next round downloads all 40 again. Under a steady per-file fault rate, a
   large batch of small files can stop making progress. ACK the files read
   before the failure.
+- **Repair within the same run.** A verify mismatch marks the file and exits
+  1, and the next run fetches it. The run could instead refetch and reverify
+  the mismatching files before it exits.
 
 ## Performance
 

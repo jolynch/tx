@@ -390,6 +390,21 @@ add `--verify 5%data`, use `--verify full` to check every byte, or pass a
 duration such as `--verify 30s` to run full data verification under a time
 budget.
 
+A failed data verify exits 1, gives the count of mismatching files and up to
+eight of their paths, and sets each one's mtime to Unix epoch 0 (Unix 4s when
+the source mtime is within 2s of the epoch, and a day past the source mtime
+when the filesystem clamps that back to it). The next `tx recv copy` sees a
+stale file and fetches it again. A file whose background `fdatasync` failed
+gets the same mark after the copy finishes, so a rerun fetches it again
+instead of trusting its matching metadata. If the copy fails before the
+staging rename, the file's resume progress is dropped instead, so the rerun
+fetches it again. When a sync-path copy (an existing destination) has files
+fail to sync in a round, it marks them, runs no further round, and exits 1
+saying the destination failed to sync N files. If dropping the resume
+progress fails, the copy removes its progress file, so the rerun fetches
+every file again. Marking is best-effort: a failure prints a warning and does
+not change the exit code.
+
 ### Send Server Examples
 
 ```bash

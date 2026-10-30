@@ -14,6 +14,7 @@ import (
 
 	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/idset"
 	"github.com/jolynch/tx/internal/sysio"
 )
 
@@ -116,13 +117,24 @@ func StartSyncWorker(fsyncInterval int64, noSync bool, progressInterval time.Dur
 	}
 }
 
-// Unsynced returns how many distinct paths background batches failed to
+// Unsynced returns how many distinct files background batches failed to
 // sync. Stop reports them too; this count is for callers that check after it.
 func (w *SyncWorker) Unsynced() int64 {
 	if w == nil || w.background == nil {
 		return 0
 	}
 	return w.background.unsynced.Load()
+}
+
+// Failed returns the IDs of the files whose background sync failed. Stop's
+// error names only the first few paths; callers that repair the files use this
+// full set. It holds IDs rather than paths so that a disk that fails every
+// sync costs bits, not a string per file.
+func (w *SyncWorker) Failed() idset.Set {
+	if w == nil || w.background == nil {
+		return idset.Set{}
+	}
+	return w.background.failedIDs()
 }
 
 // SyncOutput returns a sync callback for fd. The returned function is intended
@@ -132,8 +144,9 @@ func (w *SyncWorker) Unsynced() int64 {
 // be valid and positioned at the final write offset for this output. offset
 // must be the starting write offset for the same output segment, because the
 // background sync path uses currentPosition-offset to account for written bytes.
-// path names the output in stop's error if its background sync fails.
-func (w *SyncWorker) SyncOutput(fd *os.File, offset int64, path string) func() error {
+// id is the output's file ID, which Failed reports if its background sync
+// fails; path names it in stop's error and log line.
+func (w *SyncWorker) SyncOutput(fd *os.File, offset int64, id uint64, path string) func() error {
 	if w == nil || fd == nil {
 		return func() error { return nil }
 	}
@@ -148,7 +161,7 @@ func (w *SyncWorker) SyncOutput(fd *os.File, offset int64, path string) func() e
 			if written < 0 {
 				written = 0
 			}
-			w.background.enqueue(dupFD, written, path)
+			w.background.enqueue(dupFD, written, id, path)
 			return nil
 		}
 		if w.inlineSync {
@@ -267,12 +280,12 @@ type backgroundSyncer struct {
 	peakFiles     atomic.Int64
 	currentBatch  atomic.Int64
 	peakBatch     atomic.Int64
-	// unsynced counts the distinct paths whose fdatasync failed; a split
+	// unsynced counts the distinct files whose fdatasync failed; a split
 	// file syncs one descriptor per window, so it can fail more than once.
 	// failedPaths keeps the first maxReportedSyncFailures for stop's error.
 	unsynced    atomic.Int64
 	failedMu    sync.Mutex
-	failedSeen  map[string]struct{}
+	failed      idset.Set
 	failedPaths []string
 	faults      *faults.Injector
 }
@@ -280,6 +293,7 @@ type backgroundSyncer struct {
 type syncRequest struct {
 	fd   int
 	size int64
+	id   uint64
 	path string
 }
 
@@ -343,7 +357,7 @@ func (bs *backgroundSyncer) syncBatch(batch []syncRequest, stderr io.Writer) {
 			// No retry: after a failed fdatasync the kernel may have dropped
 			// the dirty pages, so a second call can succeed without the data.
 			if err := fdatasync(bs.faults, req.fd); err != nil {
-				bs.recordFailure(req.path)
+				bs.recordFailure(req.id, req.path)
 				fmt.Fprintf(stderr, "background fdatasync: %s: %v\n", req.path, err)
 			}
 			if statErr == nil {
@@ -358,27 +372,30 @@ func (bs *backgroundSyncer) syncBatch(batch []syncRequest, stderr io.Writer) {
 	}
 }
 
-func (bs *backgroundSyncer) recordFailure(path string) {
+func (bs *backgroundSyncer) recordFailure(id uint64, path string) {
 	bs.failedMu.Lock()
 	defer bs.failedMu.Unlock()
-	if _, dup := bs.failedSeen[path]; dup {
+	if !bs.failed.Add(id) {
 		return
 	}
-	if bs.failedSeen == nil {
-		bs.failedSeen = make(map[string]struct{})
-	}
-	bs.failedSeen[path] = struct{}{}
 	bs.unsynced.Add(1)
 	if len(bs.failedPaths) < maxReportedSyncFailures {
 		bs.failedPaths = append(bs.failedPaths, path)
 	}
 }
 
+// failedIDs returns a copy of the failed file IDs.
+func (bs *backgroundSyncer) failedIDs() idset.Set {
+	bs.failedMu.Lock()
+	defer bs.failedMu.Unlock()
+	return bs.failed.Clone()
+}
+
 // failedErr returns an error naming the files whose sync failed, or nil.
 func (bs *backgroundSyncer) failedErr() error {
 	bs.failedMu.Lock()
 	defer bs.failedMu.Unlock()
-	n := len(bs.failedSeen)
+	n := bs.failed.Len()
 	if n == 0 {
 		return nil
 	}
@@ -393,12 +410,12 @@ func (bs *backgroundSyncer) failedErr() error {
 	return &markedError{msg: fmt.Sprintf("%d %s failed to sync and may not be durable: %s", n, noun, list), mark: ErrSyncFailed}
 }
 
-func (bs *backgroundSyncer) enqueue(fd int, size int64, path string) {
+func (bs *backgroundSyncer) enqueue(fd int, size int64, id uint64, path string) {
 	pendingBytes := bs.pendingBytes.Add(size)
 	pendingFiles := bs.pendingFiles.Add(1)
 	updateMaxAtomic(&bs.peakBytes, pendingBytes)
 	updateMaxAtomic(&bs.peakFiles, pendingFiles)
-	bs.ch <- syncRequest{fd: fd, size: size, path: path}
+	bs.ch <- syncRequest{fd: fd, size: size, id: id, path: path}
 }
 
 func (bs *backgroundSyncer) snapshot() SyncSnapshot {

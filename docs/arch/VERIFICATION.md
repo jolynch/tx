@@ -95,8 +95,37 @@ When `--verify` is a duration, the client behaves as a bounded full verifier:
 This is why a budgeted verify can end in `[partial-ok]` instead of `[ok]`.
 
 Real checksum mismatches found before the forced stop still fail the command.
+
 Local copies have no grace period: hashing in progress stops at its next
 1 MiB read.
+
+### Mismatch Reporting
+
+A checksum mismatch does not stop the run. Verification keeps checking the
+remaining batches and reports every mismatching file: the `[fail]` line gives
+the count and up to eight destination paths. Other errors, such as a read or
+network failure, still cancel the run at once.
+
+Verification runs after the staging rename, so the next copy takes the sync
+path, which compares only size, mtime, and mode. To make that run fetch the
+files again, verification sets each mismatching regular file's atime and mtime
+to Unix epoch 0 (Unix 4s when the source mtime is within 2s of the epoch, and
+a day past the source mtime when the filesystem clamps that back to it) and
+prints `marked N files to fetch again on the next run`. Marking is best-effort:
+a failure prints a warning and does not change the exit code. A failed
+background `fdatasync` marks its files the same way. Both find the files by
+manifest ID, so a run that fails every file holds a bit per file, not a path.
+When the copy fails before the rename, there is no target to mark; the run
+drops the failed files from the `.tx/` progress state instead, so a resume
+fetches them again; if that rewrite fails, it removes the progress file, and
+the resume fetches every file. `tx recv copy` into an existing destination (the sync
+path) syncs each round's outputs with that round's own worker and drains it
+before the next round's scan, probe, and SYNC. It resolves the round's failed
+IDs against that round's manifest, since every round numbers its files afresh.
+When a round's syncs fail, the run marks those files, starts no further round,
+and exits 1 with `destination failed to sync N files`; refetching them in the
+same run would repeat the failing syncs, and the run does not report that the
+remote failed to converge.
 
 ### Checksum Batching
 

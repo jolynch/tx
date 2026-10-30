@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"math/rand/v2"
 	"net"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -474,6 +477,48 @@ func runWithSysFaults(t *testing.T, sys string, args ...string) (int, string) {
 	return code, stderr.String()
 }
 
+// TestCLIFailedSyncRerunFetchesFilesAgain checks a copy whose every
+// fdatasync fails exits 1, and that a later fault-free copy into the same
+// destination fetches those files again: their bytes may not have reached
+// disk, and their metadata alone would otherwise pass for current. After the
+// failed run the test flips a byte in each file, keeping size and mtime, as a
+// dropped dirty page would; only a refetch repairs them.
+func TestCLIFailedSyncRerunFetchesFilesAgain(t *testing.T) {
+	srv := startSyncFaultServer(t)
+	_, remote, files := srv.newTree(t)
+	dst := filepath.Join(t.TempDir(), "dst")
+	args := []string{"copy", "-y", "--progress=false", "--verify", "none", "--fsync-interval", "1MiB", remote, dst}
+	code, stderr := runWithSysFaults(t, "fdatasync.fail=1", args...)
+	if code != 1 {
+		t.Fatalf("copy with failing fdatasync exit %d, want 1: %s", code, stderr)
+	}
+	checkSyncFaultFiles(t, dst, files)
+
+	for name := range files {
+		path := filepath.Join(dst, name)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data[len(data)/2] ^= 0xff
+		if err := os.WriteFile(path, data, info.Mode().Perm()); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if code, stderr := runWithSysFaults(t, "", args...); code != 0 {
+		t.Fatalf("rerun exit %d: %s", code, stderr)
+	}
+	checkSyncFaultFiles(t, dst, files)
+}
+
 // TestCLIFailedBackgroundSyncExitsNonzero checks a copy or get whose
 // background fdatasyncs fail still writes every file, then exits nonzero and
 // names each file that failed to sync: a fresh copy, a copy into an existing
@@ -619,4 +664,326 @@ func TestCLIFailedSyncfsWarns(t *testing.T) {
 		}
 		wantWarning(t, code, stderr, stats)
 	})
+}
+
+// roundTwoOnlySeed returns a seed for which an injector with fdatasync.fail=0.5
+// passes its first fdatasync and fails its second. The injector counts
+// fdatasyncs per kind, so a run that syncs one file in SYNC round 1 and one
+// in round 2 sees a clean first round and a failing second one. The CLI has no
+// way to change an injector's rates between rounds, so the schedule does it.
+func roundTwoOnlySeed(t *testing.T) uint64 {
+	t.Helper()
+	for seed := uint64(1); seed < 10000; seed++ {
+		inj := faults.New(faults.Config{Seed: seed, Specs: map[faults.Family]string{faults.FamilySys: "fdatasync.fail=0.5"}})
+		if inj.Sys(faults.SysFdatasync) == nil && inj.Sys(faults.SysFdatasync) != nil {
+			return seed
+		}
+	}
+	t.Fatal("no seed passes the first fdatasync and fails the second")
+	return 0
+}
+
+// TestCLISyncRoundFailedSyncStopsAndMarksThatRoundsFile checks a copy into an
+// existing destination stops after the SYNC round whose syncs failed. Round 1
+// refetches a.txt (changed upstream) as ID 1 and syncs cleanly. Round 2 adds
+// 0new.txt ahead of it, so 0new.txt takes ID 1 and a.txt becomes ID 2, and
+// round 2's fdatasync fails. The failed ID 1 must resolve against round 2's
+// manifest: 0new.txt is marked, and a.txt, which held ID 1 in round 1, is not.
+// The run must start no third round, so it never refetches 0new.txt, exits 1
+// with the destination-sync message and not "remote has not converged", and a
+// clean rerun fetches 0new.txt again and exits 0.
+func TestCLISyncRoundFailedSyncStopsAndMarksThatRoundsFile(t *testing.T) {
+	tmp := t.TempDir()
+	dst := filepath.Join(tmp, "dst")
+	aBody, nBody := []byte("hello"), []byte("brand new")
+	meta := func(body []byte, mtime int64) *tx.FileTrailerMetadata {
+		return &tx.FileTrailerMetadata{Size: int64(len(body)), MtimeNS: mtime, Mode: "0644"}
+	}
+	aOld := []string{buildTestManifestEntry(1, int64(len(aBody)), 100, 0o644, "a.txt")}
+	aOnly := []string{buildTestManifestEntry(1, int64(len(aBody)), 150, 0o644, "a.txt")}
+	both := []string{
+		buildTestManifestEntry(1, int64(len(nBody)), 300, 0o644, "0new.txt"),
+		buildTestManifestEntry(2, int64(len(aBody)), 150, 0o644, "a.txt"),
+	}
+	// stage 0 is the clean first copy, 1 the run under faults, 2 the rerun.
+	var stage, syncCalls, newSends atomic.Int64
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbTXFER:
+			entries := [][]string{aOld, aOnly, both}[stage.Load()]
+			if err := writeManifestResponse(out, buildTestManifestRaw("rounds", entries)); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbSYNC:
+			if stage.Load() == 1 && syncCalls.Add(1) == 1 {
+				return writeSyncResponse(out, "rounds", aOnly, nil)
+			}
+			return writeSyncResponse(out, "rounds", both, nil)
+		case intftcp.VerbSEND:
+			for _, p := range req.Params[1:] {
+				fid, _ := strconv.ParseUint(p["fid"], 10, 64)
+				body, m := aBody, meta(aBody, 150)
+				switch {
+				case stage.Load() == 0:
+					m = meta(aBody, 100)
+				case fid == 1 && (stage.Load() == 2 || syncCalls.Load() >= 2):
+					body, m = nBody, meta(nBody, 300)
+					newSends.Add(1)
+				}
+				if _, err := io.WriteString(out, buildCLIFrameWithMetadata(fid, body, 0, m)); err != nil {
+					return err
+				}
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	remote := "tx://" + srv.URL + "/remote"
+	args := []string{"copy", "-y", "--progress=false", "--verify=none", "--fsync-interval", "1MiB", remote, dst}
+	if code, stderr := runWithSysFaults(t, "", args...); code != 0 {
+		t.Fatalf("first copy exit %d:\n%s", code, stderr)
+	}
+
+	stage.Store(1)
+	t.Setenv(faults.EnvSeed, strconv.FormatUint(roundTwoOnlySeed(t), 10))
+	t.Setenv(faults.EnvSys, "fdatasync.fail=0.5")
+	var stdout, stderrBuf bytes.Buffer
+	code := RunCLI(args, &stdout, &stderrBuf)
+	stderr := stderrBuf.String()
+	if code != 1 {
+		t.Fatalf("exit %d, want 1:\n%s", code, stderr)
+	}
+	if strings.Contains(stderr, "remote has not converged") {
+		t.Errorf("a sync failure was reported as non-convergence:\n%s", stderr)
+	}
+	for _, want := range []string{"failed to sync", "fetch again on the next run", "did not finish converging"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr lacks %q:\n%s", want, stderr)
+		}
+	}
+	if got := syncCalls.Load(); got != 2 {
+		t.Errorf("ran %d SYNC rounds, want 2: no round starts after one whose syncs failed", got)
+	}
+	if got := newSends.Load(); got != 1 {
+		t.Errorf("0new.txt was fetched %d times, want once: it must not be refetched in the same run", got)
+	}
+	mtime := func(name string) int64 {
+		info, err := os.Stat(filepath.Join(dst, name))
+		if err != nil {
+			t.Fatalf("%s: %v\n%s", name, err, stderr)
+		}
+		return info.ModTime().UnixNano()
+	}
+	if mtime("0new.txt") == 300 {
+		t.Errorf("0new.txt, whose sync failed, keeps its source mtime: it was not marked to fetch again\n%s", stderr)
+	}
+	if got := mtime("a.txt"); got != 150 {
+		t.Errorf("a.txt synced cleanly, but its mtime is %d, want 150: another round's ID marked it\n%s", got, stderr)
+	}
+
+	// Flip a byte in the failed file, keeping its size and (marked) mtime, as
+	// a dropped dirty page would.
+	failed := filepath.Join(dst, "0new.txt")
+	info, err := os.Stat(failed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(failed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[len(data)/2] ^= 0xff
+	if err := os.WriteFile(failed, data, info.Mode().Perm()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(failed, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+
+	stage.Store(2)
+	if code, stderr := runWithSysFaults(t, "", args...); code != 0 {
+		t.Fatalf("rerun exit %d:\n%s", code, stderr)
+	}
+	if got, err := os.ReadFile(failed); err != nil || !bytes.Equal(got, nBody) {
+		t.Fatalf("0new.txt after rerun: %q, err %v; want %q", got, err, nBody)
+	}
+	if got := mtime("0new.txt"); got != 300 {
+		t.Fatalf("0new.txt mtime after rerun %d, want 300", got)
+	}
+}
+
+// TestCLIFailedSyncBeforeRenameRerunFetchesFilesAgain checks a copy whose
+// background fdatasync fails and which then fails before the staging rename
+// fetches the unsafe file again on the rerun. The failure is a symlink that
+// cannot be created because its parent is a regular file, which the run only
+// discovers after every file is downloaded. The progress state counts a.txt
+// done, so the test flips a byte in its staged copy, keeping size and mtime,
+// as a dropped dirty page would.
+func TestCLIFailedSyncBeforeRenameRerunFetchesFilesAgain(t *testing.T) {
+	failedSyncBeforeRename(t, false)
+}
+
+// TestCLIFailedProgressResetRemovesProgressFile is the same run, but the
+// rewrite of the progress state that drops the failed file fails: the test
+// makes the save's temporary file path a non-empty directory the moment the
+// first fdatasync fails, after every earlier save. The run must then remove
+// the progress file, so a rerun refetches everything instead of trusting the
+// stale "done" entry for a.txt.
+func TestCLIFailedProgressResetRemovesProgressFile(t *testing.T) {
+	failedSyncBeforeRename(t, true)
+}
+
+// failedSyncBeforeRename runs the scenario both tests above describe. With
+// blockProgressSave, it also blocks the progress save at the first injected
+// fdatasync failure and requires the progress file to be gone afterwards.
+func failedSyncBeforeRename(t *testing.T, blockProgressSave bool) {
+	tmp := t.TempDir()
+	dst := filepath.Join(tmp, "dst")
+	aBody := bytes.Repeat([]byte("a"), 4096)
+	aMeta := &tx.FileTrailerMetadata{Size: int64(len(aBody)), MtimeNS: 100, Mode: "0644"}
+	// b.txt keeps the progress state non-empty when a.txt's entry is dropped
+	// (an empty state is removed rather than rewritten), so b.txt's fdatasync
+	// must succeed in the blocked variant: only the first one does.
+	bBody := bytes.Repeat([]byte("b"), 4096)
+	bMeta := &tx.FileTrailerMetadata{Size: int64(len(bBody)), MtimeNS: 100, Mode: "0644"}
+	fileEntry := buildTestManifestEntry(1, int64(len(aBody)), 100, 0o644, "a.txt")
+	bEntry := buildTestManifestEntry(3, int64(len(bBody)), 100, 0o644, "b.txt")
+	var linkParent atomic.Bool
+	linkParent.Store(true)
+	entries := func() []string {
+		if linkParent.Load() {
+			return []string{fileEntry, buildTestSymlinkManifestEntry(2, 200, 0o777, "a.txt/ln", "target"), bEntry}
+		}
+		return []string{fileEntry, bEntry}
+	}
+	srv := newFTCPTestServer(t, func(req intftcp.Request, out io.Writer) error {
+		switch req.Verb {
+		case intftcp.VerbPROBE:
+			return writeCLIProbeResponse(req, out)
+		case intftcp.VerbTXFER:
+			if err := writeManifestResponse(out, buildTestManifestRaw("prerename", entries())); err != nil {
+				return err
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbSYNC:
+			return writeSyncResponse(out, "prerename", entries(), nil)
+		case intftcp.VerbSEND:
+			for _, p := range req.Params[1:] {
+				switch p["fid"] {
+				case "1":
+					if _, err := io.WriteString(out, buildCLIFrameWithMetadata(1, aBody, 0, aMeta)); err != nil {
+						return err
+					}
+				case "3":
+					if _, err := io.WriteString(out, buildCLIFrameWithMetadata(3, bBody, 0, bMeta)); err != nil {
+						return err
+					}
+				}
+			}
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		case intftcp.VerbACK:
+			_, err := io.WriteString(out, "OK\r\n")
+			return err
+		default:
+			return fmt.Errorf("unexpected verb: %v", req.Verb)
+		}
+	})
+	defer srv.Close()
+
+	args := []string{"copy", "-y", "--progress=false", "--verify=none", "--fsync-interval", "1MiB", "tx://" + srv.URL + "/remote", dst}
+	progressPath := filepath.Join(tmp, ".tx", "dst", "manifest.progress")
+	blocker := progressPath + ".tmp"
+	var code int
+	var stderr string
+	if blockProgressSave {
+		seed := roundTwoOnlySeed(t)
+		sink := events.NewSink()
+		var once atomic.Bool
+		sink.Subscribe(func(e events.Event) {
+			if e.Name == "fault" && once.CompareAndSwap(false, true) {
+				if err := os.MkdirAll(filepath.Join(blocker, "keep"), 0o755); err != nil {
+					t.Errorf("block progress save: %v", err)
+				}
+			}
+		})
+		prev := faultsFromEnv
+		t.Cleanup(func() { faultsFromEnv = prev })
+		faultsFromEnv = func(func(string) (string, bool)) (*faults.Injector, error) {
+			return faults.New(faults.Config{Seed: seed, Specs: map[faults.Family]string{faults.FamilySys: "fdatasync.fail=0.5"}, Events: sink}), nil
+		}
+		var out, errOut bytes.Buffer
+		code = RunCLI(args, &out, &errOut)
+		faultsFromEnv = prev
+		stderr = errOut.String()
+	} else {
+		code, stderr = runWithSysFaults(t, "fdatasync.fail=1", args...)
+	}
+	if code == 0 {
+		t.Fatalf("first copy exit 0, want failure:\n%s", stderr)
+	}
+	if blockProgressSave {
+		if _, err := os.Stat(blocker); err != nil {
+			t.Fatalf("the progress save was never blocked: %v\n%s", err, stderr)
+		}
+		if _, err := os.Stat(progressPath); !os.IsNotExist(err) {
+			t.Errorf("progress file survives a failed reset (stat err %v): a resume would trust stale done entries\n%s", err, stderr)
+		}
+		if err := os.RemoveAll(blocker); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(dst); err == nil {
+		t.Fatalf("first copy renamed the staging tree though the symlink failed:\n%s", stderr)
+	}
+	// Flip a byte in each staged file, keeping size and mtime, as a dropped
+	// dirty page would. In the blocked variant either file may be the one
+	// whose sync failed; the progress file must be gone either way.
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if name == "b.txt" && !blockProgressSave {
+			continue
+		}
+		staged := filepath.Join(tmp, ".tx", "dst", "remote", name)
+		info, err := os.Stat(staged)
+		if err != nil {
+			t.Fatalf("%s was not staged: %v\n%s", name, err, stderr)
+		}
+		data, err := os.ReadFile(staged)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data[len(data)/2] ^= 0xff
+		if err := os.WriteFile(staged, data, info.Mode().Perm()); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(staged, info.ModTime(), info.ModTime()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	linkParent.Store(false)
+	if code, stderr := runWithSysFaults(t, "", args...); code != 0 {
+		t.Fatalf("rerun exit %d:\n%s", code, stderr)
+	}
+	for name, want := range map[string][]byte{"a.txt": aBody, "b.txt": bBody} {
+		if name == "b.txt" && !blockProgressSave {
+			continue
+		}
+		got, err := os.ReadFile(filepath.Join(dst, name))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Errorf("%s after rerun: %d bytes, err %v; the rerun skipped a file whose staged bytes were corrupt", name, len(got), err)
+		}
+	}
 }
