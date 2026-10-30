@@ -10,9 +10,8 @@ var profiles = map[string]map[Family]string{
 	// so a batch of 40 small files must usually get through. Each duration
 	// fits a shape with alpha between about 0.2 and 0.7: most samples near the
 	// low end with a real tail, rather than nearly all at the minimum.
-	// It leaves out the kinds no layer can detect without --verify, which
-	// would let a run succeed with wrong data (read.flip, write.lost, and
-	// write.flip), and open.enoent, after which the file is correctly
+	// It leaves out UndetectedKinds, which would let a run without --verify
+	// succeed with wrong data, and open.enoent, after which the file is correctly
 	// reported missing for good.
 	"bad-day": {
 		FamilyNet: "delay=0.01:β(10us,300us,2ms,10ms), pause=0.001:β(5ms,30ms,200ms,300ms), " +

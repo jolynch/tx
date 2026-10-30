@@ -78,6 +78,8 @@ type Injector struct {
 	busyOps  atomic.Uint64
 	dials    atomic.Uint64
 	attempts sync.Map // file key -> *atomic.Uint64
+	hitMu    sync.Mutex
+	hit      map[uint64]struct{} // files an undetected kind fired on
 
 	counts struct {
 		clientConns, serverConns atomic.Uint64

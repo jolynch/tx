@@ -67,15 +67,21 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
     transfers under the `internal/faults` catalog. Model:
     `FuzzMemTransferUnderFaults`. They begin with `faults.SkipUnlessPBT`, so
     they run only under `make pbt-faults`, and they sit outside `acceptance`
-    because they fail until the bugs they find are fixed. CI's
-    `fault-injection` job runs `make -k pbt-faults PBT_EXCLUDE=known`, so
-    remove a kind from `PBT_KNOWN` once its bugs are fixed, and CI keeps it
-    fixed. Go's fuzzer stops any input past 10s without a message, so keep
-    each input's budget near 8s; a property that cannot bound its steps that
-    tightly sweeps seeds in a plain test instead, as `TestTreeCopyUnderFaults`
-    does. Record each failure in IDEAS.md with its repro line, keeping a
-    failing input as an `f.Add` seed since the repository ignores fuzz
-    corpora; move a property to `fuzz-long` once it passes.
+    because they fail when they find a bug. CI's `fault-injection` job runs
+    `make -k pbt-faults PBT_EXCLUDE=known`, which leaves out the kinds in
+    `PBT_KNOWN` (empty now): add a kind there while its bug is open, and
+    remove it once fixed, so CI keeps it fixed. The kinds in
+    `faults.UndetectedKinds()` have a verify-backed contract: without
+    `--verify` they may leave wrong bytes in the files they fired on, and
+    with it the next run repairs them. Go's fuzzer stops any input past 10s
+    without a message, so hold each input to one deadline of about 9s, with
+    each step reporting its own overrun first; a property that cannot bound
+    its steps that tightly sweeps seeds in a plain test instead, as
+    `TestTreeCopyUnderFaults` does. Record each failure in IDEAS.md with
+    its repro line, keeping a failing input as an `f.Add` seed since the
+    repository ignores fuzz corpora. A property stays in `pbt-faults` once it
+    passes: its swarms keep exploring under budgets longer than `fuzz-long`
+    gives, and its CI job keeps every fixed kind fixed.
   - The tiers are a budget, not a ranking. Fuzzing exists to discover
     interesting behavior, not to finish quickly: a test that keeps finding new
     states is the better test. Never narrow one to make it fit `fuzz-short`.
@@ -163,7 +169,7 @@ make unit         # go test -race ./...
 make fuzz-short   # unit-test replacements; 5s each
 make fuzz-long    # whole-system properties; 30s each
 make acceptance   # fuzz-short, then fuzz-long
-make pbt-faults   # fault-injection properties; fail until their bugs are fixed
+make pbt-faults   # fault-injection properties; fail when they find a bug
 make bench        # Go microbenchmarks; pre-commit only (pegs the machine)
 make bench-acceptance        # tx-bench end to end on a 5GiB dataset (BENCH_SIZE)
 make bench-acceptance-dials  # dial budget of that run
