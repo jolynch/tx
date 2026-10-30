@@ -138,6 +138,7 @@ type Env struct {
 	openedMu sync.Mutex
 	opened   map[uint64][]int64 // where the last round opened each file's outputs
 	unsynced int64              // files the last round's sync worker failed to sync
+	refetch  []uint64           // files the next round downloads again from offset 0
 }
 
 const root = "/memxfer"
@@ -339,8 +340,19 @@ func (e *Env) Pending() []uint64 {
 	return out
 }
 
+// Refetch marks files for download again: each Round fetches them from
+// offset 0 even when the server holds them done, as a tx recv copy run
+// does for files a failed --verify marked stale. The mark stays until a
+// Round that its context did not cut short returns no error. The harness
+// cannot tell which files a round's errors name, and it must not read the
+// sinks to decide.
+func (e *Env) Refetch(ids []uint64) {
+	e.refetch = slices.Compact(slices.Sorted(slices.Values(append(slices.Clone(e.refetch), ids...))))
+}
+
 // Round downloads every pending file once, resuming each from the bytes
-// the server last acknowledged, as a resumed tx recv copy does.
+// the server last acknowledged, as a resumed tx recv copy does, and every
+// file marked by Refetch from the start.
 func (e *Env) Round(ctx context.Context) (resp tx.StartFromManifestResponse, err error) {
 	e.unsynced = 0
 	tr, ok := e.st.GetTransfer(e.transferID)
@@ -351,9 +363,14 @@ func (e *Env) Round(ctx context.Context) (resp tx.StartFromManifestResponse, err
 	// tx recv copy's manifest carries its .tx/ progress.
 	m := e.manifest
 	manifest := tx.Manifest{TransferID: m.TransferID, Root: m.Root, Mode: m.Mode, Concurrency: m.Concurrency, Entries: slices.Clone(m.Entries)}
+	// A refetched file starts at offset 0 whether or not it is pending.
+	refetched := slices.Clone(e.refetch)
+	ids := slices.Compact(slices.Sorted(slices.Values(append(e.Pending(), refetched...))))
 	var entries []tx.ManifestEntry
-	for _, id := range e.Pending() {
-		manifest.Entries[id-1].Progress.AckBytes = tr.AckedSize[id]
+	for _, id := range ids {
+		if !slices.Contains(refetched, id) {
+			manifest.Entries[id-1].Progress.AckBytes = tr.AckedSize[id]
+		}
 		entries = append(entries, manifest.Entries[id-1])
 	}
 	if len(entries) == 0 {
@@ -367,6 +384,9 @@ func (e *Env) Round(ctx context.Context) (resp tx.StartFromManifestResponse, err
 			resp.Errors = append(resp.Errors, syncErr)
 		}
 		e.unsynced = worker.Unsynced()
+		if err == nil && len(resp.Errors) == 0 && ctx.Err() == nil {
+			e.refetch = slices.DeleteFunc(e.refetch, func(id uint64) bool { return slices.Contains(refetched, id) })
+		}
 	}()
 	e.openedMu.Lock()
 	e.opened = map[uint64][]int64{}
@@ -433,21 +453,44 @@ func (e *Env) Done() []uint64 {
 // Verify runs tx recv copy --verify full's checks of every file: first each
 // copy's size, as its metadata stage does, then its data against the
 // server, through the client. It returns nil only when every size and byte
-// matched. A budget above zero bounds the data pass: dispatch stops when it
+// matched. When files differ, it returns a *filexfercli.MismatchError naming
+// every file of the wrong size and, among the rest, every file whose data
+// differs. Any other error, including a *MismatchError wrapped with a
+// failure or a partial run, is returned unchanged: the verification itself
+// failed or fell short, and it says nothing about the files it did not
+// reach. A budget above zero bounds the data pass: dispatch stops when it
 // expires, and checks still running are cancelled a quarter of it later.
 func (e *Env) Verify(budget time.Duration) error {
+	var ids []uint64
+	m := e.manifest
+	sized := tx.Manifest{TransferID: m.TransferID, Root: m.Root, Mode: m.Mode, Concurrency: m.Concurrency}
 	for i, size := range e.cfg.Sizes {
 		info, err := e.dst[i].Stat()
 		if err != nil {
 			return err
 		}
 		if info.Size() != size {
-			return fmt.Errorf("file %d holds %d bytes, want %d", i+1, info.Size(), size)
+			ids = append(ids, uint64(i+1))
+		} else {
+			sized.Entries = append(sized.Entries, e.manifest.Entries[i])
 		}
 	}
-	return filexfercli.VerifyCopy(e.client, e.manifest, func(entry tx.ManifestEntry) string {
+	err := filexfercli.VerifyCopy(e.client, &sized, func(entry tx.ManifestEntry) string {
 		return fmt.Sprintf("/proc/self/fd/%d", e.dst[entry.ID-1].Fd())
 	}, filexfercli.VerifyCopyOptions{Workers: e.conc, Budget: budget, Grace: budget / 4})
+	// Only a bare mismatch error says it found every wrong file it was
+	// asked about; one wrapped with a failure or a partial run does not.
+	switch mm, bare := err.(*filexfercli.MismatchError); {
+	case bare:
+		ids = append(ids, mm.IDs...)
+	case err != nil:
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	slices.Sort(ids)
+	return &filexfercli.MismatchError{IDs: ids}
 }
 
 // Writes returns how many output Write calls the client has made.

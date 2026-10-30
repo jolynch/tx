@@ -4,6 +4,7 @@ package memxfer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/jolynch/tx"
+	"github.com/jolynch/tx/internal/cmd/filexfercli"
 	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/faults"
 )
@@ -221,8 +223,23 @@ func TestReadFlipReachesZeroCopyFiles(t *testing.T) {
 	if err := e.Restart(nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Verify(0); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+	var mm *filexfercli.MismatchError
+	if err := e.Verify(0); !errors.As(err, &mm) || !slices.Equal(mm.IDs, []uint64{1, 2}) {
 		t.Fatalf("verify of corrupt copies returned %v", err)
+	}
+	// The server marks both files done, so only Refetch fetches them again.
+	if p := e.Pending(); len(p) > 0 {
+		t.Fatalf("files %v pending after the round", p)
+	}
+	e.Refetch(mm.IDs)
+	if resp, err := e.Round(context.Background()); err != nil || len(resp.Errors) > 0 {
+		t.Fatalf("repair round: %v, %v", err, resp.Errors)
+	}
+	if m := e.Mismatched(); len(m) > 0 {
+		t.Fatalf("files %v still wrong after the repair round", m)
+	}
+	if err := e.Verify(0); err != nil {
+		t.Fatalf("verify after the repair round: %v", err)
 	}
 }
 
@@ -362,6 +379,100 @@ func TestVerifyBudget(t *testing.T) {
 	}
 }
 
+// TestVerifyRepairs checks the repair path for the faults only verification
+// detects. After a round under write.flip, read.flip, or write.lost, Verify
+// returns a *filexfercli.MismatchError naming exactly the files that differ
+// from the source, short ones included: a lost write can leave a file short,
+// the size check is the loud form of the same detection, and the repair must
+// cover it. Refetch then downloads those files again from offset 0, though
+// the server marks them done, and the copy verifies clean.
+func TestVerifyRepairs(t *testing.T) {
+	quiet(t)
+	// Small files and files of at least 1 MiB, which read.flip reaches
+	// only through the faulted reader (see TestReadFlipReachesZeroCopyFiles).
+	sizes := []int64{4 << 10, 64 << 10, 1 << 20, 2 << 20, 3 << 20}
+	for _, spec := range []string{"write.flip=1", "read.flip=1", "write.lost=1", "write.lost=0.5"} {
+		t.Run(spec, func(t *testing.T) {
+			inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilyDisk: spec}})
+			e, err := Start(Config{Sizes: sizes, Seed: 1, Faults: inj})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close()
+			if _, err := e.Round(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.Restart(nil); err != nil {
+				t.Fatal(err)
+			}
+			bad := e.Mismatched()
+			if len(bad) == 0 {
+				t.Fatalf("%s left every file intact; the test would pass vacuously", spec)
+			}
+			err = e.Verify(0)
+			me, bare := err.(*filexfercli.MismatchError)
+			if !bare {
+				t.Fatalf("verify returned %T %v; want a bare *filexfercli.MismatchError", err, err)
+			}
+			if !slices.Equal(me.IDs, bad) {
+				t.Fatalf("verify named files %v; Mismatched is %v", me.IDs, bad)
+			}
+			e.Refetch(me.IDs)
+			if resp, err := e.Round(context.Background()); err != nil || len(resp.Errors) > 0 {
+				t.Fatalf("repair round: %v %v", err, resp.Errors)
+			}
+			if m := e.Mismatched(); len(m) != 0 {
+				t.Fatalf("files %v still differ after the repair round", m)
+			}
+			if err := e.Verify(0); err != nil {
+				t.Fatalf("verify after repair: %v", err)
+			}
+		})
+	}
+}
+
+// TestRefetchMark checks the mark Refetch sets survives a round that
+// reports an error, and clears after one that does not.
+func TestRefetchMark(t *testing.T) {
+	quiet(t)
+	inj := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilyDisk: "write.flip=1"}})
+	e, err := Start(Config{Sizes: sizes()[:3], Seed: 1, Faults: inj})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if _, err := e.Round(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	e.Refetch([]uint64{3, 1, 2, 3})
+	if !slices.Equal(e.refetch, []uint64{1, 2, 3}) {
+		t.Fatalf("mark %v, want [1 2 3] sorted and without repeats", e.refetch)
+	}
+	// Failed syncs make a round report an error, though its files arrive.
+	failing := faults.New(faults.Config{Seed: 1, Specs: map[faults.Family]string{faults.FamilySys: "fdatasync.fail=1"}})
+	if err := e.Restart(failing); err != nil {
+		t.Fatal(err)
+	}
+	if resp, err := e.Round(context.Background()); err != nil || len(resp.Errors) == 0 {
+		t.Fatalf("round with failing syncs: %v, errors %v; want errors", err, resp.Errors)
+	}
+	if !slices.Equal(e.refetch, []uint64{1, 2, 3}) {
+		t.Fatalf("mark %v after a round with errors, want it kept", e.refetch)
+	}
+	if err := e.Restart(nil); err != nil {
+		t.Fatal(err)
+	}
+	if resp, err := e.Round(context.Background()); err != nil || len(resp.Errors) > 0 {
+		t.Fatalf("clean round: %v %v", err, resp.Errors)
+	}
+	if len(e.refetch) != 0 {
+		t.Fatalf("mark %v after a clean round, want none", e.refetch)
+	}
+	if m := e.Mismatched(); len(m) != 0 {
+		t.Fatalf("files %v still differ after the clean round", m)
+	}
+}
+
 // TestUnsyncedCountsFailedSyncs checks Env.Unsynced, the durability signal
 // the fault property reads, counts outputs whose background sync failed,
 // and none when every sync succeeds; and that a round whose syncs failed
@@ -407,11 +518,21 @@ func TestUnsyncedCountsFailedSyncs(t *testing.T) {
 //  1. No silent corruption or loss: after every round, each file the
 //     server marks done holds exactly the source's bytes; and a round that
 //     reports no errors had no background output sync fail or get skipped,
-//     and, unless its deadline cut it short, left no file pending.
+//     and, unless its deadline cut it short, left no file pending. The one
+//     excuse is the contract of faults.UndetectedKinds (read.flip,
+//     write.lost, write.flip), which only verification detects: a file such
+//     a kind fired on (Injector.UndetectedFiles) may hold wrong bytes. Every
+//     other file stays exact.
 //  2. Verify is sound: a verify pass that reports success means every file
-//     matches.
+//     matches, and under faults other than read.flip, the files it reports
+//     are wrong.
 //  3. Convergence: after the clean round every file is done and correct,
-//     and verification passes.
+//     except those an undetected kind fired on. The clean verify then
+//     returns nil when every file is correct, and otherwise a bare
+//     *filexfercli.MismatchError naming exactly the wrong files; a partial
+//     or failed verify fails the input. Env.Refetch of the files it names,
+//     and a repair round, then leave every file correct, and a final verify
+//     passes.
 //  4. Benign faults are harmless: under only latencies and failures of
 //     advisory syscalls (fadvise, readahead, mmap, mincore, setsockopt),
 //     the first round finishes every file without an error.
@@ -419,14 +540,14 @@ func TestUnsyncedCountsFailedSyncs(t *testing.T) {
 //     the environment closes, the goroutines and descriptors it used are
 //     released.
 //
-// Go's fuzzer stops any input that runs past 10s, with no message, so the
-// budgets add up to about 8s and each step reports its own overrun first.
+// Go's fuzzer stops any input that runs past 10s, with no message, so each
+// step is also held to one input deadline (inputDeadline) and reports its
+// own overrun, with every goroutine's stack, first.
 //
-// It runs only with TX_PBT_FAULTS set (make pbt-faults), since it fails
-// until the bugs it finds are fixed. With TX_FAULTS_* set, every input runs
-// under those faults instead of its own, so a failure's repro line reruns
-// it. TX_PBT_FAULTS_EXCLUDE turns kinds off, to look past a failure already
-// recorded in docs/IDEAS.md.
+// It runs only with TX_PBT_FAULTS set (make pbt-faults). With TX_FAULTS_*
+// set, every input runs under those faults instead of its own, so a failure's
+// repro line reruns it. TX_PBT_FAULTS_EXCLUDE turns kinds off, to look past a
+// failure already recorded in docs/IDEAS.md.
 func FuzzMemTransferUnderFaults(f *testing.F) {
 	faults.SkipUnlessPBT(f)
 	quiet(f)
@@ -441,7 +562,13 @@ func FuzzMemTransferUnderFaults(f *testing.F) {
 	f.Add(uint64(7), uint8(1), uint8(0x12), uint8(faults.PBTBenign))     // seed#11
 	f.Add(uint64(8), uint8(6), uint8(0b0110), uint8(faults.PBTBenign))   // seed#12
 	f.Add(uint64(24449), uint8(2), uint8(0x35), uint8(faults.PBTBenign)) // seed#13: the largest mix over one connection
+	// seed#14: undetected faults leave a wrong file that verify finds and a
+	// refetch repairs
+	f.Add(uint64(208), uint8(0), uint8(0x10), uint8(faults.PBTSwarm))
 	f.Fuzz(func(t *testing.T, seed uint64, modeByte, flags, faultSet uint8) {
+		deadline := time.Now().Add(inputDeadline)
+		// limit clamps a step's limit to the time left in the input.
+		limit := func(l time.Duration) time.Duration { return max(min(l, time.Until(deadline)), 0) }
 		goroutines, fds := resources()
 		mode := Modes()[int(modeByte)%len(Modes())]
 		cfg, err := faults.PBTConfig(seed, faults.PBTFaultSet(faultSet))
@@ -468,6 +595,17 @@ func FuzzMemTransferUnderFaults(f *testing.F) {
 		where := func() string {
 			return fmt.Sprintf("mode %s, comp %s, %d files, faults %v; repro %s", mode, comp, len(sizes), inj.Counts().InjectedByKind(), inj.Repro())
 		}
+		// excuse returns the files among ids that no undetected kind fired on:
+		// the wrong files that nothing excuses.
+		excuse := func(ids []uint64) (rest []uint64) {
+			hit := inj.UndetectedFiles()
+			for _, id := range ids {
+				if !slices.Contains(hit, id) {
+					rest = append(rest, id)
+				}
+			}
+			return rest
+		}
 		// round runs one bounded round and checks liveness and property 1.
 		round := func(name string, timeout time.Duration) tx.StartFromManifestResponse {
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -476,14 +614,16 @@ func FuzzMemTransferUnderFaults(f *testing.F) {
 				resp tx.StartFromManifestResponse
 				err  error
 			}
-			r := within(t, name, timeout+roundGrace, where, func() result {
+			r := within(t, name, limit(timeout+roundGrace), where, func() result {
 				resp, err := e.Round(ctx)
 				return result{resp, err}
 			})
 			if r.err != nil {
 				t.Fatalf("%s: %v; %s", name, r.err, where())
 			}
-			if bad := corruptDone(e); len(bad) > 0 {
+			// Files an undetected kind fired on may be done and wrong, which
+			// is the contract without --verify; the verify steps check them.
+			if bad := excuse(corruptDone(e)); len(bad) > 0 {
 				// A round resumes from bytes earlier rounds acknowledged, so
 				// the corruption may date from one of them.
 				t.Fatalf("after the %s, files %v are done with wrong bytes (errors %v); %s", name, bad, firstN(r.resp.Errors, 3), where())
@@ -497,7 +637,7 @@ func FuzzMemTransferUnderFaults(f *testing.F) {
 			return r.resp
 		}
 		verify := func(name string, budget time.Duration) error {
-			return within(t, name, budget+budget/4+roundGrace, where, func() error { return e.Verify(budget) })
+			return within(t, name, limit(budget+budget/4+roundGrace), where, func() error { return e.Verify(budget) })
 		}
 
 		if inj.Benign() {
@@ -510,9 +650,17 @@ func FuzzMemTransferUnderFaults(f *testing.F) {
 		for r := 0; r < faultRounds && len(e.Pending()) > 0; r++ {
 			round(fmt.Sprintf("fault round %d", r), faultRoundTimeout)
 		}
-		if err := verify("verify under faults", faultVerifyBudget); err == nil {
-			if m := e.Mismatched(); len(m) > 0 {
-				t.Fatalf("verify passed with files %v wrong; %s", m, where())
+		err = verify("verify under faults", faultVerifyBudget)
+		wrong := e.Mismatched()
+		switch mm := new(filexfercli.MismatchError); {
+		case err == nil && len(wrong) > 0:
+			t.Fatalf("verify passed with files %v wrong; %s", wrong, where())
+		case errors.As(err, &mm) && !slices.Contains(inj.Kinds(), "disk.read.flip"):
+			// Only a flipped verify read can condemn a file that is right.
+			for _, id := range mm.IDs {
+				if !slices.Contains(wrong, id) {
+					t.Fatalf("verify under faults reported file %d, which is right (wrong: %v); %s", id, wrong, where())
+				}
 			}
 		}
 
@@ -520,11 +668,32 @@ func FuzzMemTransferUnderFaults(f *testing.F) {
 			t.Fatal(err)
 		}
 		resp := round("clean round", cleanRoundTimeout)
-		if p, m := e.Pending(), e.Mismatched(); len(p) > 0 || len(m) > 0 {
+		if p, m := e.Pending(), excuse(e.Mismatched()); len(p) > 0 || len(m) > 0 {
 			t.Fatalf("clean round left pending %v, mismatched %v (errors %v); %s", p, m, firstN(resp.Errors, 3), where())
 		}
-		if err := verify("clean verify", cleanVerifyBudget); err != nil {
+		// Without faults, verify names exactly the wrong files, which only
+		// an undetected kind can have left, and fetching them again repairs
+		// them. A partial or failed verify is not a pass.
+		err = verify("clean verify", cleanVerifyBudget)
+		wrong = e.Mismatched()
+		mm, bare := err.(*filexfercli.MismatchError)
+		switch {
+		case len(wrong) == 0 && err != nil:
 			t.Fatalf("verify of a correct copy: %v; %s", err, where())
+		case len(wrong) > 0 && !bare:
+			t.Fatalf("verify of a copy with files %v wrong returned %T %v, want a bare mismatch error; %s", wrong, err, err, where())
+		case len(wrong) > 0 && !slices.Equal(mm.IDs, wrong):
+			t.Fatalf("verify named files %v, but files %v are wrong; %s", mm.IDs, wrong, where())
+		}
+		if len(wrong) > 0 {
+			e.Refetch(mm.IDs)
+			resp = round("repair round", cleanRoundTimeout)
+			if m := e.Mismatched(); len(m) > 0 {
+				t.Fatalf("repair round left files %v wrong (errors %v); %s", m, firstN(resp.Errors, 3), where())
+			}
+			if err := verify("final verify", cleanVerifyBudget); err != nil {
+				t.Fatalf("verify after the repair round: %v; %s", err, where())
+			}
 		}
 		e.Close()
 		closed = true
@@ -534,8 +703,20 @@ func FuzzMemTransferUnderFaults(f *testing.F) {
 	})
 }
 
-// Each input's budget, which with Start and Close stays near 8s at worst.
+// Each input's steps, whose timeouts and budgets add up (without the rare
+// overrun past them) to
+//
+//	2 fault rounds x 0.75s + verify under faults 0.5s + clean round 2s
+//	  + clean verify 1s + repair round 2s + final verify 1s     = 8s
+//
+// and release 0.5s. Each step's within limit adds roundGrace (0.5s), and a
+// verify's also a quarter of its budget, so the limits sum to about 12s,
+// past Go's 10s silent kill. Every within limit is therefore clamped to
+// inputDeadline from the input's start: a step that overruns is reported,
+// with stacks, before the fuzzer kills the input. The clean and final
+// verifies need their whole budget, since a partial verify fails the input.
 const (
+	inputDeadline     = 9 * time.Second
 	faultRounds       = 2
 	faultRoundTimeout = 750 * time.Millisecond
 	faultVerifyBudget = 500 * time.Millisecond

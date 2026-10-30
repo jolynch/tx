@@ -14,10 +14,13 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -182,10 +185,19 @@ func writeFaultTree(t *testing.T, src string, seed uint64) {
 // restarts without faults and one clean copy runs. It checks:
 //
 //  1. A copy that exits 0, with or without --verify, leaves a tree equal to
-//     the source: paths, types, content, modes, mtimes, symlink targets,
-//     hardlink groups, and the root directory's mode and mtime.
+//     the source: paths, types, modes, mtimes, symlink targets, hardlink
+//     groups, and the root directory's mode and mtime; and content, except
+//     for a copy run without --verify under faults.UndetectedKinds
+//     (read.flip, write.lost, write.flip), which no layer detects without
+//     it. That copy may exit 0 with wrong bytes, and only its content is
+//     excused.
 //  2. The clean copy exits 0 and converges to an equal tree, whatever the
-//     earlier runs left in the destination and its .tx/ state.
+//     earlier runs left in the destination and its .tx/ state. Under
+//     undetected kinds the clean copy runs with --verify full, and may exit
+//     1 with a data-verification failure, but only one that names exactly
+//     the files of the tree that differ from the source (the same count,
+//     and every path it shows among them). It marks them stale, and a
+//     second clean copy with --verify full must exit 0 with an equal tree.
 //  3. Benign faults are harmless: under only latencies and failures of
 //     advisory syscalls, the first copy exits 0.
 //  4. Every copy returns within copyTimeout.
@@ -314,8 +326,14 @@ func treeCopyUnderFaults(t *testing.T, seed uint64) {
 		go func() { code <- RunCLI(args(verify), &stdout, &stderr) }()
 		select {
 		case c := <-code:
+			// Without --verify, a run whose undetected kinds fired may exit
+			// 0 with wrong bytes: that is the contract. Everything else
+			// about the tree is still checked. The copy removes its .tx/
+			// state on success, so the IDs those kinds hit cannot be
+			// mapped to paths, and content is excused only once one fired.
 			if c == 0 {
-				got, err := dataset.Verify(context.Background(), dst, want, dataset.VerifyOptions{Content: true, Jobs: 2})
+				content := verify || len(inj.UndetectedFiles()) == 0
+				got, err := dataset.Verify(context.Background(), dst, want, dataset.VerifyOptions{Content: content, Jobs: 2})
 				if err != nil || !got.OK() {
 					t.Fatalf("%s copy (verify=%v) exited 0 but the tree differs: %v %v; %s\nstderr:\n%s", name, verify, err, got.Mismatches, where(), stderr.String())
 				}
@@ -344,11 +362,65 @@ func treeCopyUnderFaults(t *testing.T, seed uint64) {
 	}
 	clientFaults.Store(nil)
 	srv.restart(t, nil)
-	if code, stderr := copyOnce("clean", flags&0b1 != 0); code != 0 {
+	// Only verification finds what the undetected kinds changed, so their
+	// clean copy verifies, and may exit 1 naming the files it found wrong;
+	// the next copy fetches those again.
+	verifyClean := flags&0b1 != 0 || inj.Undetected()
+	code, stderr := copyOnce("clean", verifyClean)
+	if code != 0 && inj.Undetected() && strings.Contains(stderr, "failed data verification") {
+		// The failure must be the corruption itself: as many files as the
+		// tree has wrong, and no right one among those it names.
+		checkReportedFiles(t, stderr, dst, want, where)
+		code, stderr = copyOnce("repair", true)
+	}
+	if code != 0 {
 		t.Fatalf("clean copy exited %d after faulted runs; %s\nstderr:\n%s", code, where(), stderr)
 	}
 	if testing.Verbose() {
 		t.Logf("mode %s: faults %v", mode, inj.Counts().InjectedByKind())
+	}
+}
+
+// verifyFailure matches the CLI's data-verification failure line: the count,
+// the destination paths it shows, and an optional tail naming the rest.
+var verifyFailure = regexp.MustCompile(`(\d+) files? failed data verification: (.*?)(?:, and \d+ more)? \(first: `)
+
+// checkReportedFiles fails t unless the data-verification failure in stderr
+// names exactly the files of dst whose content differs from want: the same
+// count, and every path it shows among them. The failed copy has already
+// marked those files stale, so this ignores mtimes. A hardlink group is one
+// file, named by any of its paths.
+func checkReportedFiles(t *testing.T, stderr, dst string, want []dataset.Entry, where func() string) {
+	t.Helper()
+	m := verifyFailure.FindStringSubmatch(stderr)
+	if m == nil {
+		t.Fatalf("clean copy failed verification in a form the test cannot read; %s\nstderr:\n%s", where(), stderr)
+	}
+	got, err := dataset.Verify(context.Background(), dst, want, dataset.VerifyOptions{Content: true, SkipMtime: true, Jobs: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MismatchCount > dataset.MaxReportedMismatches {
+		t.Fatalf("%d files differ, past the %d the dataset check lists; the test tree grew; %s", got.MismatchCount, dataset.MaxReportedMismatches, where())
+	}
+	inode := func(path string) uint64 {
+		info, err := os.Lstat(filepath.Join(dst, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.Sys().(*syscall.Stat_t).Ino
+	}
+	wrong := map[uint64]bool{}
+	for _, mm := range got.Mismatches {
+		wrong[inode(mm.Path)] = true
+	}
+	if n, _ := strconv.Atoi(m[1]); n != len(wrong) {
+		t.Fatalf("clean copy reported %d files failing verification, but %d differ: %v; %s\nstderr:\n%s", n, len(wrong), got.Mismatches, where(), stderr)
+	}
+	for _, p := range strings.Split(m[2], ", "+dst+"/") {
+		if p = strings.TrimPrefix(p, dst+"/"); !wrong[inode(p)] {
+			t.Fatalf("clean copy reported %q, which matches the source (wrong: %v); %s\nstderr:\n%s", p, got.Mismatches, where(), stderr)
+		}
 	}
 }
 

@@ -14,12 +14,12 @@ PBTDEADLINE ?= 10m
 PBTPARALLEL ?= 4
 PBTCACHE ?= $(CURDIR)/.pbt-fuzzcache
 # Fault kinds the pbt-faults swarms leave out, comma-separated, such as
-# disk.write.lost,disk.write.flip: to look past failures already recorded.
-# Until those are fixed, an empty list fails on its first seed; known, alone
-# or in the list, stands for PBT_KNOWN, the kinds behind the failures
-# docs/IDEAS.md records.
+# disk.write.lost,disk.write.flip: to look past a failure already recorded.
+# known, alone or in the list, stands for PBT_KNOWN, the kinds behind the
+# failures docs/IDEAS.md records. None fail now, so PBT_KNOWN is empty; add
+# a kind to it when a property finds a bug that will take a while to fix.
 PBT_EXCLUDE ?=
-PBT_KNOWN := disk.read.flip,disk.write.lost,disk.write.flip
+PBT_KNOWN :=
 # Fuzzes one target for a time budget, ending it with SIGINT rather than
 # -fuzztime (see scripts/fuzz): [-race] PACKAGE TARGET DURATION DEADLINE.
 FUZZ := ./scripts/fuzz
@@ -110,9 +110,10 @@ fuzz-long:
 	$(FUZZ) -race ./internal/cmd/filexfercli FuzzCopyVerifyDetectsCorruption $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG) -parallel=4
 
 # Fault-injection properties (docs/arch/FAULTS.md). They are not part of
-# acceptance: they fail until the bugs they find are fixed, and each moves to
-# fuzz-long once it passes. CI's fault-injection job runs them with
-# PBT_EXCLUDE=known, so a kind fixed and removed from PBT_KNOWN stays fixed.
+# acceptance: they fail whenever they find a bug, and they stay here once
+# they pass, with longer budgets than fuzz-long. CI's fault-injection job
+# runs them with PBT_EXCLUDE=known, so a kind removed from PBT_KNOWN stays
+# fixed.
 # They skip unless TX_PBT_FAULTS is set, so their seeds never fail make unit.
 # TestTreeCopyUnderFaults sweeps random seeds for PBTTIME instead of fuzzing,
 # since its CLI copies can outlast the fuzzer's 10s limit per input. Each

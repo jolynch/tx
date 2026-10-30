@@ -395,12 +395,19 @@ func TestSpecs(t *testing.T) {
 	if bad.rates[NetReset] != 0 || bad.rates[NetPartial] == 0 {
 		t.Fatalf("bad-day with an override has kinds %v", bad.Kinds())
 	}
-	// bad-day leaves out the kinds no layer detects without --verify, and
-	// open.enoent, which leaves a file missing for good.
-	for _, k := range []Kind{DiskReadFlip, DiskWriteLost, DiskWriteFlip, DiskOpenENOENT} {
-		if bad.rates[k] != 0 {
-			t.Fatalf("bad-day turns on %s", k)
+	// bad-day leaves out UndetectedKinds and open.enoent, which leaves a file
+	// missing for good.
+	if bad.Undetected() || bad.rates[DiskOpenENOENT] != 0 {
+		t.Fatalf("bad-day turns on %v", bad.Kinds())
+	}
+	// UndetectedKinds names exactly the three kinds bad-day leaves out.
+	for _, k := range []Kind{DiskReadFlip, DiskWriteLost, DiskWriteFlip} {
+		if !slices.Contains(UndetectedKinds(), k.String()) || bad.rates[k] != 0 {
+			t.Fatalf("%s is not in UndetectedKinds or bad-day turns it on", k)
 		}
+	}
+	if !one(t, FamilyDisk, "write.lost=0.5").Undetected() || one(t, FamilyDisk, "write.eio=0.5").Undetected() || (*Injector)(nil).Undetected() {
+		t.Fatal("Undetected misjudges write.lost, write.eio, or a nil injector")
 	}
 	// A rate of 0 turns a profile's timed kind off without a duration.
 	if quiet, err := Build(Config{Profile: "bad-day", Specs: map[Family]string{FamilySys: "*.latency=0"}}); err != nil || quiet.rates[syscallKind(SysSplice, sysLatency)] != 0 {

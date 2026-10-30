@@ -49,6 +49,11 @@ func Swarm(seed uint64, opts SwarmOptions) Config {
 		opts.MaxDuration = 20 * time.Millisecond
 	}
 	r := rand.New(rand.NewPCG(seed, 0x5357524d)) // "SWRM"
+	// One more coin gates the undetected kinds together, from a stream of
+	// its own so every other kind's draws stay as they were. Each is then
+	// on a quarter of the time: a property that excuses them then sees
+	// plenty of runs with none.
+	undetectedOn := rand.New(rand.NewPCG(seed, 0x554e4454)).IntN(2) == 0 // "UNDT"
 	entries := make([][]string, familyCount)
 	for k := range Kind(kindCount) {
 		info := kinds[k]
@@ -70,7 +75,7 @@ func Swarm(seed uint64, opts SwarmOptions) Config {
 			dist = ":" + swarmDist(r, opts.MaxDuration)
 		}
 		excluded := (opts.Families != nil && !slices.Contains(opts.Families, info.family)) || slices.Contains(opts.Exclude, k.String()) ||
-			(opts.Benign && !benignKind(k))
+			(opts.Benign && !benignKind(k)) || (!undetectedOn && slices.Contains(undetectedKinds, k.String()))
 		if on && !excluded {
 			entries[info.family] = append(entries[info.family], info.name+"="+strconv.FormatFloat(rate, 'g', 3, 64)+dist)
 		}
@@ -207,6 +212,51 @@ func (i *Injector) Benign() bool {
 		}
 	}
 	return true
+}
+
+// undetectedKinds are the kinds no layer detects without verification: the
+// bytes change after the server or client hashed them, so a run without
+// --verify can exit 0 with wrong data. With --verify, the mismatch is
+// reported and the next run fetches the file again.
+var undetectedKinds = []string{"disk.read.flip", "disk.write.lost", "disk.write.flip"}
+
+// UndetectedKinds returns the names of the kinds no layer detects without
+// verification, as Kind.String spells them.
+func UndetectedKinds() []string { return slices.Clone(undetectedKinds) }
+
+// Undetected reports whether i turns on any of UndetectedKinds.
+func (i *Injector) Undetected() bool {
+	for _, k := range i.Kinds() {
+		if slices.Contains(undetectedKinds, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// UndetectedFiles returns, sorted, the files a kind in UndetectedKinds
+// fired on at a site that changes a downloaded copy: a SEND read for
+// read.flip, an output write for write.flip and write.lost. The decision is
+// by block or read, so a file's last bytes may lie past a fired fault's
+// position and be untouched; the list may therefore name a file that is
+// still right, but never omits one that is wrong. A nil injector returns nil.
+func (i *Injector) UndetectedFiles() []uint64 {
+	if i == nil {
+		return nil
+	}
+	i.hitMu.Lock()
+	defer i.hitMu.Unlock()
+	return slices.Sorted(maps.Keys(i.hit))
+}
+
+// recordHit notes that an undetected kind fired on file.
+func (i *Injector) recordHit(file uint64) {
+	i.hitMu.Lock()
+	defer i.hitMu.Unlock()
+	if i.hit == nil {
+		i.hit = map[uint64]struct{}{}
+	}
+	i.hit[file] = struct{}{}
 }
 
 // benignKind reports whether k only delays IO or fails an advisory syscall.

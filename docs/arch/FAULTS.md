@@ -159,8 +159,9 @@ fits the shape: from a mean and one percentile, or from two percentiles.
 in-memory transfer still finishes with correct bytes within a few resume
 rounds; `TestBadDayCompletes` in `internal/memxfer` holds it to that in every
 session mode, each with its own seed. It leaves out `read.flip`,
-`write.lost`, and `write.flip`, which no layer detects without `--verify`, so
-a run could succeed with wrong data, and `open.enoent`, after which a file
+`write.lost`, and `write.flip` (`faults.UndetectedKinds()`), which no layer
+detects without `--verify`, so a run could succeed with wrong data, and
+`open.enoent`, after which a file
 stays missing until a later round delivers it. Its per-file kinds stay near
 0.1–0.3%: one fault fails a whole SEND batch, so a batch of small files must
 usually get through.
@@ -189,11 +190,11 @@ tests check it.
 | MSG    | `busy`                       | each accept, on a server requiring auth                              | `ERR BUSY`; the client retries the handshake                                 |
 | DISK   | `open.enoent`, `open.eio`    | each SEND and CXSUM open                                             | 404 until a later round delivers it; or a loud error                          |
 | DISK   | `read.eio`, `read.latency` ⏱ | each buffered SEND, CXSUM, and verify read                           | loud error; liveness. Spliced frames: SYS `splice`                           |
-| DISK   | `read.flip`                  | each SEND, CXSUM, and verify read: one bit                           | none without `--verify`: the server hashes what it read                      |
+| DISK   | `read.flip`                  | each SEND, CXSUM, and verify read: one bit                           | `--verify`; the next run fetches the file again                              |
 | DISK   | `write.eio`, `write.enospc`  | each 64 KiB block of a client output                                 | loud error at the block; resume repairs                                      |
 | DISK   | `write.short`, `write.torn`  | each output block: stops inside it                                   | loud error; a short write breaks `io.Writer` and must be caught              |
 | DISK   | `write.latency` ⏱            | each output block                                                    | liveness only                                                                |
-| DISK   | `write.lost`, `write.flip`   | each output block: skipped (seekable outputs only), or one bit       | none without `--verify`: the client hashes before writing                    |
+| DISK   | `write.lost`, `write.flip`   | each output block: skipped (seekable outputs only), or one bit       | `--verify`; the next run fetches the file again                              |
 | SYS    | `<syscall>.fail`             | each gated syscall                                                   | hard errors loud; advisory calls skipped; `EINTR` retried                    |
 | SYS    | `<syscall>.latency` ⏱        | each gated syscall                                                   | liveness only                                                                |
 | SYS    | `<syscall>.short`            | each splice, tee, or copy_file_range: fewer bytes                    | handled by the caller's loop                                                 |
@@ -265,9 +266,12 @@ target (`pbt-memxfer`, `pbt-tree`, `pbt-pool`), so `make -k pbt-faults` runs
 every one past a failing one. Each input picks a
 fault set from its seed: a swarm (`faults.Swarm`), which turns on each kind
 with probability one half at a log-uniform rate; the `bad-day` profile; or a
-swarm of benign kinds only. The same seed derives the schedule, and a
-failure message ends with the line that reruns its faults; which operation
-a fault lands on can still vary with timing, as
+swarm of benign kinds only. A separate coin, drawn from its own stream so no
+other kind's draw changes, also gates `read.flip`, `write.lost`, and
+`write.flip` together, which makes each of them appear a quarter of the time.
+The same seed derives the schedule, and a failure message ends with the line
+that reruns its faults; which operation a fault lands on can still vary with
+timing, as
 [Reproducing a run](#reproducing-a-run) describes.
 
 | Property                     | Package                    | What it drives                                                         |
@@ -279,7 +283,26 @@ a fault lands on can still vary with timing, as
 They check that tx either finishes correctly or fails loudly:
 
 - A file the server marks done, or a copy that exits 0, holds exactly the
-  source's bytes and metadata.
+  source's bytes and metadata. The one exception is the kinds in
+  `faults.UndetectedKinds()` (`read.flip`, `write.lost`, `write.flip`), which
+  only `--verify` detects. The injector records the files they fired on
+  (`Injector.UndetectedFiles`: a SEND read for `read.flip`, an output write
+  for the others), and only those files may be done with wrong bytes.
+  In memxfer every other file stays exact, so a real bug cannot hide
+  behind the contract; the tree copy excuses content more broadly, as
+  below.
+- Verification under those kinds finds exactly the wrong files. In memxfer,
+  a clean verify returns nil when every file is right, and otherwise a
+  bare `MismatchError` naming exactly the wrong files; a partial or failed
+  verify fails the input. `Env.Refetch` of those files and a repair round
+  then leave every file right, and a final verify passes. In the tree
+  copy, a copy run without `--verify` may exit 0 with wrong content once
+  an undetected kind has fired, since its IDs cannot be mapped to paths
+  after the copy removes its `.tx/` state, but its paths, types, modes,
+  mtimes, links, and root are still checked; a
+  clean copy run with `--verify full` may fail only with a report naming
+  exactly the files that differ, and a second one then exits 0 with an equal
+  tree.
 - A round that reports no errors had no background output sync fail or
   get skipped.
 - A verify pass that reports success means every byte matches.
@@ -288,20 +311,23 @@ They check that tx either finishes correctly or fails loudly:
 - Every step returns within its budget, and memxfer releases every
   goroutine and descriptor it used.
 
-Go's fuzzer stops any input that runs past 10s, with no message, so the two
-fuzz targets keep each input near 8s at worst and report an overrun, with
-every goroutine's stack, before then. A CLI copy cannot be bounded that
+Go's fuzzer stops any input that runs past 10s, with no message, so
+`FuzzMemTransferUnderFaults` holds each input to one deadline of 9s: every
+step's limit is clamped to the time left, so an overrun is reported with
+every goroutine's stack before then. A CLI copy cannot be bounded that
 tightly: it may wait out tx's own timeouts, such as 15s for an ACK. So
 `TestTreeCopyUnderFaults` sweeps seeds in a plain test, allowing each copy
 90s.
 
 The tests never touch a disk: memxfer keeps files in memfds, and the tree
 copy runs on tmpfs (`/dev/shm`, or `TX_PBT_TMPFS`), skipping when neither
-is tmpfs. They sit outside `acceptance`, because they fail until the bugs
-they find are fixed; each moves to `fuzz-long` once it passes. CI's
-`fault-injection` job runs `make -k pbt-faults PBT_EXCLUDE=known`: every
-kind except the `PBT_KNOWN` ones behind recorded failures, so a kind
-removed from that list once fixed stays fixed.
+is tmpfs. They sit outside `acceptance`, because they fail whenever they
+find a bug, and they stay in `pbt-faults` once they pass, where their swarms
+get longer budgets than `fuzz-long` gives. CI's `fault-injection`
+job runs `make -k pbt-faults PBT_EXCLUDE=known`: every kind except the
+`PBT_KNOWN` ones behind recorded failures. That list is empty now. Add a
+kind to it while its bug is open, and remove it once fixed, so CI keeps it
+fixed.
 
 | Variable                  | Effect                                                                                                         |
 | ------------------------- | -------------------------------------------------------------------------------------------------------------- |

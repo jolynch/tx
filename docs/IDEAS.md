@@ -46,12 +46,12 @@ instead of widening the current change; remove an entry when it ships.
   what it read and the client hashes the buffer before writing it, so a
   flipped read on the server (`read.flip`) or a lost or flipped write on the
   client (`write.lost`, `write.flip`) leaves a file marked done with wrong
-  bytes. Only `--verify` catches them, as FAULTS.md's catalog says.
-  pbt-faults confirms all three, for example `TX_PBT_FAULTS=1
-  TX_FAULTS_SEED=7 TX_FAULTS_DISK='write.flip=0.2' go test -run
-  'FuzzMemTransferUnderFaults/seed#0' ./internal/memxfer`. Rereading written
-  ranges before the ACK would catch the client's; the server's needs a
-  second read or a checksum from below the page cache.
+  bytes. `--verify` reports them and marks the files stale, so the next run
+  fetches them again; a run without it exits 0 with the wrong bytes.
+  Closing that gap means rereading what the client wrote before the ACK,
+  for example with `O_DIRECT` so the reread reaches the device rather than
+  the page cache, which costs a second pass over every byte; the server's
+  side needs a second read or a checksum from below the page cache.
 - **A revived file can make a logged transfer incomplete again.** A file
   acknowledged missing (`-1`) counts as finished, so a transfer whose last
   pending file hits a transient `ENOENT` logs `txfer-complete` and emits

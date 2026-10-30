@@ -1,6 +1,9 @@
 package faults
 
 import (
+	"bytes"
+	"context"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -123,5 +126,138 @@ func TestWithout(t *testing.T) {
 	}
 	if _, err := Build(Without(Config{}, []string{"net.nonsense"})); err == nil {
 		t.Fatal("Without hid an unknown kind")
+	}
+}
+
+// TestUndetected checks Undetected is true exactly for injectors enabling a
+// kind no layer detects without verification, and that UndetectedKinds names
+// real kinds.
+func TestUndetected(t *testing.T) {
+	want := []string{"disk.read.flip", "disk.write.lost", "disk.write.flip"}
+	if !slices.Equal(UndetectedKinds(), want) {
+		t.Fatalf("UndetectedKinds = %v, want %v", UndetectedKinds(), want)
+	}
+	for _, k := range UndetectedKinds() {
+		name, ok := strings.CutPrefix(k, "disk.")
+		if !ok {
+			t.Fatalf("%s is not a DISK kind", k)
+		}
+		inj := one(t, FamilyDisk, name+"=1")
+		if !slices.Contains(inj.Kinds(), k) {
+			t.Errorf("%s is not a kind: Kinds() = %v", k, inj.Kinds())
+		}
+		if !inj.Undetected() {
+			t.Errorf("injector enabling %s: Undetected() = false", k)
+		}
+	}
+	var nilInj *Injector
+	for name, inj := range map[string]*Injector{
+		"nil":       nilInj,
+		"no faults": New(Config{Seed: 1}),
+		"bad-day":   New(Config{Seed: 1, Profile: "bad-day"}),
+		"benign":    one(t, FamilyDisk, "read.eio=1, write.short=1"),
+	} {
+		if inj.Undetected() {
+			t.Errorf("%s injector: Undetected() = true", name)
+		}
+	}
+}
+
+// TestUndetectedFiles checks the injector records the files an undetected
+// kind fired on, and only at the sites that change a downloaded copy.
+func TestUndetectedFiles(t *testing.T) {
+	data := make([]byte, 3*writeBlock)
+	read := func(spec string, site Site, file uint64) *Injector {
+		inj := one(t, FamilyDisk, spec)
+		r := inj.WrapReaderAt(context.Background(), site, file, bytes.NewReader(data))
+		if _, err := r.ReadAt(make([]byte, 1024), 0); err != nil {
+			t.Fatal(err)
+		}
+		return inj
+	}
+	write := func(spec string, site Site, file uint64) *Injector {
+		inj := one(t, FamilyDisk, spec)
+		w := inj.WrapWriter(site, file, 0, nopWriteCloser{&bytes.Buffer{}})
+		if _, err := w.Write(data); err != nil {
+			t.Fatal(err)
+		}
+		return inj
+	}
+	if got := read("read.flip=1", SiteSendRead, 7).UndetectedFiles(); !slices.Equal(got, []uint64{7}) {
+		t.Errorf("read.flip on a SEND read recorded %v, want [7]", got)
+	}
+	for _, site := range []Site{SiteCXSUMRead, SiteVerifyRead} {
+		if got := read("read.flip=1", site, 7).UndetectedFiles(); got != nil {
+			t.Errorf("read.flip at site %d recorded %v, want none", site, got)
+		}
+	}
+	if got := read("read.eio=0", SiteSendRead, 7).UndetectedFiles(); got != nil {
+		t.Errorf("a read with no flips recorded %v", got)
+	}
+	if got := write("write.flip=1", SiteOutputWrite, 3).UndetectedFiles(); !slices.Equal(got, []uint64{3}) {
+		t.Errorf("write.flip recorded %v, want [3]", got)
+	}
+	// A writer that cannot seek gets no lost blocks, so records none.
+	lost := one(t, FamilyDisk, "write.lost=1")
+	if _, err := lost.WrapWriter(SiteOutputWrite, 4, 0, nopWriteCloser{&bytes.Buffer{}}).Write(data); err != nil || lost.UndetectedFiles() != nil {
+		t.Errorf("write.lost on a writer that cannot seek recorded %v, %v", lost.UndetectedFiles(), err)
+	}
+	if got := write("write.torn=0, write.short=0", SiteOutputWrite, 3).UndetectedFiles(); got != nil {
+		t.Errorf("no undetected kind recorded %v", got)
+	}
+	var nilInj *Injector
+	if nilInj.UndetectedFiles() != nil {
+		t.Error("a nil injector recorded files")
+	}
+	// Several files come back sorted, once each.
+	inj := one(t, FamilyDisk, "write.flip=1")
+	for _, id := range []uint64{9, 2, 9, 5} {
+		if _, err := inj.WrapWriter(SiteOutputWrite, id, 0, nopWriteCloser{&bytes.Buffer{}}).Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := inj.UndetectedFiles(); !slices.Equal(got, []uint64{2, 5, 9}) {
+		t.Errorf("recorded %v, want [2 5 9]", got)
+	}
+}
+
+// TestSwarmUndetectedGate checks the group coin that gates the undetected
+// kinds leaves every other kind's draw as it was: a swarm minus those kinds
+// equals the same swarm with them excluded, and the coin comes up both ways.
+func TestSwarmUndetectedGate(t *testing.T) {
+	strip := func(cfg Config) map[Family]string {
+		out := map[Family]string{}
+		for f, spec := range cfg.Specs {
+			var keep []string
+			for _, e := range strings.Split(spec, ", ") {
+				name, _, _ := strings.Cut(e, "=")
+				if !slices.Contains(UndetectedKinds(), strings.ToLower(f.String())+"."+name) {
+					keep = append(keep, e)
+				}
+			}
+			if len(keep) > 0 {
+				out[f] = strings.Join(keep, ", ")
+			}
+		}
+		return out
+	}
+	opts := SwarmOptions{MaxRate: 0.05, MaxDuration: 10 * time.Millisecond}
+	without := opts
+	without.Exclude = UndetectedKinds()
+	on, off := 0, 0
+	for seed := range uint64(300) {
+		cfg := Swarm(seed, opts)
+		if !maps.Equal(strip(cfg), strip(Swarm(seed, without))) {
+			t.Fatalf("seed %d: the gate changed other kinds: %v vs %v", seed, cfg.Specs, Swarm(seed, without).Specs)
+		}
+		if New(cfg).Undetected() {
+			on++
+		} else {
+			off++
+		}
+	}
+	// Each kind is on a quarter of the time, so about 58% of swarms have one.
+	if on < 100 || off < 60 {
+		t.Fatalf("%d of 300 swarms enabled an undetected kind", on)
 	}
 }

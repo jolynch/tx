@@ -91,6 +91,9 @@ func (r *readerAt) ReadAt(p []byte, off int64) (int, error) {
 	}
 	n, err := r.r.ReadAt(p, off)
 	if n > 0 && i.firesAt(DiskReadFlip, key, 0, r.file, off) {
+		if r.site == SiteSendRead {
+			i.recordHit(r.file)
+		}
 		rng := i.rng(DiskReadFlip, key, 0)
 		p[rng.IntN(n)] ^= 1 << rng.IntN(8)
 	}
@@ -114,7 +117,7 @@ func (i *Injector) WrapWriter(site Site, file uint64, offset int64, w io.WriteCl
 	}
 	first := (offset + writeBlock - 1) / writeBlock * writeBlock
 	_, seeks := w.(io.Seeker)
-	return &writer{w: w, inj: i, key: i.diskKey(site, file, offset), file: file, pos: offset, next: first, failAt: -1, seeks: seeks}
+	return &writer{w: w, inj: i, key: i.diskKey(site, file, offset), file: file, site: site, pos: offset, next: first, failAt: -1, seeks: seeks}
 }
 
 // writer decides each write fault once per block of the file it writes, at
@@ -126,6 +129,7 @@ type writer struct {
 	inj  *Injector
 	key  uint64
 	file uint64
+	site Site
 	pos  int64 // where the next byte lands
 	next int64 // the next block start to decide
 	// seeks reports whether w can skip a lost block, leaving the file's
@@ -167,10 +171,20 @@ func (w *writer) decide(end int64) {
 		}
 		if w.seeks && at(DiskWriteLost) {
 			w.lost = append(w.lost, [2]int64{b, b + writeBlock})
+			w.recordHit()
 		}
 		if at(DiskWriteFlip) {
+			w.recordHit()
 			w.flips = append(w.flips, b+i.rng(DiskWriteFlip, w.key, op).Int64N(writeBlock))
 		}
+	}
+}
+
+// recordHit notes that an undetected fault fired on w's file, if w writes
+// the downloaded copy.
+func (w *writer) recordHit() {
+	if w.site == SiteOutputWrite {
+		w.inj.recordHit(w.file)
 	}
 }
 
