@@ -388,7 +388,7 @@ func (e *Env) Round(ctx context.Context) (resp tx.StartFromManifestResponse, err
 			e.openedMu.Lock()
 			e.opened[entry.ID] = append(e.opened[entry.ID], offset)
 			e.openedMu.Unlock()
-			return countingWriter{WriteCloser: w, e: e}, worker.SyncOutput(fd, offset, fmt.Sprintf("file %d", entry.ID)), nil
+			return countingWriter{WriteCloser: w, e: e}, worker.SyncOutput(fd, offset, entry.ID, fmt.Sprintf("file %d", entry.ID)), nil
 		},
 		Concurrency:        e.conc,
 		BatchMaxBytes:      1 << 20,

@@ -230,6 +230,10 @@ go run ./cmd/tx-bench local -s 256MiB -n 1
   typed allowlist, and age key decoding. flynn/noise runs only the handshake
   and stays inside the package; the record layer owns its AEAD, nonce counter,
   and REKEY, and allocates nothing per record.
+- `internal/idset`: a set of file IDs, a bitset for dense IDs that falls back
+  to a sorted slice for sparse ones. Failure paths (`fsync.SyncWorker.Failed`,
+  verify mismatches) keep IDs rather than a path per file; look paths up in
+  the manifest when marking or reporting.
 - `internal/{pagecache,fsync,sampler,utils,metrics}`:
   cache restore, fsync batching, sampling, network/string helpers, and metrics.
 - `internal/events`: the nil-safe event `Sink`, its JSON-lines encoding, and

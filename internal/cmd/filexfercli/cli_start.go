@@ -414,6 +414,40 @@ func runStart(serverURL string, cfg startArgs, stdout io.Writer, stderr io.Write
 				}
 			}
 			code = finishSyncError(stderr, cfg.stats, err, rewrite, code)
+			// A file that failed to sync may be corrupt on disk, yet its
+			// size, mtime, and mode match, so the next run would skip it.
+			// Every output of this run was opened from manifest, so the
+			// failed IDs resolve against manifest.Entries.
+			failed := syncWorker.Failed()
+			if renamed {
+				// Mark the target copies stale so the next run fetches them
+				// again.
+				markEntriesForRefetch(stderr, "copy-fsync", ps.TargetDir, &failed, manifest.Entries)
+			} else if failed.Len() > 0 {
+				// The run is not complete: it exits 1, and a rerun resumes from
+				// progress state, which does not look at mtimes. Forget the
+				// files' progress so the rerun fetches them again. The writer
+				// keeps the highest ack it has seen, so stop it first and
+				// rewrite the state it leaves.
+				if !progressStopped {
+					stopProgress()
+					progressStopped = true
+				}
+				for id := range failed.All() {
+					delete(progressState, id)
+				}
+				if err := saveProgressState(ps.ProgressPath, manifestFingerprint, progressState); err != nil {
+					// The old progress file still counts these files done. Removing
+					// it needs no space, so it works on a full disk, and a resume
+					// without progress fetches everything again, which is safe.
+					fmt.Fprintf(stderr, "copy-fsync: WARNING: could not reset progress of %d files that failed to sync: %v\n", failed.Len(), err)
+					if rmErr := os.Remove(ps.ProgressPath); rmErr != nil && !os.IsNotExist(rmErr) {
+						fmt.Fprintf(stderr, "copy-fsync: error: could not remove %s: %v; a resume may skip files that are not durable\n", ps.ProgressPath, rmErr)
+					}
+				} else {
+					fmt.Fprintf(stderr, "copy-fsync: reset progress of %d files that failed to sync; the next run fetches them again\n", failed.Len())
+				}
+			}
 		}
 		cancelStop()
 		if !cfg.noSync && !cfg.discard {

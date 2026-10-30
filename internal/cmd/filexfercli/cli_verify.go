@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,7 @@ import (
 	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/idset"
 	"github.com/jolynch/tx/internal/sampler"
 	"github.com/zeebo/xxh3"
 )
@@ -74,7 +76,12 @@ type verifyDataResult struct {
 	planned           int64 // samples the plan drew; fewer verified is partial
 	elapsed           time.Duration
 	partial           bool
-	seed              uint64
+	// unchecked is whether some planned sample was neither verified nor in
+	// a batch that found a mismatch, so a budget cut or a failure left it
+	// unexamined. A run that found mismatches is partial yet may be fully
+	// checked.
+	unchecked bool
+	seed      uint64
 }
 
 // coverage reports the files and bytes verified out of the totals.
@@ -99,7 +106,13 @@ func finishDataVerify(stderr io.Writer, prefix string, cfg copyCLIConfig, metaFa
 	if cfg.verifyDataSamplePct > 0 {
 		result, err := verify()
 		if err != nil {
-			fmt.Fprintf(stderr, "%s: [fail] seed=%016x %v\n", prefix, result.seed, err)
+			// A failure joined with mismatches spans lines; keep it on the
+			// [fail] line.
+			fmt.Fprintf(stderr, "%s: [fail] seed=%016x %s\n", prefix, result.seed, strings.ReplaceAll(err.Error(), "\n", "; "))
+			var m mismatchError
+			if errors.As(err, &m) {
+				m.markForRefetch(stderr, prefix)
+			}
 			return 1
 		}
 		fmt.Fprintln(stderr, formatVerifyDataSummaryLine(prefix, result, cfg.verifyDataSamplePct, cfg.verifyBudget))
@@ -207,6 +220,7 @@ func newVerifyFiles(root string, entries []tx.ManifestEntry, opts verifyOptions,
 // verifyProgress accumulates verified coverage across workers.
 type verifyProgress struct {
 	files, samples, bytes atomic.Int64
+	mismatched            atomic.Int64 // samples of batches that found a mismatch
 }
 
 func (p *verifyProgress) done(items []verifyItem) {
@@ -229,14 +243,113 @@ func (p *verifyProgress) result(totals verifyDataResult, start time.Time) verify
 	totals.bytes = p.bytes.Load()
 	totals.elapsed = time.Since(start)
 	totals.partial = totals.samples < totals.planned
+	totals.unchecked = totals.samples+p.mismatched.Load() < totals.planned
 	return totals
 }
 
 // mismatchError marks a data mismatch, which fails the run even when it is
 // found while the run is being cancelled.
-type mismatchError struct{ error }
+// It names every mismatching file it knows of, once each, by manifest ID: a
+// run that finds every file wrong holds a bit per file, not a path.
+type mismatchError struct {
+	error            // detail of the first mismatch found
+	ids   *idset.Set // nil until the first mismatch
+	// files is the run's verify files, which Error searches to name the
+	// first few of ids. runVerify sets it on the error it returns; without
+	// it, Error names IDs.
+	files []*verifyFile
+}
+
+// maxMismatchPathsShown caps the destination paths in a mismatch message.
+const maxMismatchPathsShown = 8
 
 func isMismatch(err error) bool { return errors.As(err, new(mismatchError)) }
+
+// add records a mismatch in item's file. The first mismatch's detail stands,
+// so detail runs only for it and the rest cost no formatting.
+func (m *mismatchError) add(it verifyItem, detail func(verifyItem) error) {
+	if m.ids == nil {
+		m.ids = new(idset.Set)
+	}
+	m.ids.Add(it.file.entry.ID)
+	if m.error == nil {
+		m.error = detail(it)
+	}
+}
+
+// merge adds other's files and keeps the first detail.
+func (m *mismatchError) merge(other mismatchError) {
+	if m.error == nil {
+		m.error = other.error
+	}
+	if other.ids.Len() == 0 {
+		return
+	}
+	if m.ids == nil {
+		m.ids = new(idset.Set)
+	}
+	m.ids.Union(other.ids)
+}
+
+// Error names the count and up to maxMismatchPathsShown destination paths,
+// then the first mismatch's detail. The paths are the first files in
+// manifest order, found by scanning the run's files once.
+func (m mismatchError) Error() string {
+	detail := "data mismatch"
+	if m.error != nil {
+		detail = m.error.Error()
+	}
+	n := m.ids.Len()
+	if n == 0 {
+		return detail
+	}
+	shown := make([]string, 0, maxMismatchPathsShown)
+	if m.files != nil {
+		for _, f := range m.files {
+			if len(shown) == maxMismatchPathsShown {
+				break
+			}
+			if m.ids.Has(f.entry.ID) {
+				shown = append(shown, f.dstPath)
+			}
+		}
+	} else {
+		for id := range m.ids.All() {
+			if len(shown) == maxMismatchPathsShown {
+				break
+			}
+			shown = append(shown, fmt.Sprintf("file %d", id))
+		}
+	}
+	list := strings.Join(shown, ", ")
+	if more := n - len(shown); more > 0 {
+		list += fmt.Sprintf(", and %d more", more)
+	}
+	noun := "files"
+	if n == 1 {
+		noun = "file"
+	}
+	return fmt.Sprintf("%d %s failed data verification: %s (first: %s)", n, noun, list, detail)
+}
+
+// MismatchError reports that data verification found files whose bytes
+// differ from the source.
+type MismatchError struct {
+	// IDs are the manifest IDs of the mismatching files, ascending.
+	IDs []uint64
+	err error // the verification error; nil for one built from IDs alone
+}
+
+func (e *MismatchError) Error() string {
+	if e.err == nil {
+		return fmt.Sprintf("%d files failed verification: %v", len(e.IDs), e.IDs)
+	}
+	return e.err.Error()
+}
+
+// Unwrap returns the verification error, which can join a failure other
+// than the mismatches.
+func (e *MismatchError) Unwrap() error { return e.err }
 
 // verifyRun configures runVerify.
 type verifyRun struct {
@@ -250,7 +363,9 @@ type verifyRun struct {
 }
 
 // runVerify deals the planned samples to workers that check them, and
-// returns the coverage reached. The first failure cancels the rest. Once the
+// returns the coverage reached. The first failure other than a mismatch
+// cancels the rest; mismatches are collected from every batch and returned
+// together, so a run names all the bad files it reached. Once the
 // budget expires, dispatch stops and batches in flight get the grace period
 // before they are cancelled. tick, when set, reports progress every 2s.
 func runVerify(r verifyRun) (verifyDataResult, error) {
@@ -260,6 +375,8 @@ func runVerify(r verifyRun) (verifyDataResult, error) {
 	var progress verifyProgress
 	var failOnce sync.Once
 	var failure error
+	var mismatchMu sync.Mutex
+	var mismatches mismatchError
 	batches := make(chan []verifyItem)
 	var wg sync.WaitGroup
 	for range max(1, r.workers) {
@@ -269,9 +386,17 @@ func runVerify(r verifyRun) (verifyDataResult, error) {
 				switch {
 				case err == nil:
 					progress.done(items)
-				// Once cancelled, an error is the cancellation, except a
-				// mismatch, which is a finding.
-				case ctx.Err() == nil || isMismatch(err):
+				// A mismatch is a finding, not a reason to stop: collect it and
+				// keep verifying so one run names every bad file.
+				case isMismatch(err):
+					var m mismatchError
+					errors.As(err, &m)
+					progress.mismatched.Add(int64(len(items)))
+					mismatchMu.Lock()
+					mismatches.merge(m)
+					mismatchMu.Unlock()
+				// Once cancelled, any other error is the cancellation.
+				case ctx.Err() == nil:
 					failOnce.Do(func() { failure = err; cancel() })
 				}
 			}
@@ -317,7 +442,16 @@ dispatch:
 	for {
 		select {
 		case <-done:
-			return progress.result(r.totals, start), failure
+			// Every worker has returned, so nothing else touches mismatches.
+			result := progress.result(r.totals, start)
+			if mismatches.error == nil {
+				return result, failure
+			}
+			mismatches.files = r.files
+			if failure == nil {
+				return result, mismatches
+			}
+			return result, errors.Join(failure, mismatches)
 		case <-budgetC:
 			startGrace()
 		case <-graceC:
@@ -452,8 +586,11 @@ type VerifyCopyOptions struct {
 // VerifyCopy checks every byte of a remote copy, as tx recv copy --verify
 // full does: each regular file's local copy, at local(entry), against the
 // server's CXSUM hashes of the same ranges. It returns nil only when every
-// range matched. internal/memxfer uses it to run this verification against
-// its memfds.
+// range matched. When ranges differ and nothing else went wrong, the error
+// is a *MismatchError naming every mismatching file; when a failure or a
+// budget cut also left files unchecked, it wraps one (errors.As finds it),
+// and its IDs name only the files reached. internal/memxfer uses it to run
+// this verification against its memfds.
 func VerifyCopy(client *tx.Client, manifest *tx.Manifest, local func(tx.ManifestEntry) string, opts VerifyCopyOptions) error {
 	sampling := verifyOptions{pct: 100, frameSize: defaultVerifyFrameSize, seed: 1, budget: opts.Budget}
 	files, totals := newVerifyFiles(manifest.Root, manifest.Entries, sampling, func(entry tx.ManifestEntry) (string, string) {
@@ -466,17 +603,33 @@ func VerifyCopy(client *tx.Client, manifest *tx.Manifest, local func(tx.Manifest
 		check: func(ctx context.Context, items []verifyItem) error {
 			return verifyCopyItems(ctx, client, nil, manifest.TransferID, items)
 		}})
-	if err == nil && result.partial {
-		err = fmt.Errorf("verified only %s", result.coverage())
+	var m mismatchError
+	if !errors.As(err, &m) {
+		if err == nil && result.partial {
+			err = fmt.Errorf("verified only %s", result.coverage())
+		}
+		return err
 	}
-	return err
+	me := &MismatchError{IDs: slices.Collect(m.ids.All()), err: err}
+	if _, pure := err.(mismatchError); pure && !result.unchecked {
+		return me
+	}
+	// The mismatches are not the whole story: a failure or a budget cut
+	// left files unchecked. The wrapper still matches *MismatchError with
+	// errors.As, but is not one, so a caller that needs every wrong file
+	// can tell.
+	if result.unchecked {
+		return fmt.Errorf("%w; verified only %s", me, result.coverage())
+	}
+	return fmt.Errorf("verification incomplete: %w", me)
 }
 
 // verifyCopyItems compares the items' local hashes with the server's CXSUM
 // hashes of the same ranges. The server hashes while this worker hashes the
 // local copy. Batch duration approaches the slower side's duration.
 // The first failure on either side cancels the other and is the one
-// returned. A verify_hash event times the local hashing; the client's CXSUM
+// returned. When the hashes differ, the error names every mismatching file
+// in the batch. A verify_hash event times the local hashing; the client's CXSUM
 // req_start/req_end events time the remote request.
 func verifyCopyItems(ctx context.Context, client *tx.Client, sink *events.Sink, transferID string, items []verifyItem) error {
 	ctx, cancel := context.WithCancel(ctx)
@@ -509,10 +662,16 @@ func verifyCopyItems(ctx context.Context, client *tx.Client, sink *events.Sink, 
 	if failure != nil {
 		return failure
 	}
+	var bad mismatchError
 	for i, it := range items {
 		if !strings.EqualFold(remote[i], want[i]) {
-			return mismatchError{fmt.Errorf("checksum mismatch for %s at offset=%d size=%d", it.file.dstPath, it.sample.Offset, it.sample.Size)}
+			bad.add(it, func(it verifyItem) error {
+				return fmt.Errorf("checksum mismatch for %s at offset=%d size=%d", it.file.dstPath, it.sample.Offset, it.sample.Size)
+			})
 		}
+	}
+	if bad.ids.Len() > 0 {
+		return bad
 	}
 	return nil
 }
@@ -575,10 +734,16 @@ func verifyLocalItems(ctx context.Context, items []verifyItem, inj *faults.Injec
 	if err != nil {
 		return err
 	}
+	var bad mismatchError
 	for i, it := range items {
 		if !strings.EqualFold(src[i], dst[i]) {
-			return mismatchError{fmt.Errorf("data mismatch %s at offset=%d size=%d", it.file.entry.Path, it.sample.Offset, it.sample.Size)}
+			bad.add(it, func(it verifyItem) error {
+				return fmt.Errorf("data mismatch %s at offset=%d size=%d", it.file.entry.Path, it.sample.Offset, it.sample.Size)
+			})
 		}
+	}
+	if bad.ids.Len() > 0 {
+		return bad
 	}
 	return nil
 }

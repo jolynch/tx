@@ -1057,7 +1057,7 @@ func openDownloadOutput(entry tx.ManifestEntry, offset int64, destPath string, s
 			return nil, nil, fmt.Errorf("seek output file for resume: %w", err)
 		}
 	}
-	syncOutput := syncWorker.SyncOutput(fd, offset, destPath)
+	syncOutput := syncWorker.SyncOutput(fd, offset, entry.ID, destPath)
 	return inj.WrapWriter(faults.SiteOutputWrite, entry.ID, offset, fd), syncOutput, nil
 }
 

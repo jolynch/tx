@@ -81,6 +81,7 @@ func (e *verifyFuzzEnv) close() {
 
 var (
 	verifySeedPattern    = regexp.MustCompile(`verify-data: .*seed=([0-9a-f]{16})`)
+	verifyFuzzFileName   = regexp.MustCompile(`f\d+\.bin`)
 	verifySamplesPattern = regexp.MustCompile(`verify-data: \[ok\] .*samples=(\d+)`)
 )
 
@@ -91,6 +92,8 @@ var (
 // the daemonless path.
 //
 // With --verify full the run must fail and report 100.0% of files and bytes.
+// The input can flip k >= 1 distinct files, and the failure must name each of
+// them and no other.
 //
 // With --verify N%data the clean run must pass and draw floor or ceil of N%
 // of the tree's 4 MiB slots, counted here from the file sizes. After the flip,
@@ -108,6 +111,8 @@ func FuzzCopyVerifyDetectsCorruption(f *testing.F) {
 	f.Add(uint64(4), uint8(0b011), uint8(1), uint64(6<<20), uint8(0x10), uint8(50))
 	f.Add(uint64(5), uint8(0b100), uint8(0), uint64(9<<20), uint8(0x01), uint8(40))
 	f.Add(uint64(6), uint8(0b101), uint8(1), uint64(1<<20), uint8(0x02), uint8(60))
+	f.Add(uint64(8), uint8(0b000), uint8(1), uint64(3)<<56|4096, uint8(1), uint8(50))
+	f.Add(uint64(9), uint8(0b001), uint8(0), uint64(2)<<56|100, uint8(0x40), uint8(50))
 	f.Add(uint64(7), uint8(0b111), uint8(0), uint64(7<<20), uint8(0x04), uint8(100))
 	f.Fuzz(func(t *testing.T, seed uint64, mode uint8, fileIdx uint8, offset uint64, xor uint8, rawPct uint8) {
 		remote, encrypt, sampled := mode&1 != 0, mode&2 != 0, mode&4 != 0
@@ -198,30 +203,49 @@ func FuzzCopyVerifyDetectsCorruption(f *testing.F) {
 			}
 		}
 
+		// With --verify full, the top byte of offset picks how many distinct
+		// files to corrupt, 1 to all of them, starting at fileIdx. The
+		// sampled mode corrupts one file, since which flips it catches
+		// depends on the sample.
+		k := 1
+		if !sampled {
+			k = 1 + int(offset>>56)%len(names)
+		}
+		offset &= 1<<56 - 1
+		corrupted := map[string]bool{}
 		victimName := names[int(fileIdx)%len(names)]
-		victim := filepath.Join(dst, victimName)
-		info, err := os.Stat(victim)
-		if err != nil {
-			t.Fatal(err)
-		}
-		at := int64(offset % uint64(info.Size()))
-		fd, err := os.OpenFile(victim, os.O_RDWR, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var b [1]byte
-		if _, err := fd.ReadAt(b[:], at); err != nil {
-			t.Fatal(err)
-		}
-		b[0] ^= xor | 1
-		if _, err := fd.WriteAt(b[:], at); err != nil {
-			t.Fatal(err)
-		}
-		if err := fd.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chtimes(victim, info.ModTime(), info.ModTime()); err != nil {
-			t.Fatal(err)
+		var info os.FileInfo
+		var at int64
+		for j := range k {
+			name := names[(int(fileIdx)+j)%len(names)]
+			corrupted[name] = true
+			victim := filepath.Join(dst, name)
+			fi, err := os.Stat(victim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pos := int64(offset % uint64(fi.Size()))
+			if j == 0 {
+				info, at = fi, pos
+			}
+			fd, err := os.OpenFile(victim, os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var b [1]byte
+			if _, err := fd.ReadAt(b[:], pos); err != nil {
+				t.Fatal(err)
+			}
+			b[0] ^= xor | 1
+			if _, err := fd.WriteAt(b[:], pos); err != nil {
+				t.Fatal(err)
+			}
+			if err := fd.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(victim, fi.ModTime(), fi.ModTime()); err != nil {
+				t.Fatal(err)
+			}
 		}
 
 		stdout.Reset()
@@ -232,6 +256,15 @@ func FuzzCopyVerifyDetectsCorruption(f *testing.F) {
 			if !failed {
 				t.Fatalf("verify full missed a flipped byte in %s at offset %d of %d (exit %d): %s",
 					victimName, at, info.Size(), code, stderr.String())
+			}
+			// The failure must name every corrupted file and no other.
+			_, report, _ := strings.Cut(stderr.String(), "verify-data: [fail]")
+			named := map[string]bool{}
+			for _, name := range verifyFuzzFileName.FindAllString(report, -1) {
+				named[name] = true
+			}
+			if !reflect.DeepEqual(named, corrupted) {
+				t.Fatalf("verify full flipped %d of %d files (%v) but its failure names %v: %s", k, len(names), corrupted, named, stderr.String())
 			}
 			return
 		}

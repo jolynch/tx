@@ -106,13 +106,66 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 
 	outRoot := ps.TargetDir
 
-	syncWorker, stopSync := fsync.StartSyncWorker(cfg.fsyncInterval, cfg.noSync, cfg.progressInterval, stderr, fsync.WithFaults(cfg.auth.faults))
-	defer func() {
-		stopCtx, cancelStop := context.WithTimeout(context.Background(), defaultFsyncTimeout)
-		if err := stopSync(stopCtx); err != nil {
-			code = finishSyncError(stderr, cfg.stats, err, nil, code)
+	// serverManifest is the latest server state.
+	var serverManifest *tx.Manifest
+	// Each round has its own sync worker. File IDs belong to the manifest
+	// that issued them: every SYNC numbers its entries afresh, so a failed ID
+	// is meaningful only against the round's manifest. finishRound drains the
+	// current round's worker and resolves its failed IDs against that round's
+	// entries, so no round's IDs meet another round's manifest and only one
+	// round's entries stay referenced. The drain is serial: a copy with
+	// downloads waits for its fsync backlog before the convergence round's
+	// scan, probe, and SYNC.
+	var (
+		roundWorker  *fsync.SyncWorker
+		roundStop    func(context.Context) error
+		roundEntries []tx.ManifestEntry
+		syncFailed   bool
+	)
+	// finishRound reports how many files failed to sync in the round, after
+	// marking them. The caller stops: refetching them in this run would only
+	// repeat the failing syncs.
+	finishRound := func() (failedFiles int) {
+		if roundStop == nil {
+			return 0
 		}
-		cancelStop()
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), defaultFsyncTimeout)
+		defer cancelStop()
+		if err := roundStop(stopCtx); err != nil {
+			if finishSyncError(stderr, cfg.stats, err, nil, 0) != 0 {
+				syncFailed = true
+			}
+			// Mark the files stale so the next run fetches them again; their
+			// size, mtime, and mode would otherwise match. A skip-write run
+			// wrote nothing.
+			if !cfg.skipWrite {
+				failed := roundWorker.Failed()
+				failedFiles = failed.Len()
+				markEntriesForRefetch(stderr, logPrefix+"-fsync", ps.TargetDir, &failed, roundEntries)
+			}
+		}
+		roundWorker, roundStop, roundEntries = nil, nil, nil
+		return failedFiles
+	}
+	// stopOnSyncFailure finishes the current round and reports whether files
+	// failed to sync, after printing why the run stops.
+	stopOnSyncFailure := func() bool {
+		n := finishRound()
+		if n == 0 {
+			return false
+		}
+		noun := "files"
+		if n == 1 {
+			noun = "file"
+		}
+		fmt.Fprintf(stderr, "%s: destination failed to sync %d %s; they are marked to fetch again on the next run, and the copy did not finish converging\n", logPrefix, n, noun)
+		return true
+	}
+	defer func() {
+		finishRound()
+		if syncFailed && code == 0 {
+			code = 1
+		}
 		if !cfg.noSync {
 			syncCtx, cancel := context.WithTimeout(context.Background(), defaultSyncfsTimeout)
 			defer cancel()
@@ -123,7 +176,8 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 	}()
 
 	// Load server manifest once for metadata (Root, Mode, Concurrency, etc.).
-	serverManifest, serverManifestErr := tx.LoadManifest(ps.ServerManifestPath)
+	var serverManifestErr error
+	serverManifest, serverManifestErr = tx.LoadManifest(ps.ServerManifestPath)
 	if serverManifestErr != nil {
 		if cfg.sourceDir == "" {
 			fmt.Fprintf(stderr, "load server manifest failed (run transfer first, or provide -s): %v\n", serverManifestErr)
@@ -148,6 +202,9 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 	}
 
 	for round := 0; round < maxSyncRounds; round++ {
+		if stopOnSyncFailure() {
+			return 1
+		}
 		// Build the oldManifest we hand to SyncManifest. End-of-copy callers
 		// pass the saved server manifest explicitly for round 0; otherwise we
 		// scan the local target dir to see what's already on disk.
@@ -277,6 +334,8 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 			return 1
 		}
 		serverManifest = mergedManifest
+		syncWorker, stopSync := fsync.StartSyncWorker(cfg.fsyncInterval, cfg.noSync, cfg.progressInterval, stderr, fsync.WithFaults(cfg.auth.faults))
+		roundWorker, roundStop, roundEntries = syncWorker, stopSync, mergedManifest.Entries
 
 		// Always delete removed files to converge.
 		if !cfg.skipWrite {
@@ -507,6 +566,9 @@ func runSync(serverURL string, cfg syncArgs, stdout io.Writer, stderr io.Writer)
 		}
 	}
 
+	if stopOnSyncFailure() {
+		return 1
+	}
 	fmt.Fprintf(stderr, "%s: remote has not converged after %d sync rounds\n", logPrefix, maxSyncRounds)
 	return 1
 }

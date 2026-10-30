@@ -3485,6 +3485,80 @@ func startRealCLIServer(t *testing.T, root string) (string, *store.Store, <-chan
 	return ln.Addr().String(), st, exited
 }
 
+// TestRunCLIVerifyNamesEveryCorruptFileAndRerunRepairs flips one byte in two
+// destination files, keeping size and mtime, so only data verification can
+// see them. --verify full must fail and name both files. A later copy without
+// verification must then fetch both again: the failed verify leaves a mark
+// that the metadata comparison of the next run sees.
+func TestRunCLIVerifyNamesEveryCorruptFileAndRerunRepairs(t *testing.T) {
+	src := t.TempDir()
+	files := map[string][]byte{}
+	for i, size := range []int{3 << 10, 200 << 10, 1 << 20, 64 << 10, 5 << 10} {
+		data := make([]byte, size)
+		for j := range data {
+			data[j] = byte(j*31 + i*7 + j>>8)
+		}
+		name := fmt.Sprintf("f%d.bin", i)
+		if i == 3 {
+			name = filepath.Join("sub", name)
+		}
+		files[name] = data
+		writeLocalTestFile(t, filepath.Join(src, name), data)
+	}
+	addr, _, _ := startRealCLIServer(t, src)
+	dst := filepath.Join(t.TempDir(), "dst")
+	remote := "tx://" + addr + "/"
+	run := func(extra ...string) (int, string) {
+		args := append([]string{"copy", "-y", "--progress=false", "--skip-fsync"}, extra...)
+		var stdout, stderr bytes.Buffer
+		code := RunCLI(append(args, remote, dst), &stdout, &stderr)
+		return code, stderr.String()
+	}
+	if code, stderr := run("--verify", "none"); code != 0 {
+		t.Fatalf("first copy exit %d: %s", code, stderr)
+	}
+
+	corrupt := []string{"f1.bin", filepath.Join("sub", "f3.bin")}
+	for _, name := range corrupt {
+		path := filepath.Join(dst, name)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data[len(data)/2] ^= 0xff
+		if err := os.WriteFile(path, data, info.Mode().Perm()); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	code, stderr := run("--verify", "full")
+	if code != 1 {
+		t.Fatalf("verify full exit %d, want 1: %s", code, stderr)
+	}
+	for _, name := range corrupt {
+		if !strings.Contains(stderr, name) {
+			t.Fatalf("verify failure does not name %s: %s", name, stderr)
+		}
+	}
+
+	if code, stderr := run("--verify", "none"); code != 0 {
+		t.Fatalf("repair copy exit %d: %s", code, stderr)
+	}
+	for name, want := range files {
+		got, err := os.ReadFile(filepath.Join(dst, name))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("%s differs from its source after the rerun (err %v)", name, err)
+		}
+	}
+}
+
 func TestRunCLICopyEmptyFilesCompleteEndToEnd(t *testing.T) {
 	src := t.TempDir()
 	mtime := time.Unix(1_700_000_000, 0)
