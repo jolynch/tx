@@ -378,12 +378,10 @@ instead of widening the current change; remove an entry when it ships.
 
 - **Split the oversized files.** `client.go` (about 3,850 lines: options,
   manifest model, download orchestration, probe math, ACK plumbing),
-  `cli.go` (about 2,200), `client_tcp.go` (about 1,500: pool, auth, verbs),
-  and `internal/filexfer/ftcp/send.go` (about 1,500: requests, windows,
-  buffering, and zero-copy)
-  mix several concerns, as do `cli_test.go` and `client_test.go`. Split along
-  those seams; the 2026-05 split of `cli.go` into per-command files is the
-  model.
+  `cli.go` (about 2,200), and `client_tcp.go` (about 1,500: pool, auth,
+  verbs) mix several concerns, as do `cli_test.go` and `client_test.go`.
+  Split along those seams; the 2026-05 split of `cli.go` into per-command
+  files is the model.
 - **TXFER and SYNC repeat setup code.** Their transfer setup overlaps, and the
   close-the-updates-channel closure is copied three times in `txfer.go` and
   `sync.go`.
