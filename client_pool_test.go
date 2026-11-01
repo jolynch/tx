@@ -1305,6 +1305,90 @@ func TestPoolRefillCountsProbedConnections(t *testing.T) {
 	}
 }
 
+// TestPoolRefillCountsCompletingConnections holds a refill snapshot open
+// while a fill or probe publishes its connection. Completion must keep it
+// counted until the snapshot ends, even if it read the idle count earlier.
+func TestPoolRefillCountsCompletingConnections(t *testing.T) {
+	for _, probe := range []bool{false, true} {
+		t.Run(fmt.Sprintf("probe=%v", probe), func(t *testing.T) {
+			dialer := &keepAlivePipeDialer{}
+			c := &Client{FileAddr: "pipe", contextDialer: dialer.DialContext}
+			pool := newTCPConnPool(tcpAuthState{}, tcpPoolOptions{size: 1}, 5000)
+			defer pool.stop()
+			finished := make(chan struct{})
+			var publish func()
+			pending := &pool.refilling
+			if probe {
+				dialer.holdHeartbeats = make(chan struct{})
+				dialer.heartbeats = make(chan struct{}, 1)
+				var publishOnce sync.Once
+				publish = func() { publishOnce.Do(func() { close(dialer.holdHeartbeats) }) }
+				defer publish()
+				pool.triggerRefill(c)
+				deadline := time.Now().Add(2 * time.Second)
+				for pool.refilling.Load() != 0 {
+					if time.Now().After(deadline) {
+						t.Fatal("initial fill never finished")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				go func() {
+					pool.heartbeatIdleConns(c, 0)
+					close(finished)
+				}()
+				select {
+				case <-dialer.heartbeats:
+				case <-time.After(2 * time.Second):
+					t.Fatal("heartbeat never probed the idle connection")
+				}
+				pending = &pool.probing
+			} else {
+				// Hold publication until refill has reserved its connection.
+				pool.idleMu.Lock()
+				var publishOnce sync.Once
+				publish = func() { publishOnce.Do(pool.idleMu.Unlock) }
+				defer publish()
+				pool.triggerRefill(c)
+				go func() {
+					pool.bg.Wait()
+					close(finished)
+				}()
+			}
+			pool.refillMu.Lock()
+			var snapshotOnce sync.Once
+			finishSnapshot := func() { snapshotOnce.Do(pool.refillMu.Unlock) }
+			defer finishSnapshot()
+			idle := len(pool.ready)
+			publish()
+
+			deadline := time.Now().Add(2 * time.Second)
+			for len(pool.ready) != 1 {
+				if time.Now().After(deadline) {
+					t.Fatal("connection was never published")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			select {
+			case <-finished:
+				t.Fatal("completion let a refill snapshot miss its idle connection")
+			case <-time.After(20 * time.Millisecond):
+			}
+			if counted := idle + int(pending.Load()); counted != 1 {
+				t.Fatalf("snapshot counts %d connections, want 1", counted)
+			}
+			finishSnapshot()
+			select {
+			case <-finished:
+			case <-time.After(2 * time.Second):
+				t.Fatal("connection completion did not finish after the snapshot")
+			}
+			if open := dialer.Open(); open != 1 {
+				t.Fatalf("%d connections open after completion, want 1", open)
+			}
+		})
+	}
+}
+
 // TestPoolConnReturnedAfterCloseIsClosed returns a borrowed connection after
 // Client.Close stopped its pool: it must close and free its slot.
 func TestPoolConnReturnedAfterCloseIsClosed(t *testing.T) {
@@ -1444,6 +1528,8 @@ func FuzzTCPConnPool(f *testing.F) {
 // TX_PBT_FAULTS set.
 func FuzzTCPConnPoolUnderFaults(f *testing.F) {
 	faults.SkipUnlessPBT(f)
+	// CI found a refill that missed a connection moving from filling to idle.
+	f.Add(uint64(3), []byte("291x\x04Z\x00\x05!C7\x00#"))
 	f.Add(uint64(1), []byte{4, 4, 4, 4, 0, 0, 0, 0, 0, 1, 2, 3, 0, 0})
 	f.Add(uint64(2), []byte{0, 2, 1, 1, 0, 0, 0, 0, 9, 17, 25, 3, 3, 4})
 	f.Add(uint64(3), []byte{2, 2, 2, 2, 0, 0, 0, 5, 3, 7, 0, 6, 0, 1})

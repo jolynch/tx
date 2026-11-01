@@ -139,6 +139,9 @@ type tcpConnPool struct {
 	// pool keeps reusable session connections; zero selects single-use
 	// connections.
 	sessionMS atomic.Int64
+	// refillMu orders refill decisions against fills and probes completing.
+	// A snapshot must not miss either moving back to ready.
+	refillMu sync.Mutex
 	// refilling counts background fills in flight; each holds a slot.
 	refilling atomic.Int64
 	// probing counts idle sessions out for a heartbeat probe. They are in
@@ -521,6 +524,7 @@ func (c *Client) dialPoolConn(ctx context.Context, p *tcpConnPool) (net.Conn, er
 }
 
 // openCount is the pool's idle, borrowed, filling, and probing connections.
+// The caller holds refillMu so fills and probes stay counted mid-snapshot.
 // A connection mid-dial on demand, or between a borrow or return and its
 // counter update, is briefly missed; a refill decided then can overshoot the
 // target until the next tick trims it, which is accepted.
@@ -532,11 +536,18 @@ func (p *tcpConnPool) openCount() int {
 // reach its target. Each fill holds a slot, so refills never push the pool
 // past its limit, and a scale-down lowers the target so replacement fills
 // never undo it.
-func (p *tcpConnPool) triggerRefill(c *Client) { p.refill(c, 0) }
+func (p *tcpConnPool) triggerRefill(c *Client) {
+	if p == nil {
+		return
+	}
+	p.refillMu.Lock()
+	defer p.refillMu.Unlock()
+	p.refill(c, 0)
+}
 
 // refill is triggerRefill for a caller holding refilling counts that no
 // longer stand for a pending connection: a finishing fill, whose connection
-// is already idle, passes held=1.
+// is already idle, passes held=1. The caller holds refillMu.
 func (p *tcpConnPool) refill(c *Client, held int) {
 	// Without keep-alive a connection serves one command and cannot be
 	// heartbeated, and the server closes one that sends nothing for its
@@ -561,6 +572,8 @@ func (p *tcpConnPool) refill(c *Client, held int) {
 func (c *Client) fillTCPPoolConn(p *tcpConnPool) {
 	filled := false
 	defer func() {
+		p.refillMu.Lock()
+		defer p.refillMu.Unlock()
 		// A failed fill does not retry: the next acquire dials on demand
 		// instead of this loop hammering an unreachable server. A filled one
 		// starts the next fill while it still counts as in flight, so the
@@ -653,7 +666,11 @@ func (p *tcpConnPool) heartbeatIdleConns(c *Client, interval time.Duration) {
 			defer func() { <-p.hbSem }()
 			// Runs after the connection is back in the idle stack or
 			// closed, so it stays counted until then.
-			defer p.probing.Add(-1)
+			defer func() {
+				p.refillMu.Lock()
+				p.probing.Add(-1)
+				p.refillMu.Unlock()
+			}()
 			// Stopping the pool closes a probe's connection, so stop never
 			// waits out a probe's timeout.
 			stopWatch := watchManagedTCPConnContext(p.ctx, sc)
