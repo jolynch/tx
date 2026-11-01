@@ -3459,10 +3459,9 @@ func TestRunCLICopySendFailureReturnsNonzero(t *testing.T) {
 	}
 }
 
-// startRealCLIServer runs the real FTCP server over root with a short
-// --exit-after, so the returned channel closes only once a transfer has
-// completed on the server and the exit timer has fired.
-func startRealCLIServer(t *testing.T, root string) (string, *store.Store, <-chan struct{}) {
+// startRealCLIServer runs the real FTCP server over root. A zero exitAfter
+// keeps it alive until cleanup; otherwise it exits after transfer inactivity.
+func startRealCLIServer(t *testing.T, root string, exitAfter time.Duration) (string, *store.Store, <-chan struct{}) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -3475,7 +3474,7 @@ func startRealCLIServer(t *testing.T, root string) (string, *store.Store, <-chan
 		defer close(exited)
 		_ = intftcp.Serve(ln, intftcp.ServerOptions{
 			Deps:      intftcp.NewRuntimeDeps(st, intftcp.WithRoot(root)),
-			ExitAfter: 100 * time.Millisecond,
+			ExitAfter: exitAfter,
 		})
 	}()
 	t.Cleanup(func() {
@@ -3505,7 +3504,7 @@ func TestRunCLIVerifyNamesEveryCorruptFileAndRerunRepairs(t *testing.T) {
 		files[name] = data
 		writeLocalTestFile(t, filepath.Join(src, name), data)
 	}
-	addr, _, _ := startRealCLIServer(t, src)
+	addr, _, _ := startRealCLIServer(t, src, 0)
 	dst := filepath.Join(t.TempDir(), "dst")
 	remote := "tx://" + addr + "/"
 	run := func(extra ...string) (int, string) {
@@ -3578,7 +3577,7 @@ func TestRunCLICopyEmptyFilesCompleteEndToEnd(t *testing.T) {
 
 	for _, skipWrite := range []bool{false, true} {
 		t.Run(fmt.Sprintf("skip-write=%v", skipWrite), func(t *testing.T) {
-			addr, st, exited := startRealCLIServer(t, src)
+			addr, st, exited := startRealCLIServer(t, src, 100*time.Millisecond)
 			dst := filepath.Join(t.TempDir(), "dst")
 			args := []string{"copy", "--progress=false", "--verify", "none"}
 			if skipWrite {
