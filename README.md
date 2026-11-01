@@ -1,3 +1,9 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="imgs/logo_dark_2048w.png">
+  <source media="(prefers-color-scheme: light)" srcset="imgs/logo_light_2048w.png">
+  <img alt="tx logo: two boxes connected by a transfer arrow" src="imgs/logo_light_2048w.png" width="100%">
+</picture>
+
 # `tx`: Fast file transfer for the cloud
 
 `tx` copies directories and files at line rate by fully saturating modern cloud
