@@ -10,6 +10,7 @@ The docs are organized into four top-level sections:
 ## Architecture
 
 - [Overview](./arch/OVERVIEW.md)
+- [Cloud transfer limits](./arch/CLOUD.md)
 - [Transfer Modes](./arch/TRANSFER.md)
 - [Verification](./arch/VERIFICATION.md)
 - [Fault Injection](./arch/FAULTS.md)
