@@ -122,8 +122,16 @@ func TestRestoreWorkerPoolSendBatchAbortsOnPoolClose(t *testing.T) {
 	// Give the producer a moment to fill the channel and block.
 	time.Sleep(50 * time.Millisecond)
 
+	// Signal shutdown before releasing the parked worker; released first,
+	// it can drain every item before Close begins.
+	closed := make(chan struct{})
+	go func() {
+		p.Close()
+		close(closed)
+	}()
+	<-p.done
 	close(release)
-	p.Close()
+	<-closed
 
 	if got := p.dropped.Load(); got == 0 {
 		t.Fatalf("expected some items to drop after pool close, got %d", got)
