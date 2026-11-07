@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/jolynch/tx/internal/filexfer/limit"
+	"github.com/jolynch/tx/internal/filexfer/policy"
 )
 
 // Interface is the transfer-state contract consumers depend on. *Store is
@@ -38,6 +39,19 @@ type Interface interface {
 	VerifyTransferFileWindowHashes(txferID string, hashes []WindowHash) []bool
 	AcknowledgeTransferFiles(entries []AckEntry) bool
 	SetTransferPageCache(txferID string, fileID uint64, blob []byte) bool
+
+	// Per-file adaptive compression state, kept across a file's windows.
+	// A SEND loads a window's state only when an earlier window preceded it
+	// (offset above zero) and saves it only when another window follows, so
+	// a single-window file never touches the store. Saves arrive with the
+	// request's window hashes in RecordTransferWindows, one lock acquisition
+	// per request; Load takes only the compression mutex. An entry is freed
+	// when its file turns Done or Missing and when the transfer is deleted
+	// or reaped; a save for a Done or Missing file is skipped. The same call
+	// adds the request's delivery-rate summary to the transfer's, which the
+	// completion log reports.
+	LoadFileCompression(txferID string, fileID uint64) (policy.FileCompression, bool)
+	RecordTransferWindows(txferID string, rec WindowRecords) bool
 
 	// Deadlines, backing --exit-after.
 	SetTransferDeadline(txferID string, deadlineMS int64) bool

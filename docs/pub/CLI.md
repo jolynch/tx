@@ -610,8 +610,17 @@ line:
 | `rec` | When | Fields |
 |-------|------|--------|
 | `start` | A TXFER or SYNC creates a transfer | `tid`, `path` (the requested path, including a single file's name), `t` |
-| `end` | The transfer completes, or at exit for one that never did | `tid`, `path`, `complete`, `files`, `bytes`, `logical_bytes` and `wire_bytes` of the windows sent, `windows` per codec, `send_path` (`sendfile` or `buffered`) per window, `dur_ns` |
+| `end` | The transfer completes, or at exit for one that never did | `tid`, `path`, `complete`, `files`, `bytes`, `logical_bytes` and `wire_bytes` of the windows sent, `windows` per codec, `send_path` (`sendfile` or `buffered`) per window, `dur_ns`, and, for a completed transfer, `rates` when an adaptive window reached the compression policy (see below) |
 | `process` | At exit | `conns_accepted`, `peak_conns`, `heartbeats` (keep-alive PROBEs), `transfers`, `exit` (`sigterm`, `sigint`, or `exit-after`) |
+
+`rates` totals the adaptive windows whose frames reached the compression
+policy: `files` (counted on their window at offset 0), `windows`, `sampled`
+(windows that used a background codec sample), and for `kernel` (the TCP
+delivery rate) and `userspace` (the rate the server's own writes showed)
+the `n`, `min_bps`, `max_bps`, and `sum_bps` of each window's last reading.
+`userspace_over_kernel_sum` and `_n` give their mean ratio where a window
+had both. The server also logs these at completion, after `txfer-complete`,
+as a `txfer-rate` line.
 
 `t` is unix nanoseconds. SIGTERM and SIGINT stop the server cleanly: the
 listener closes, progress targets get their final write, and the `end` and

@@ -92,6 +92,13 @@ fuzz-short:
 fuzz-long:
 	$(FUZZ) -race ./internal/filexfer/ftcp FuzzChecksumFrameMatchesWriteFrame $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/stats FuzzFitBeta $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) ./internal/filexfer/policy FuzzCompressionPolicyRegret $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) ./internal/filexfer/policy FuzzCompressionPolicyStationary $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) ./internal/filexfer/policy FuzzCompressionPolicyReaction $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) ./internal/filexfer/policy FuzzBackgroundCompression $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) ./internal/filexfer/policy FuzzBackgroundReaction $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) ./internal/filexfer/policy FuzzBackgroundThroughput $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) ./internal/filexfer/policy FuzzBackgroundSendBuffer $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/faults FuzzSpecRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race . FuzzTCPConnPool $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/aead FuzzReadRecords $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)

@@ -18,6 +18,10 @@ type FileLookupError = store.FileLookupError
 type TransferObservedLinkUpdate = store.TransferObservedLinkUpdate
 type AckEntry = store.AckEntry
 type WindowHash = store.WindowHash
+type FileCompressionUpdate = store.FileCompressionUpdate
+type WindowRecords = store.WindowRecords
+type WindowRate = store.WindowRate
+type RateSummary = store.RateSummary
 type FileLookup = store.FileLookup
 
 const (

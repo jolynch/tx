@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -155,7 +156,11 @@ func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
 	deps := &mockDeps{filePath: tmp}
 
 	var rawOut bytes.Buffer
-	slowOut := delayedWriter{w: &rawOut, delay: 25 * time.Millisecond}
+	delay := 25 * time.Millisecond
+	if raceEnabled {
+		delay = 100 * time.Millisecond // Instrumented codecs need a slower link to remain worthwhile.
+	}
+	slowOut := delayedWriter{w: &rawOut, delay: delay}
 	_, err := streamSendItem(context.Background(), unbufferedSendOutput(&slowOut), deps, "tx-adapt", sendItem{FileID: 9, Offset: 0, Size: 0, Comp: "adapt", Path: tmp}, mustFileRef(t, deps, 9, tmp), defaultZeroCopyMinFrameBytes)
 	if err != nil {
 		t.Fatalf("streamSendItem failed: %v", err)
@@ -180,6 +185,34 @@ func TestStreamSendItemAdaptiveUpgradesFromNone(t *testing.T) {
 	}
 	if !sawCompressed {
 		t.Fatalf("expected adaptive mode to upgrade to a compressed frame, comps=%v", comps)
+	}
+}
+
+func TestStreamSendItemAdaptiveIncompressibleStaysUncompressed(t *testing.T) {
+	// Background candidates that cannot shrink random data never reach the wire.
+	size := (32 * defaultFileFrameLogicalSize) + 1
+	data := make([]byte, size)
+	rand.New(rand.NewSource(7)).Read(data)
+	tmp := writeTempSendFile(t, data)
+	deps := &mockDeps{filePath: tmp}
+
+	var rawOut bytes.Buffer
+	slowOut := delayedWriter{w: &rawOut, delay: 25 * time.Millisecond}
+	_, err := streamSendItem(context.Background(), unbufferedSendOutput(&slowOut), deps, "tx-adapt-rand", sendItem{FileID: 9, Offset: 0, Size: 0, Comp: "adapt", Path: tmp}, mustFileRef(t, deps, 9, tmp), defaultZeroCopyMinFrameBytes)
+	if err != nil {
+		t.Fatalf("streamSendItem failed: %v", err)
+	}
+	comps, err := frameComps(rawOut.Bytes())
+	if err != nil {
+		t.Fatalf("frameComps failed: %v", err)
+	}
+	if len(comps) < 30 {
+		t.Fatalf("expected >=30 frames, got %d", len(comps))
+	}
+	for i, comp := range comps {
+		if comp != "none" {
+			t.Fatalf("incompressible frame %d used %q; background probes must stay off the wire", i, comp)
+		}
 	}
 }
 

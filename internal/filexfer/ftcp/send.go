@@ -2,7 +2,6 @@ package ftcp
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -10,13 +9,11 @@ import (
 	"net"
 	"os"
 	"runtime"
-	"runtime/trace"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/jolynch/tx/internal/bufpool"
 	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
@@ -36,6 +33,10 @@ const defaultZeroCopyMinFrameBytes int64 = 1 << 20
 
 // zeroCopyOff, as a zeroCopyMinBytes value, sends every frame buffered.
 const zeroCopyOff int64 = 0
+
+// sendSniffEvery spaces background samples by file frame index. A pending
+// comparison asks each frame instead; busy workers always skip the request.
+const sendSniffEvery = 8
 
 // sendOutputBufferBytes sizes the buffer one SEND response writes its frames
 // through, so a small file's header, payload, and trailer, and many small
@@ -118,6 +119,8 @@ type frameStreamArgs struct {
 	// events, or the adaptive policy choosing the next frame's codec. A
 	// frame nothing reads skips its clock reads.
 	Timed bool
+	// Sample copies already-read bytes for a nonblocking background job.
+	Sample *sendSampleJob
 }
 
 type frameStreamStats struct {
@@ -125,7 +128,7 @@ type frameStreamStats struct {
 	WireSize       int64
 	PrepareLatency time.Duration
 	// ReadLatency is the part of PrepareLatency spent reading the file; the
-	// rest is compression.
+	// rest is hashing, compression, and copying a background sample.
 	ReadLatency     time.Duration
 	WriteLatency    time.Duration
 	NextOffset      int64
@@ -266,12 +269,20 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 	_ = deps.SetTransferFilesState(header.TransferID, running, TransferStateRunning)
 	hashes := make([]WindowHash, 0, len(records))
 	var done []uint64
+	// Only files whose window learned something leave compression state, so
+	// most requests never take a buffer from the pool.
+	var comps *compUpdates
+	defer func() { comps.release() }()
+	var rates RateSummary
+	var ratedFiles []uint64
 	recordHashes := func() error {
 		if len(done) > 0 {
 			_ = deps.SetTransferFilesState(header.TransferID, done, TransferStateDone)
 		}
-		if len(hashes) > 0 && !deps.SetTransferFileWindowHashes(header.TransferID, hashes) {
-			return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
+		if compList := comps.list(); len(hashes) > 0 || len(compList) > 0 || rates.Windows > 0 {
+			if !deps.RecordTransferWindows(header.TransferID, WindowRecords{Hashes: hashes, Compression: compList, Rates: rates, RatedFiles: ratedFiles}) {
+				return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
+			}
 		}
 		return nil
 	}
@@ -283,11 +294,14 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 	// writes, an authenticated session, already buffers into whole records.
 	inj := faults.FromContext(ctx)
 	resp := unbufferedSendOutput(out)
-	if header.Mode != loadStrategyGentle && transportFlusher(out) == nil {
+	resp.recoveryFlush = transportFlusher(out)
+	if header.Mode != loadStrategyGentle && resp.recoveryFlush == nil {
 		resp = newBufferedSendOutput(out)
 		defer resp.release()
+		resp.recoveryFlush = resp.Flush
 	}
 	resp.faults = inj
+	resp.ownRate.src = sendRateSourceFor(ctx, out)
 	transfer, hasTransfer := deps.GetTransferSummary(header.TransferID)
 	for i, record := range records {
 		item := record.item(header.Mode)
@@ -308,6 +322,7 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 				limited = limiter.WrapRateLimitedWriter(limited, ctx)
 			}
 			itemOut = unbufferedSendOutput(limited)
+			itemOut.rate = resp.rate
 			itemOut.frameFlush = transportFlusher(out)
 			itemOut.faults = inj
 		}
@@ -322,6 +337,18 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 		if sent.done {
 			done = append(done, item.FileID)
 		}
+		if sent.hasComp {
+			if comps == nil {
+				comps = compUpdatesPool.Get().(*compUpdates)
+			}
+			comps.s = append(comps.s, sent.comp)
+		}
+		if sent.decided {
+			rates.Add(sent.rate)
+			if sent.rate.FirstWindow {
+				ratedFiles = append(ratedFiles, sent.rate.FileID)
+			}
+		}
 		if err != nil {
 			_ = recordHashes()
 			_ = resp.Flush()
@@ -333,6 +360,36 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 		return err
 	}
 	return resp.Flush()
+}
+
+// sendFrameMetricsHook, when set by a test, sees the metrics of every frame
+// handed to the compression policy, as DecideSampled sees them. Production leaves
+// it nil.
+var sendFrameMetricsHook func(policy.CompressionMetrics)
+
+// compUpdates holds a request's compression updates in a reusable slice.
+type compUpdates struct {
+	s []FileCompressionUpdate
+}
+
+var compUpdatesPool = sync.Pool{New: func() any { return new(compUpdates) }}
+
+// list returns the updates; a nil receiver has none.
+func (c *compUpdates) list() []FileCompressionUpdate {
+	if c == nil {
+		return nil
+	}
+	return c.s
+}
+
+// release empties the updates and returns them to the pool. A nil receiver
+// does nothing. The updates must not be used afterwards.
+func (c *compUpdates) release() {
+	if c == nil {
+		return
+	}
+	c.s = c.s[:0]
+	compUpdatesPool.Put(c)
 }
 
 // sendOutput is where one SEND item writes its frames. Frames go to w, which
@@ -347,11 +404,19 @@ type sendOutput struct {
 	// frameFlush, when set, sends a completed frame through a transport that
 	// batches writes; gentle responses use it so frames keep their pacing.
 	frameFlush func() error
+	// recoveryFlush, when set, sends a fast response's buffered frames to
+	// the socket; frames measured by a recovery check use it.
+	recoveryFlush func() error
 	// hasher is reset and reused by each item, rather than allocating 1.2 KiB
 	// per file.
 	hasher xxh3.Hasher128
 	// faults gates the request's file and syscall sites; nil disables it.
 	faults *faults.Injector
+	// rate turns measured writes into the write times the compression
+	// policy sees; it points at ownRate unless the response shares one
+	// across outputs.
+	rate    *sendRate
+	ownRate sendRate
 }
 
 var sendOutputBufferPool = sync.Pool{
@@ -362,11 +427,15 @@ var sendOutputBufferPool = sync.Pool{
 func newBufferedSendOutput(out io.Writer) *sendOutput {
 	buf := sendOutputBufferPool.Get().(*bufio.Writer)
 	buf.Reset(out)
-	return &sendOutput{w: buf, buf: buf, conn: extractTCPConn(out)}
+	o := &sendOutput{w: buf, buf: buf, conn: extractTCPConn(out)}
+	o.rate = &o.ownRate
+	return o
 }
 
 func unbufferedSendOutput(out io.Writer) *sendOutput {
-	return &sendOutput{w: out, conn: extractTCPConn(out)}
+	o := &sendOutput{w: out, conn: extractTCPConn(out)}
+	o.rate = &o.ownRate
+	return o
 }
 
 // Flush writes any buffered frames to the response.
@@ -418,14 +487,23 @@ func checkTransferDeadline(deps Deps, txferID string, transfer Transfer) error {
 
 // sentItem is what a sent item leaves for its SEND to record: the window
 // hash, and for a directory, which is complete once sent, that it is Done.
+// When another window of the file follows, comp is the compression state it
+// starts from, and hasComp is set; an error exit still reports what the
+// frames already sent taught the policy. When a frame reached the policy,
+// decided is set and rate holds what the window showed about the delivery
+// rate, for the transfer's completion log.
 type sentItem struct {
-	hash WindowHash
-	done bool
+	hash    WindowHash
+	done    bool
+	comp    FileCompressionUpdate
+	hasComp bool
+	decided bool
+	rate    WindowRate
 }
 
 // streamSendItem sends one item as frames. Frames of at least zeroCopyMinBytes
 // use the zero-copy path when the output allows it; zeroCopyOff disables it.
-func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID string, item sendItem, fileRef FileRef, zeroCopyMinBytes int64) (sentItem, error) {
+func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID string, item sendItem, fileRef FileRef, zeroCopyMinBytes int64) (sent sentItem, _ error) {
 	ctx, windowTask := utils.NewTraceTask(ctx, "send-window")
 	defer windowTask.End()
 	scope := events.FromContext(ctx)
@@ -519,6 +597,64 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 	adaptive := item.Comp == "adapt"
 	currentMode := initialCompressionMode(item.Comp)
 	compressPolicy := policy.NewCompressionPolicy()
+	// A file sent in several windows keeps its adaptive state between them,
+	// so a learned mode and the policy's learned state survive each window
+	// boundary.
+	// This window works on its own copy; windows of one file that run
+	// concurrently each save at their end, and the last save wins. A
+	// single-window file never touches the store.
+	//
+	// State is loaded only when an earlier window preceded this one, and
+	// saved only when a later one follows within the smaller of the
+	// manifest size and the size on disk. The last window, a resumed tail
+	// window therefore leave nothing behind that no ACK would free. A window
+	// saved before the file shrank stays until the transfer is reaped, one
+	// entry per file.
+	startState := policy.FileCompression{Mode: currentMode, Policy: *compressPolicy}
+	if adaptive && item.Offset > 0 {
+		if st, ok := deps.LoadFileCompression(txferID, item.FileID); ok {
+			currentMode = st.Mode
+			*compressPolicy = st.Policy
+			startState = st
+		}
+	}
+	if adaptive {
+		// A file with no state of its own starts from what the connection
+		// measured about its link; its codec evidence stays its own.
+		out.rate.seedLink(compressPolicy)
+	}
+	fileEnd := fileInfo.Size()
+	if fileRef.FileSize >= 0 {
+		fileEnd = min(fileEnd, fileRef.FileSize)
+	}
+	saveState := adaptive && item.Offset+windowLen < fileEnd
+	framesSent := 0
+	var sampler sendSampler
+	defer sampler.close()
+	// windowRate is what the window's decided frames showed about the
+	// delivery rate, reported when one reached the policy, even on an error
+	// exit.
+	windowRate := WindowRate{FileID: item.FileID, FirstWindow: item.Offset == 0}
+	decidedFrame := false
+	if adaptive {
+		defer func() {
+			if decidedFrame {
+				sent.decided, sent.rate = true, windowRate
+			}
+		}()
+	}
+	if saveState {
+		// Also runs on an error exit, so what the frames already sent
+		// taught the policy is not lost. The caller applies it with the
+		// request's window hashes.
+		defer func() {
+			// A window that learned nothing leaves the stored state as is.
+			if end := (policy.FileCompression{Mode: currentMode, Policy: *compressPolicy}); framesSent > 0 && end != startState {
+				sent.comp = FileCompressionUpdate{FileID: item.FileID, State: end}
+				sent.hasComp = true
+			}
+		}()
+	}
 	windowHasher := &out.hasher
 	windowHasher.Reset()
 
@@ -571,6 +707,12 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 		}
 
 		frameComp := policy.FrameCompTokenForMode(currentMode)
+		// Every adaptive frame goes to the policy except a terminal frame
+		// whose window leaves no state: its decision would choose a codec
+		// for a frame that never comes. A saved terminal frame's decision
+		// picks the next window's first codec. An active recovery still
+		// observes a final frame so its loss reaches the connection budget.
+		decide := adaptive && (!isTerminal || saveState || compressPolicy.RecoveryActive())
 		var terminalMD *encoding.FileFrameMetadata
 		if isTerminal {
 			md := encoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
@@ -595,9 +737,25 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 			PipeSizeBytes: pipeSizeBytes,
 			DirectIO:      usedDirectOpen,
 			Faults:        inj,
-			// The policy is per item, so a terminal frame's latencies would
-			// only choose a codec for a frame that never comes.
-			Timed: scope.Sink.Enabled() || (adaptive && !isTerminal),
+			Timed:         scope.Sink.Enabled() || decide,
+		}
+
+		if decide && (compressPolicy.BackgroundPending() || (cursor/defaultFileFrameLogicalSize)%sendSniffEvery == 0) {
+			windowEnd := item.Offset + windowLen
+			work := sampleWork{
+				fileFrames: framesLeft(cursor, windowEnd, fileEnd),
+				fileBytes:  fileEnd - cursor,
+				// A terminal frame decides only when the window saves state.
+				windowFrames: framesLeft(cursor, windowEnd, windowEnd),
+				windowBytes:  min(windowEnd, fileEnd) - cursor,
+			}
+			if !saveState {
+				work.windowFrames--
+				if work.windowBytes > 0 {
+					work.windowBytes -= (work.windowBytes-1)%defaultFileFrameLogicalSize + 1
+				}
+			}
+			frameArgs.Sample = sampler.request(ctx, work, compressPolicy, out.rate.wallFrame())
 		}
 
 		if readaheadCh != nil && !isTerminal {
@@ -610,18 +768,43 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 			}
 		}
 
+		// Checks and their validation judge codecs by raw frame time, which
+		// a frame left in a fast response's buffer would miss entirely in a
+		// one-frame window: the request's final flush follows the decision.
+		// Such frames flush, and only they give up batching. Output earlier
+		// frames and items left buffered drains first, untimed, so the
+		// frame's flush times its own bytes alone.
+		timedFlush := out.frameFlush == nil && out.recoveryFlush != nil && decide && compressPolicy.RecoveryActive()
+		if timedFlush {
+			if err := out.recoveryFlush(); err != nil {
+				return sentItem{}, err
+			}
+		}
+
 		frameOffset := cursor
 		var stats frameStreamStats
 		sendPath := sendPathBuffered
 		if zeroCopyMinBytes > 0 && frameSize >= zeroCopyMinBytes && canZeroCopy(frameArgs) {
 			// The splice bypasses out.w, so flush it and send this frame's
 			// header and trailer to the socket as well, in order.
+			// The flush writes earlier frames' bytes, work this frame forced,
+			// so it counts toward this frame's write time as a buffered
+			// frame's forced flush does.
+			var flushStart time.Time
+			if frameArgs.Timed {
+				flushStart = time.Now()
+			}
 			if err := out.Flush(); err != nil {
 				return sentItem{}, err
+			}
+			var flushLatency time.Duration
+			if frameArgs.Timed {
+				flushLatency = time.Since(flushStart)
 			}
 			frameArgs.Output = out.conn
 			sendPath = sendPathSendfile
 			stats, err = streamFramePayloadZeroCopy(fd, &frameOffset, frameArgs)
+			stats.WriteLatency += flushLatency
 		} else {
 			stats, err = streamFramePayloadBuffered(fd, &frameOffset, frameArgs)
 		}
@@ -644,12 +827,12 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 					return sentItem{}, protocolErr{code: "INTERNAL", message: "invalid resume offset after direct I/O retry"}
 				}
 				if cursor == item.Offset {
+					// No frame was sent, so the policy has not run and
+					// holds the state the window started with.
 					if item.Mode == loadStrategyFast {
 						tryAdviseSequential(inj, fd, item.Offset, windowLen)
 					}
 					firstFrame = true
-					currentMode = initialCompressionMode(item.Comp)
-					compressPolicy = policy.NewCompressionPolicy()
 					windowHasher.Reset()
 				} else {
 					if item.Mode == loadStrategyFast {
@@ -661,17 +844,36 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 			return sentItem{}, err
 		}
 
+		flush := out.frameFlush
+		if timedFlush {
+			flush = out.recoveryFlush
+		}
+		var checkFlush time.Duration // what a recovery flush added
+		if flush != nil {
+			// A compressed frame may fit entirely in the transport's record
+			// buffer. Its flush wait is part of this frame's write cost.
+			var flushStart time.Time
+			if frameArgs.Timed {
+				flushStart = time.Now()
+			}
+			if err := flush(); err != nil {
+				return sentItem{}, err
+			}
+			if frameArgs.Timed {
+				d := time.Since(flushStart)
+				stats.WriteLatency += d
+				if timedFlush {
+					checkFlush = d
+				}
+			}
+		}
 		if scope.Sink.Enabled() {
 			emitWindow(scope, txferID, item.FileID, cursor, frameComp, sendPath, stats)
 		}
 		cursor = stats.NextOffset
 		remaining -= frameSize
 		firstFrame = false
-		if out.frameFlush != nil {
-			if err := out.frameFlush(); err != nil {
-				return sentItem{}, err
-			}
-		}
+		framesSent++
 		if isTerminal && scope.Sink.Enabled() && cursor >= fileRef.FileSize {
 			scope.Sink.Emit("file_done", txferID, events.F("conn", scope.Conn), events.F("file", item.FileID), events.Dur("dur", time.Since(itemStart)))
 		}
@@ -683,18 +885,43 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 			recorded = WindowHash{FileID: item.FileID, EndBytes: cursor, HashToken: stats.WindowHashToken}
 		}
 
-		if adaptive && !isTerminal {
-			// WriteLatency times writes into the response buffer, much as
-			// unbuffered writes timed the kernel socket buffer, not the wire.
-			// When the buffer fills, the flush is charged to the frame that
-			// forced it, which is the backpressure signal the policy wants.
-			decision := compressPolicy.Decide(currentMode, policy.CompressionMetrics{
-				LogicalSize:    stats.LogicalSize,
-				WireSize:       stats.WireSize,
-				PrepareLatency: stats.PrepareLatency,
-				WriteLatency:   stats.WriteLatency,
-			})
-			if decision.Next != currentMode {
+		if decide {
+			// A write into the response buffer or the socket's send buffer
+			// returns before the bytes leave; out.rate raises such a write
+			// to its wire bytes over the connection's delivery rate. A
+			// flush a frame forced is charged to that frame, which is the
+			// backpressure signal the policy wants.
+			metrics := policy.CompressionMetrics{
+				LogicalSize:     stats.LogicalSize,
+				WireSize:        stats.WireSize,
+				PrepareLatency:  stats.PrepareLatency,
+				ReadLatency:     stats.ReadLatency,
+				WriteLatency:    out.rate.writeTime(stats.WireSize, stats.WriteLatency),
+				FrameLatency:    stats.PrepareLatency + stats.WriteLatency,
+				FlushLatency:    checkFlush,
+				RecoveryAllowed: fileEnd-cursor >= policy.RecoveryFrames*defaultFileFrameLogicalSize,
+				RecoveryReady:   out.rate.recoveryReady(),
+			}
+			out.rate.observeFrame(stats.LogicalSize, stats.PrepareLatency+stats.WriteLatency)
+			var sample *encoding.CodecSamples
+			// A completed sample is already paid for; it was admitted only
+			// while it could still change the codec.
+			if result, ready := sampler.take(); ready {
+				sample = &result
+				if result.Has(encoding.EncodingLz4) {
+					metrics.SniffRatio = result.Ratio(encoding.EncodingLz4)
+				}
+				windowRate.Sampled = true
+			}
+			windowRate.KernelBps, windowRate.UserBps = out.rate.readings()
+			decidedFrame = true
+			if sendFrameMetricsHook != nil {
+				sendFrameMetricsHook(metrics)
+			}
+			decision := compressPolicy.DecideSampled(currentMode, metrics, sample)
+			out.rate.noteRecovery(decision.RecoveryLoss, stats.PrepareLatency+stats.WriteLatency)
+			out.rate.saveLink(compressPolicy)
+			if decision.Next != currentMode || decision.Reason == "recovery-won" {
 				prevComp := policy.FrameCompTokenForMode(currentMode)
 				nextComp := policy.FrameCompTokenForMode(decision.Next)
 				log.Printf(
@@ -850,666 +1077,4 @@ func maxFrameWireHint(comp string, logicalSize int64) (int64, error) {
 	default:
 		return encoding.MaxFrameWireSizeHintBytes(comp, logicalSize)
 	}
-}
-
-func desiredPipeSizeBytes(windowLen int64, frameSize int64) int {
-	maxPipeSize := bestEffortPipeMaxSizeBytes()
-	const minPipeSize = 64 * 1024
-	if frameSize <= 0 {
-		return minPipeSize
-	}
-	if windowLen > maxPipeSize {
-		return int(maxPipeSize)
-	}
-	return int(max(minPipeSize, min(frameSize, maxPipeSize)))
-}
-
-func bestEffortPipeMaxSizeBytes() int64 {
-	pipeMaxSizeOnce.Do(func() {
-		raw, err := os.ReadFile("/proc/sys/fs/pipe-max-size") //nolint:forbidigo // Kernel limit lookup; pipe setup uses the pipe and fcntl gates.
-		if err != nil {
-			return
-		}
-		value, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
-		if err != nil || value <= 0 {
-			return
-		}
-		pipeMaxSizeBytes = value
-	})
-	return pipeMaxSizeBytes
-}
-
-func growPipeBestEffort(inj *faults.Injector, pipeFD *os.File, sizeBytes int) {
-	sysio.SetPipeSize(inj, pipeFD, sizeBytes)
-}
-
-// frameLineBytes is the pooled buffer a frame header or trailer line is
-// formatted into. Lines are usually under 300 bytes; a longer one grows the
-// slice rather than failing.
-const frameLineBytes = 4 << 10
-
-func appendFrameHeaderLine(dst []byte, fileID uint64, offset int64, size int64, wireSize int64, comp string, maxWSizeHint *int64, ts int64) []byte {
-	dst = append(dst, "FX/1 "...)
-	dst = strconv.AppendUint(dst, fileID, 10)
-	dst = append(dst, " offset="...)
-	dst = strconv.AppendInt(dst, offset, 10)
-	dst = append(dst, " size="...)
-	dst = strconv.AppendInt(dst, size, 10)
-	dst = append(dst, " wsize="...)
-	dst = strconv.AppendInt(dst, wireSize, 10)
-	dst = append(dst, " comp="...)
-	dst = append(dst, comp...)
-	if maxWSizeHint != nil {
-		dst = append(dst, " max-wsize="...)
-		dst = strconv.AppendInt(dst, *maxWSizeHint, 10)
-	}
-	dst = append(dst, " ts="...)
-	dst = strconv.AppendInt(dst, ts, 10)
-	return append(dst, '\n')
-}
-
-func appendFrameTrailerLine(dst []byte, fileID uint64, ts int64, next int64, windowHashToken string, metadata *encoding.FileFrameMetadata) []byte {
-	dst = append(dst, "FXT/1 "...)
-	dst = strconv.AppendUint(dst, fileID, 10)
-	dst = append(dst, " status=ok ts="...)
-	dst = strconv.AppendInt(dst, ts, 10)
-	if windowHashToken != "" {
-		dst = append(dst, " file-hash="...)
-		dst = append(dst, windowHashToken...)
-	}
-	dst = append(dst, " next="...)
-	dst = strconv.AppendInt(dst, next, 10)
-	if metadata != nil {
-		dst = appendMetadataTrailerTokens(dst, metadata)
-	}
-	return append(dst, '\n')
-}
-
-// appendMetadataTrailerTokens appends the space-prefixed meta: tokens of a
-// terminal trailer. Spaces in user and group names become underscores, since
-// tokens are space-separated.
-func appendMetadataTrailerTokens(dst []byte, metadata *encoding.FileFrameMetadata) []byte {
-	dst = append(dst, " meta:size="...)
-	dst = strconv.AppendInt(dst, metadata.Size, 10)
-	dst = append(dst, " meta:mtime_ns="...)
-	dst = strconv.AppendInt(dst, metadata.MtimeNS, 10)
-	dst = append(dst, " meta:mode="...)
-	dst = append(dst, metadata.Mode...)
-	dst = append(dst, " meta:uid="...)
-	dst = append(dst, metadata.UID...)
-	dst = append(dst, " meta:gid="...)
-	dst = append(dst, metadata.GID...)
-	dst = append(dst, " meta:user="...)
-	dst = appendSpacesAsUnderscores(dst, metadata.User)
-	dst = append(dst, " meta:group="...)
-	return appendSpacesAsUnderscores(dst, metadata.Group)
-}
-
-func appendSpacesAsUnderscores(dst []byte, s string) []byte {
-	for i := 0; i < len(s); i++ {
-		if s[i] == ' ' {
-			dst = append(dst, '_')
-		} else {
-			dst = append(dst, s[i])
-		}
-	}
-	return dst
-}
-
-func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStreamArgs) (frameStreamStats, error) {
-	readBufPtr, err := bufpool.Get(bufpool.BucketSize(args.FrameSize))
-	if err != nil {
-		return frameStreamStats{}, err
-	}
-	defer bufpool.Put(readBufPtr)
-	readBuf := *readBufPtr
-
-	writeLatency := time.Duration(0)
-	var timedWrites *time.Duration
-	if args.Timed {
-		timedWrites = &writeLatency
-	}
-	isCompressed := args.Comp != "none"
-
-	// For compressed: collect into frameBuf so wireSize is known before writing the header.
-	// For none: normally stream directly, but when using direct I/O retry path we stage
-	// payload in-memory until the read succeeds to avoid writing partial frame headers.
-	payloadWriter := io.Writer(args.Output)
-	var frameBuf *bytes.Buffer
-	var closeCompWriter func() error
-	var stagingBuf *bytes.Buffer
-	stagedDirectWrite := args.DirectIO && !isCompressed
-
-	if isCompressed {
-		frameBuf = acquireCompressedFrameBuffer(args.FrameSize, args.Comp)
-		defer releaseCompressedFrameBuffer(frameBuf)
-		var compWriter io.Writer
-		var selected string
-		compWriter, closeCompWriter, selected, err = encoding.WrapCompressedWriter(frameBuf, args.Comp, args.Mode)
-		if err != nil {
-			return frameStreamStats{}, err
-		}
-		if selected != args.Comp {
-			return frameStreamStats{}, errors.New("compression mode negotiation mismatch")
-		}
-		payloadWriter = compWriter
-	} else {
-		if stagedDirectWrite {
-			staging, releaseStaging, stageErr := bufpool.Acquire(bufpool.BucketSize(args.FrameSize))
-			if stageErr != nil {
-				return frameStreamStats{}, stageErr
-			}
-			defer releaseStaging()
-			stagingBuf = bytes.NewBuffer(staging[:0])
-			payloadWriter = stagingBuf
-		} else {
-			if err := writeFrameHeader(args.Output, args, args.FrameSize, timedWrites); err != nil {
-				return frameStreamStats{}, err
-			}
-		}
-	}
-
-	timing := timeNothing
-	if args.Timed {
-		timing = timeReads
-		if isCompressed {
-			timing = timeReadsAndHandling
-		}
-	}
-	timeChunkWrites := args.Timed && !isCompressed && !stagedDirectWrite
-	readRegion := trace.StartRegion(args.Ctx, "frame-read")
-	var src io.ReaderAt = fd
-	if args.Faults != nil {
-		src = args.Faults.WrapReaderAt(args.Ctx, faults.SiteSendRead, args.FileID, fd)
-	}
-	prepareLatency, readLatency, err := streamBufferedRead(src, fileOffset, args.FrameSize, readBuf, timing, func(chunk []byte) error {
-		_, _ = args.WindowHasher.Write(chunk)
-		var writeStart time.Time
-		if timeChunkWrites {
-			writeStart = time.Now()
-		}
-		written, writeErr := payloadWriter.Write(chunk)
-		if timeChunkWrites {
-			writeLatency += time.Since(writeStart)
-		}
-		if writeErr != nil {
-			return writeErr
-		}
-		if written != len(chunk) {
-			return io.ErrShortWrite
-		}
-		return nil
-	})
-	readRegion.End()
-	if err != nil {
-		return frameStreamStats{}, err
-	}
-
-	wireSize := args.FrameSize
-	if isCompressed {
-		compRegion := trace.StartRegion(args.Ctx, "frame-compress")
-		if err := closeCompWriter(); err != nil {
-			compRegion.End()
-			return frameStreamStats{}, err
-		}
-		wireSize = int64(frameBuf.Len())
-		if err := writeFrameHeader(args.Output, args, wireSize, timedWrites); err != nil {
-			compRegion.End()
-			return frameStreamStats{}, err
-		}
-		if err := timedWrite(args.Output, frameBuf.Bytes(), timedWrites); err != nil {
-			compRegion.End()
-			return frameStreamStats{}, err
-		}
-		compRegion.End()
-	} else if stagedDirectWrite {
-		if err := writeFrameHeader(args.Output, args, wireSize, timedWrites); err != nil {
-			return frameStreamStats{}, err
-		}
-		if err := timedWrite(args.Output, stagingBuf.Bytes(), timedWrites); err != nil {
-			return frameStreamStats{}, err
-		}
-	}
-
-	windowHashToken, err := writeFrameTrailer(args.Output, args, timedWrites)
-	if err != nil {
-		return frameStreamStats{}, err
-	}
-
-	return frameStreamStats{
-		LogicalSize:     args.FrameSize,
-		WireSize:        wireSize,
-		PrepareLatency:  prepareLatency,
-		ReadLatency:     readLatency,
-		WriteLatency:    writeLatency,
-		NextOffset:      *fileOffset,
-		WindowHashToken: windowHashToken,
-	}, nil
-}
-
-func dupConnFD(conn *net.TCPConn) (int, error) {
-	// The caller applies the dup gate before entering this helper.
-	dupFD, err := sysio.DupConn(nil, conn)
-	if err != nil {
-		return -1, err
-	}
-	if dupFD < 0 {
-		return -1, errors.New("failed to duplicate connection fd")
-	}
-	return dupFD, nil
-}
-
-const zeroCopyPollTimeoutMs = 30_000 // 30s per poll wait
-
-// zeroCopySyscalls contains the raw operations used by the zero-copy loop.
-// Keeping this per invocation lets tests reproduce short and interrupted
-// operations without mutable package-level syscall hooks.
-type zeroCopySyscalls struct {
-	splice func(int, *int64, int, *int64, int, int) (int64, error)
-	tee    func(int, int, int, int) (int64, error)
-	poll   func([]sysio.PollFd, int) (int, error)
-}
-
-func kernelZeroCopySyscalls() zeroCopySyscalls {
-	splice, tee, poll := sysio.ZeroCopyCalls(nil)
-	return zeroCopySyscalls{splice: splice, tee: tee, poll: poll}
-}
-
-func waitSocketWritable(fd int, syscalls zeroCopySyscalls) error {
-	pollFDs := []sysio.PollFd{{Fd: int32(fd), Events: sysio.POLLOUT}}
-	for {
-		n, err := syscalls.poll(pollFDs, zeroCopyPollTimeoutMs)
-		if err != nil {
-			if errors.Is(err, sysio.EINTR) {
-				continue
-			}
-			return err
-		}
-		if n == 0 {
-			return errors.New("zero-copy splice timed out waiting for socket writable")
-		}
-		if pollFDs[0].Revents&(sysio.POLLERR|sysio.POLLHUP|sysio.POLLNVAL) != 0 {
-			return errors.New("socket error during zero-copy splice")
-		}
-		if pollFDs[0].Revents&sysio.POLLOUT != 0 {
-			return nil
-		}
-		return errors.New("socket did not become writable during zero-copy splice")
-	}
-}
-
-func streamFramePayloadZeroCopy(fd *os.File, fileOffset *int64, args frameStreamArgs) (frameStreamStats, error) {
-	syscalls := kernelZeroCopySyscalls()
-	if args.Faults != nil {
-		syscalls = faultZeroCopySyscalls(args.Faults, syscalls)
-	}
-	return streamFramePayloadZeroCopyWithSyscalls(fd, fileOffset, args, syscalls)
-}
-
-// faultZeroCopySyscalls puts inj's gates in front of each zero-copy syscall.
-func faultZeroCopySyscalls(inj *faults.Injector, sc zeroCopySyscalls) zeroCopySyscalls {
-	return zeroCopySyscalls{
-		splice: inj.WrapSplice(sc.splice),
-		tee:    inj.WrapTee(sc.tee),
-		poll:   inj.WrapPoll(sc.poll),
-	}
-}
-
-func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args frameStreamArgs, syscalls zeroCopySyscalls) (frameStreamStats, error) {
-	srcR, srcW, err := sysio.Pipe(args.Faults)
-	if err != nil {
-		return frameStreamStats{}, err
-	}
-	defer srcR.Close()
-	defer srcW.Close()
-	growPipeBestEffort(args.Faults, srcR, args.PipeSizeBytes)
-	growPipeBestEffort(args.Faults, srcW, args.PipeSizeBytes)
-
-	copyBufSize := bufpool.BucketSize(int64(args.PipeSizeBytes))
-	copyBuf, releaseCopyBuf, err := bufpool.Acquire(copyBufSize)
-	if err != nil {
-		return frameStreamStats{}, err
-	}
-	defer releaseCopyBuf()
-
-	if err := args.Faults.Sys(faults.SysDup); err != nil {
-		return frameStreamStats{}, err
-	}
-	outFD, err := dupConnFD(args.OutputTCPConn)
-	if err != nil {
-		return frameStreamStats{}, err
-	}
-	defer sysio.Close(outFD)
-
-	// Hash pipe: tee duplicates pipe1 data here for hashing, while pipe1
-	// data is spliced directly to the socket without entering userspace.
-	hashPipeR, hashPipeW, err := sysio.Pipe(args.Faults)
-	if err != nil {
-		return frameStreamStats{}, err
-	}
-	defer hashPipeR.Close()
-	defer hashPipeW.Close()
-	growPipeBestEffort(args.Faults, hashPipeR, args.PipeSizeBytes)
-	growPipeBestEffort(args.Faults, hashPipeW, args.PipeSizeBytes)
-
-	writeLatency := time.Duration(0)
-	if err := writeFrameHeader(args.Output, args, args.FrameSize, &writeLatency); err != nil {
-		return frameStreamStats{}, err
-	}
-
-	prepareLatency := time.Duration(0)
-	remaining := args.FrameSize
-
-	// Fd() puts these into blocking mode — required for raw tee/splice syscalls.
-	srcRFD := int(srcR.Fd())
-	hashPipeWFD := int(hashPipeW.Fd())
-
-	readRegion := trace.StartRegion(args.Ctx, "frame-read-zerocopy")
-	for remaining > 0 {
-		step := remaining
-		if step > int64(args.PipeSizeBytes) {
-			step = int64(args.PipeSizeBytes)
-		}
-
-		spliceStart := time.Now()
-		splicedIn, spliceErr := syscalls.splice(int(fd.Fd()), fileOffset, int(srcW.Fd()), nil, int(step), sysio.SPLICE_F_MOVE)
-		prepareLatency += time.Since(spliceStart)
-		if spliceErr != nil {
-			if errors.Is(spliceErr, sysio.EINTR) {
-				continue
-			}
-			readRegion.End()
-			return frameStreamStats{}, spliceErr
-		}
-		if splicedIn <= 0 {
-			readRegion.End()
-			return frameStreamStats{}, io.ErrUnexpectedEOF
-		}
-
-		// tee(2) does not consume src bytes. If tee returns a partial
-		// duplicate, we must consume exactly that amount from src before
-		// calling tee again, otherwise we'd duplicate the same prefix
-		// repeatedly.
-		sourceRemaining := splicedIn
-		for sourceRemaining > 0 {
-			teeStart := time.Now()
-			teed, teeErr := syscalls.tee(srcRFD, hashPipeWFD, int(sourceRemaining), 0)
-			prepareLatency += time.Since(teeStart)
-			if teeErr != nil {
-				if errors.Is(teeErr, sysio.EINTR) {
-					continue
-				}
-				readRegion.End()
-				return frameStreamStats{}, teeErr
-			}
-			if teed <= 0 {
-				readRegion.End()
-				return frameStreamStats{}, io.ErrUnexpectedEOF
-			}
-
-			// splice: consume teed bytes from pipe1 → socket (zero-copy)
-			writeStart := time.Now()
-			moveRemaining := teed
-			for moveRemaining > 0 {
-				moved, moveErr := syscalls.splice(srcRFD, nil, outFD, nil, int(moveRemaining), sysio.SPLICE_F_MOVE)
-				if moveErr != nil {
-					if errors.Is(moveErr, sysio.EINTR) {
-						continue
-					}
-					if errors.Is(moveErr, sysio.EAGAIN) {
-						if waitErr := waitSocketWritable(outFD, syscalls); waitErr != nil {
-							readRegion.End()
-							return frameStreamStats{}, waitErr
-						}
-						continue
-					}
-					readRegion.End()
-					return frameStreamStats{}, moveErr
-				}
-				if moved <= 0 {
-					readRegion.End()
-					return frameStreamStats{}, io.ErrUnexpectedEOF
-				}
-				moveRemaining -= moved
-			}
-			writeLatency += time.Since(writeStart)
-
-			// read from hash pipe + hash (the only userspace copy)
-			readStart := time.Now()
-			n, readErr := io.ReadFull(hashPipeR, copyBuf[:teed])
-			prepareLatency += time.Since(readStart)
-			if n > 0 {
-				_, _ = args.WindowHasher.Write(copyBuf[:n])
-			}
-			if readErr != nil {
-				readRegion.End()
-				return frameStreamStats{}, readErr
-			}
-			sourceRemaining -= teed
-		}
-		remaining -= splicedIn
-	}
-	readRegion.End()
-
-	windowHashToken, err := writeFrameTrailer(args.Output, args, &writeLatency)
-	if err != nil {
-		return frameStreamStats{}, err
-	}
-
-	return frameStreamStats{
-		LogicalSize:     args.FrameSize,
-		WireSize:        args.FrameSize,
-		PrepareLatency:  prepareLatency,
-		ReadLatency:     prepareLatency,
-		WriteLatency:    writeLatency,
-		NextOffset:      *fileOffset,
-		WindowHashToken: windowHashToken,
-	}, nil
-}
-
-func writeFrameHeader(out io.Writer, args frameStreamArgs, wireSize int64, writeLatency *time.Duration) error {
-	buf, err := bufpool.Get(frameLineBytes)
-	if err != nil {
-		return err
-	}
-	line := appendFrameHeaderLine((*buf)[:0], args.FileID, args.Offset, args.FrameSize, wireSize, args.Comp, args.MaxWSizeHint, args.HeaderTS)
-	err = timedWrite(out, line, writeLatency)
-	bufpool.Put(buf)
-	return err
-}
-
-// timedWrite writes p, adding the write's duration to latency when latency
-// is not nil.
-func timedWrite(out io.Writer, p []byte, latency *time.Duration) error {
-	if latency == nil {
-		_, err := out.Write(p)
-		return err
-	}
-	start := time.Now()
-	_, err := out.Write(p)
-	*latency += time.Since(start)
-	return err
-}
-
-func writeFrameTrailer(out io.Writer, args frameStreamArgs, writeLatency *time.Duration) (string, error) {
-	windowHashToken := ""
-	if args.IsTerminal {
-		windowHashToken = encoding.FormatXXH128HashToken(args.WindowHasher.Sum128())
-	}
-	buf, err := bufpool.Get(frameLineBytes)
-	if err != nil {
-		return "", err
-	}
-	// One clock read stamps the trailer and starts the write timing.
-	now := time.Now()
-	line := appendFrameTrailerLine((*buf)[:0], args.FileID, now.UnixMilli(), args.Next, windowHashToken, args.TerminalMD)
-	_, err = out.Write(line)
-	bufpool.Put(buf)
-	if err != nil {
-		return "", err
-	}
-	if writeLatency != nil {
-		*writeLatency += time.Since(now)
-	}
-	return windowHashToken, nil
-}
-
-// readTiming selects which latencies streamBufferedRead measures.
-type readTiming uint8
-
-const (
-	timeNothing readTiming = iota
-	timeReads
-	// timeReadsAndHandling also charges handle to prepare latency, for
-	// frames whose handler compresses.
-	timeReadsAndHandling
-)
-
-func streamBufferedRead(
-	src io.ReaderAt,
-	fileOffset *int64,
-	frameSize int64,
-	buf []byte,
-	timing readTiming,
-	handle func([]byte) error,
-) (prepareLatency, readLatency time.Duration, err error) {
-	remaining := frameSize
-	for remaining > 0 {
-		readSize := len(buf)
-		if int64(readSize) > remaining {
-			readSize = int(remaining)
-		}
-		var start time.Time
-		if timing != timeNothing {
-			start = time.Now()
-		}
-		n, readErr := src.ReadAt(buf[:readSize], *fileOffset)
-		if timing != timeNothing {
-			readLatency += time.Since(start)
-		}
-		if n > 0 {
-			*fileOffset += int64(n)
-			remaining -= int64(n)
-			if timing == timeReadsAndHandling {
-				start = time.Now()
-			}
-			if err := handle(buf[:n]); err != nil {
-				return 0, 0, err
-			}
-			if timing == timeReadsAndHandling {
-				prepareLatency += time.Since(start)
-			}
-		}
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) && remaining == 0 {
-				break
-			}
-			return 0, 0, readErr
-		}
-	}
-	if remaining != 0 {
-		return 0, 0, io.ErrUnexpectedEOF
-	}
-	return prepareLatency + readLatency, readLatency, nil
-}
-
-func acquireCompressedFrameBuffer(logicalSize int64, comp string) *bytes.Buffer {
-	maxEncoded, err := encoding.MaxEncodedFrameSizeBytes(comp, logicalSize)
-	if err != nil || maxEncoded <= 0 {
-		maxEncoded = defaultCompressedFrameBufferBytes
-	}
-	capacity := int(maxEncoded)
-	if capacity <= 0 {
-		capacity = defaultCompressedFrameBufferBytes
-	}
-
-	if raw := compressedFrameBufferPool.Get(); raw != nil {
-		if buf, ok := raw.(*bytes.Buffer); ok && buf != nil {
-			buf.Reset()
-			if buf.Cap() >= capacity {
-				return buf
-			}
-			return bytes.NewBuffer(make([]byte, 0, capacity))
-		}
-	}
-	return bytes.NewBuffer(make([]byte, 0, capacity))
-}
-
-func releaseCompressedFrameBuffer(buf *bytes.Buffer) {
-	if buf == nil {
-		return
-	}
-	if buf.Cap() > maxCompressedFrameBufferPoolBytes {
-		return
-	}
-	buf.Reset()
-	compressedFrameBufferPool.Put(buf)
-}
-
-// minSequentialAdviceBytes is the smallest window worth advising. The kernel's
-// default readahead (128 KiB) already covers a read this small, so the advice
-// would be a syscall per file that changes nothing.
-const minSequentialAdviceBytes = 128 << 10
-
-func tryAdviseSequential(inj *faults.Injector, fd *os.File, offset int64, length int64) {
-	if fd == nil || offset < 0 || length < minSequentialAdviceBytes {
-		return
-	}
-	_ = sysio.Fadvise(inj, fd.Fd(), offset, length, sysio.FADV_SEQUENTIAL)
-}
-
-// readaheadHint describes a file region for the background readahead goroutine
-// to prefetch into the page cache.
-type readaheadHint struct {
-	offset int64
-	length int64
-}
-
-// tryReadAheadRange issues the readahead(2) syscall to asynchronously populate
-// the page cache for the given byte range.
-func tryReadAheadRange(inj *faults.Injector, fd *os.File, offset int64, length int64) {
-	if fd == nil || offset < 0 || length <= 0 {
-		return
-	}
-	_ = sysio.Readahead(inj, fd.Fd(), offset, length)
-}
-
-// startFrameReadahead spawns a background goroutine that issues readahead(2)
-// for file regions received on the returned channel. The goroutine exits when
-// done is closed or the channel is closed. Call the returned stop function to
-// ensure the goroutine has exited before closing fd.
-func startFrameReadahead(inj *faults.Injector, fd *os.File, done <-chan struct{}) (chan readaheadHint, func()) {
-	ch := make(chan readaheadHint, 1)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case hint, ok := <-ch:
-				if !ok {
-					return
-				}
-				tryReadAheadRange(inj, fd, hint.offset, hint.length)
-			case <-done:
-				return
-			}
-		}
-	}()
-	stop := func() {
-		close(ch)
-		wg.Wait()
-	}
-	return ch, stop
-}
-
-// sendReadaheadHint sends a readahead hint to the background goroutine,
-// discarding any stale hint already in the channel so that the goroutine
-// always processes the most recent request.
-func sendReadaheadHint(ch chan readaheadHint, hint readaheadHint) {
-	select {
-	case <-ch:
-	default:
-	}
-	ch <- hint
 }

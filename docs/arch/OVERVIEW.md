@@ -220,54 +220,111 @@ on the receiver all overlap — keeping SSD, CPU, and NIC busy simultaneously.
 
 ## Adaptive Compression
 
-Compression helps when data compresses well, but hurts when it doesn't — the
-CPU time spent compressing incompressible data is pure overhead. `tx` solves
-this with per-frame adaptive compression that continuously adjusts its strategy
-based on observed bottlenecks.
+With `--compress adapt`, the sender chooses compression per frame to maximize
+logical throughput. Compression helps when it saves more network time than it
+costs in CPU, but it cannot improve a receiver disk bottleneck.
+[Cloud transfer limits](CLOUD.md) illustrates how these limits can change
+during a cloud copy.
 
 ### Frame-level adaptation
 
-Files are streamed as a sequence of 4 MiB frames. After each frame the server
-records two signals:
+Files stream as 4 MiB frames. The policy measures each frame's logical bytes
+over its prepare and write time. Prepare includes disk reads, hashing, and
+compression; write includes sending and flushing the frame.
 
-- **Compression ratio** — logical bytes / wire bytes.
-- **Read-over-write ratio** — time spent preparing the frame (disk read +
-  compress) vs. time spent writing it to the network.
+Buffered writes can return before bytes reach the receiver. To avoid mistaking
+buffer space for network bandwidth, the policy also uses the kernel reported
+TCP delivery rate when available, falling back to a rate estimated from the connection's writes. Measured backpressure still captures a path that slows
+down. Delivery estimates and sample coverage appear in `txfer-rate` logs and `--stats`.
 
-These signals are smoothed with an exponential moving average (α = 0.80). The
-policy then makes a decision:
+### Background sampling
 
-| Signal | Action |
-|--------|--------|
-| Read-over-write < 0.10 | **Upgrade** — CPU is idle relative to network; try stronger compression |
-| Ratio < 0.90 or read-over-write > 1.10 | **Downgrade** — compression is a bottleneck; use lighter or no compression |
-| Otherwise | **Hold** — current mode is balanced |
+Workers test lz4 and zstd level 1 on samples of up to 256 KiB from bytes already
+read. They measure compression cost and ratio without rereading files or
+sending upward trials on the wire. Zstd is tested even when lz4 gains nothing,
+so the policy can detect data that benefits only from stronger compression
+such as that already compressed with lz4.
 
-To avoid flapping, changes require two consecutive frames agreeing on the same
-direction (hysteresis streak = 2).
+Sampling measures codecs the current frames cannot show: an lz4 stream tests
+only zstd. Separate limits bound codec workers and pending results, so a
+result waiting for its frame does not hold a worker. SEND never waits for
+either. Files and windows must have enough time left to use a result.
+Admission includes scheduling delays in sample latency,
+and workers skip remaining codecs when their window ends. Bounded retries
+prevent a stale latency estimate from closing sampling permanently.
+
+Uncompressed files back off sampling when neither codec can repay its CPU
+cost. A change in frame cost reopens sampling; periodic samples also detect
+changed data. Thread CPU time keeps preemption out of measured codec costs.
+
+The stream keeps its current codec while the policy compares estimated
+throughput. Repeated wins justify a switch; normal frame timings then validate
+it and restore the previous codec if it proves slower. The policy backs off
+after losing comparisons and explores again when throughput or compressibility
+changes.
+
+Compressed streams also check cheaper codecs on real frames: none first,
+then lz4 from zstd if none loses. Each episode first sends two frames of the
+current codec, flushed as the check's are, and adds their flush time to that
+codec's average cost. Two observations at least 3% faster than the sum
+justify a switch; eight normal frames validate it and can restore
+the previous codec. Validation compares the mean raw time of every frame
+since the switch, check frames included, so a send buffer that absorbs the
+first frames cannot hide their cost. A fast response flushes its buffer after
+each baseline, check, and validation frame, rather than only when the request
+ends, so all of them are timed to the same point. Output already buffered
+drains first, untimed, so each flush times one frame's bytes. An episode sends at most
+16 MiB of cheaper codecs and needs 28 MiB left in the file. All of a server's connections share a budget
+of about 1% of steady-state frame time for unsuccessful checks, so neither
+new connections nor new files get unpaid checks. A starting check charges
+the budget one frame in advance, which keeps most other connections from
+starting checks before its losses are known; it does not make checks
+exclusive. Detected cost changes, including 10% drift
+for eight home observations, allow an earlier check when fresh home timings
+confirm the change, without forgiving earlier losses. The confirmation needs
+more evidence the costlier the failed checks behind it. An unconfirmed change
+keeps their backoff. An adopted codec whose validated cost is more than twice
+from what it won at also allows an early check: the path changed while it
+validated, or the estimate missed a bottleneck. So does lz4 winning from zstd
+at a write cost no single path explains beside none's losing frame: the path
+changed during the check. Upward exploration stays in the background and
+resumes as soon as a check wins.
+
+### Policy state
+
+Each file keeps its codec and learned policy across windows. Concurrent
+windows work on independent copies, with the last save becoming the next
+window's starting point. This avoids locking per frame, but many small
+parallel windows can slow learning. State is released when the file finishes
+or its transfer is removed.
+
+Connections share their uncompressed link estimate with new files, so each
+file need not relearn the same baseline. Compression ratios and codec evidence
+stay with the file, since different files can compress differently.
+
+A file's policy is in one of three phases. While steady, it observes its
+current codec and runs background comparisons. A check sends a cheaper codec
+on real frames. Validation measures a codec the policy adopted, from a
+comparison or a check, and can restore the previous one. A check requested
+during validation waits for it to end.
 
 ### Compression ladder
 
-The adaptation walks a three-rung ladder:
+The policy chooses among three codecs and can skip lz4 when zstd wins directly:
 
 ```mermaid
 flowchart LR
     none["none (starting mode)"] -->|Upgrade| lz4["lz4"]
     lz4 -->|Upgrade| zstd["zstd (level 1)"]
+    none -->|Background evidence| zstd
     zstd -->|Downgrade| lz4
     lz4 -->|Downgrade| none
 ```
 
-The default starting point is `none`. On slow links with compressible data, the
-server upgrades toward `zstd` and can effectively exceed line rate because
-compressed frames are smaller than the raw data. On fast networks with
-incompressible data (e.g. already-compressed media), the server stays at `none`
-or downgrades back — avoiding any CPU overhead. Mixed datasets (e.g. a
-directory with both text logs and JPEG images) see the server adapt
-frame-by-frame as data characteristics change.
-
-The client can also force a specific compression mode (`--compress none|lz4|zstd`)
-to skip adaptation.
+Every file starts at `none`. On slow networks, compressible data can exceed
+network line rate in logical bytes. Incompressible data stays uncompressed,
+with occasional background samples to detect changes. Use
+`--compress none|lz4|zstd` to force a codec and skip adaptation.
 
 ## Verification
 

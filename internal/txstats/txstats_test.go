@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/filexfer/store"
 )
 
 func readRecords(t *testing.T, path string) []ServerRecord {
@@ -47,7 +48,8 @@ func TestServerWriterRecords(t *testing.T) {
 		sink.Emit("window", "t1", events.F("len", int64(100)), events.F("wire", int64(40)), events.F("codec", c), events.F("send_path", "buffered"))
 	}
 	sink.Emit("window", "unknown", events.F("len", int64(1)))
-	sink.Emit("transfer_done", "t1", events.F("files", 3), events.F("bytes", int64(300)), events.Dur("dur", time.Second))
+	rates := store.RateSummary{Files: 2, Windows: 3, Sampled: 1, Kernel: store.RateStats{N: 3, Min: 1, Max: 9, Sum: 15}}
+	sink.Emit("transfer_done", "t1", events.F("files", 3), events.F("bytes", int64(300)), events.Dur("dur", time.Second), events.F("rates", rates))
 	if err := w.Close("sigterm"); err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +66,9 @@ func TestServerWriterRecords(t *testing.T) {
 	if end.Rec != RecEnd || end.TID != "t1" || !*end.Complete || end.Files != 3 || end.Bytes != 300 ||
 		end.LogicalBytes != 300 || end.WireBytes != 120 || end.Windows["zstd"] != 2 || end.SendPath["buffered"] != 3 {
 		t.Fatalf("end record %+v", end)
+	}
+	if end.Rates == nil || *end.Rates != rates {
+		t.Fatalf("end record rates %+v, want %+v", end.Rates, rates)
 	}
 	if open := recs[3]; open.Rec != RecEnd || open.TID != "t2" || *open.Complete {
 		t.Fatalf("unfinished transfer record %+v", open)

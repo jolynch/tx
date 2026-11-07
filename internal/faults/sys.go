@@ -26,6 +26,7 @@ const (
 	SysMmap
 	SysMincore
 	SysSetsockopt
+	SysGetsockopt
 	sysCount
 )
 
@@ -45,6 +46,7 @@ var syscallNames = [sysCount]string{
 	SysMmap:          "mmap",
 	SysMincore:       "mincore",
 	SysSetsockopt:    "setsockopt",
+	SysGetsockopt:    "getsockopt",
 }
 
 func (sc Syscall) String() string { return syscallNames[sc] }
@@ -70,6 +72,7 @@ var syscallErrnos = [sysCount][]syscall.Errno{
 	SysMmap:          {unix.ENOMEM, unix.EAGAIN},
 	SysMincore:       {unix.ENOMEM, unix.EAGAIN},
 	SysSetsockopt:    {unix.ENOBUFS, unix.EINVAL},
+	SysGetsockopt:    {unix.ENOPROTOOPT, unix.EINVAL},
 }
 
 // Sys is the gate in front of a syscall site. It may sleep for an injected

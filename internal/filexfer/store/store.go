@@ -18,6 +18,8 @@ import (
 	"github.com/jolynch/tx/internal/events"
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
+	"github.com/jolynch/tx/internal/filexfer/policy"
+	"github.com/jolynch/tx/internal/idset"
 	"github.com/jolynch/tx/internal/utils"
 	"github.com/zeebo/xxh3"
 )
@@ -109,6 +111,16 @@ type managedTransfer struct {
 	// hash needs only a shared hold of mu. Lock order: mu, then hashMu.
 	hashMu       sync.Mutex
 	windowHashes map[windowHashKey]windowHashState
+
+	// compMu guards compression alone: the adaptive state of files whose
+	// SEND spans several windows, dropped when the file is Done or the
+	// transfer ends. Lock order: mu, then compMu.
+	compMu      sync.Mutex
+	compression map[uint64]policy.FileCompression
+	// rates totals the transfer's adaptive windows for its completion log,
+	// and ratedFiles holds the files it has counted; compMu guards both.
+	rates      RateSummary
+	ratedFiles idset.Set
 }
 
 // Store holds transfer state for a server. There is no process-wide
@@ -182,14 +194,23 @@ func WithRequestPath(p string) TransferOption {
 	return func(t *Transfer) { t.RequestPath = p }
 }
 
-// emitDone reports a transfer that just became complete. Callers invoke it
+// emitDone reports a transfer that just became complete, with its rate
+// summary when any window reached the compression policy. Callers invoke it
 // after releasing the transfer's lock.
-func (s *Store) emitDone(t Transfer) {
-	s.events.Emit("transfer_done", t.ID,
+func (s *Store) emitDone(t Transfer, rates RateSummary) {
+	if !s.events.Enabled() {
+		return
+	}
+	fields := []events.Field{
 		events.F("path", t.RequestPath),
 		events.F("files", t.NumFiles),
 		events.F("bytes", t.TotalSize),
-		events.Dur("dur", time.Since(t.CreatedAt)))
+		events.Dur("dur", time.Since(t.CreatedAt)),
+	}
+	if rates.Windows > 0 {
+		fields = append(fields, events.F("rates", rates))
+	}
+	s.events.Emit("transfer_done", t.ID, fields...)
 }
 
 // NewStore returns an isolated store with its own expiry goroutine. Callers
@@ -321,9 +342,15 @@ func (s *Store) MaybeLogTransferComplete(txferID string) bool {
 	t.CompleteLogged = true
 	line := formatTransferComplete(t)
 	done := summarizeTransfer(*t)
+	managed.compMu.Lock()
+	rates := managed.rates
+	managed.compMu.Unlock()
 	managed.mu.Unlock()
 	log.Print(line)
-	s.emitDone(done)
+	if rates.Windows > 0 {
+		log.Print(formatRates(done.ID, done.NumFiles, rates))
+	}
+	s.emitDone(done, rates)
 	return true
 }
 
@@ -589,6 +616,9 @@ func (s *Store) RegisterTransferFileStates(txferID string, updates []TransferFil
 		managed.transfer.PathHash[idx] = update.PathHash
 		if shouldAdvanceState(managed.transfer.State[idx], state) {
 			managed.transfer.State[idx] = state
+			if state == TransferStateDone {
+				managed.dropFileCompression(update.FileID)
+			}
 		}
 		managed.transfer.countEntry(idx, 1)
 	}
@@ -607,6 +637,7 @@ func (s *Store) DeleteTransfer(txferID string) bool {
 	managed := v.(*managedTransfer)
 	managed.mu.Lock()
 	managed.deleted = true
+	managed.dropAllCompression()
 	managed.mu.Unlock()
 	return true
 }
@@ -810,6 +841,9 @@ func (s *Store) SetTransferFilesState(txferID string, fileIDs []uint64, state ui
 			continue
 		}
 		managed.transfer.setState(idx, state)
+		if state == TransferStateDone {
+			managed.dropFileCompression(fileID)
+		}
 		advanced = true
 	}
 	if advanced {
@@ -876,6 +910,7 @@ func (s *Store) acknowledgeFileLocked(managed *managedTransfer, fileID uint64, a
 	}
 
 	if ackBytes == -1 {
+		managed.dropFileCompression(fileID)
 		if shouldAdvanceState(currentState, TransferStateMissing) {
 			wasTerminal := currentState == TransferStateDone || currentState == TransferStateMissing
 			managed.transfer.setState(idx, TransferStateMissing)
@@ -916,6 +951,7 @@ func (s *Store) acknowledgeFileLocked(managed *managedTransfer, fileID uint64, a
 	// revived file whose bytes were all acknowledged before is counted again.
 	if managed.transfer.AckedSize[idx] >= maxAck && managed.transfer.State[idx] < TransferStateDone && isRegularFileEntryType(managed.transfer.EntryType[idx]) {
 		managed.transfer.setState(idx, TransferStateDone)
+		managed.dropFileCompression(fileID)
 		managed.transfer.Done++
 		s.touchLocked(managed, now)
 	}
@@ -980,7 +1016,7 @@ func (s *Store) ClipTransfer(txferID string) bool {
 		log.Print(line)
 	}
 	if emptyDone {
-		s.emitDone(done)
+		s.emitDone(done, RateSummary{})
 	}
 	return true
 }
@@ -1016,6 +1052,7 @@ func (s *Store) reapExpiredLoop() {
 			expired := !managed.deleted && !managed.transfer.ExpiresAt.After(now)
 			if expired {
 				managed.deleted = true
+				managed.dropAllCompression()
 			}
 			managed.mu.Unlock()
 			if expired {
@@ -1063,6 +1100,27 @@ type WindowHash struct {
 // the transfer's locks, so a SEND records all its files at once. It skips any
 // hash that is malformed or names an out-of-range file, and then reports false.
 func (s *Store) SetTransferFileWindowHashes(txferID string, hashes []WindowHash) bool {
+	return s.RecordTransferWindows(txferID, WindowRecords{Hashes: hashes})
+}
+
+// WindowRecords is what one SEND leaves for its transfer: its window
+// hashes, its files' compression state, and its adaptive windows' rates.
+// RatedFiles lists the files whose first window is among them; the store
+// counts each file once, however often its first window is sent.
+type WindowRecords struct {
+	Hashes      []WindowHash
+	Compression []FileCompressionUpdate
+	Rates       RateSummary
+	RatedFiles  []uint64
+}
+
+// RecordTransferWindows records a SEND's window hashes, its files'
+// compression state, and its rate summary under one acquisition of the
+// transfer's locks. A compression update for a file that is Done or Missing,
+// or out of range, is skipped without an error. It reports false as
+// SetTransferFileWindowHashes does.
+func (s *Store) RecordTransferWindows(txferID string, rec WindowRecords) bool {
+	hashes := rec.Hashes
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
 		return false
@@ -1074,6 +1132,7 @@ func (s *Store) SetTransferFileWindowHashes(txferID string, hashes []WindowHash)
 		return false
 	}
 	ok = true
+	managed.saveCompressionLocked(rec.Compression, rec.Rates, rec.RatedFiles)
 	managed.hashMu.Lock()
 	defer managed.hashMu.Unlock()
 	for _, h := range hashes {

@@ -297,6 +297,62 @@ func TestTCPByteCounts(t *testing.T) {
 	}
 }
 
+// TestTCPRateReader checks the delivery rate and its app-limited bit. One
+// small write on an idle socket is an app-limited sample, by the kernel's
+// definition; a bulk write that keeps the send queue full is not. A read
+// allocates nothing once the reader is built.
+func TestTCPRateReader(t *testing.T) {
+	client, server := tcpPair(t)
+	_ = server.SetDeadline(time.Now().Add(callTimeout))
+	r := NewTCPRateReader(nil, client)
+	if rate, _ := r.DeliveryRate(); rate != 0 {
+		t.Fatalf("fresh socket: DeliveryRate = %d, want 0", rate)
+	}
+	small := pattern(1000)
+	if _, err := client.Write(small); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(server, small); err != nil {
+		t.Fatal(err)
+	}
+	waitRate := func() (uint64, bool) {
+		deadline := time.Now().Add(callTimeout)
+		for {
+			rate, limited := r.DeliveryRate()
+			if rate > 0 || time.Now().After(deadline) {
+				return rate, limited
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if rate, limited := waitRate(); rate == 0 || !limited {
+		t.Fatalf("after one small write: DeliveryRate = %d, app-limited %v; want a rate, app-limited", rate, limited)
+	}
+	// A loaded host can leave the pipe idle between the writer's turns, so
+	// one bulk write may end on app-limited samples. A few must not.
+	bulk := pattern(8 << 20)
+	sink := make([]byte, len(bulk))
+	var rate uint64
+	limited := true
+	for try := 0; try < 5 && (rate == 0 || limited); try++ {
+		done := make(chan error, 1)
+		go func() { _, err := io.ReadFull(server, sink); done <- err }()
+		if _, err := client.Write(bulk); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		rate, limited = waitRate()
+	}
+	if rate == 0 || limited {
+		t.Fatalf("after five bulk writes: DeliveryRate = %d, app-limited %v; want a rate, not app-limited", rate, limited)
+	}
+	if allocs := testing.AllocsPerRun(100, func() { _, _ = r.DeliveryRate() }); allocs != 0 {
+		t.Fatalf("DeliveryRate allocated %.1f times per read", allocs)
+	}
+}
+
 // tcpOption returns conn's IPPROTO_TCP option opt.
 func tcpOption(t *testing.T, conn *net.TCPConn, opt int) int {
 	t.Helper()

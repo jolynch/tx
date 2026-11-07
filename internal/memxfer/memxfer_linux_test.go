@@ -838,3 +838,111 @@ func released(goroutines, fds int, wait time.Duration) error {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// codecShares counts the logical bytes the server's windows sent in each
+// codec.
+type codecShares struct {
+	mu    sync.Mutex
+	bytes map[string]int64
+}
+
+func (c *codecShares) observe(ev events.Event) {
+	if ev.Name != "window" {
+		return
+	}
+	c.mu.Lock()
+	c.bytes[ev.Str("codec")] += ev.Int("len")
+	c.mu.Unlock()
+}
+
+// compressed is the share of logical bytes sent in a compressed codec.
+func (c *codecShares) compressed() float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var all int64
+	for _, n := range c.bytes {
+		all += n
+	}
+	if all == 0 {
+		return 0
+	}
+	return 1 - float64(c.bytes["none"])/float64(all)
+}
+
+// TestAdaptiveUnderRateFaults copies compressible files with --compress
+// adapt and checks the codec follows the link. Over bare loopback the CPU,
+// not the link, limits compression, so the copy stays mostly uncompressed,
+// even when NET rate fakes some slow delivery-rate readings, as slow start
+// would. Under a server --bwlimit the link is slow for real: the rate the
+// server's writes show drops and the copy must compress, also when
+// getsockopt fails and the server has no kernel rate. Files sent as two
+// windows in flight must complete too. Every copy must verify.
+// Under the race detector the codecs no longer outrun the link, so the
+// shares go unchecked there.
+func TestAdaptiveUnderRateFaults(t *testing.T) {
+	quiet(t)
+	const link = 64 << 20 // bytes per second under --bwlimit
+	for _, tc := range []struct {
+		name    string
+		spec    map[faults.Family]string
+		rateBps int64
+		// sizes and window give the files and their window size; zero
+		// sends two 64 MiB files as one window each.
+		sizes  []int64
+		window int64
+		// minShare and maxShare bound the share of bytes sent compressed.
+		minShare, maxShare float64
+		kernel             bool // whether a kernel rate is read
+	}{
+		{"fast link", nil, 0, nil, 0, 0, 0.2, true},
+		{"fast link, some readings slow", map[faults.Family]string{faults.FamilyNet: "rate=0.3:β(20ms,50ms,100ms,200ms)"}, 0, nil, 0, 0, 0.2, true},
+		{"slow link", nil, link, nil, 0, 0.3, 1, true},
+		{"slow link, no kernel rate", map[faults.Family]string{faults.FamilySys: "getsockopt.fail=1"}, link, nil, 0, 0.3, 1, false},
+		// An 8-frame chain switches only when its file starts from the
+		// connection's link estimate, and then only if every sample lands
+		// in its frame: about 40% alone, and as little as none under CPU
+		// load. TestSeedLinkSkipsTheBaseline and
+		// TestSendLinkSeedsTheConnectionsNextFile guard the seeding; this
+		// case checks the copy completes with parallel windows.
+		{"slow link, parallel windows", nil, 2 * link, slices.Repeat([]int64{64 << 20}, 8), 32 << 20, 0, 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var inj *faults.Injector
+			if tc.spec != nil {
+				inj = faults.New(faults.Config{Seed: 7, Specs: tc.spec})
+			}
+			shares := &codecShares{bytes: map[string]int64{}}
+			sink := events.NewSink()
+			sink.Subscribe(shares.observe)
+			// One window per file, so its frames reach the policy in order:
+			// the windows of a file sent in parallel learn about one frame
+			// per round (docs/IDEAS.md).
+			sizes, window := tc.sizes, tc.window
+			if sizes == nil {
+				sizes, window = []int64{64 << 20, 64 << 20}, 64<<20
+			}
+			e, err := Start(Config{Sizes: sizes, Seed: 1, Comp: "adapt", Compressible: true,
+				WindowBytes: window, RateBps: tc.rateBps, Concurrency: 2, KeepAlive: true, Faults: inj, Events: sink})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close()
+			resp, err := e.Round(context.Background())
+			if err != nil || len(resp.Errors) > 0 {
+				t.Fatalf("round: %v %v", err, resp.Errors)
+			}
+			if p, m := e.Pending(), e.Mismatched(); len(p) > 0 || len(m) > 0 {
+				t.Fatalf("pending %v, mismatched %v", p, m)
+			}
+			r := e.Rates()
+			share := shares.compressed()
+			t.Logf("compressed %.0f%% of bytes; rates %+v", 100*share, r)
+			if !raceEnabled && (share < tc.minShare || share > tc.maxShare) {
+				t.Errorf("compressed %.0f%% of bytes, want %.0f%% to %.0f%%", 100*share, 100*tc.minShare, 100*tc.maxShare)
+			}
+			if r.Windows == 0 || r.User.N == 0 || (!tc.kernel && r.Kernel.N > 0) {
+				t.Errorf("rates %+v: want windows with userspace readings, and kernel readings only when getsockopt works", r)
+			}
+		})
+	}
+}

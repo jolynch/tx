@@ -5,7 +5,8 @@
 # compile time does not count against the budget, then ends fuzzing with
 # SIGINT rather than -fuzztime. Go reports a -fuzztime expiry that races its
 # own shutdown as "context deadline exceeded", failing a run that found
-# nothing; an interrupt ends fuzzing through a path without that race.
+# nothing; an interrupt ends fuzzing through a path without that race. A
+# fuzzer still running a minute after the interrupt is killed.
 # DEADLINE is the test binary's -test.timeout. A TARGET that matches no fuzz
 # test fails instead of silently passing, as does one that spends DURATION
 # replaying its cached corpus and never reaches new inputs: Go prints "now
@@ -45,11 +46,39 @@ cd "$dir"
 corpus="testdata/fuzz/$target"
 before=$(ls "$corpus" 2>/dev/null || true)
 start=$SECONDS
+# The script signals the fuzzer itself rather than through timeout(1):
+# uutils timeout, the default from Ubuntu 26.04, sends SIGKILL at once when
+# given --kill-after. SIGKILL follows a minute after SIGINT only if the
+# fuzzer has not exited, since -test.timeout does not cover fuzzing.
+watchdog() {
+	local pid=$1 nap=
+	trap 'kill "$nap" 2>/dev/null; exit 0' TERM
+	sleep "$duration" &
+	nap=$!
+	wait "$nap"
+	kill -INT "$pid" 2>/dev/null || exit 0
+	sleep 60 &
+	nap=$!
+	wait "$nap"
+	kill -KILL "$pid" 2>/dev/null || true
+}
+
 set +e
-timeout -s INT --preserve-status --kill-after=60s "$duration" \
+{
+	# A background job starts with SIGINT ignored; the fuzzer's
+	# signal.Notify reinstates it.
 	"$bin" -test.run='^$' -test.fuzz="^${target}\$" -test.timeout="$deadline" \
-	-test.fuzzcachedir="$(go env GOCACHE)/fuzz/$importpath" -test.paniconexit0 \
-	"${flags[@]}" 2>&1 | tee "$log"
+		-test.fuzzcachedir="$(go env GOCACHE)/fuzz/$importpath" -test.paniconexit0 \
+		"${flags[@]}" 2>&1 &
+	pid=$!
+	watchdog "$pid" >/dev/null 2>&1 &
+	dog=$!
+	wait "$pid"
+	status=$?
+	kill "$dog" 2>/dev/null
+	wait "$dog"
+	exit "$status"
+} | tee "$log"
 rc=${PIPESTATUS[0]}
 set -e
 if [ "$rc" -ne 0 ]; then

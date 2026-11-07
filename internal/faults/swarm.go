@@ -197,11 +197,12 @@ func PBTInjector(cfg Config) (*Injector, error) {
 
 // advisorySyscalls are the syscalls whose failure tx skips: hints and
 // socket tuning that change only speed.
-var advisorySyscalls = [sysCount]bool{SysFadvise: true, SysReadahead: true, SysMmap: true, SysMincore: true, SysSetsockopt: true}
+var advisorySyscalls = [sysCount]bool{SysFadvise: true, SysReadahead: true, SysMmap: true, SysMincore: true, SysSetsockopt: true, SysGetsockopt: true}
 
-// Benign reports whether every kind i turns on only delays IO or fails an
-// advisory syscall (fadvise, readahead, mmap, mincore, setsockopt), so a
-// transfer under i must succeed as it would without faults, only slower.
+// Benign reports whether every kind i turns on only delays IO, fakes a
+// delivery-rate reading, or fails an advisory syscall (fadvise, readahead,
+// mmap, mincore, setsockopt, getsockopt), so a transfer under i must succeed
+// as it would without faults, only slower.
 func (i *Injector) Benign() bool {
 	if i == nil {
 		return true
@@ -259,12 +260,13 @@ func (i *Injector) recordHit(file uint64) {
 	i.hit[file] = struct{}{}
 }
 
-// benignKind reports whether k only delays IO or fails an advisory syscall.
+// benignKind reports whether k only delays IO, fakes a delivery-rate
+// reading, or fails an advisory syscall.
 func benignKind(k Kind) bool {
 	if kinds[k].timed {
 		return true
 	}
-	if k < sysKindBase {
+	if k < sysKindBase || int(k) >= sysKindEnd {
 		return false
 	}
 	sc, action := Syscall(int(k-sysKindBase)/sysActions), int(k-sysKindBase)%sysActions

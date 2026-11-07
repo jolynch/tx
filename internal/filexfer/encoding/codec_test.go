@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"crypto/rand"
 	"fmt"
+	mrand "math/rand"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -344,5 +346,74 @@ func TestZstdChecksumOnlyWhereNothingElseVerifies(t *testing.T) {
 	}
 	if h.HasCheckSum {
 		t.Fatal("data frame carries a zstd checksum the window hash makes redundant")
+	}
+}
+
+func TestSampleCodecsFindsZstdPastLz4(t *testing.T) {
+	pattern := make([]byte, 128<<10)
+	mrand.New(mrand.NewSource(91)).Read(pattern)
+	data := bytes.Repeat(pattern, 2)
+	original := bytes.Clone(data)
+	s, err := SampleCodecs(data, SampleBoth, nil)
+	if err != nil || !s.Valid() || !s.Has(EncodingLz4) || !s.Has(EncodingZstd) {
+		t.Fatalf("sample: %+v, %v", s, err)
+	}
+	if s.Ratio(EncodingLz4) > 1.05 || s.Ratio(EncodingZstd) < 1.8 {
+		t.Fatalf("want poor lz4 and useful zstd: lz4 %.3f zstd %.3f", s.Ratio(EncodingLz4), s.Ratio(EncodingZstd))
+	}
+	if !bytes.Equal(data, original) {
+		t.Fatal("sample modified the caller's data")
+	}
+	// Bytes beyond the bounded sample do not affect either measured size.
+	s2, err := SampleCodecs(append(data, make([]byte, CodecSampleBytes)...), SampleBoth, nil)
+	if err != nil || s2.LogicalSize != CodecSampleBytes || s2.Lz4.WireSize != s.Lz4.WireSize || s2.Zstd.WireSize != s.Zstd.WireSize {
+		t.Fatalf("unbounded sample: %+v, %v", s2, err)
+	}
+	if empty, err := SampleCodecs(nil, SampleBoth, nil); err != nil || empty.Valid() {
+		t.Fatalf("empty sample: %+v, %v", empty, err)
+	}
+}
+
+// A sample measures exactly the codecs it is asked for, and allocates
+// nothing for any of them.
+func TestSampleCodecsMeasuresOnlyTheRequestedSet(t *testing.T) {
+	data := bytes.Repeat([]byte("segment page "), CodecSampleBytes/13)
+	for _, set := range []SampleSet{0, SampleLz4, SampleZstd, SampleBoth} {
+		s, err := SampleCodecs(data, set, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lz4, zstd := set&SampleLz4 != 0, set&SampleZstd != 0
+		if s.Has(EncodingLz4) != lz4 || s.Has(EncodingZstd) != zstd || s.Valid() != (lz4 || zstd) {
+			t.Fatalf("set %b: %+v", set, s)
+		}
+		if !lz4 && (s.Lz4 != CodecMeasurement{}) || !zstd && (s.Zstd != CodecMeasurement{}) {
+			t.Fatalf("set %b measured an unrequested codec: %+v", set, s)
+		}
+		if raceEnabled {
+			continue // The race detector drops pooled items on purpose.
+		}
+		if allocs := testing.AllocsPerRun(10, func() {
+			if _, err := SampleCodecs(data, set, nil); err != nil {
+				panic(err)
+			}
+		}); allocs != 0 {
+			t.Fatalf("set %b allocates %.1f times per sample", set, allocs)
+		}
+	}
+}
+
+func TestSampleCodecsUsesTheSuppliedClock(t *testing.T) {
+	var now time.Duration
+	clock := func() time.Duration {
+		now += 10 * time.Microsecond
+		return now
+	}
+	sample, err := SampleCodecs(bytes.Repeat([]byte("sample "), 1024), SampleBoth, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sample.Lz4.Elapsed != 10*time.Microsecond || sample.Zstd.Elapsed != 10*time.Microsecond {
+		t.Fatalf("codec costs did not use the supplied clock: %+v", sample)
 	}
 }

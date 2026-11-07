@@ -20,3 +20,9 @@ tmp_*_test.go
 /tx-bench-dst/
 /tx-bench-*.json
 /.pbt-fuzzcache/
+
+# Cached imports for cloud figure generation.
+/docs/arch/__pycache__/
+
+# Local Claude Code settings and agent worktrees.
+/.claude/
