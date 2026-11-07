@@ -8,6 +8,8 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
 
 - [Architecture](docs/arch/OVERVIEW.md): concurrency, connection pooling,
   compression, verification, and durability.
+- [Cloud transfer limits](docs/arch/CLOUD.md): modeled AWS copies where the
+  bottleneck moves mid-transfer, and the scripts that draw their figures.
 - [Transfer modes](docs/arch/TRANSFER.md): fast/gentle copy and sync behavior.
 - [Verification](docs/arch/VERIFICATION.md): metadata/data integrity, sampling,
   ACK validation, and failure semantics.

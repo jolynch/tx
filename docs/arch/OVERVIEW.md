@@ -223,6 +223,8 @@ on the receiver all overlap — keeping SSD, CPU, and NIC busy simultaneously.
 With `--compress adapt`, the sender chooses compression per frame to maximize
 logical throughput. Compression helps when it saves more network time than it
 costs in CPU, but it cannot improve a receiver disk bottleneck.
+[Cloud transfer limits](CLOUD.md) illustrates how these limits can change
+during a cloud copy.
 
 ### Frame-level adaptation
 
