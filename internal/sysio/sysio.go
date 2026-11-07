@@ -1,14 +1,16 @@
 // Package sysio is where tx's raw system calls on the data path belong, so
 // fault injection reaches each one. Every function that can fault takes the
 // injector first and applies its gate before the real call; a nil injector
-// costs one nil check. Calls the fault catalog has no kind for are plain:
-// TCPByteCounts, PeekAlive, OpenDir, OpenNonblockingWriter, Close, Munmap,
-// and TotalMemoryBytes. SetTCPUserTimeout and SetTCPNotSentLowat are plain
-// too; their callers check the setsockopt gate. golangci-lint (make lint)
-// rejects imports of syscall and golang.org/x/sys/unix outside this package,
-// internal/faults, the harnesses, signal setup, and the events target writer,
-// except in test files. The events writer cannot import sysio because
-// faults depends on events. See docs/arch/FAULTS.md.
+// costs one nil check. TCPRateReader's reads pass the getsockopt gate, and
+// the NET rate kind can replace their result. Calls the fault catalog has no
+// kind for are plain: TCPByteCounts, PeekAlive, OpenDir,
+// OpenNonblockingWriter, Close, Munmap, and TotalMemoryBytes.
+// SetTCPUserTimeout and SetTCPNotSentLowat are plain too; their callers check
+// the setsockopt gate. golangci-lint (make lint) rejects imports of syscall
+// and golang.org/x/sys/unix outside this package, internal/faults, the
+// harnesses, signal setup, and the events target writer, except in test
+// files. The events writer cannot import sysio because faults depends on
+// events. See docs/arch/FAULTS.md.
 package sysio
 
 import (

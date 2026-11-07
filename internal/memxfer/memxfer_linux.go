@@ -38,6 +38,7 @@ import (
 	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/ftcp"
+	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/fsync"
 )
@@ -104,6 +105,15 @@ type Config struct {
 	KeepAlive bool
 	// Comp is the client's compression: "", "none", "lz4", "zstd", or "adapt".
 	Comp string
+	// Compressible fills the files with words that compress about 2.5:1,
+	// instead of random bytes.
+	Compressible bool
+	// WindowBytes splits a file into windows of this size, two in flight
+	// at once; zero picks 1 MiB. A file no larger goes in one window.
+	WindowBytes int64
+	// RateBps, when set, copies in gentle mode under a server --bwlimit of
+	// this many bytes per second: a link limit compression can beat.
+	RateBps int64
 	// Concurrency is the client's connection count; zero picks 4.
 	Concurrency int
 	// Faults, when set, faults both sides.
@@ -158,7 +168,7 @@ func Start(cfg Config) (_ *Env, err error) {
 			return nil, err
 		}
 		e.src = append(e.src, src)
-		if _, err := io.Copy(src, io.LimitReader(content(cfg.Seed, uint64(id+1)), cfg.Sizes[id])); err != nil {
+		if _, err := io.Copy(src, io.LimitReader(content(cfg, uint64(id+1)), cfg.Sizes[id])); err != nil {
 			return nil, err
 		}
 		dst, err := memfd(fmt.Sprintf("memxfer-dst-%d", id+1))
@@ -184,6 +194,13 @@ func Start(cfg Config) (_ *Env, err error) {
 		}
 	})
 	serverOpts := ftcp.ServerOptions{Events: sink, RequireAuth: cfg.Mode.RequireAuth}
+	if cfg.RateBps > 0 {
+		lim, err := limit.NewLimiterFromBps(cfg.RateBps, 0)
+		if err != nil {
+			return nil, err
+		}
+		serverOpts.Limiter = lim
+	}
 	if cfg.KeepAlive {
 		serverOpts.KeepAliveTimeout = cfg.KeepAliveTimeout
 		if serverOpts.KeepAliveTimeout <= 0 {
@@ -191,6 +208,9 @@ func Start(cfg Config) (_ *Env, err error) {
 		}
 	}
 	clientOpts := []tx.ClientOption{tx.WithComp(cfg.Comp)}
+	if cfg.RateBps > 0 {
+		clientOpts = append(clientOpts, tx.WithLoadStrategy(tx.LoadStrategyGentle))
+	}
 	if cfg.Mode.Encrypt != "" {
 		serverID, err := age.GenerateX25519Identity()
 		if err != nil {
@@ -223,6 +243,9 @@ func Start(cfg Config) (_ *Env, err error) {
 		e.conc = 4
 	}
 	e.clientOpts = append(clientOpts, tx.WithConcurrency(e.conc))
+	if cfg.WindowBytes > 0 {
+		e.clientOpts = append(e.clientOpts, tx.WithFileRequestWindowBytes(max(cfg.WindowBytes, 2*e.windowBytes())))
+	}
 	e.deps = &deps{Deps: ftcp.NewRuntimeDeps(e.st), files: e.src}
 	serverOpts.Deps = e.deps
 	e.serverOpts = serverOpts
@@ -324,7 +347,11 @@ func (e *Env) register() error {
 	close(updates)
 	<-e.st.RegisterTransferFileState(tr.ID, updates, store.TransferStateStarted)
 	e.st.ClipTransfer(tr.ID)
-	e.manifest = &tx.Manifest{TransferID: tr.ID, Root: root, Mode: tx.LoadStrategyFast, Concurrency: 4, Entries: entries}
+	mode := tx.LoadStrategyFast
+	if e.cfg.RateBps > 0 {
+		mode = tx.LoadStrategyGentle
+	}
+	e.manifest = &tx.Manifest{TransferID: tr.ID, Root: root, Mode: mode, Concurrency: 4, Entries: entries}
 	return nil
 }
 
@@ -411,9 +438,16 @@ func (e *Env) Round(ctx context.Context) (resp tx.StartFromManifestResponse, err
 			return countingWriter{WriteCloser: w, e: e}, worker.SyncOutput(fd, offset, entry.ID, fmt.Sprintf("file %d", entry.ID)), nil
 		},
 		Concurrency:        e.conc,
-		BatchMaxBytes:      1 << 20,
+		BatchMaxBytes:      e.windowBytes(),
 		SplitWindowWorkers: 2,
 	})
+}
+
+func (e *Env) windowBytes() int64 {
+	if e.cfg.WindowBytes > 0 {
+		return e.cfg.WindowBytes
+	}
+	return 1 << 20
 }
 
 // Opened returns the offsets at which the last round opened file id's
@@ -525,12 +559,20 @@ func (e *Env) Mismatched() []uint64 {
 		id := uint64(i + 1)
 		got, err := hashFile(e.dst[i], size)
 		want := xxh3.New128()
-		_, _ = io.Copy(want, io.LimitReader(content(e.cfg.Seed, id), size))
+		_, _ = io.Copy(want, io.LimitReader(content(e.cfg, id), size))
 		if err != nil || got != want.Sum128() {
 			out = append(out, id)
 		}
 	}
 	return out
+}
+
+// Rates returns the transfer's delivery-rate summary so far: what the
+// kernel and the server's own writes said, over the adaptive windows that
+// reached the compression policy.
+func (e *Env) Rates() store.RateSummary {
+	r, _ := e.st.TransferRates(e.transferID)
+	return r
 }
 
 // Client returns the environment's client.
@@ -550,14 +592,54 @@ func (e *Env) Close() {
 	}
 }
 
-// content returns file id's bytes: a ChaCha8 stream keyed by seed and id.
-func content(seed, id uint64) io.Reader {
+// content returns file id's bytes: a ChaCha8 stream keyed by the seed and
+// id, or words drawn by that stream when cfg asks for compressible files.
+func content(cfg Config, id uint64) io.Reader {
 	var key [32]byte
 	for i := range 8 {
-		key[i] = byte(seed >> (8 * i))
+		key[i] = byte(cfg.Seed >> (8 * i))
 		key[8+i] = byte(id >> (8 * i))
 	}
-	return rand.NewChaCha8(key)
+	stream := rand.NewChaCha8(key)
+	if cfg.Compressible {
+		return &wordReader{rng: rand.New(stream)}
+	}
+	return stream
+}
+
+// vocabulary is a fixed set of made-up words, the same in every run.
+var vocabulary = func() []string {
+	r := rand.New(rand.NewPCG(1, 2))
+	words := make([]string, 4096)
+	for i := range words {
+		w := make([]byte, 3+r.IntN(8))
+		for j := range w {
+			w[j] = byte('a' + r.IntN(26))
+		}
+		words[i] = string(w)
+	}
+	return words
+}()
+
+// wordReader is an endless text of vocabulary words, common ones more
+// often, separated by spaces.
+type wordReader struct {
+	rng  *rand.Rand
+	word []byte // the rest of a word cut short by the last Read
+}
+
+func (w *wordReader) Read(p []byte) (int, error) {
+	n := 0
+	for n < len(p) {
+		if len(w.word) == 0 {
+			w.word = append(w.word[:0], vocabulary[w.rng.IntN(w.rng.IntN(len(vocabulary))+1)]...)
+			w.word = append(w.word, ' ')
+		}
+		c := copy(p[n:], w.word)
+		n += c
+		w.word = w.word[c:]
+	}
+	return n, nil
 }
 
 // hashFile hashes f's contents if it holds exactly size bytes.

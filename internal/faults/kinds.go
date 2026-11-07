@@ -76,8 +76,21 @@ const (
 
 var sysActionNames = [sysActions]string{"fail", "latency", "short"}
 
-// kindCount is how many kinds exist: the fixed kinds, then three per syscall.
-const kindCount = int(sysKindBase) + int(sysCount)*sysActions
+// sysKindEnd follows the last SYS kind: the fixed kinds, then three per
+// syscall.
+const sysKindEnd = int(sysKindBase) + int(sysCount)*sysActions
+
+// Kinds added after the SYS kinds, so adding one shifts no existing kind's
+// number, and with it no seeded schedule.
+const (
+	// NetRate replaces a TCP delivery-rate reading with 1 MiB per drawn
+	// duration, as a connection in slow start or on a slower path reports.
+	NetRate = Kind(sysKindEnd) + iota
+	kindEnd
+)
+
+// kindCount is how many kinds exist.
+const kindCount = int(kindEnd)
 
 // syscallKind returns the SYS kind for sc and an action.
 func syscallKind(sc Syscall, action int) Kind {
@@ -120,6 +133,7 @@ var kinds = func() [kindCount]kindInfo {
 		{DiskWriteLatency, FamilyDisk, "write.latency", true},
 		{DiskWriteLost, FamilyDisk, "write.lost", false},
 		{DiskWriteFlip, FamilyDisk, "write.flip", false},
+		{NetRate, FamilyNet, "rate", true},
 	}
 	for _, f := range fixed {
 		k[f.kind] = kindInfo{family: f.family, name: f.name, timed: f.timed}
@@ -180,7 +194,7 @@ func lookupKinds(f Family, name string) ([]Kind, bool) {
 		}
 		return nil, false
 	}
-	for k := range Kind(sysKindBase) {
+	for k := range Kind(kindCount) {
 		if kinds[k].family == f && kinds[k].name == name {
 			return []Kind{k}, true
 		}

@@ -20,10 +20,11 @@ Four capabilities make this possible:
   chunks - so every connection does roughly equal work with no head-of-line
   blocking.
 
-- **Adaptive compression.** The server monitors read vs. write latency per 4 MiB
-  frame and walks a `none → lz4 → zstd` ladder. Compressible files effectively
-  exceed line rate; incompressible files (media, archives) stream with zero CPU
-  overhead.
+- **Adaptive compression.** The server measures each 4 MiB frame's throughput
+  and samples lz4 and zstd level 1 on bounded background workers. It switches
+  after sustained evidence, validates the result on normal frames, and skips
+  sampling when a file has too little work left. Losing probes never become
+  trial frames on the wire.
 
 - **Background durability.** Per-file `fdatasync` is moved off the download
   critical path into a background batcher that deduplicates by inode.

@@ -53,6 +53,9 @@ func TestNilInjectorIsIdentity(t *testing.T) {
 		t.Fatal("a nil injector fired a request or connection fault")
 	}
 	inj.DelayRequest()
+	if rate, limited := inj.DeliveryRate(5, true); rate != 5 || !limited {
+		t.Fatalf("DeliveryRate = %d, %v; want the measurement", rate, limited)
+	}
 	samePointer := func(name string, got, want any) {
 		t.Helper()
 		if reflect.ValueOf(got).Pointer() != reflect.ValueOf(want).Pointer() {
@@ -418,6 +421,49 @@ func TestSpecs(t *testing.T) {
 	}
 	if _, err := Build(Config{Profile: "good-day"}); err == nil {
 		t.Fatal("accepted an unknown profile")
+	}
+}
+
+// TestAppendedKindsKeepNumbers pins the numbering of the kinds that predate
+// the appended ones: a kind's number seeds its schedule, so inserting one
+// in the middle would change every reproduction after it.
+func TestAppendedKindsKeepNumbers(t *testing.T) {
+	if sysKindBase != 28 || SysSetsockopt != 15 || DiskWriteFlip != 27 {
+		t.Fatalf("existing kinds moved: sysKindBase=%d SysSetsockopt=%d DiskWriteFlip=%d", sysKindBase, SysSetsockopt, DiskWriteFlip)
+	}
+	if NetRate.String() != "net.rate" || NetRate.Family() != FamilyNet || int(NetRate) < sysKindEnd {
+		t.Fatalf("NetRate is %s (%d), want net.rate after the SYS kinds", NetRate, int(NetRate))
+	}
+	if k := syscallKind(SysGetsockopt, sysFail); k.String() != "sys.getsockopt.fail" || !benignKind(k) || !benignKind(NetRate) {
+		t.Fatalf("%s or net.rate is not a benign kind", k)
+	}
+}
+
+// TestNetRateReplacesReadings checks NET rate turns a delivery-rate reading
+// into 1 MiB per drawn duration, not application-limited, when it fires, and
+// passes the measurement through when it does not.
+func TestNetRateReplacesReadings(t *testing.T) {
+	always := one(t, FamilyNet, "rate=1:β(10ms,20ms,40ms,50ms)")
+	for range 64 {
+		rate, limited := always.DeliveryRate(1<<30, true)
+		if limited || rate < 20<<20 || rate > 100<<20 {
+			t.Fatalf("DeliveryRate = %d, limited %v; want 20 to 100 MiB/s, not limited", rate, limited)
+		}
+	}
+	half := one(t, FamilyNet, "rate=0.5:β(10ms,20ms,40ms,50ms)")
+	var replaced, kept int
+	for range 256 {
+		if rate, limited := half.DeliveryRate(1<<30, true); rate == 1<<30 && limited {
+			kept++
+		} else {
+			replaced++
+		}
+	}
+	if replaced == 0 || kept == 0 {
+		t.Fatalf("rate=0.5 replaced %d of 256 readings", replaced)
+	}
+	if rate, limited := one(t, FamilyNet, "reset=0.5").DeliveryRate(7, true); rate != 7 || !limited {
+		t.Fatalf("an injector without NET rate returned %d, %v", rate, limited)
 	}
 }
 

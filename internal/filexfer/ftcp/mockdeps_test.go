@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/limit"
+	"github.com/jolynch/tx/internal/filexfer/policy"
 	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/pagecache"
 )
@@ -69,8 +71,13 @@ type mockDeps struct {
 	windowHash       string
 	setStateCalls    int
 	setWindowCalls   int
-	stateBatches     int        // SetTransferFilesState calls
-	windowBatches    int        // SetTransferFileWindowHashes calls
+	stateBatches     int         // SetTransferFilesState calls
+	windowBatches    int         // SetTransferFileWindowHashes calls
+	rates            RateSummary // counts of the windows RecordTransferWindows saw
+	ratedFiles       []uint64    // the distinct files rates.Files counted
+	compression      map[uint64]policy.FileCompression
+	compLoads        int        // LoadFileCompression calls
+	compSaves        int        // compression updates saved
 	refBatches       int        // GetFileRefs calls
 	openFileCalls    int        // OpenFileRef calls
 	openedFiles      []*os.File // files OpenFileRef opened, to check they close
@@ -211,6 +218,38 @@ func (m *mockDeps) SetTransferFileWindowHashes(txferID string, hashes []WindowHa
 		m.SetTransferFileWindowHash(txferID, h.FileID, h.EndBytes, h.HashToken)
 	}
 	return true
+}
+
+// RecordTransferWindows records the hashes as SetTransferFileWindowHashes
+// does, the compression updates, counting each in compSaves, and the rates
+// in rates, counting each rated file once as the store does.
+func (m *mockDeps) RecordTransferWindows(txferID string, rec WindowRecords) bool {
+	hashes := rec.Hashes
+	m.rates.Windows += rec.Rates.Windows
+	for _, id := range rec.RatedFiles {
+		if !slices.Contains(m.ratedFiles, id) {
+			m.ratedFiles = append(m.ratedFiles, id)
+			m.rates.Files++
+		}
+	}
+	m.rates.Sampled += rec.Rates.Sampled
+	m.rates.Kernel.N += rec.Rates.Kernel.N
+	m.rates.User.N += rec.Rates.User.N
+	for _, c := range rec.Compression {
+		m.compSaves++
+		if m.compression == nil {
+			m.compression = make(map[uint64]policy.FileCompression)
+		}
+		m.compression[c.FileID] = c.State
+	}
+	return m.SetTransferFileWindowHashes(txferID, hashes)
+}
+
+// LoadFileCompression keeps per-file state in a map and counts its calls.
+func (m *mockDeps) LoadFileCompression(_ string, fileID uint64) (policy.FileCompression, bool) {
+	m.compLoads++
+	st, ok := m.compression[fileID]
+	return st, ok
 }
 
 func (m *mockDeps) VerifyTransferFileWindowHash(string, uint64, int64, string) bool { return true }

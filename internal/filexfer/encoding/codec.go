@@ -282,7 +282,10 @@ func zstdEncoderOptions() []zstd.EOption {
 func acquirePooledZstdEncoder(dst io.Writer) (*zstd.Encoder, error) {
 	if raw := zstdEncoderPool.Get(); raw != nil {
 		if encoder, ok := raw.(*zstd.Encoder); ok && encoder != nil {
-			encoder.Reset(dst)
+			// EncodeAll needs no streaming state when dst is nil.
+			if dst != nil {
+				encoder.Reset(dst)
+			}
 			return encoder, nil
 		}
 	}

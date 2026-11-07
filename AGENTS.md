@@ -341,11 +341,19 @@ command, file, window, and ACK events. A nil sink costs one nil check.
   which counts from the transfer's last forward progress.
 - FM/1 front-codes paths/mtimes. FX/1 frames carry file ID, codec, offsets,
   sizes, and checksum; zstd/lz4 decoders are pooled.
-- `CompressionPolicy` selects zstd, lz4, or identity from read/write latency.
+- `CompressionPolicy` selects zstd, lz4, or identity per frame to maximize
+  logical throughput, using bounded background lz4/zstd samples and observed
+  frame costs. Losing candidates never become trial frames on the wire.
 
 `Store` is a `sync.Map` of transfers with **no process-wide instance**:
 whoever runs a server owns one and closes it. Each transfer has an RWMutex
-over its state and a separate mutex for window hashes. Per-file state is
+over its state and separate mutexes for window hashes and for the adaptive
+compression state of multi-window files. A window loads that state only when
+an earlier window preceded it and saves it only when another follows; SEND
+applies its saves, its window hashes, and its delivery-rate summary
+(`RecordTransferWindows`) under one lock acquisition per request; the
+summary becomes the completion log's `txfer-rate` line. An entry is freed when its file is Done or
+Missing, and when the transfer is deleted or reaped. Per-file state is
 `Started -> Running -> Done` (or `Missing` for 404, which a later ACK of its
 bytes revives, since an `ENOENT` can be transient), and `StateCounts` keeps
 per-state totals current so status needs no scan.

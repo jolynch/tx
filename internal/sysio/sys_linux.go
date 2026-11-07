@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -149,6 +150,18 @@ func Syncfs(inj *faults.Injector, fd int) error {
 	return unix.Syncfs(fd)
 }
 
+// ThreadCPUTime returns the CPU time the calling OS thread has used. Time
+// the thread spent preempted does not count, so a busy host does not inflate
+// what it measures. The caller locks its goroutine to its thread around the
+// interval it times. It returns false when the clock is unavailable.
+func ThreadCPUTime() (time.Duration, bool) {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_THREAD_CPUTIME_ID, &ts); err != nil {
+		return 0, false
+	}
+	return time.Duration(ts.Nano()), true
+}
+
 // TotalMemoryBytes returns the system's RAM, from sysinfo(2).
 func TotalMemoryBytes() (int64, error) {
 	var info unix.Sysinfo_t
@@ -218,6 +231,75 @@ func TCPByteCounts(conn *net.TCPConn) (received, sent int64) {
 		}
 	})
 	return received, sent
+}
+
+// tcpInfoAppLimitedByte is the offset in struct tcp_info of the byte that
+// holds tcpi_delivery_rate_app_limited, its first bitfield. unix.TCPInfo
+// leaves that byte as padding after Options.
+const tcpInfoAppLimitedByte = 7
+
+// tcpInfoAppLimitedMask selects that bitfield. C compilers allocate
+// bitfields from the low bit on little-endian targets and from the high bit
+// on big-endian ones.
+var tcpInfoAppLimitedMask = func() uint8 {
+	one := uint16(1)
+	if *(*uint8)(unsafe.Pointer(&one)) == 1 {
+		return 0x01
+	}
+	return 0x80
+}()
+
+// TCPRateReader reads a TCP socket's delivery rate from TCP_INFO. Build one
+// per connection and keep it: a read allocates nothing, where SyscallConn and
+// GetsockoptTCPInfo allocate on every call. It is not safe for concurrent
+// use.
+type TCPRateReader struct {
+	inj  *faults.Injector
+	raw  syscall.RawConn
+	read func(fd uintptr) // bound once, so Control allocates nothing
+	info unix.TCPInfo
+	size uint32
+	ok   bool
+}
+
+// NewTCPRateReader returns a reader of conn's TCP_INFO behind the getsockopt
+// gate, whose NET rate kind can also replace a reading. If conn has no file
+// descriptor, every read reports no rate.
+func NewTCPRateReader(inj *faults.Injector, conn *net.TCPConn) *TCPRateReader {
+	r := &TCPRateReader{inj: inj}
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return r
+	}
+	r.raw = raw
+	r.read = func(fd uintptr) {
+		r.size = unix.SizeofTCPInfo
+		_, _, errno := unix.Syscall6(unix.SYS_GETSOCKOPT, fd, unix.IPPROTO_TCP, unix.TCP_INFO,
+			uintptr(unsafe.Pointer(&r.info)), uintptr(unsafe.Pointer(&r.size)), 0)
+		r.ok = errno == 0
+	}
+	return r
+}
+
+// DeliveryRate returns the socket's delivery rate, tcpi_delivery_rate in
+// bytes per second, and whether that rate came from an application-limited
+// sample, one taken while the sender had too little data queued to fill the
+// path. It returns 0 when the kernel has no rate sample yet or the read
+// fails. The kernel keeps the most recent sample that was not
+// application-limited unless a limited one is higher.
+func (r *TCPRateReader) DeliveryRate() (bytesPerSec uint64, appLimited bool) {
+	if r == nil || r.raw == nil {
+		return 0, false
+	}
+	if r.inj.Sys(faults.SysGetsockopt) != nil {
+		return 0, false
+	}
+	r.ok = false
+	if err := r.raw.Control(r.read); err != nil || !r.ok {
+		return 0, false
+	}
+	flags := *(*uint8)(unsafe.Add(unsafe.Pointer(&r.info), tcpInfoAppLimitedByte))
+	return r.inj.DeliveryRate(r.info.Delivery_rate, flags&tcpInfoAppLimitedMask != 0)
 }
 
 // SetTCPUserTimeout sets TCP_USER_TIMEOUT on conn: the kernel closes the

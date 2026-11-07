@@ -96,7 +96,7 @@ Both sides also emit:
 | `window`                     | `conn`, `file`, `off`, `len`, `wire`, `codec`, `send_path` (`sendfile` or `buffered`), `read_dur`, `comp_dur`, `write_dur` |
 | `file_done`                  | `conn`, `file`, `dur` (first window start to last window end) |
 | `ack`                        | `conn`, `files`, `bytes` |
-| `transfer_start` / `transfer_done` | `path`; done: `files`, `bytes`, `dur` |
+| `transfer_start` / `transfer_done` | `path`; done: `files`, `bytes`, `dur`, and `rates` when an adaptive window reached the compression policy (as in `--stats`) |
 | `rss`                        | `bytes`, sampled as on the client |
 
 The `file` field holds manifest file IDs, which match across sides within a
