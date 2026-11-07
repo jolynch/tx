@@ -45,7 +45,8 @@ Four capabilities make this possible:
 
 See [docs/README.md](docs/README.md) for the documentation index and
 [docs/arch/OVERVIEW.md](docs/arch/OVERVIEW.md) for a deeper dive.
-If you are curious about benchmarking on
+[docs/arch/CLOUD.md](docs/arch/CLOUD.md) shows why adapting matters when
+cloud bottlenecks move mid-copy. If you are curious about benchmarking on
 your own setup check out
 [bench/README.md](bench/README.md) which has a data generator that can both
 generate incompressible (random) and
