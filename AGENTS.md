@@ -155,9 +155,10 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
 - Write byte sizes and rates in binary units: KiB, MiB, GiB, MiB/s. "MB" is
   ambiguous, and many readers take it to mean MiB. Bit rates stay decimal
   (Mbps, Gbps). Go benchmarks report decimal MB/s; convert before quoting.
-- Commit messages: a short imperative subject (about 60 characters or fewer)
-  and, when needed, a body of no more than a few sentences on what changed and
-  why. No per-file inventories or bullet lists of every change.
+- Commit messages: use an imperative subject of 60 characters or fewer.
+  Add a body only when needed for key context about what changed and why;
+  keep it to a few sentences, separated from the subject by a blank line,
+  and wrap at 72 columns. Omit per-file inventories and change-by-change lists.
 - PR descriptions: four short sections, a few sentences each — **Problem**,
   **Proposal**, **Rejected alternatives**, and **Verification**.
 
@@ -343,7 +344,10 @@ command, file, window, and ACK events. A nil sink costs one nil check.
   sizes, and checksum; zstd/lz4 decoders are pooled.
 - `CompressionPolicy` selects zstd, lz4, or identity per frame to maximize
   logical throughput, using bounded background lz4/zstd samples and observed
-  frame costs. Losing candidates never become trial frames on the wire.
+  frame costs. Upward comparisons stay in the background; bounded checks on
+  real frames let measured throughput select a cheaper codec. Its sampled
+  controller (`DecideSampled`) is the only entry point, with steady, check,
+  and validate phases; the policy sim drives it as SEND does.
 
 `Store` is a `sync.Map` of transfers with **no process-wide instance**:
 whoever runs a server owns one and closes it. Each transfer has an RWMutex

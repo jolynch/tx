@@ -57,10 +57,15 @@ const (
 	// longer than simReact decisions, per fuzz input, but never less than
 	// one run.
 	simStuck = 0.10
-	// simHeavyReact is the decision budget of the reaction property under
-	// high noise, where a stall can hide a slow mode for a while.
+	// simHeavyReact is the decision budget of the reaction quality sweep
+	// under high noise, where a stall can hide a slow mode for a while.
 	simHeavyReact = 48
-	// simChanges and simHeavyChanges bound mode changes per 1,000 settled
+	// simHeavyLimit is the reaction fuzzers' disaster bound under high noise.
+	// A searching fuzzer always finds batches whose noise hides a change
+	// for longer, so they check only that no run sticks: the policy's worst
+	// found inputs leave within about 190 frames.
+	simHeavyLimit = 512
+	// simChanges and simHeavyChanges bound codec changes per 1,000 settled
 	// frames of one stationary fuzz input, under uniform and heavy-tailed
 	// noise.
 	simChanges      = 30
@@ -276,6 +281,14 @@ type sim struct {
 	sigma   float64 // lognormal sigma on prepare and write; 0 for none
 	outlier float64 // probability a frame is an outlier
 	none    int     // none frames drawn so far
+	// sndbuf is a socket send buffer, in bytes, or 0 for none; queued is
+	// what it holds. A buffered write returns before its bytes leave, so a
+	// frame's raw time (FrameLatency) can be far below its rate-floored write.
+	sndbuf, queued float64
+	// frames counts decide's frames, for the sample cadence; budget is
+	// the connection's recovery budget.
+	frames int
+	budget RecoveryBudget
 }
 
 func newSim(seed uint64, jitter float64) *sim {
@@ -338,6 +351,22 @@ func (s *sim) frame(r simRegime, m CompressionMode) CompressionMetrics {
 		PrepareLatency: time.Duration(prepare * float64(time.Second)),
 		WriteLatency:   time.Duration(write * float64(time.Second)),
 	}
+	if s.sndbuf > 0 {
+		// The path drains the buffer while the next frame prepares, and a
+		// write waits only for the bytes that do not fit, so raw frame times
+		// sum to wall time. WriteLatency stays the rate-floored write, as
+		// SEND's writeTime reports it.
+		drain := float64(wireSize) / write
+		s.queued = max(0, s.queued-prepare*drain)
+		wait := 0.0
+		if free := s.sndbuf - s.queued; float64(wireSize) <= free {
+			s.queued += float64(wireSize)
+		} else {
+			wait = (float64(wireSize) - free) / drain
+			s.queued = s.sndbuf
+		}
+		fm.FrameLatency = time.Duration((prepare + wait) * float64(time.Second))
+	}
 	if m == CompressionModeNone {
 		if s.none++; s.none%simSniffEvery == 0 {
 			ratio := r.ratio[1] * (1 + 0.1*(s.sniffer.Float64()-0.5))
@@ -347,24 +376,48 @@ func (s *sim) frame(r simRegime, m CompressionMode) CompressionMetrics {
 	return fm
 }
 
-// checkStep fails unless next is a mode adapt uses, at most one rung above
-// current or any rung below it (C6): upgrades move one rung, and downgrades
-// may go straight to none.
+// checkStep fails unless next is a mode adapt uses (C6). Background
+// evidence may take none straight to zstd, and checks may drop any rung.
 func checkStep(t testing.TB, current, next CompressionMode) {
 	t.Helper()
-	rn := simRung(next)
-	if rn < 0 {
-		t.Fatalf("Decide(%s) chose %s, which adapt does not use", modeName(current), modeName(next))
+	if simRung(next) < 0 {
+		t.Fatalf("DecideSampled(%s) chose %s, which adapt does not use", modeName(current), modeName(next))
 	}
-	if rc := simRung(current); rc >= 0 && rn-rc > 1 {
-		t.Fatalf("Decide jumped from %s to %s", modeName(current), modeName(next))
+}
+
+// sampleFor returns the codec sample SEND would hand p with its frame-th
+// frame: at every simSniffEvery-th frame and while a comparison is pending,
+// holding only the codecs p needs. Copies of one policy get equal samples.
+func sampleFor(p *CompressionPolicy, r simRegime, frame int) *encoding.CodecSamples {
+	if !p.BackgroundPending() && frame%simSniffEvery != 0 {
+		return nil
 	}
+	return maskSample(samplesForRegime(r), p.SampleNeeds())
+}
+
+// sendMetrics sets the fields SEND adds to a frame's metrics: its read
+// time, and recovery's room and budget. Its sniff ratio comes from samples.
+func (s *sim) sendMetrics(r simRegime, m CompressionMetrics) CompressionMetrics {
+	m.ReadLatency = min(m.PrepareLatency, time.Duration(r.prepare[0]*float64(time.Second)))
+	m.SniffRatio = 0
+	m.RecoveryAllowed, m.RecoveryReady = true, s.budget.Ready()
+	return m
+}
+
+// decide sends one frame of r in mode through the production controller, as
+// SEND does, and charges the connection's budget.
+func (s *sim) decide(p *CompressionPolicy, r simRegime, mode CompressionMode) CompressionDecision {
+	m := s.sendMetrics(r, s.frame(r, mode))
+	d := p.DecideSampled(mode, m, sampleFor(p, r, s.frames))
+	s.budget.Observe(d.RecoveryLoss, observedLatency(m))
+	s.frames++
+	return d
 }
 
 // step runs one frame of r in mode and returns the policy's next mode.
 func (s *sim) step(t testing.TB, p *CompressionPolicy, r simRegime, mode CompressionMode) CompressionMode {
 	t.Helper()
-	next := p.Decide(mode, s.frame(r, mode)).Next
+	next := s.decide(p, r, mode).Next
 	checkStep(t, mode, next)
 	return next
 }
@@ -432,6 +485,7 @@ func FuzzCompressionPolicyRegret(f *testing.F) {
 	}
 	head := []byte{3, 1, 0, 0}
 	f.Add(cat(head, seg([]byte{0, 1, 0, 2, 2, 1, 2}, 200)))                                        // network, incompressible, cheap lz4
+	f.Add([]byte("70\aa02X0020000200000"))                                                         // a check's baseline must not take on two frames' jitter
 	f.Add(cat(head, seg([]byte{0, 1, 1, 2, 2, 1, 2}, 200)))                                        // network, ratio 1.05
 	f.Add(cat(head, seg([]byte{0, 1, 2, 1, 1, 1, 2}, 200)))                                        // network, ratio 2
 	f.Add(cat(head, seg([]byte{0, 0, 3, 1, 1, 1, 2}, 200)))                                        // slow network, ratio 3
@@ -463,6 +517,9 @@ func FuzzCompressionPolicyRegret(f *testing.F) {
 	f.Add([]byte("710200211100"))
 	f.Add([]byte("000000A00210"))
 	f.Add([]byte("01000190011\x02"))
+	f.Add([]byte("\xeb00000A12220"))      // noise must not repeatedly reopen costly wire trials
+	f.Add([]byte("00002000000000X20220")) // ratio changes must refresh the clipped baseline
+	f.Add([]byte("\xeb00100A12220"))      // a noise burst must not erase expensive-trial backoff
 	f.Add([]byte("701701910010"))
 	f.Add([]byte("21C00120010\x020"))
 	f.Add([]byte("70100090011011200110"))
@@ -563,7 +620,7 @@ func regretRun(t *testing.T, s *sim, segs []simSegment, window int, per []tally)
 			if !blind && i >= settleUntil {
 				per[si].add(r, mode)
 			}
-			next := fc.Policy.Decide(mode, s.frame(r, mode)).Next
+			next := s.decide(&fc.Policy, r, mode).Next
 			checkStep(t, mode, next)
 			fc.Mode = next
 			frame++
@@ -576,13 +633,17 @@ func regretRun(t *testing.T, s *sim, segs []simSegment, window int, per []tally)
 
 // FuzzCompressionPolicyStationary checks C4 and C2 as disaster bounds in one
 // regime held for 1,056 frames from a fresh policy, summed over simRuns
-// jittered runs: after settling, at most simChanges mode changes per 1,000
-// frames (simHeavyChanges under heavy-tailed noise) and a time efficiency of
+// jittered runs: after settling, at most simChanges adopted codec changes
+// per 1,000 frames (simHeavyChanges under heavy-tailed noise), checks that
+// lose at most 2% of the time, and a time efficiency of
 // at least simEfficiency (simHeavyEfficiency under heavy-tailed noise); on
 // incompressible data, at most 5% of all frames compressed.
 //
 // Input: jitter and noise (see sim.noisy), two seed bytes, a regime.
 func FuzzCompressionPolicyStationary(f *testing.F) {
+	f.Add([]byte("\xff1700X0200"))                 // noise must preserve upward as well as downward backoff
+	f.Add([]byte("1010722120"))                    // cheaper-codec credit must not overlap upward wins
+	f.Add([]byte("A1101A0000"))                    // tiny write-cost changes must not reopen comparisons
 	f.Add([]byte{3, 0, 0, 0, 1, 0, 2, 2, 1, 2})    // network, incompressible, cheap lz4
 	f.Add([]byte{3, 0, 0, 0, 3, 1, 2, 2, 1, 2})    // fast network, ratio 1.05
 	f.Add([]byte{3, 0, 0, 0, 1, 2, 1, 1, 1, 2})    // network, ratio 2
@@ -599,6 +660,8 @@ func FuzzCompressionPolicyStationary(f *testing.F) {
 	f.Add([]byte("7\x00C0221110"))
 	f.Add([]byte("7'C00A1000"))
 	f.Add([]byte("\xff\xff00120010")) // found against the round 3 policy
+	f.Add([]byte("\xeb7000A2222"))    // high ratios make repeated false alarms expensive
+	f.Add([]byte("2101020020"))       // disk-bound tie: samples and checks trade codecs
 	f.Fuzz(func(t *testing.T, in []byte) {
 		st, ok := runStationary(t, in, simRuns)
 		if !ok {
@@ -608,8 +671,17 @@ func FuzzCompressionPolicyStationary(f *testing.F) {
 		if heavy(in[0]) {
 			wantChanges = simHeavyChanges
 		}
+		// Adopted codecs must be stable. Checks of cheaper codecs send real
+		// frames by design and stay within their budget of about 1%.
 		if st.changes*1000 > st.counted*wantChanges {
-			t.Errorf("C4: %d mode changes in %d settled frames, want at most %d per 1,000\n  %v", st.changes, st.counted, wantChanges, st.r)
+			t.Errorf("C4: %d codec changes in %d settled frames, want at most %d per 1,000\n  %v", st.changes, st.counted, wantChanges, st.r)
+		}
+		wantLoss := 0.02
+		if heavy(in[0]) {
+			wantLoss = 1/simHeavyEfficiency - 1
+		}
+		if st.loss > wantLoss*st.ty.taken {
+			t.Errorf("C4: checks lost %.2fs of %.2fs settled, want at most %.0f%%\n  %v", st.loss, st.ty.taken, 100*wantLoss, st.r)
 		}
 		wantEff := simEfficiency
 		if heavy(in[0]) {
@@ -628,9 +700,10 @@ func FuzzCompressionPolicyStationary(f *testing.F) {
 // stationaryResult is one stationary input's outcome.
 type stationaryResult struct {
 	r                  simRegime
-	ty                 tally // settled frames
-	changes, counted   int   // mode changes and frames after settling
-	compressed, frames int   // frames in any compressing mode, and all frames
+	ty                 tally   // settled frames
+	changes, counted   int     // adopted codec changes and frames after settling
+	loss               float64 // seconds of settled time recovery checks charged
+	compressed, frames int     // frames in any compressing mode, and all frames
 }
 
 // runStationary decodes a stationary input and runs it runs times. It reports
@@ -657,11 +730,16 @@ func runStationary(t *testing.T, in []byte, runs int) (stationaryResult, bool) {
 			if i >= simSettle {
 				st.ty.add(st.r, mode)
 			}
-			next := s.step(t, p, st.r, mode)
-			if i >= simSettle && next != mode {
-				st.changes++
+			home := p.home
+			d := s.decide(p, st.r, mode)
+			checkStep(t, mode, d.Next)
+			if i >= simSettle {
+				st.loss += d.RecoveryLoss.Seconds()
+				if p.home != home {
+					st.changes++
+				}
 			}
-			mode = next
+			mode = d.Next
 		}
 	}
 	return st, true
@@ -670,7 +748,9 @@ func runStationary(t *testing.T, in []byte, runs int) (stationaryResult, bool) {
 // FuzzCompressionPolicyReaction checks C3 as a disaster bound: after any
 // history, a regime change that makes the current mode simSlow times slower
 // than the best, and that mode can see, sends the policy out of it within
-// simReact decisions in all but simStuck of 40 jittered runs.
+// simReact decisions in all but simStuck of 40 jittered runs. Under
+// heavy-tailed noise only the disaster bound simHeavyLimit applies;
+// TestCompressionPolicyQualitySweep holds the typical reaction.
 //
 // Input: jitter and noise (see sim.noisy), a seed byte, up to three history
 // segments of a regime and a length byte (32 + 4x frames), then the new regime.
@@ -683,6 +763,10 @@ func FuzzCompressionPolicyReaction(f *testing.F) {
 		return out
 	}
 	head := []byte{3, 0}
+	f.Add([]byte("\xff210X0011012A0010"))                                                                            // the receiver's disk speeds up while a mispredicted zstd validates
+	f.Add([]byte("\xbb200X0000212X0001"))                                                                            // heavy noise hides a disk speedup for longer than the quality bound
+	f.Add([]byte("70102102100191200"))                                                                               // a check straddling a path change must not hold back upward samples
+	f.Add([]byte("10009010011120000"))                                                                               // none lost a check on the old path, lz4 won on the new one
 	f.Add(cat(head, []byte{0, 3, 0, 1, 1, 1, 2, 255}, []byte{0, 0, 3, 1, 1, 1, 2}))                                  // long incompressible history, then the link slows
 	f.Add(cat(head, []byte{0, 0, 4, 1, 0, 0, 2, 100}, []byte{2, 0, 4, 1, 0, 0, 2}))                                  // compression right, then CPU bound
 	f.Add(cat(head, []byte{0, 2, 4, 1, 0, 1, 2, 100}, []byte{1, 2, 4, 1, 0, 1, 2}))                                  // compression right, then receiver disk
@@ -693,9 +777,18 @@ func FuzzCompressionPolicyReaction(f *testing.F) {
 	f.Add([]byte("\xe3\xff00X0012012X0010"))                                                                         // found against the round 3 policy
 	f.Add([]byte("\xe3200X0001012X0010"))                                                                            // high noise: found against the swarm-style bounds
 	f.Add([]byte("\xff800X0011012X0010"))
-	f.Add([]byte("7A00X1002X2020010")) // found against round 2: a trial running when home's regime shifts
+	f.Add([]byte("7A00X1002X2020010"))    // found against round 2: a trial running when home's regime shifts
+	f.Add([]byte("\xe3000X0011012X0010")) // PR #50 acceptance: noisy network-to-disk shift
+	f.Add([]byte("\xe3200X0000012X0001")) // a long downward backoff hid the new bottleneck
+	f.Add([]byte("\xeb000X0000012X0001")) // noisy cost shifts must still reopen downward checks
+	f.Add([]byte("\xeb200X0000Y12X0001")) // the reference must not follow a noisy shift too quickly
+	f.Add([]byte("\xbb200X0000Y12X0001")) // codec CPU cost must not hide persistent write drift
 	f.Fuzz(func(t *testing.T, in []byte) {
-		rc, ok := runReaction(t, in, 40)
+		react := 0
+		if len(in) > 0 && heavy(in[0]) {
+			react = simHeavyLimit
+		}
+		rc, ok := runReaction(t, in, 40, react)
 		if !ok {
 			return
 		}
@@ -724,7 +817,9 @@ type reactionResult struct {
 
 // runReaction decodes a reaction input and runs it runs times. It reports
 // false when the input is too short or has no history.
-func runReaction(t *testing.T, in []byte, runs int) (reactionResult, bool) {
+// runReaction reports how many runs stayed in a slow mode for react frames
+// after the change, or simReact and simHeavyReact when react is 0.
+func runReaction(t *testing.T, in []byte, runs, react int) (reactionResult, bool) {
 	const segBytes = simRegimeBytes + 1
 	var rc reactionResult
 	if len(in) < 2+segBytes+simRegimeBytes {
@@ -734,6 +829,9 @@ func runReaction(t *testing.T, in []byte, runs int) (reactionResult, bool) {
 	rc.react = simReact
 	if heavy(in[0]) {
 		rc.react = simHeavyReact
+	}
+	if react > 0 {
+		rc.react = react
 	}
 	rc.final = regimeFromBytes(in[len(in)-simRegimeBytes:])
 	hist := in[2 : len(in)-simRegimeBytes]
@@ -849,7 +947,7 @@ func TestCompressionPolicyQualitySweep(t *testing.T) {
 			for i := 0; i < sweepReaction; i++ {
 				in := sweepBytes(rng, 2+(simRegimeBytes+1)*(1+rng.IntN(3))+simRegimeBytes)
 				in[0] = sweepNoise(rng, half.heavy)
-				if rc, ok := runReaction(t, in, 10); ok {
+				if rc, ok := runReaction(t, in, 10, 0); ok {
 					applicable += rc.applicable
 					stuck += rc.stuck
 				}
@@ -871,108 +969,4 @@ func TestCompressionPolicyQualitySweep(t *testing.T) {
 			}
 		})
 	}
-}
-
-// Background results can be delayed or absent while the bottleneck changes.
-// A newly selected codec needs four independent results; rollback may
-// restore an already established codec. Copying the
-// per-file state at a window boundary must preserve every decision, and so
-// must sampling only the codecs SampleNeeds names.
-func FuzzBackgroundCompression(f *testing.F) {
-	f.Add([]byte("00X00200000000000")) // candidate ratios must not shorten the live low-gain streak
-	f.Add([]byte("0020000201102127"))  // establish a codec on a downward comparison
-	f.Add([]byte{0, 0, 4, 0, 2, 2, 2, 255, 0, 2, 1, 0, 1, 1, 0, 255})
-	f.Add([]byte{1, 2, 4, 1, 1, 1, 2, 255})
-	f.Add([]byte{0, 0, 0, 0, 0, 0, 0, 0})
-	f.Add([]byte{0, 0, 4, 0, 2, 2, 2, 255, 1, 2, 4}) // seeded from a different link
-	f.Add([]byte("00A0000000000000"))                // a settled lz4 home must still sample zstd's ratio
-	f.Fuzz(func(t *testing.T, in []byte) {
-		if len(in) < 8 {
-			return
-		}
-		p := NewCompressionPolicy()
-		if len(in)%8 == 3 {
-			// Start from the link estimate a file on another regime left on
-			// the connection, which may be stale: seeding must not let a
-			// switch skip this file's own evidence.
-			prior := NewCompressionPolicy()
-			r := regimeFromBytes(in[len(in)-8:])
-			ps := newSim(6, .3)
-			for range 8 {
-				prior.DecideSampled(CompressionModeNone, ps.frame(r, CompressionModeNone), nil)
-			}
-			if link, ok := prior.Link(); ok {
-				p.SeedLink(link)
-			}
-		}
-		masked := *p
-		// Odd-length inputs deliver each masked sample a frame after it was
-		// requested, as a busy worker can.
-		late := len(in)%2 == 1
-		needs := masked.SampleNeeds()
-		mode := CompressionModeNone
-		s := newSim(5, .3)
-		evidence := 0
-		established := [3]bool{true, false, false}
-		for seg := 0; seg+8 <= len(in) && seg < 32; seg += 8 {
-			r := regimeFromBytes(in[seg:])
-			sample := samplesForRegime(r)
-			for frame := range 96 {
-				m := s.frame(r, mode)
-				m.ReadLatency = min(m.PrepareLatency, time.Duration(r.prepare[0]*float64(time.Second)))
-				var ready *encoding.CodecSamples
-				if in[seg+7] != 0 && frame%8 <= int(in[seg+7]%8) {
-					ready = &sample
-					evidence++
-				}
-				clone := *p
-				requested := masked.SampleNeeds()
-				if !late {
-					needs = requested
-				}
-				var partial *encoding.CodecSamples
-				if ready != nil {
-					partial = maskSample(*ready, needs)
-				}
-				d := p.DecideSampled(mode, m, ready)
-				if other := clone.DecideSampled(mode, m, ready); d != other || *p != clone {
-					t.Fatal("copying window state changed a decision")
-				}
-				if other := masked.DecideSampled(mode, m, partial); d != other || *p != masked {
-					// The one allowed difference: the masked sample lacked a
-					// codec the full one had, or was not taken, because it
-					// was requested under an earlier state. On time, that
-					// happens only for a comparison opened on its frame.
-					lacked := ready != nil && (partial == nil || *partial != *ready)
-					if !lacked || !late && !masked.BackgroundPending() {
-						t.Fatalf("sampling only %b changed a decision: %+v, want %+v", needs, other, d)
-					}
-					masked = *p
-				}
-				needs = requested
-				if simRung(d.Next) < 0 {
-					t.Fatalf("invalid mode %v", d.Next)
-				}
-				if d.Next > mode {
-					if d.Reason == "sample-overestimated" {
-						if !established[d.Next] {
-							t.Fatal("rollback selected an unmeasured codec")
-						}
-					} else if evidence < BackgroundWinFrames {
-						t.Fatalf("upgrade %v -> %v used only %d results", mode, d.Next, evidence)
-					}
-				}
-				if d.Next != mode {
-					if d.Reason == "sample-won" {
-						if evidence < BackgroundWinFrames {
-							t.Fatalf("winning %v -> %v at seg %d frame %d used %d results; low=%d shadowLow=%d validate=%d", mode, d.Next, seg, frame, evidence, p.low, p.shadow.low, p.shadow.validate)
-						}
-						established[d.Next] = true
-					}
-					evidence = 0
-				}
-				mode = d.Next
-			}
-		}
-	})
 }

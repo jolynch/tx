@@ -5,6 +5,8 @@ import (
 	"math/rand/v2"
 	"testing"
 	"time"
+
+	"github.com/jolynch/tx/internal/filexfer/encoding"
 )
 
 // scenario runs one policy through segments and returns the mode each frame
@@ -223,35 +225,9 @@ func TestCompressionPolicyIncompressibleData(t *testing.T) {
 					t.Errorf("%s: %d of %d frames compressed, want at most 5%%\n  %v", name, compressed, n, r)
 					continue
 				}
-				var starts []int
-				for i := 1; i < n; i++ {
-					if modes[i-1] == CompressionModeNone && modes[i] != CompressionModeNone {
-						starts = append(starts, i)
-					}
-				}
-				// A rare reset of the spacing, from noise that looked like a
-				// regime change, is tolerated once per run. A reset shows as
-				// a run of shrinking gaps.
-				resets, shrinking := 0, false
-				for i := 2; i < len(starts); i++ {
-					gap, prev := starts[i]-starts[i-1], starts[i-1]-starts[i-2]
-					shrank := gap*4 < prev*3
-					if shrank && !shrinking {
-						resets++
-					}
-					shrinking = shrank
-				}
-				if resets > 1 {
-					t.Errorf("%s: probe spacing reset %d times: starts %v", name, resets, starts)
-				}
-				if len(starts) >= 4 {
-					if first, last := starts[1]-starts[0], starts[len(starts)-1]-starts[len(starts)-2]; last < 2*first {
-						t.Errorf("%s: probe gaps did not grow: starts %v", name, starts)
-					}
-				}
-				if b == simNetwork && (len(starts) == 0 || starts[len(starts)-1] < n/2) {
-					t.Errorf("%s: no probe in the second half of %d frames: starts %v", name, n, starts)
-				}
+				// Upward exploration stays off the wire: incompressible data
+				// costs only bounded background samples, which
+				// TestCompressionPolicyProbeGapsBounded spaces.
 			}
 		}
 	}
@@ -267,8 +243,9 @@ func TestFileCompressionZeroValueStartsFresh(t *testing.T) {
 		got := FileCompression{Mode: mode}
 		want := FileCompression{Mode: CompressionModeNone, Policy: *NewCompressionPolicy()}
 		for i := 0; i < 200; i++ {
-			m := s.frame(r, want.Mode)
-			dg, dw := got.Policy.Decide(got.Mode, m), want.Policy.Decide(want.Mode, m)
+			m := s.sendMetrics(r, s.frame(r, want.Mode))
+			dg := got.Policy.DecideSampled(got.Mode, m, sampleFor(&got.Policy, r, i))
+			dw := want.Policy.DecideSampled(want.Mode, m, sampleFor(&want.Policy, r, i))
 			if dg.Next != dw.Next {
 				t.Fatalf("FileCompression{Mode: %s} at frame %d chose %s; a fresh policy at none chose %s",
 					modeName(mode), i, modeName(dg.Next), modeName(dw.Next))
@@ -295,7 +272,7 @@ func TestCompressionPolicyDegenerateMetrics(t *testing.T) {
 		p := NewCompressionPolicy()
 		mode := start
 		for i := 0; i < 64; i++ {
-			next := p.Decide(mode, frames[i%len(frames)]).Next
+			next := p.DecideSampled(mode, frames[i%len(frames)], nil).Next
 			checkStep(t, mode, next)
 			mode = next
 		}
@@ -319,13 +296,15 @@ func TestCompressionPolicyDeterministic(t *testing.T) {
 		if i == 450 {
 			c = a
 		}
-		m := s.frame(segs[i/300], a.Mode)
-		da, db := a.Policy.Decide(a.Mode, m), b.Policy.Decide(b.Mode, m)
+		r := segs[i/300]
+		m := s.sendMetrics(r, s.frame(r, a.Mode))
+		da := a.Policy.DecideSampled(a.Mode, m, sampleFor(&a.Policy, r, i))
+		db := b.Policy.DecideSampled(b.Mode, m, sampleFor(&b.Policy, r, i))
 		if da != db {
 			t.Fatalf("frame %d: identical policies decided %+v and %+v", i, da, db)
 		}
 		if i >= 450 {
-			if dc := c.Policy.Decide(c.Mode, m); dc != da {
+			if dc := c.Policy.DecideSampled(c.Mode, m, sampleFor(&c.Policy, r, i)); dc != da {
 				t.Fatalf("frame %d: the copy decided %+v, the original %+v", i, dc, da)
 			}
 			c.Mode = da.Next
@@ -348,14 +327,20 @@ func TestCompressionPolicyDecideDoesNotAllocate(t *testing.T) {
 	}
 	p := NewCompressionPolicy()
 	mode := CompressionModeNone
+	sample := samplesForRegime(r)
 	i := 0
 	n := testing.AllocsPerRun(1000, func() {
 		m := frames[i%len(frames)]
+		m.RecoveryAllowed, m.RecoveryReady = true, true
+		var ready *encoding.CodecSamples
+		if i%3 == 0 {
+			ready = &sample
+		}
 		i++
-		mode = p.Decide(mode, m).Next
+		mode = p.DecideSampled(mode, m, ready).Next
 	})
 	if n != 0 {
-		t.Fatalf("Decide allocated %v times per call", n)
+		t.Fatalf("DecideSampled allocated %v times per call", n)
 	}
 }
 
@@ -489,28 +474,32 @@ func TestCompressionPolicyNearTieSettlesOnCheaperCodec(t *testing.T) {
 }
 
 // TestCompressionPolicyProbeGapsBounded: on incompressible data a network
-// bound link keeps checking whether the data changed. Over 4,096 frames no
-// stretch without a probe, from the start, between probes, or to the end,
-// exceeds 300 frames, and probes continue in the second half.
+// bound link keeps checking, with background samples, whether the data
+// changed. Over 4,096 frames no stretch without a sample, from the start,
+// between samples, or to the end, exceeds 300 frames, and samples continue
+// in the second half.
 func TestCompressionPolicyProbeGapsBounded(t *testing.T) {
 	const n, maxGap = 4096, 300
 	for _, ratio := range []float64{1.0, 1.05} {
 		r := regime(simNetwork, 128, 4<<10, 4<<10, 512, ratio, ratio)
 		for seed := uint64(0); seed < 5; seed++ {
-			modes := scenario(t, seed, 0.3, CompressionModeNone, simSegment{r, n})
+			s := newSim(seed, 0.3)
+			p := NewCompressionPolicy()
+			mode := CompressionModeNone
 			prev, widest, late := 0, 0, 0
-			for i := 1; i < n; i++ {
-				if modes[i-1] == CompressionModeNone && modes[i] != CompressionModeNone {
+			for i := range n {
+				if sampleFor(p, r, s.frames) != nil {
 					widest = max(widest, i-prev)
 					prev = i
 					if i >= n/2 {
 						late++
 					}
 				}
+				mode = s.step(t, p, r, mode)
 			}
 			widest = max(widest, n-prev)
 			if widest > maxGap || late == 0 {
-				t.Errorf("ratio %.2f seed %d: widest gap between probes %d (want at most %d), %d probes in the second half\n  %v",
+				t.Errorf("ratio %.2f seed %d: widest gap between samples %d (want at most %d), %d samples in the second half\n  %v",
 					ratio, seed, widest, maxGap, late, r)
 			}
 		}
@@ -626,7 +615,7 @@ func TestCompressionPolicyDropsToNoneOnLowGain(t *testing.T) {
 				if i < lowGainFrames-1 {
 					r = dip
 				}
-				d := p.Decide(mode, s.frame(r, mode))
+				d := s.decide(p, r, mode)
 				checkStep(t, mode, d.Next)
 				if d.Reason == "low-gain" && d.Next == CompressionModeNone {
 					t.Fatalf("seed %d: a dip of %d incompressible frames dropped %s to none", seed, lowGainFrames-1, modeName(mode))
@@ -658,7 +647,7 @@ func TestCompressionPolicyStatePersistsAcrossWindows(t *testing.T) {
 			if fc.Mode != CompressionModeNone {
 				compressed++
 			}
-			next := fc.Policy.Decide(fc.Mode, s.frame(r, fc.Mode)).Next
+			next := s.decide(&fc.Policy, r, fc.Mode).Next
 			checkStep(t, fc.Mode, next)
 			fc.Mode = next
 		}

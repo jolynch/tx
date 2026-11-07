@@ -20,3 +20,6 @@ tmp_*_test.go
 /tx-bench-dst/
 /tx-bench-*.json
 /.pbt-fuzzcache/
+
+# Local Claude Code settings and agent worktrees.
+/.claude/

@@ -156,9 +156,69 @@ instead of widening the current change; remove an entry when it ships.
   σ up to 0.5 and 1-3% stalled frames), not on real links. Check them on
   burst-credit and disk-bound instances, and check that a 256 KiB sample
   compressed on one goroutine predicts a fast-mode frame's cost, since fast
-  mode compresses a frame's blocks in parallel. Under heavy-tailed noise the
-  fuzzers check only basic properties; a searching fuzzer finds inputs below
-  0.75 efficiency there, while the seeded quality sweep averages above 0.99.
+  mode compresses a frame's blocks in parallel. CLOUD.md supplies candidate
+  rates directly from its hardware model and assumes fair turns for sample
+  slots; it does not replay Go's estimator, validation, and window scheduling.
+  Validate its 9–17-second response to the network clamp with those parts
+  together, including all 16 or 64 data connections. Policy properties cover
+  noisy cost shifts, but do not measure worker contention or socket delivery.
+
+- **The policy prices a frame as prepare plus write.** Behind a send buffer,
+  the kernel sends one frame while the next compresses, so a frame really
+  takes nearer the larger of the two, and background predictions undervalue
+  CPU-heavy codecs.
+  - The gap rarely decides the codec. Across 300 random regimes in the
+    policy sim behind buffers of one to eight frames (`sndbuf`), pricing by
+    prepare plus write picks a mode over 10% slower than the best in 7, or
+    about 2%. Mean efficiency against each mode's steady time, max(prepare,
+    write), is 0.95–0.98, and most of the loss comes from absorbed frames
+    and checks, not this gap.
+  - A learned overlap did not help: each connection estimated the hidden
+    share of the smaller part, as floored minus raw write over min(prepare,
+    floored write), and predictions used prepare + write − overlap ×
+    min(prepare, write). Mean efficiency moved from 0.976 to 0.978 behind
+    one frame and from 0.949 to 0.938 behind eight.
+  - In near-ties, checks measure the overlap that samples miss, so the
+    adopted codec alternates; `FuzzBackgroundSendBuffer` seed
+    `"00007212200"` shows none and lz4 trading places every episode.
+  - A sim buffer counts wire bytes, so behind a disk that binds logical
+    bytes it holds many compressed frames and takes hundreds of frames to
+    fill. Measure such regimes at steady state, or charge the bytes still
+    queued at the end.
+- **Samples and checks trade codecs when the receiver's disk binds.** When
+  every codec runs at the disk's rate, background samples predict that
+  compression shortens the write and adopt zstd, and checks then find none
+  no slower and win it back. That happens about six times per 1,000 frames.
+  The checks lose little, about 0.5% of the time, so the budget does not
+  stop them, but the adopted codec keeps changing. Samples see the disk
+  floor only after a failed validation. Repros for
+  `FuzzCompressionPolicyStationary`: `"2101020020"` and `"7\".1020020"`.
+- **Validation can pass a codec a buffer flatters.** A send buffer of B
+  frames can absorb a check's frames and the first validation frames, which
+  lowers the 10-frame validation mean by up to about B/10. Behind three or
+  more frames, a codec about a quarter slower can pass the 10% bar, and
+  samples priced without overlap never undo it. `FuzzBackgroundSendBuffer`
+  covers buffers of up to two frames for this reason. Repros, with the
+  buffer byte read modulo 9 rather than 3: `"20007A02210120000"` (3 frames,
+  lz4 truly faster than none) and `"\xeb8207A2022"` (2 frames, heavy noise).
+- **A young baseline can roll back a correct switch.** A file's first frames
+  can land in an empty send buffer, so the uncompressed baseline starts far
+  below its true cost. Its average admits each frame at no more than twice
+  itself, so it rises at most 1.25 times per frame, and a background winner
+  adopted within a few frames can fail validation against it. In the sim,
+  none's baseline was 12 ms against a true 125 ms at frame 7, and lz4 was
+  restored for 15 frames before being adopted again (`"00000X0000"`, 3-frame
+  buffer). An unclipped mean until the baseline is seeded fixes this, but
+  needs a counter `FileCompression` has no room for.
+- **Heavy noise forces repeated checks.** A detected cost change starts a
+  check without waiting for the budget once fresh timings confirm it, and
+  heavy-tailed noise confirms often: `"\xe3C001A0201"` and
+  `"\xff\xff102A0011"` run about 2.5 episodes per 224 frames. The early
+  restore bounds each episode once failure is certain, and confirmation
+  needs more evidence after costly losses (z up to 4). Where one losing none
+  frame costs hundreds of lz4 frames (`"\xffA00A22220"`, lz4 ratio 225),
+  throughput still averages 0.64 of the best, mostly from the first,
+  unpaid check.
 - **Large files sent as small windows rarely adapt.** The CLI's batch is
   often 4 MiB, so a large file goes out as one-frame windows, two or more of
   them in flight at once.
@@ -172,11 +232,45 @@ instead of widening the current change; remove an entry when it ships.
     every W windows, and the last save wins. With 16 MiB windows on two
     connections, a 48 MiB file never switched.
   - Seeding a file from its connection's link estimate cuts a chain's
-    warm-up from 8 frames to about 5, so 16 MiB windows, 16 in flight, now
-    compress about 3 of each chain's 8 frames instead of none.
+    warm-up to four winning samples, so 16 MiB windows, 16 in flight, can
+    compress about half of each chain's eight frames.
   - Waiting a bounded time (about the last sample's cost) for a running
     sample before a window that saves state ends would fix the first. The
     rest needs windows of a file to share or chain their state.
+  - The cost is large where compression pays. In a policy simulation of
+    one 4 GiB file on a 32 MiB/s link with zstd at 3:1, 16 concurrent
+    16-frame windows ran 19% slower than zstd throughout, against 1% for
+    one stream, because each window relearned from none.
+- **Mix a codec with none when CPU binds.** When a codec is CPU-bound below
+  what the wire could carry, sending part of the traffic uncompressed fills
+  the idle wire. In the CLOUD.md model of lz4-compressed segment files on
+  i4i.4xlarge after the network clamp, zstd -1 alone delivers 1,418 MiB/s;
+  a mix sending about 74% as zstd -1 and the rest uncompressed delivers
+  about 1,770 MiB/s. The policy picks one codec per frame, so a mix would
+  need per-connection codec shares or a CPU-aware home.
+- **Resolve the remaining large-file CPU gap.** Warm tmpfs AES-GCM copies
+  (4 GiB, 128 MiB files, 12 CPUs per peer) use about 2% more sender CPU
+  than `9a4c4fd` (eight paired ABBA comparisons; 95% interval +0.75% to
+  +3.15%). Wall-time intervals include zero. A direct comparison with the
+  starting sampler patch found no added recovery overhead. Profile sampling
+  work before further tuning. Keep separate worker and result budgets:
+  completed results must not hold codec workers, and two streams must still
+  gather enough evidence to switch.
+- **PROBE payload costs a fifth of the sender's CPU.** `handlePROBEWithInput`
+  sends its link-probe bytes from `crypto/rand`. In a profile of
+  `tx send tree` copying two 128 MiB files over loopback without keep-alive,
+  `runtime.vgetrandom` under that copy took about 210 ms of the sender's
+  0.6 s of CPU per transfer, in this branch and at `aeac9f2` alike. The
+  probe needs incompressible bytes, not secret ones: a fixed random buffer
+  filled once, or `math/rand/v2` ChaCha8, would do.
+- **Persistent sample workers.** Each background sample starts a goroutine
+  (`go j.run()` in `send_sampling.go`), its one allocation. The goroutine
+  count is already bounded by the sample slots and the sender never waits,
+  so the cost is one allocation and about 1 µs per sample, against
+  milliseconds of codec work. Long-lived workers fed by a channel would
+  remove it and let a test lock the full sample cycle at zero allocations.
+  The lifecycle tests block a worker through the `measure` hook, so they
+  would need a private pool.
 - **A rising kernel rate resets comparisons.** Early in a SEND the kernel's
   maximum rises from slow-start readings, so the charged write time of home's
   frames falls, from 190 ms to 108 ms per 4 MiB in one memxfer run. The
@@ -184,10 +278,10 @@ instead of widening the current change; remove an entry when it ships.
   restarts the comparison. Re-anchoring home's cost when the rate estimate
   rises would avoid the reset.
 - **Short files never compress under `adapt`.** A switch needs four winning
-  samples of the file's own data, plus one frame to send in the new codec,
-  and four more frames to seed the baseline when its connection has no link
-  estimate yet, so a file of fewer than about six frames (24 MiB) always
-  goes uncompressed. Many small files bundled into one SEND could share
+  samples of the file's own data, plus a frame to send in the new codec.
+  A fresh connection also needs four baseline frames. Files of at most
+  16 MiB cannot adapt, even on a slow link. Many small files bundled into
+  one SEND could share
   a policy for the whole request.
 - **Bound batch lookup metadata.** SEND and CXSUM resolve all request items
   together to avoid per-file transfer locking. Their lookup and reference arrays
@@ -327,6 +421,16 @@ instead of widening the current change; remove an entry when it ships.
     `ZeroCopyConn` returns nil for a throttled connection.
   - The risk is the swarm budget: pbt-faults inputs must stay within about
     9s, so swarm draws need a floor near 16 MiB/s.
+- **`TestProbeTCPSucceedsThroughThrottledLink` fails under load.** In a full
+  `go test -race ./...` run it can fail with `authenticate: context deadline
+  exceeded` about 200 ms in, at its 200 ms trickle floor; it passes alone.
+  The authentication deadline leaves no margin over the floor when the
+  machine is busy. Give the handshake a margin above the floor, or make the
+  test's throttle independent of scheduling delay.
+- **Report listener setup failures in authentication tests.**
+  `TestServeRejectsInvalidAllowlist` ignores a `net.Listen` error and then
+  uses the nil listener. It panics when loopback sockets are unavailable;
+  fail at setup with the listen error instead.
 - **Page-cache tests do not check advisory syscall arguments.** The gate
   tests pass if `touchPages` uses `FADV_DONTNEED` instead of `FADV_WILLNEED`.
   Check advice, offsets, and lengths with syscall interception. Exact
