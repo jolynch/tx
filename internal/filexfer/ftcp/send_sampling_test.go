@@ -1,19 +1,24 @@
 package ftcp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jolynch/tx/internal/aead"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/jolynch/tx/internal/filexfer/policy"
 	"github.com/zeebo/xxh3"
 )
@@ -334,7 +339,8 @@ func TestSendSamplingSkipsSmallFiles(t *testing.T) {
 }
 
 // Long-distance repetition is invisible to lz4 but profitable for zstd.
-// The transfer must discover it without ever sending a losing lz4 frame.
+// The upward comparison must discover it without sending an lz4 trial.
+// Once zstd is established, a bounded recovery episode may check lz4.
 func TestSendSamplingDiscoversZstdPastLz4(t *testing.T) {
 	pattern := make([]byte, 128<<10)
 	rand.New(rand.NewSource(91)).Read(pattern)
@@ -347,6 +353,7 @@ func TestSendSamplingDiscoversZstdPastLz4(t *testing.T) {
 		t.Run(fmt.Sprintf("%d-frame windows", windowFrames), func(t *testing.T) {
 			deps, tid, path := multiWindowFile(t, data)
 			found := false
+			lz4Checks := 0
 			for first := 0; first < 20; first += windowFrames {
 				raw := sendWindow(t, deps, tid, path, first, windowFrames, pace)
 				frames, err := decodeFrameStream(raw)
@@ -358,7 +365,10 @@ func TestSendSamplingDiscoversZstdPastLz4(t *testing.T) {
 				}
 				for _, frame := range frames {
 					if frame.Header.Comp == encoding.EncodingLz4 {
-						t.Fatal("a losing lz4 trial was sent")
+						if !found {
+							t.Fatal("an upward lz4 trial was sent before zstd was established")
+						}
+						lz4Checks++
 					}
 					lo, hi := frame.Header.Offset, frame.Header.Offset+frame.Header.Size
 					if !bytes.Equal(frame.Logical, data[lo:hi]) {
@@ -369,6 +379,9 @@ func TestSendSamplingDiscoversZstdPastLz4(t *testing.T) {
 			}
 			if !found {
 				t.Fatal("zstd was never discovered")
+			}
+			if lz4Checks > 2 {
+				t.Fatalf("short transfer sent %d lz4 check frames, want at most two", lz4Checks)
 			}
 		})
 	}
@@ -510,5 +523,564 @@ func TestSendSamplingRecoversFromAStaleCost(t *testing.T) {
 	noteSampleCost(2*time.Millisecond, true)
 	if sampler.request(context.Background(), work, p, metrics) == nil {
 		t.Fatal("a fresh cost did not restore normal admission")
+	}
+}
+
+// A server's connections share one recovery budget: a new connection, or
+// a later SEND on the same one, must not get an unpaid check.
+func TestRecoveryBudgetBelongsToServer(t *testing.T) {
+	var budget policy.RecoveryBudget
+	first := sendRate{src: &sendRateSource{budget: &budget}}
+	first.noteRecovery(time.Millisecond, time.Millisecond)
+	for name, later := range map[string]sendRate{
+		"same connection":  {src: first.src},
+		"other connection": {src: &sendRateSource{budget: &budget}},
+	} {
+		if later.recoveryReady() {
+			t.Fatalf("%s discarded the server's recovery debt", name)
+		}
+	}
+	other := sendRate{src: &sendRateSource{budget: &budget}}
+	other.noteRecovery(0, 100*time.Millisecond)
+	if !first.recoveryReady() {
+		t.Fatal("progress on another connection did not repay the shared budget")
+	}
+	// A SEND outside a server keeps its own budget.
+	alone := sendRate{src: &sendRateSource{}}
+	alone.noteRecovery(time.Millisecond, time.Millisecond)
+	if alone.recoveryReady() || !first.recoveryReady() {
+		t.Fatal("a sessionless SEND shared the server's budget")
+	}
+}
+
+// The receiver paces decoded bytes, so compression cannot remove this
+// bottleneck. Default buffers delay backpressure; small buffers expose it
+// promptly. Every frame crosses a saved FX/1 window boundary.
+func TestRecoveryAcrossBufferedTCPWindows(t *testing.T) {
+	for _, buffer := range []int{0, 64 << 10} {
+		t.Run(fmt.Sprintf("socket-buffer=%d", buffer), func(t *testing.T) {
+			testRecoveryAcrossTCPWindows(t, buffer)
+		})
+	}
+}
+
+func testRecoveryAcrossTCPWindows(t *testing.T, buffer int) {
+	t.Helper()
+	const frames = 32
+	data := bytes.Repeat(wordyBytes(int(defaultFileFrameLogicalSize)), frames+1)
+	for frame := range frames + 1 {
+		data[int64(frame)*defaultFileFrameLogicalSize] = byte(frame)
+	}
+	deps, tid, path := multiWindowFile(t, data)
+	p := policy.NewCompressionPolicy()
+	for range 16 {
+		p.DecideSampled(policy.CompressionModeZstdLevel1, policy.CompressionMetrics{
+			LogicalSize: defaultFileFrameLogicalSize, WireSize: defaultFileFrameLogicalSize / 3,
+			PrepareLatency: time.Millisecond, WriteLatency: 400 * time.Millisecond}, nil)
+	}
+	deps.RecordTransferWindows(tid, WindowRecords{Compression: []FileCompressionUpdate{{FileID: 1,
+		State: policy.FileCompression{Mode: policy.CompressionModeZstdLevel1, Policy: *p}}}})
+	server, client := newTCPPair(t)
+	t.Cleanup(func() { _ = server.Close(); _ = client.Close() })
+	for _, c := range []*net.TCPConn{server, client} {
+		if err := c.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if buffer > 0 {
+			if err := c.SetWriteBuffer(buffer); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.SetReadBuffer(buffer); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	result := make(chan error, 1)
+	go func() {
+		br := bufio.NewReader(client)
+		none := 0
+		for frame := range frames {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				result <- err
+				return
+			}
+			header, err := encoding.ParseFXHeader(strings.TrimSpace(line))
+			if err != nil {
+				result <- err
+				return
+			}
+			r, err := encoding.DecodePayloadReaderByComp(io.LimitReader(br, header.WireSize), header.Comp)
+			if err != nil {
+				result <- err
+				return
+			}
+			logical, err := io.ReadAll(r)
+			closeErr := r.Close()
+			if err != nil {
+				result <- err
+				return
+			}
+			if closeErr != nil {
+				result <- closeErr
+				return
+			}
+			start := int64(frame+1) * defaultFileFrameLogicalSize
+			if !bytes.Equal(logical, data[start:start+defaultFileFrameLogicalSize]) {
+				result <- fmt.Errorf("frame %d differs from source", frame)
+				return
+			}
+			if _, err = (&rateWriter{w: io.Discard, nsPerByte: 5}).Write(logical); err != nil {
+				result <- err
+				return
+			}
+			line, err = br.ReadString('\n')
+			if err == nil {
+				_, err = encoding.ParseFXTrailer(strings.TrimSpace(line))
+			}
+			if err != nil {
+				result <- err
+				return
+			}
+			if header.Comp == "none" {
+				none++
+			}
+		}
+		if none == 0 {
+			result <- errors.New("compressed stream never checked none")
+			return
+		}
+		result <- nil
+	}()
+	out := newBufferedSendOutput(server)
+	defer out.release()
+	out.ownRate.src = &sendRateSource{conn: server}
+	refs, errs := deps.GetFileRefs(tid, []FileLookup{{FileID: 1, Path: path}})
+	if errs[0] != nil {
+		t.Fatal(errs[0])
+	}
+	for first := 1; first <= frames; first++ {
+		sent, err := streamSendItem(context.Background(), out, deps, tid,
+			sendItem{FileID: 1, Offset: int64(first) * defaultFileFrameLogicalSize, Size: defaultFileFrameLogicalSize, Comp: "adapt", Path: path}, refs[0], 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		applyWindowState(deps, tid, sent)
+		if err = out.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoveryTerminalFrameChargesLoss(t *testing.T) {
+	deps, tid, path := multiWindowFile(t, compressibleBytes(2*defaultFileFrameLogicalSize))
+	p := policy.NewCompressionPolicy()
+	var d policy.CompressionDecision
+	for range 16 {
+		d = p.DecideSampled(policy.CompressionModeLz4, policy.CompressionMetrics{
+			LogicalSize: defaultFileFrameLogicalSize, WireSize: defaultFileFrameLogicalSize / 3,
+			PrepareLatency: time.Nanosecond, WriteLatency: time.Nanosecond,
+			RecoveryAllowed: true, RecoveryReady: true}, nil)
+		if d.Reason == "recovery-check" {
+			break
+		}
+	}
+	if !p.RecoveryActive() {
+		t.Fatal("setup did not request a check")
+	}
+	deps.RecordTransferWindows(tid, WindowRecords{Compression: []FileCompressionUpdate{{FileID: 1,
+		State: policy.FileCompression{Mode: d.Next, Policy: *p}}}})
+	refs, errs := deps.GetFileRefs(tid, []FileLookup{{FileID: 1, Path: path}})
+	if errs[0] != nil {
+		t.Fatal(errs[0])
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// Cancellation interrupts the transport. An unfinished frame must not
+	// become a throughput observation or charge recovery debt.
+	reader, writer := io.Pipe()
+	_ = reader.CloseWithError(ctx.Err())
+	defer writer.Close()
+	canceledOut := unbufferedSendOutput(writer)
+	canceledOut.ownRate.src = &sendRateSource{}
+	_, err := streamSendItem(ctx, canceledOut, deps, tid, sendItem{
+		FileID: 1, Offset: defaultFileFrameLogicalSize, Size: defaultFileFrameLogicalSize, Comp: "adapt", Path: path}, refs[0], 0)
+	if !errors.Is(err, context.Canceled) || !canceledOut.rate.recoveryReady() {
+		t.Fatalf("canceled check: err=%v ready=%v", err, canceledOut.rate.recoveryReady())
+	}
+	out := unbufferedSendOutput(io.Discard)
+	out.ownRate.src = &sendRateSource{}
+	_, err = streamSendItem(context.Background(), out, deps, tid, sendItem{
+		FileID: 1, Offset: defaultFileFrameLogicalSize, Size: defaultFileFrameLogicalSize, Comp: "adapt", Path: path}, refs[0], 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.rate.recoveryReady() {
+		t.Fatal("terminal recovery frame did not charge its excess time")
+	}
+}
+
+type samplingRateConn struct {
+	net.Conn
+	rate rateWriter
+}
+
+func (c *samplingRateConn) Write(p []byte) (int, error) { return c.rate.Write(p) }
+
+func sampledNoiseWriter(t *testing.T, wireCost int64) (*aead.MessageWriter, *aead.Session) {
+	t.Helper()
+	server, client := newTCPPair(t)
+	t.Cleanup(func() { _ = server.Close(); _ = client.Close() })
+	for _, c := range []*net.TCPConn{server, client} {
+		if err := c.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conn := &samplingRateConn{Conn: server, rate: rateWriter{w: server}}
+	serverKey, _ := clientKey(t)
+	clientIdentity, _ := clientKey(t)
+	type handshake struct {
+		session *aead.Session
+		err     error
+	}
+	ready := make(chan handshake, 1)
+	go func() {
+		br := bufio.NewReader(conn)
+		line, err := br.ReadBytes('\n')
+		if err != nil {
+			ready <- handshake{err: err}
+			return
+		}
+		s, _, err := aead.ServerHandshake(conn, br, line, aead.ServerConfig{Static: serverKey, AnyKey: true})
+		ready <- handshake{s, err}
+	}()
+	cs, err := aead.ClientHandshake(client, aead.ClientConfig{
+		Mode: aead.ModeAge, Cipher: aead.AlgorithmAES, Static: clientIdentity, ServerKey: serverKey.Public})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+	result := <-ready
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	t.Cleanup(func() { _ = result.session.Close() })
+	conn.rate.nsPerByte = wireCost
+	return result.session.Writer(true), cs
+}
+
+// lz4RecoveryCheck returns a zstd policy whose recovery check lost with none
+// and now checks lz4, with home's 20 ms frames as the baseline; m is home's
+// last frame and d the decision to send lz4.
+func lz4RecoveryCheck(t *testing.T) (*policy.CompressionPolicy, policy.CompressionMetrics, policy.CompressionDecision) {
+	t.Helper()
+	p := policy.NewCompressionPolicy()
+	m := policy.CompressionMetrics{
+		LogicalSize: defaultFileFrameLogicalSize, WireSize: defaultFileFrameLogicalSize / 1000,
+		PrepareLatency: 5 * time.Millisecond, WriteLatency: 15 * time.Millisecond,
+		RecoveryAllowed: true, RecoveryReady: true}
+	var d policy.CompressionDecision
+	for range 32 {
+		d = p.DecideSampled(policy.CompressionModeZstdLevel1, m, nil)
+		if d.Reason == "recovery-check" {
+			break
+		}
+	}
+	if d.Next != policy.CompressionModeNone {
+		t.Fatalf("no uncompressed check: %+v", d)
+	}
+	m.WireSize, m.WriteLatency = m.LogicalSize, time.Second
+	d = p.DecideSampled(d.Next, m, nil)
+	if d.Next != policy.CompressionModeLz4 {
+		t.Fatalf("no lz4 check after none lost: %+v", d)
+	}
+	return p, m, d
+}
+
+// A fast response buffers small compressed frames, and in a one-frame window
+// sends them only when the request ends, after the policy decided. Frames a
+// recovery check measures must still carry their wire time: on a 128 KiB/s
+// link, lz4 is far slower than the zstd baseline and must be restored, and
+// the loss charged to the server's budget.
+func TestRecoveryMeasuresFastResponseFlush(t *testing.T) {
+	const wireCost = int64(time.Second) / (128 << 10)
+	for _, transport := range []string{"plain", "aead"} {
+		t.Run(transport, func(t *testing.T) {
+			p, _, d := lz4RecoveryCheck(t)
+			data := compressibleBytes(12 * defaultFileFrameLogicalSize)
+			deps, tid, path := multiWindowFile(t, data)
+			deps.RecordTransferWindows(tid, WindowRecords{Compression: []FileCompressionUpdate{{FileID: 1,
+				State: policy.FileCompression{Mode: d.Next, Policy: *p}}}})
+			req, err := ParseRequest([]byte("SEND " + tid + " mode=fast"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var budget policy.RecoveryBudget
+			for frame := 1; frame <= 10; frame++ {
+				var w io.Writer
+				var finish func() ([]byte, error)
+				if transport == "plain" {
+					var raw bytes.Buffer
+					w = &rateWriter{w: &raw, nsPerByte: wireCost}
+					finish = func() ([]byte, error) { return raw.Bytes(), nil }
+				} else {
+					writer, receiver := sampledNoiseWriter(t, wireCost)
+					type received struct {
+						raw []byte
+						err error
+					}
+					done := make(chan received, 1)
+					go func() {
+						r, err := receiver.Reader()
+						if err != nil {
+							done <- received{err: err}
+							return
+						}
+						raw, err := io.ReadAll(r)
+						done <- received{raw, err}
+					}()
+					w = writer
+					finish = func() ([]byte, error) {
+						if err := writer.End(); err != nil {
+							return nil, err
+						}
+						result := <-done
+						return result.raw, result.err
+					}
+				}
+				// Each window is a new SEND on a new connection of one server.
+				ctx := context.WithValue(context.Background(), sendRateKey{}, &sendRateSource{budget: &budget})
+				off := int64(frame) * defaultFileFrameLogicalSize
+				item := fmt.Sprintf("fd=1 %q offset=%d size=%d comp=adapt", path, off, defaultFileFrameLogicalSize)
+				if err := handleSENDWithOptions(ctx, req, framedItemBody(t, item), w, deps, nil, 0, 25); err != nil {
+					t.Fatal(err)
+				}
+				raw, err := finish()
+				if err != nil {
+					t.Fatal(err)
+				}
+				frames, err := decodeFrameStream(raw)
+				if err != nil || len(frames) != 1 {
+					t.Fatalf("decoded %d frames: %v", len(frames), err)
+				}
+				if !bytes.Equal(frames[0].Logical, data[off:off+defaultFileFrameLogicalSize]) {
+					t.Fatalf("frame %d differs from source", frame)
+				}
+			}
+			st, _ := deps.LoadFileCompression(tid, 1)
+			if st.Mode != policy.CompressionModeZstdLevel1 {
+				t.Fatalf("slower lz4 kept: its buffered frames' wire time escaped the check (mode %v)", st.Mode)
+			}
+			if budget.Ready() {
+				t.Fatal("the losing check charged nothing to the server's budget")
+			}
+		})
+	}
+}
+
+// writeLog records the size of each write that reaches it.
+type writeLog struct {
+	raw    bytes.Buffer
+	writes []int
+}
+
+func (w *writeLog) Write(p []byte) (int, error) {
+	w.writes = append(w.writes, len(p))
+	return w.raw.Write(p)
+}
+
+// A recovery frame must reach the writer before the policy times it, or
+// the time its bytes take escapes the check; and its flush must write its
+// own bytes alone, not output earlier items left in a fast response's
+// buffer, or the baseline counts their wire time as home's. This checks
+// which bytes had been written rather than how long that took, so it does
+// not depend on timing.
+func TestRecoveryFlushTimesOnlyItsFrame(t *testing.T) {
+	const frame = defaultFileFrameLogicalSize
+	data := compressibleBytes(8 * frame)
+	deps, tid, path := multiWindowFile(t, data)
+	p := policy.NewCompressionPolicy()
+	m := policy.CompressionMetrics{LogicalSize: frame, WireSize: frame / 1000,
+		PrepareLatency: time.Millisecond, WriteLatency: time.Millisecond,
+		RecoveryAllowed: true, RecoveryReady: true}
+	var d policy.CompressionDecision
+	for range 32 {
+		if d = p.DecideSampled(policy.CompressionModeZstdLevel1, m, nil); d.Reason == "recovery-baseline" {
+			break
+		}
+	}
+	if d.Reason != "recovery-baseline" {
+		t.Fatalf("no baseline: %+v", d)
+	}
+	deps.RecordTransferWindows(tid, WindowRecords{Compression: []FileCompressionUpdate{{FileID: 1,
+		State: policy.FileCompression{Mode: d.Next, Policy: *p}}}})
+	req, err := ParseRequest([]byte("SEND " + tid + " mode=fast"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seven small items leave about 56 KiB buffered before the baseline.
+	var items []string
+	for range 7 {
+		items = append(items, fmt.Sprintf("fd=1 %q offset=0 size=8192 comp=none", path))
+	}
+	items = append(items, fmt.Sprintf("fd=1 %q offset=%d size=%d comp=adapt", path, frame, 4*frame))
+	w := &writeLog{}
+	type observed struct {
+		wire                int64
+		lastWrite, received int
+	}
+	var seen []observed
+	sendFrameMetricsHook = func(m policy.CompressionMetrics) {
+		seen = append(seen, observed{m.WireSize, w.writes[len(w.writes)-1], w.raw.Len()})
+	}
+	t.Cleanup(func() { sendFrameMetricsHook = nil })
+	if err := handleSENDWithOptions(context.Background(), req, framedItemBody(t, items...), w, deps, nil, 0, 25); err != nil {
+		t.Fatal(err)
+	}
+	frames, err := decodeFrameStream(w.raw.Bytes())
+	if err != nil || len(frames) != 11 {
+		t.Fatalf("decoded %d frames: %v", len(frames), err)
+	}
+	for i, f := range frames {
+		if !bytes.Equal(f.Logical, data[f.Header.Offset:f.Header.Offset+int64(len(f.Logical))]) {
+			t.Fatalf("frame %d differs from source", i)
+		}
+	}
+	if len(seen) < 3 {
+		t.Fatalf("policy saw %d frames, want two baseline frames and a check", len(seen))
+	}
+	// A frame's own flush writes its header, payload, and trailer.
+	const overhead = 4 << 10
+	for i, o := range seen[:3] {
+		if got, err := decodeFrameStream(w.raw.Bytes()[:o.received]); err != nil || len(got) != 7+i+1 {
+			t.Fatalf("recovery frame %d was timed before it reached the writer (%d whole frames there: %v)", i, len(got), err)
+		}
+		if o.lastWrite > int(o.wire)+overhead {
+			t.Fatalf("recovery frame %d's flush wrote %d bytes for a %d-byte frame: earlier output was timed with it", i, o.lastWrite, o.wire)
+		}
+	}
+}
+
+// A small compressed frame reaches the socket only when its AEAD record is
+// flushed. Recovery must measure that wait when checking and validating lz4.
+func TestRecoveryMeasuresAuthenticatedFlush(t *testing.T) {
+	for _, phase := range []string{"check", "validation"} {
+		t.Run(phase, func(t *testing.T) {
+			p, m, d := lz4RecoveryCheck(t)
+			frames := 1
+			if phase == "validation" {
+				// Resume a saved episode whose two buffered check frames won.
+				m.WireSize = m.LogicalSize / 256
+				m.PrepareLatency, m.WriteLatency = time.Millisecond, time.Millisecond
+				for range 2 {
+					d = p.DecideSampled(d.Next, m, nil)
+				}
+				if d.Reason != "recovery-won" {
+					t.Fatalf("no validation after winning checks: %+v", d)
+				}
+				frames = 8
+			}
+			data := compressibleBytes(10 * defaultFileFrameLogicalSize)
+			deps, tid, path := multiWindowFile(t, data)
+			deps.RecordTransferWindows(tid, WindowRecords{Compression: []FileCompressionUpdate{{FileID: 1,
+				State: policy.FileCompression{Mode: d.Next, Policy: *p}}}})
+			refs, errs := deps.GetFileRefs(tid, []FileLookup{{FileID: 1, Path: path}})
+			if errs[0] != nil {
+				t.Fatal(errs[0])
+			}
+			const wireCost = int64(time.Second) / (128 << 10)
+			writer, receiver := sampledNoiseWriter(t, wireCost)
+			type received struct {
+				data []byte
+				err  error
+			}
+			done := make(chan received, 1)
+			go func() {
+				r, err := receiver.Reader()
+				if err != nil {
+					done <- received{err: err}
+					return
+				}
+				raw, err := io.ReadAll(r)
+				done <- received{raw, err}
+			}()
+			// The configured limiter permits far more than the downstream link.
+			limiter, err := limit.NewLimiterFromBps(1<<30, 1<<20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := unbufferedSendOutput(limiter.WrapRateLimitedWriter(writer, context.Background()))
+			out.frameFlush = writer.FlushFunc()
+			out.ownRate.src = &sendRateSource{}
+			rec := recordFrameMetrics(t)
+			sent, err := streamSendItem(context.Background(), out, deps, tid, sendItem{
+				FileID: 1, Offset: defaultFileFrameLogicalSize, Size: int64(frames) * defaultFileFrameLogicalSize,
+				Comp: "adapt", Path: path, Mode: loadStrategyGentle}, refs[0], 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.End(); err != nil {
+				t.Fatal(err)
+			}
+			result := <-done
+			if result.err != nil {
+				t.Fatal(result.err)
+			}
+			decoded, err := decodeFrameStream(result.data)
+			if err != nil || len(decoded) != frames {
+				t.Fatalf("decoded %d frames, want %d: %v", len(decoded), frames, err)
+			}
+			for i, frame := range decoded {
+				start := int64(i+1) * defaultFileFrameLogicalSize
+				if frame.Header.Offset != start || !bytes.Equal(frame.Logical, data[start:start+defaultFileFrameLogicalSize]) {
+					t.Fatalf("frame %d differs from source", i)
+				}
+			}
+			observations := rec.snapshot()
+			if len(observations) != frames {
+				t.Fatalf("observed %d frames, want %d", len(observations), frames)
+			}
+			for _, observed := range observations {
+				if observed.WireSize >= 60<<10 {
+					t.Fatalf("frame no longer fits one AEAD record: %+v", observed)
+				}
+				wait := time.Duration(observed.WireSize * wireCost)
+				if observed.WriteLatency < wait || observed.FrameLatency < observed.PrepareLatency+wait {
+					t.Fatalf("flush wait %v missing from frame metrics: %+v", wait, observed)
+				}
+			}
+			if !sent.hasComp || sent.comp.State.Mode != policy.CompressionModeZstdLevel1 {
+				t.Fatalf("slower lz4 retained: %+v", sent.comp.State)
+			}
+			if out.rate.recoveryReady() {
+				t.Fatal("unsuccessful recovery did not charge its flush cost")
+			}
+		})
+	}
+}
+
+func TestSendFailedFlushLeavesNoObservation(t *testing.T) {
+	deps, tid, path := multiWindowFile(t, compressibleBytes(2*defaultFileFrameLogicalSize))
+	refs, errs := deps.GetFileRefs(tid, []FileLookup{{FileID: 1, Path: path}})
+	if errs[0] != nil {
+		t.Fatal(errs[0])
+	}
+	out := unbufferedSendOutput(io.Discard)
+	out.frameFlush = func() error { return context.Canceled }
+	out.ownRate.src = &sendRateSource{}
+	rec := recordFrameMetrics(t)
+	sent, err := streamSendItem(context.Background(), out, deps, tid, sendItem{
+		FileID: 1, Size: defaultFileFrameLogicalSize, Comp: "adapt", Path: path}, refs[0], 0)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("flush error = %v, want cancellation", err)
+	}
+	if len(rec.snapshot()) != 0 || sent.decided || sent.hasComp || sent.hash.HashToken != "" {
+		t.Fatalf("failed flush became a completed observation: %+v", sent)
+	}
+	if !out.rate.recoveryReady() {
+		t.Fatal("failed flush charged recovery debt")
 	}
 }

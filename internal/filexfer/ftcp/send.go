@@ -294,9 +294,11 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 	// writes, an authenticated session, already buffers into whole records.
 	inj := faults.FromContext(ctx)
 	resp := unbufferedSendOutput(out)
-	if header.Mode != loadStrategyGentle && transportFlusher(out) == nil {
+	resp.recoveryFlush = transportFlusher(out)
+	if header.Mode != loadStrategyGentle && resp.recoveryFlush == nil {
 		resp = newBufferedSendOutput(out)
 		defer resp.release()
+		resp.recoveryFlush = resp.Flush
 	}
 	resp.faults = inj
 	resp.ownRate.src = sendRateSourceFor(ctx, out)
@@ -361,7 +363,7 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 }
 
 // sendFrameMetricsHook, when set by a test, sees the metrics of every frame
-// handed to the compression policy, as Decide sees them. Production leaves
+// handed to the compression policy, as DecideSampled sees them. Production leaves
 // it nil.
 var sendFrameMetricsHook func(policy.CompressionMetrics)
 
@@ -402,6 +404,9 @@ type sendOutput struct {
 	// frameFlush, when set, sends a completed frame through a transport that
 	// batches writes; gentle responses use it so frames keep their pacing.
 	frameFlush func() error
+	// recoveryFlush, when set, sends a fast response's buffered frames to
+	// the socket; frames measured by a recovery check use it.
+	recoveryFlush func() error
 	// hasher is reset and reused by each item, rather than allocating 1.2 KiB
 	// per file.
 	hasher xxh3.Hasher128
@@ -705,8 +710,9 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 		// Every adaptive frame goes to the policy except a terminal frame
 		// whose window leaves no state: its decision would choose a codec
 		// for a frame that never comes. A saved terminal frame's decision
-		// picks the next window's first codec.
-		decide := adaptive && (!isTerminal || saveState)
+		// picks the next window's first codec. An active recovery still
+		// observes a final frame so its loss reaches the connection budget.
+		decide := adaptive && (!isTerminal || saveState || compressPolicy.RecoveryActive())
 		var terminalMD *encoding.FileFrameMetadata
 		if isTerminal {
 			md := encoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
@@ -759,6 +765,19 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 					offset: nextOffset,
 					length: nextFrameSize,
 				})
+			}
+		}
+
+		// Checks and their validation judge codecs by raw frame time, which
+		// a frame left in a fast response's buffer would miss entirely in a
+		// one-frame window: the request's final flush follows the decision.
+		// Such frames flush, and only they give up batching. Output earlier
+		// frames and items left buffered drains first, untimed, so the
+		// frame's flush times its own bytes alone.
+		timedFlush := out.frameFlush == nil && out.recoveryFlush != nil && decide && compressPolicy.RecoveryActive()
+		if timedFlush {
+			if err := out.recoveryFlush(); err != nil {
+				return sentItem{}, err
 			}
 		}
 
@@ -825,6 +844,24 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 			return sentItem{}, err
 		}
 
+		flush := out.frameFlush
+		if timedFlush {
+			flush = out.recoveryFlush
+		}
+		if flush != nil {
+			// A compressed frame may fit entirely in the transport's record
+			// buffer. Its flush wait is part of this frame's write cost.
+			var flushStart time.Time
+			if frameArgs.Timed {
+				flushStart = time.Now()
+			}
+			if err := flush(); err != nil {
+				return sentItem{}, err
+			}
+			if frameArgs.Timed {
+				stats.WriteLatency += time.Since(flushStart)
+			}
+		}
 		if scope.Sink.Enabled() {
 			emitWindow(scope, txferID, item.FileID, cursor, frameComp, sendPath, stats)
 		}
@@ -832,11 +869,6 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 		remaining -= frameSize
 		firstFrame = false
 		framesSent++
-		if out.frameFlush != nil {
-			if err := out.frameFlush(); err != nil {
-				return sentItem{}, err
-			}
-		}
 		if isTerminal && scope.Sink.Enabled() && cursor >= fileRef.FileSize {
 			scope.Sink.Emit("file_done", txferID, events.F("conn", scope.Conn), events.F("file", item.FileID), events.Dur("dur", time.Since(itemStart)))
 		}
@@ -855,11 +887,14 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 			// flush a frame forced is charged to that frame, which is the
 			// backpressure signal the policy wants.
 			metrics := policy.CompressionMetrics{
-				LogicalSize:    stats.LogicalSize,
-				WireSize:       stats.WireSize,
-				PrepareLatency: stats.PrepareLatency,
-				ReadLatency:    stats.ReadLatency,
-				WriteLatency:   out.rate.writeTime(stats.WireSize, stats.WriteLatency),
+				LogicalSize:     stats.LogicalSize,
+				WireSize:        stats.WireSize,
+				PrepareLatency:  stats.PrepareLatency,
+				ReadLatency:     stats.ReadLatency,
+				WriteLatency:    out.rate.writeTime(stats.WireSize, stats.WriteLatency),
+				FrameLatency:    stats.PrepareLatency + stats.WriteLatency,
+				RecoveryAllowed: fileEnd-cursor >= policy.RecoveryFrames*defaultFileFrameLogicalSize,
+				RecoveryReady:   out.rate.recoveryReady(),
 			}
 			out.rate.observeFrame(stats.LogicalSize, stats.PrepareLatency+stats.WriteLatency)
 			var sample *encoding.CodecSamples
@@ -878,8 +913,9 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 				sendFrameMetricsHook(metrics)
 			}
 			decision := compressPolicy.DecideSampled(currentMode, metrics, sample)
+			out.rate.noteRecovery(decision.RecoveryLoss, stats.PrepareLatency+stats.WriteLatency)
 			out.rate.saveLink(compressPolicy)
-			if decision.Next != currentMode {
+			if decision.Next != currentMode || decision.Reason == "recovery-won" {
 				prevComp := policy.FrameCompTokenForMode(currentMode)
 				nextComp := policy.FrameCompTokenForMode(decision.Next)
 				log.Printf(

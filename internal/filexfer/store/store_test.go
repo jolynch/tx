@@ -1758,10 +1758,10 @@ func fileCompressionFixture(t *testing.T, s *Store) string {
 func sampleFileCompression() policy.FileCompression {
 	p := policy.NewCompressionPolicy()
 	for range 6 {
-		p.Decide(policy.CompressionModeNone, policy.CompressionMetrics{
+		p.DecideSampled(policy.CompressionModeNone, policy.CompressionMetrics{
 			LogicalSize: 4 << 20, WireSize: 4 << 20,
 			PrepareLatency: time.Millisecond, WriteLatency: 20 * time.Millisecond,
-		})
+		}, nil)
 	}
 	return policy.FileCompression{Mode: policy.CompressionModeLz4, Policy: *p}
 }
