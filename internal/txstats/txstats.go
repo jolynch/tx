@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jolynch/tx/internal/events"
+	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/metrics"
 )
 
@@ -39,6 +40,9 @@ type ServerRecord struct {
 	Windows      map[string]int64 `json:"windows,omitempty"`
 	SendPath     map[string]int64 `json:"send_path,omitempty"`
 	DurNS        int64            `json:"dur_ns,omitempty"`
+	// Rates summarizes what the transfer's adaptive windows showed about
+	// the delivery rate, from the kernel and from the server's own writes.
+	Rates *store.RateSummary `json:"rates,omitempty"`
 
 	// process
 	ConnsAccepted int64  `json:"conns_accepted,omitempty"`
@@ -106,7 +110,13 @@ func (w *ServerWriter) observe(e events.Event) {
 			return
 		}
 		delete(w.open, e.TID)
-		w.writeLocked(endRecord(e.T, e.TID, acc, true, e.Int("files"), e.Int("bytes")))
+		r := endRecord(e.T, e.TID, acc, true, e.Int("files"), e.Int("bytes"))
+		if v, ok := e.Get("rates"); ok {
+			if rates, ok := v.(store.RateSummary); ok {
+				r.Rates = &rates
+			}
+		}
+		w.writeLocked(r)
 	case "accept":
 		w.accepted++
 		w.live++

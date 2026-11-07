@@ -142,6 +142,53 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Performance
 
+- **Bound the per-file compression state.** Entries for files that never
+  complete live until the transfer is reaped, about 150 to 300 B per file. A
+  client that sends a tiny first window of each of many large files and never
+  ACKs can grow the map to the file count. A cap on entries, or a stored-at
+  time that expires old ones, would bound it.
+- **Measure the compression policy on real links.** The background-sample
+  cadence (every eighth frame, four winning samples), the sequential test's
+  margins (3% with 2.5 standard errors, 6% at the 16-sample cap), the 8-frame
+  validation with its 10% restore threshold, and the backoff (24 to 256
+  frames, up to 4,096 when costly) in `internal/filexfer/policy` were tuned in
+  a simulator with uniform jitter up to ±30% and heavy-tailed noise (lognormal
+  σ up to 0.5 and 1-3% stalled frames), not on real links. Check them on
+  burst-credit and disk-bound instances, and check that a 256 KiB sample
+  compressed on one goroutine predicts a fast-mode frame's cost, since fast
+  mode compresses a frame's blocks in parallel. Under heavy-tailed noise the
+  fuzzers check only basic properties; a searching fuzzer finds inputs below
+  0.75 efficiency there, while the seeded quality sweep averages above 0.99.
+- **Large files sent as small windows rarely adapt.** The CLI's batch is
+  often 4 MiB, so a large file goes out as one-frame windows, two or more of
+  them in flight at once.
+  - A window's background sample is abandoned when the window ends. Unless
+    the sample finishes during that one frame, as it does only on slow links,
+    the window never uses it. In memxfer's 1 MiB windows over loopback, 94
+    windows used no sample.
+  - The client keeps a sliding window of a file's windows in flight, and
+    each new one loads the state the last finished window saved. With W in
+    flight, the state forms W interleaved chains, each advancing one frame
+    every W windows, and the last save wins. With 16 MiB windows on two
+    connections, a 48 MiB file never switched.
+  - Seeding a file from its connection's link estimate cuts a chain's
+    warm-up from 8 frames to about 5, so 16 MiB windows, 16 in flight, now
+    compress about 3 of each chain's 8 frames instead of none.
+  - Waiting a bounded time (about the last sample's cost) for a running
+    sample before a window that saves state ends would fix the first. The
+    rest needs windows of a file to share or chain their state.
+- **A rising kernel rate resets comparisons.** Early in a SEND the kernel's
+  maximum rises from slow-start readings, so the charged write time of home's
+  frames falls, from 190 ms to 108 ms per 4 MiB in one memxfer run. The
+  regime check reads that as a path change about a dozen frames later and
+  restarts the comparison. Re-anchoring home's cost when the rate estimate
+  rises would avoid the reset.
+- **Short files never compress under `adapt`.** A switch needs four winning
+  samples of the file's own data, plus one frame to send in the new codec,
+  and four more frames to seed the baseline when its connection has no link
+  estimate yet, so a file of fewer than about six frames (24 MiB) always
+  goes uncompressed. Many small files bundled into one SEND could share
+  a policy for the whole request.
 - **Bound batch lookup metadata.** SEND and CXSUM resolve all request items
   together to avoid per-file transfer locking. Their lookup and reference arrays
   add peak memory beyond the decoded body limit, especially for many tiny items.
@@ -174,6 +221,8 @@ instead of widening the current change; remove an entry when it ships.
   allocations and 630 KiB with zstd (7 and 200 KiB with lz4), which dominates
   small compressible files sent with `comp=zstd`. Pool them with
   `Reset`, apart from the framed-body pool, which must keep zstd's checksum.
+  Construction also precedes the prepare-time timer in
+  `streamFramePayloadBuffered`; include that setup in the measured cost.
 - **Framed-body zstd buffer churn.** `CompressZstdPooled` reallocates about
   8 MiB of encoder history and decoder block whenever GC empties the pool:
   about 60% of the bytes allocated during a small-file `--verify full`.
@@ -266,6 +315,18 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Testing
 
+- **No fault slows a link per byte.** NET `delay` sleeps per read and write
+  call, and a buffered 4 MiB frame is one write, so it barely slows a bulk
+  copy, and compressing a frame does not reduce its delay. Zero-copy frames
+  also bypass the connection wrapper. `TestAdaptiveUnderRateFaults` uses
+  the server's `--bwlimit` in gentle mode for a slow link instead.
+  - A NET `throttle` kind would model slow links in fast mode: decided per
+    connection at `WrapConn`, its drawn duration the time per MiB.
+    `faults.Conn.Write` paces 64 KiB chunks against a next-free time, with
+    the existing `sleep` honoring deadlines and `Close`, and
+    `ZeroCopyConn` returns nil for a throttled connection.
+  - The risk is the swarm budget: pbt-faults inputs must stay within about
+    9s, so swarm draws need a floor near 16 MiB/s.
 - **Page-cache tests do not check advisory syscall arguments.** The gate
   tests pass if `touchPages` uses `FADV_DONTNEED` instead of `FADV_WILLNEED`.
   Check advice, offsets, and lengths with syscall interception. Exact

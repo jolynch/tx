@@ -298,3 +298,21 @@ func (c *Conn) Write(p []byte) (int, error) {
 	}
 	return c.Conn.Write(p)
 }
+
+// DeliveryRate returns the TCP delivery rate a read should report: the
+// measured rate and its application-limited flag, or, when NET rate fires,
+// 1 MiB per drawn duration, not application-limited. It pretends the
+// connection is in slow start or on a slower path, which only changes how
+// the sender's compression policy charges its writes. A nil injector
+// returns the measurement.
+func (i *Injector) DeliveryRate(bytesPerSec uint64, appLimited bool) (uint64, bool) {
+	if i == nil || i.rates[NetRate] <= 0 {
+		return bytesPerSec, appLimited
+	}
+	op := i.rateOps.Add(1)
+	if !i.fires(NetRate, 0, op) {
+		return bytesPerSec, appLimited
+	}
+	d := max(time.Microsecond, i.sample(NetRate, 0, op))
+	return uint64(float64(1<<20) / d.Seconds()), false
+}

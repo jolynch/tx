@@ -303,6 +303,13 @@ type connSession struct {
 	// the command succeeds.
 	grantKeepAlive bool
 	events         events.Scope
+
+	// rateSource is the socket the connection's SENDs read their delivery
+	// rate from. baseCtx carries it and the fault injector; commandContext
+	// builds it on the connection's first command and starts every
+	// command's context from it, so commands add no allocation for them.
+	rateSource sendRateSource
+	baseCtx    context.Context
 }
 
 // handleConn confines a panic to this connection and logs its stack. Panics in
@@ -580,8 +587,12 @@ func (s *connSession) run() error {
 }
 
 func (s *connSession) commandContext() (context.Context, func()) {
-	cmdCtx, connTask := trace.NewTask(context.Background(), "tcp-connection")
-	cmdCtx = faults.NewContext(cmdCtx, s.faults)
+	if s.baseCtx == nil {
+		// SENDs read the socket's delivery rate even when an authenticated
+		// session or fault wrapper sits in front of it.
+		s.baseCtx = withSendRateSource(faults.NewContext(context.Background(), s.faults), &s.rateSource, s.conn)
+	}
+	cmdCtx, connTask := trace.NewTask(s.baseCtx, "tcp-connection")
 	return events.WithScope(cmdCtx, s.events), connTask.End
 }
 

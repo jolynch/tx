@@ -181,21 +181,30 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 	timing := timeNothing
 	if args.Timed {
 		timing = timeReads
-		if isCompressed {
+		if isCompressed || stagedDirectWrite {
 			timing = timeReadsAndHandling
 		}
 	}
 	timeChunkWrites := args.Timed && !isCompressed && !stagedDirectWrite
+	// Hashing a chunk before it streams out, and copying a sample, is
+	// prepare work, as it is for compressed and zero-copy frames. The
+	// compressed and staged paths time it inside their handler.
+	var hashLatency time.Duration
 	readRegion := trace.StartRegion(args.Ctx, "frame-read")
 	var src io.ReaderAt = fd
 	if args.Faults != nil {
 		src = args.Faults.WrapReaderAt(args.Ctx, faults.SiteSendRead, args.FileID, fd)
 	}
 	prepareLatency, readLatency, err := streamBufferedRead(src, fileOffset, args.FrameSize, readBuf, timing, func(chunk []byte) error {
+		var hashStart, writeStart time.Time
+		if timeChunkWrites {
+			hashStart = time.Now()
+		}
 		_, _ = args.WindowHasher.Write(chunk)
-		var writeStart time.Time
+		args.Sample.capture(chunk)
 		if timeChunkWrites {
 			writeStart = time.Now()
+			hashLatency += writeStart.Sub(hashStart)
 		}
 		written, writeErr := payloadWriter.Write(chunk)
 		if timeChunkWrites {
@@ -213,13 +222,23 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 	if err != nil {
 		return frameStreamStats{}, err
 	}
+	prepareLatency += hashLatency
 
 	wireSize := args.FrameSize
 	if isCompressed {
 		compRegion := trace.StartRegion(args.Ctx, "frame-compress")
+		// Close finishes the frame. A codec that compresses blocks on
+		// goroutines, such as lz4 in fast mode, does most of its work here.
+		var closeStart time.Time
+		if args.Timed {
+			closeStart = time.Now()
+		}
 		if err := closeCompWriter(); err != nil {
 			compRegion.End()
 			return frameStreamStats{}, err
+		}
+		if args.Timed {
+			prepareLatency += time.Since(closeStart)
 		}
 		wireSize = int64(frameBuf.Len())
 		if err := writeFrameHeader(args.Output, args, wireSize, timedWrites); err != nil {
@@ -366,7 +385,9 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 		return frameStreamStats{}, err
 	}
 
-	prepareLatency := time.Duration(0)
+	// prepareLatency is readLatency, the splices, tees, and hash pipe
+	// reads that bring the data in, plus hashing and copying the sample.
+	prepareLatency, readLatency := time.Duration(0), time.Duration(0)
 	remaining := args.FrameSize
 
 	// Fd() puts these into blocking mode — required for raw tee/splice syscalls.
@@ -382,7 +403,7 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 
 		spliceStart := time.Now()
 		splicedIn, spliceErr := syscalls.splice(int(fd.Fd()), fileOffset, int(srcW.Fd()), nil, int(step), sysio.SPLICE_F_MOVE)
-		prepareLatency += time.Since(spliceStart)
+		readLatency += time.Since(spliceStart)
 		if spliceErr != nil {
 			if errors.Is(spliceErr, sysio.EINTR) {
 				continue
@@ -403,7 +424,7 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 		for sourceRemaining > 0 {
 			teeStart := time.Now()
 			teed, teeErr := syscalls.tee(srcRFD, hashPipeWFD, int(sourceRemaining), 0)
-			prepareLatency += time.Since(teeStart)
+			readLatency += time.Since(teeStart)
 			if teeErr != nil {
 				if errors.Is(teeErr, sysio.EINTR) {
 					continue
@@ -443,12 +464,16 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 			}
 			writeLatency += time.Since(writeStart)
 
-			// read from hash pipe + hash (the only userspace copy)
+			// Read from the hash pipe and hash: the only userspace copy,
+			// so background sampling copies it rather than reading the file again.
 			readStart := time.Now()
 			n, readErr := io.ReadFull(hashPipeR, copyBuf[:teed])
-			prepareLatency += time.Since(readStart)
+			hashStart := time.Now()
+			readLatency += hashStart.Sub(readStart)
 			if n > 0 {
 				_, _ = args.WindowHasher.Write(copyBuf[:n])
+				args.Sample.capture(copyBuf[:n])
+				prepareLatency += time.Since(hashStart)
 			}
 			if readErr != nil {
 				readRegion.End()
@@ -468,8 +493,8 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 	return frameStreamStats{
 		LogicalSize:     args.FrameSize,
 		WireSize:        args.FrameSize,
-		PrepareLatency:  prepareLatency,
-		ReadLatency:     prepareLatency,
+		PrepareLatency:  prepareLatency + readLatency,
+		ReadLatency:     readLatency,
 		WriteLatency:    writeLatency,
 		NextOffset:      *fileOffset,
 		WindowHashToken: windowHashToken,

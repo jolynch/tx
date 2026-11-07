@@ -34,6 +34,10 @@ const defaultZeroCopyMinFrameBytes int64 = 1 << 20
 // zeroCopyOff, as a zeroCopyMinBytes value, sends every frame buffered.
 const zeroCopyOff int64 = 0
 
+// sendSniffEvery spaces background samples by file frame index. A pending
+// comparison asks each frame instead; busy workers always skip the request.
+const sendSniffEvery = 8
+
 // sendOutputBufferBytes sizes the buffer one SEND response writes its frames
 // through, so a small file's header, payload, and trailer, and many small
 // files together, share one write syscall.
@@ -115,6 +119,8 @@ type frameStreamArgs struct {
 	// events, or the adaptive policy choosing the next frame's codec. A
 	// frame nothing reads skips its clock reads.
 	Timed bool
+	// Sample copies already-read bytes for a nonblocking background job.
+	Sample *sendSampleJob
 }
 
 type frameStreamStats struct {
@@ -122,7 +128,7 @@ type frameStreamStats struct {
 	WireSize       int64
 	PrepareLatency time.Duration
 	// ReadLatency is the part of PrepareLatency spent reading the file; the
-	// rest is compression.
+	// rest is hashing, compression, and copying a background sample.
 	ReadLatency     time.Duration
 	WriteLatency    time.Duration
 	NextOffset      int64
@@ -263,12 +269,20 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 	_ = deps.SetTransferFilesState(header.TransferID, running, TransferStateRunning)
 	hashes := make([]WindowHash, 0, len(records))
 	var done []uint64
+	// Only files whose window learned something leave compression state, so
+	// most requests never take a buffer from the pool.
+	var comps *compUpdates
+	defer func() { comps.release() }()
+	var rates RateSummary
+	var ratedFiles []uint64
 	recordHashes := func() error {
 		if len(done) > 0 {
 			_ = deps.SetTransferFilesState(header.TransferID, done, TransferStateDone)
 		}
-		if len(hashes) > 0 && !deps.SetTransferFileWindowHashes(header.TransferID, hashes) {
-			return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
+		if compList := comps.list(); len(hashes) > 0 || len(compList) > 0 || rates.Windows > 0 {
+			if !deps.RecordTransferWindows(header.TransferID, WindowRecords{Hashes: hashes, Compression: compList, Rates: rates, RatedFiles: ratedFiles}) {
+				return protocolErr{code: "INTERNAL", message: "failed to store window hash state"}
+			}
 		}
 		return nil
 	}
@@ -285,6 +299,7 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 		defer resp.release()
 	}
 	resp.faults = inj
+	resp.ownRate.src = sendRateSourceFor(ctx, out)
 	transfer, hasTransfer := deps.GetTransferSummary(header.TransferID)
 	for i, record := range records {
 		item := record.item(header.Mode)
@@ -305,6 +320,7 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 				limited = limiter.WrapRateLimitedWriter(limited, ctx)
 			}
 			itemOut = unbufferedSendOutput(limited)
+			itemOut.rate = resp.rate
 			itemOut.frameFlush = transportFlusher(out)
 			itemOut.faults = inj
 		}
@@ -319,6 +335,18 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 		if sent.done {
 			done = append(done, item.FileID)
 		}
+		if sent.hasComp {
+			if comps == nil {
+				comps = compUpdatesPool.Get().(*compUpdates)
+			}
+			comps.s = append(comps.s, sent.comp)
+		}
+		if sent.decided {
+			rates.Add(sent.rate)
+			if sent.rate.FirstWindow {
+				ratedFiles = append(ratedFiles, sent.rate.FileID)
+			}
+		}
 		if err != nil {
 			_ = recordHashes()
 			_ = resp.Flush()
@@ -330,6 +358,36 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 		return err
 	}
 	return resp.Flush()
+}
+
+// sendFrameMetricsHook, when set by a test, sees the metrics of every frame
+// handed to the compression policy, as Decide sees them. Production leaves
+// it nil.
+var sendFrameMetricsHook func(policy.CompressionMetrics)
+
+// compUpdates holds a request's compression updates in a reusable slice.
+type compUpdates struct {
+	s []FileCompressionUpdate
+}
+
+var compUpdatesPool = sync.Pool{New: func() any { return new(compUpdates) }}
+
+// list returns the updates; a nil receiver has none.
+func (c *compUpdates) list() []FileCompressionUpdate {
+	if c == nil {
+		return nil
+	}
+	return c.s
+}
+
+// release empties the updates and returns them to the pool. A nil receiver
+// does nothing. The updates must not be used afterwards.
+func (c *compUpdates) release() {
+	if c == nil {
+		return
+	}
+	c.s = c.s[:0]
+	compUpdatesPool.Put(c)
 }
 
 // sendOutput is where one SEND item writes its frames. Frames go to w, which
@@ -349,6 +407,11 @@ type sendOutput struct {
 	hasher xxh3.Hasher128
 	// faults gates the request's file and syscall sites; nil disables it.
 	faults *faults.Injector
+	// rate turns measured writes into the write times the compression
+	// policy sees; it points at ownRate unless the response shares one
+	// across outputs.
+	rate    *sendRate
+	ownRate sendRate
 }
 
 var sendOutputBufferPool = sync.Pool{
@@ -359,11 +422,15 @@ var sendOutputBufferPool = sync.Pool{
 func newBufferedSendOutput(out io.Writer) *sendOutput {
 	buf := sendOutputBufferPool.Get().(*bufio.Writer)
 	buf.Reset(out)
-	return &sendOutput{w: buf, buf: buf, conn: extractTCPConn(out)}
+	o := &sendOutput{w: buf, buf: buf, conn: extractTCPConn(out)}
+	o.rate = &o.ownRate
+	return o
 }
 
 func unbufferedSendOutput(out io.Writer) *sendOutput {
-	return &sendOutput{w: out, conn: extractTCPConn(out)}
+	o := &sendOutput{w: out, conn: extractTCPConn(out)}
+	o.rate = &o.ownRate
+	return o
 }
 
 // Flush writes any buffered frames to the response.
@@ -415,14 +482,23 @@ func checkTransferDeadline(deps Deps, txferID string, transfer Transfer) error {
 
 // sentItem is what a sent item leaves for its SEND to record: the window
 // hash, and for a directory, which is complete once sent, that it is Done.
+// When another window of the file follows, comp is the compression state it
+// starts from, and hasComp is set; an error exit still reports what the
+// frames already sent taught the policy. When a frame reached the policy,
+// decided is set and rate holds what the window showed about the delivery
+// rate, for the transfer's completion log.
 type sentItem struct {
-	hash WindowHash
-	done bool
+	hash    WindowHash
+	done    bool
+	comp    FileCompressionUpdate
+	hasComp bool
+	decided bool
+	rate    WindowRate
 }
 
 // streamSendItem sends one item as frames. Frames of at least zeroCopyMinBytes
 // use the zero-copy path when the output allows it; zeroCopyOff disables it.
-func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID string, item sendItem, fileRef FileRef, zeroCopyMinBytes int64) (sentItem, error) {
+func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID string, item sendItem, fileRef FileRef, zeroCopyMinBytes int64) (sent sentItem, _ error) {
 	ctx, windowTask := utils.NewTraceTask(ctx, "send-window")
 	defer windowTask.End()
 	scope := events.FromContext(ctx)
@@ -516,6 +592,64 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 	adaptive := item.Comp == "adapt"
 	currentMode := initialCompressionMode(item.Comp)
 	compressPolicy := policy.NewCompressionPolicy()
+	// A file sent in several windows keeps its adaptive state between them,
+	// so a learned mode and the policy's learned state survive each window
+	// boundary.
+	// This window works on its own copy; windows of one file that run
+	// concurrently each save at their end, and the last save wins. A
+	// single-window file never touches the store.
+	//
+	// State is loaded only when an earlier window preceded this one, and
+	// saved only when a later one follows within the smaller of the
+	// manifest size and the size on disk. The last window, a resumed tail
+	// window therefore leave nothing behind that no ACK would free. A window
+	// saved before the file shrank stays until the transfer is reaped, one
+	// entry per file.
+	startState := policy.FileCompression{Mode: currentMode, Policy: *compressPolicy}
+	if adaptive && item.Offset > 0 {
+		if st, ok := deps.LoadFileCompression(txferID, item.FileID); ok {
+			currentMode = st.Mode
+			*compressPolicy = st.Policy
+			startState = st
+		}
+	}
+	if adaptive {
+		// A file with no state of its own starts from what the connection
+		// measured about its link; its codec evidence stays its own.
+		out.rate.seedLink(compressPolicy)
+	}
+	fileEnd := fileInfo.Size()
+	if fileRef.FileSize >= 0 {
+		fileEnd = min(fileEnd, fileRef.FileSize)
+	}
+	saveState := adaptive && item.Offset+windowLen < fileEnd
+	framesSent := 0
+	var sampler sendSampler
+	defer sampler.close()
+	// windowRate is what the window's decided frames showed about the
+	// delivery rate, reported when one reached the policy, even on an error
+	// exit.
+	windowRate := WindowRate{FileID: item.FileID, FirstWindow: item.Offset == 0}
+	decidedFrame := false
+	if adaptive {
+		defer func() {
+			if decidedFrame {
+				sent.decided, sent.rate = true, windowRate
+			}
+		}()
+	}
+	if saveState {
+		// Also runs on an error exit, so what the frames already sent
+		// taught the policy is not lost. The caller applies it with the
+		// request's window hashes.
+		defer func() {
+			// A window that learned nothing leaves the stored state as is.
+			if end := (policy.FileCompression{Mode: currentMode, Policy: *compressPolicy}); framesSent > 0 && end != startState {
+				sent.comp = FileCompressionUpdate{FileID: item.FileID, State: end}
+				sent.hasComp = true
+			}
+		}()
+	}
 	windowHasher := &out.hasher
 	windowHasher.Reset()
 
@@ -568,6 +702,11 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 		}
 
 		frameComp := policy.FrameCompTokenForMode(currentMode)
+		// Every adaptive frame goes to the policy except a terminal frame
+		// whose window leaves no state: its decision would choose a codec
+		// for a frame that never comes. A saved terminal frame's decision
+		// picks the next window's first codec.
+		decide := adaptive && (!isTerminal || saveState)
 		var terminalMD *encoding.FileFrameMetadata
 		if isTerminal {
 			md := encoding.CollectFileFrameMetadata(fileRef.Path, fileInfo)
@@ -592,9 +731,25 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 			PipeSizeBytes: pipeSizeBytes,
 			DirectIO:      usedDirectOpen,
 			Faults:        inj,
-			// The policy is per item, so a terminal frame's latencies would
-			// only choose a codec for a frame that never comes.
-			Timed: scope.Sink.Enabled() || (adaptive && !isTerminal),
+			Timed:         scope.Sink.Enabled() || decide,
+		}
+
+		if decide && (compressPolicy.BackgroundPending() || (cursor/defaultFileFrameLogicalSize)%sendSniffEvery == 0) {
+			windowEnd := item.Offset + windowLen
+			work := sampleWork{
+				fileFrames: framesLeft(cursor, windowEnd, fileEnd),
+				fileBytes:  fileEnd - cursor,
+				// A terminal frame decides only when the window saves state.
+				windowFrames: framesLeft(cursor, windowEnd, windowEnd),
+				windowBytes:  min(windowEnd, fileEnd) - cursor,
+			}
+			if !saveState {
+				work.windowFrames--
+				if work.windowBytes > 0 {
+					work.windowBytes -= (work.windowBytes-1)%defaultFileFrameLogicalSize + 1
+				}
+			}
+			frameArgs.Sample = sampler.request(ctx, work, compressPolicy, out.rate.wallFrame())
 		}
 
 		if readaheadCh != nil && !isTerminal {
@@ -613,12 +768,24 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 		if zeroCopyMinBytes > 0 && frameSize >= zeroCopyMinBytes && canZeroCopy(frameArgs) {
 			// The splice bypasses out.w, so flush it and send this frame's
 			// header and trailer to the socket as well, in order.
+			// The flush writes earlier frames' bytes, work this frame forced,
+			// so it counts toward this frame's write time as a buffered
+			// frame's forced flush does.
+			var flushStart time.Time
+			if frameArgs.Timed {
+				flushStart = time.Now()
+			}
 			if err := out.Flush(); err != nil {
 				return sentItem{}, err
+			}
+			var flushLatency time.Duration
+			if frameArgs.Timed {
+				flushLatency = time.Since(flushStart)
 			}
 			frameArgs.Output = out.conn
 			sendPath = sendPathSendfile
 			stats, err = streamFramePayloadZeroCopy(fd, &frameOffset, frameArgs)
+			stats.WriteLatency += flushLatency
 		} else {
 			stats, err = streamFramePayloadBuffered(fd, &frameOffset, frameArgs)
 		}
@@ -641,12 +808,12 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 					return sentItem{}, protocolErr{code: "INTERNAL", message: "invalid resume offset after direct I/O retry"}
 				}
 				if cursor == item.Offset {
+					// No frame was sent, so the policy has not run and
+					// holds the state the window started with.
 					if item.Mode == loadStrategyFast {
 						tryAdviseSequential(inj, fd, item.Offset, windowLen)
 					}
 					firstFrame = true
-					currentMode = initialCompressionMode(item.Comp)
-					compressPolicy = policy.NewCompressionPolicy()
 					windowHasher.Reset()
 				} else {
 					if item.Mode == loadStrategyFast {
@@ -664,6 +831,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 		cursor = stats.NextOffset
 		remaining -= frameSize
 		firstFrame = false
+		framesSent++
 		if out.frameFlush != nil {
 			if err := out.frameFlush(); err != nil {
 				return sentItem{}, err
@@ -680,17 +848,37 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 			recorded = WindowHash{FileID: item.FileID, EndBytes: cursor, HashToken: stats.WindowHashToken}
 		}
 
-		if adaptive && !isTerminal {
-			// WriteLatency times writes into the response buffer, much as
-			// unbuffered writes timed the kernel socket buffer, not the wire.
-			// When the buffer fills, the flush is charged to the frame that
-			// forced it, which is the backpressure signal the policy wants.
-			decision := compressPolicy.Decide(currentMode, policy.CompressionMetrics{
+		if decide {
+			// A write into the response buffer or the socket's send buffer
+			// returns before the bytes leave; out.rate raises such a write
+			// to its wire bytes over the connection's delivery rate. A
+			// flush a frame forced is charged to that frame, which is the
+			// backpressure signal the policy wants.
+			metrics := policy.CompressionMetrics{
 				LogicalSize:    stats.LogicalSize,
 				WireSize:       stats.WireSize,
 				PrepareLatency: stats.PrepareLatency,
-				WriteLatency:   stats.WriteLatency,
-			})
+				ReadLatency:    stats.ReadLatency,
+				WriteLatency:   out.rate.writeTime(stats.WireSize, stats.WriteLatency),
+			}
+			out.rate.observeFrame(stats.LogicalSize, stats.PrepareLatency+stats.WriteLatency)
+			var sample *encoding.CodecSamples
+			// A completed sample is already paid for; it was admitted only
+			// while it could still change the codec.
+			if result, ready := sampler.take(); ready {
+				sample = &result
+				if result.Has(encoding.EncodingLz4) {
+					metrics.SniffRatio = result.Ratio(encoding.EncodingLz4)
+				}
+				windowRate.Sampled = true
+			}
+			windowRate.KernelBps, windowRate.UserBps = out.rate.readings()
+			decidedFrame = true
+			if sendFrameMetricsHook != nil {
+				sendFrameMetricsHook(metrics)
+			}
+			decision := compressPolicy.DecideSampled(currentMode, metrics, sample)
+			out.rate.saveLink(compressPolicy)
 			if decision.Next != currentMode {
 				prevComp := policy.FrameCompTokenForMode(currentMode)
 				nextComp := policy.FrameCompTokenForMode(decision.Next)

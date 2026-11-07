@@ -55,6 +55,7 @@ call sites, and socket setters keep their `setsockopt` gate there too.
 | `copy_file_range` | `sysio.CopyFileRange` | daemonless local copies |
 | `mmap`, `mincore`, `fadvise` | `sysio.Mmap`, `Mincore`, `Fadvise` | page-cache probe, restore, and eviction |
 | `setsockopt` | `Sys` before TCP socket setters | `SetNoDelay`, socket buffer sizes, and `TCP_USER_TIMEOUT` on dial and accept; `TCP_NOTSENT_LOWAT` on probes |
+| `getsockopt` | `sysio.TCPRateReader` | an adaptive SEND's `TCP_INFO` delivery-rate reads |
 
 Ungated adapters cover TCP byte counts, idle-socket peeks, descriptor close,
 unmapping, system memory, metadata extraction, and directory or progress
@@ -184,6 +185,7 @@ tests check it.
 | NET    | `reorder`                    | each read: two adjacent spans swapped                                | as `flip`                                                                    |
 | NET    | `dial.fail`, `dial.slow` ⏱   | each client dial                                                     | dial error, counted; the request fails or retries                            |
 | NET    | `accept.fail`                | each server accept: a temporary error in its place                   | `Serve` retries the accept; the client sees EOF or a reset                   |
+| NET    | `rate` ⏱                     | each `TCP_INFO` delivery-rate read: 1 MiB per drawn duration         | only the codec changes; the copy completes                                   |
 | MSG    | `lose-response`              | each server command, after applying it                               | the client sees a reset; ACK retries must be idempotent                      |
 | MSG    | `dup`                        | each client ACK: sent twice                                          | idempotent server state                                                      |
 | MSG    | `delay` ⏱                    | each client request                                                  | requests on other connections overtake it                                    |
@@ -198,6 +200,12 @@ tests check it.
 | SYS    | `<syscall>.fail`             | each gated syscall                                                   | hard errors loud; advisory calls skipped; `EINTR` retried                    |
 | SYS    | `<syscall>.latency` ⏱        | each gated syscall                                                   | liveness only                                                                |
 | SYS    | `<syscall>.short`            | each splice, tee, or copy_file_range: fewer bytes                    | handled by the caller's loop                                                 |
+
+NET `rate` stands in for a connection in slow start or on a slower path
+without shaping the network: a reading drawn from
+`TX_FAULTS_NET='rate=0.3:β(20ms,50ms,100ms,200ms)'` reports 5 to 50 MiB/s.
+SYS `getsockopt.fail` leaves a SEND with no kernel rate, as on another
+platform, so it runs on the rate the server measures from its own writes.
 
 TCP turns lost, duplicated, or reordered packets into delay. NET `drop`,
 `dup`, and `reorder` break that contract on purpose, as middleboxes, offload
@@ -306,7 +314,8 @@ They check that tx either finishes correctly or fails loudly:
 - A round that reports no errors had no background output sync fail or
   get skipped.
 - A verify pass that reports success means every byte matches.
-- Latencies and failed advisory syscalls alone never fail a transfer.
+- Latencies, faked rate readings, and failed advisory syscalls alone never
+  fail a transfer.
 - After the faults stop, one clean round or copy converges.
 - Every step returns within its budget, and memxfer releases every
   goroutine and descriptor it used.
