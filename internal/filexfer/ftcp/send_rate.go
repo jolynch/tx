@@ -67,6 +67,10 @@ type sendRateSource struct {
 	// admission asks whether a job finishes before its window ends, which
 	// is wall time, not the cost the policy is charged.
 	wallPerByte float64
+	// budget is the server's recovery budget, which all its connections
+	// share; nil for a SEND outside a server, which then uses own.
+	budget *policy.RecoveryBudget
+	own    policy.RecoveryBudget
 }
 
 // withSendRateSource returns ctx carrying src for conn, looking through a
@@ -232,4 +236,24 @@ func (r *sendRate) saveLink(p *policy.CompressionPolicy) {
 	if l, ok := p.Link(); ok {
 		r.src.link, r.src.hasLink = l, true
 	}
+}
+
+func (s *sendRateSource) recovery() *policy.RecoveryBudget {
+	if s.budget != nil {
+		return s.budget
+	}
+	return &s.own
+}
+
+func (r *sendRate) recoveryReady() bool {
+	return r == nil || r.src == nil || r.src.recovery().Ready()
+}
+
+// Each lost second requires 100 seconds of ordinary transfer time: a 1%
+// steady-state budget. Detected changes may check earlier, without a refund.
+func (r *sendRate) noteRecovery(loss, elapsed time.Duration) {
+	if r == nil || r.src == nil {
+		return
+	}
+	r.src.recovery().Observe(loss, elapsed)
 }

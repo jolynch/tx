@@ -23,26 +23,30 @@ Four capabilities make this possible:
 - **Adaptive compression.** The server measures each 4 MiB frame's throughput
   and samples lz4 and zstd level 1 on bounded background workers. It switches
   after sustained evidence, validates the result on normal frames, and skips
-  sampling when a file has too little work left. Losing probes never become
-  trial frames on the wire.
+  sampling when a file has too little work left. Upward comparisons stay off
+  the wire; only bounded checks of cheaper codecs use real frames.
 
-- **Background durability.** Per-file `fdatasync` is moved off the download
-  critical path into a background batcher that deduplicates by inode.
-  It starts with a 512 MiB flush target, grows the batch size under backlog
-  pressure. A
-  final `syncfs` ensures the entire filesystem is durable before the transfer
-  reports success.
+- **Background durability.** Per-file `fdatasync` is kept off the download
+  critical path in a background batcher that deduplicates by inode. It
+  starts with a 512 MiB flush target and grows the batch size under backlog
+  pressure. A final `syncfs` backstops the whole filesystem, and a failed
+  `fdatasync` fails the copy instead of reporting success.
 
-- **Lightweight verification.** Metadata checks (size, mtime, permissions) run
-  by default after every copy. Sampled data verification (`--verify 5%data`)
-  reads about 5% of bytes and catches corruption without a full re-read *or* time
-  budget verification (`--verify 30s`) verifies all metadata and as much
-  sampled data as it can in the time budget - practical on slow network
-  attached drives such as EBS.
+- **Lightweight verification.** Every transferred window is hashed, and the
+  receiver's acknowledgment verifies the hash. Metadata checks (size, mtime,
+  permissions) run by default after every copy. Sampled data verification
+  (`--verify 5%data`) reads a ~5% sample of bytes, or a time budget
+  (`--verify 30s`) checks as much data as it can in that time, which is
+  practical on network-attached drives such as EBS. A file that fails
+  verification or its `fdatasync` is fetched again on the next run.
+  Fault-injection tests in CI drive whole transfers through network, disk,
+  and syscall failures to check that a copy ends with the right bytes or
+  fails loudly.
 
 See [docs/README.md](docs/README.md) for the documentation index and
-[docs/arch/OVERVIEW.md](docs/arch/OVERVIEW.md) for a deeper dive. If you
-are curious about benchmarking on your own setup check out
+[docs/arch/OVERVIEW.md](docs/arch/OVERVIEW.md) for a deeper dive.
+If you are curious about benchmarking on
+your own setup check out
 [bench/README.md](bench/README.md) which has a data generator that can both
 generate incompressible (random) and
 compressible ([Silesia](https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia))

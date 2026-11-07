@@ -21,7 +21,7 @@ type ackItem struct {
 	// Receiver telemetry: how long the client spent receiving this window and
 	// fsyncing it, plus the bytes it newly wrote. The server validates these
 	// but does not yet act on them. They are the natural input for a
-	// receiver-aware compression policy — CompressionPolicy.Decide currently
+	// receiver-aware compression policy — CompressionPolicy.DecideSampled currently
 	// sees only the server's own PrepareLatency/WriteLatency from
 	// frameStreamStats, so it can tell that compressing is expensive to send
 	// but not that the receiver is the bottleneck. Kept on the wire so that

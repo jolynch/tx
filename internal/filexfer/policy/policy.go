@@ -29,8 +29,8 @@ const (
 	settleFrames = 8
 	// homeFrames bounds the home mean that trials are compared with, and
 	// refFrames the long averages the regime check uses and the sample
-	// variance: running means up to that many samples, then EMAs. After
-	// seeding, the long averages move at most 1/homeFrames per frame.
+	// variance: running means up to that many samples, then EMAs. Established
+	// references move at most 1/homeFrames per frame.
 	homeFrames = 16
 	refFrames  = 64
 	// homeClip caps a home sample, and its write time, at this multiple of
@@ -67,14 +67,17 @@ const (
 	// for regimeFrames frames in a row, also marks a regime change: the
 	// bottleneck moved, which changes the other modes' costs far more than
 	// home's when the other part dominates home's cost.
-	regimeFrames = 3
-	regimePart   = 2
-	regimeFloor  = 0.05
+	regimeFrames         = 3
+	regimePart           = 2
+	compressedRegimePart = 1.5
+	regimeFloor          = 0.05
 	// regimeRatio is the factor by which home's compression ratio may move
 	// from its long average before the probes restart: data that compresses
 	// differently changes what the other modes would do even when home's
 	// own times stay put. In none, the ratio is the sniffed lz4 ratio.
 	regimeRatio = 1.5
+	driftMargin = 1.10
+	driftFrames = 8
 )
 
 // Trials.
@@ -92,7 +95,6 @@ const (
 	// strong one. A trial needs two frames to lose, except on low gain,
 	// and its greatest sample counts at most homeClip times the mean of the
 	// others, so one stall can neither decide a trial nor seed a new home.
-	minWinFrames   = 3
 	maxTrialFrames = 16
 	winZ           = 2.5
 	loseZ          = 1.5
@@ -142,9 +144,17 @@ type CompressionMetrics struct {
 	PrepareLatency time.Duration
 	ReadLatency    time.Duration
 	WriteLatency   time.Duration
+	// FrameLatency is observed prepare+write time before any delivery-rate
+	// floor. Zero uses PrepareLatency+WriteLatency for synthetic observations.
+	FrameLatency time.Duration
 	// SniffRatio is the lz4 compression ratio of a slice of a frame sent in
 	// none, or 0 when the frame was not sniffed.
 	SniffRatio float32
+	// RecoveryAllowed reserves RecoveryFrames frames: an episode's baseline
+	// and check frames and a useful frame afterward.
+	RecoveryAllowed bool
+	// RecoveryReady reports whether the connection has repaid past check losses.
+	RecoveryReady bool
 }
 
 type CompressionDecision struct {
@@ -152,16 +162,20 @@ type CompressionDecision struct {
 	Reason        string
 	Ratio         float64
 	ReadOverWrite float64
+	// RecoveryLoss is the time to charge the recovery budget: a check frame's
+	// excess over the codec preceding the check, or one frame's time when a
+	// check starts.
+	RecoveryLoss time.Duration
 }
 
 // CompressionPolicy compares home costs with candidate codec costs to maximize
-// logical throughput. Decide is its sequential comparison engine; SEND calls
-// DecideSampled, which supplies background estimates instead of sending trial
-// frames. Wins need sustained evidence, and losses back off. Normal home frames
-// detect changed conditions and validate the estimates after a switch.
+// logical throughput. DecideSampled, its only entry point, compares upward
+// codecs with background estimates and checks cheaper ones on real frames.
+// Wins need sustained evidence, and losses back off. Normal home frames detect
+// changed conditions and validate the estimates after a switch.
 //
 // Costs are seconds per logical byte. The state is copyable, its zero value
-// starts at none, and neither decision method allocates.
+// starts at none, and DecideSampled does not allocate.
 type CompressionPolicy struct {
 	shadow    shadowState
 	mean      float32 // home's cost, over up to homeFrames frames
@@ -172,12 +186,19 @@ type CompressionPolicy struct {
 	refW      float32 // the same over up to refFrames frames
 	ratio     float32 // home's compression ratio, EMA α=1/4, or in none the last sniff; 0 until sampled
 	refRatio  float32 // the same over up to refFrames frames (none: EMA α=1/4 of sniffs)
-	rw        float32 // prepare over write latency across modes, EMA α=1/4; reported only
+	meanW     float32 // home's clipped write cost over up to homeFrames frames
 	up, down  float32 // CUSUMs of home's cost over and under ref, in relative units
 
-	// The running trial's sums of (clipped) costs, their squares, and its
-	// write seconds per logical byte, its least and greatest costs, and its
-	// logical and wire bytes.
+	// Comparison slots, used by one activity at a time:
+	//   - a background comparison (trial != home): its virtual frames' sums
+	//     of clipped costs and their squares, write seconds per logical
+	//     byte, least and greatest costs, and logical and wire bytes;
+	//   - a check (phaseCheck): its real frames' cost, write, logical, and
+	//     wire sums, the earlier candidate's penalty (penalty), and home's
+	//     write when it started (checkStartWrite);
+	//   - a detected change waiting to check (flagDue): the references it
+	//     moved from (changeRefs) and the check gap it may skip (changeGap).
+	// Starting one activity clears the slots of the last.
 	tSum, tSq, tMin, tMax, tWrite, tLogical, tWire float32
 
 	gap  [2]uint16 // per rung pair (see edge), frames between scheduled probes; 0 means initialGap
@@ -185,68 +206,16 @@ type CompressionPolicy struct {
 
 	home    CompressionMode
 	trial   CompressionMode // the mode on trial, or home when none is running
-	leg     uint8           // 1 when the trial is two rungs from home, 2 when passing back
+	leg     uint8           // 1 when the trial is two rungs from home
 	tn      uint8           // trial frames so far
 	n       uint8           // home samples since home's estimates were seeded, saturating
 	out     uint8           // consecutive frames home's write, prepare, or ratio sat outside its band
-	low     uint8           // consecutive frames sent compressed that compressed less than lowGain, saturating
 	pending uint8           // directions to probe without waiting
+	drift   uint8           // consecutive observations of sustained cost drift
 }
 
 func NewCompressionPolicy() *CompressionPolicy {
 	return &CompressionPolicy{}
-}
-
-// Decide takes the metrics of a frame sent in current and returns the mode
-// for the next frame: at most one rung up, or any rung down. Only a drop on
-// low gain skips a rung, straight to none.
-func (p *CompressionPolicy) Decide(current CompressionMode, m CompressionMetrics) CompressionDecision {
-	if current > CompressionModeZstdLevel1 {
-		// Not a mode adapt sends in, as in a zero FileCompression read with
-		// another zero value for its mode: start over as a fresh policy at
-		// none, taking this frame as its first.
-		*p = CompressionPolicy{}
-		current = CompressionModeNone
-	}
-	if m.LogicalSize <= 0 || m.PrepareLatency < 0 || m.WriteLatency < 0 ||
-		m.PrepareLatency+m.WriteLatency <= 0 {
-		return p.decision(current, "hold")
-	}
-	if current != p.trial {
-		// The caller sent a mode other than the one chosen.
-		p.rehome(current)
-	}
-
-	rw := float32(safeLatencyRatio(m.PrepareLatency, m.WriteLatency))
-	if p.rw == 0 {
-		p.rw = rw
-	} else {
-		p.rw += (rw - p.rw) / 4
-	}
-	logical := float32(m.LogicalSize)
-	cost := float32((m.PrepareLatency + m.WriteLatency).Seconds()) / logical
-	ratio := float32(1)
-	if m.WireSize > 0 {
-		ratio = logical / float32(m.WireSize)
-	}
-	if current == CompressionModeNone || ratio >= lowGain {
-		p.low = 0
-	} else if p.low < 255 {
-		p.low++
-	}
-	if p.leg == 2 {
-		// Passing back through the first rung: not a sample.
-		p.leg = 0
-		p.trial = p.home
-		return p.decision(p.home, "probe-lost")
-	}
-	if p.trial != p.home {
-		return p.trialFrame(cost, float32(m.WriteLatency.Seconds())/logical, ratio, logical, float32(max(m.WireSize, 0)))
-	}
-	if p.home == CompressionModeNone {
-		ratio = m.SniffRatio
-	}
-	return p.homeFrame(cost, float32(m.WriteLatency.Seconds())/logical, ratio, true)
 }
 
 // homeFrame records a frame sent in home, at cost seconds per logical byte,
@@ -264,22 +233,34 @@ func (p *CompressionPolicy) homeFrame(cost, write, ratio float32, schedule bool)
 	mean := &p.mean
 	if p.n == 1 {
 		*mean, p.fast, p.ref, p.sampleVar = cost, cost, cost, 0
-		p.fastW, p.refW = write, write
+		p.meanW, p.fastW, p.refW = write, write, write
 	} else {
 		cost = min(cost, homeClip*p.fast)
 		write = min(write, homeClip*max(p.fastW, regimeFloor*p.fast))
 		d := (cost - p.fast) / p.fast
 		*mean += (cost - *mean) / float32(min(p.n, homeFrames))
+		p.meanW += (write - p.meanW) / float32(min(p.n, homeFrames))
 		p.sampleVar += (d*d - p.sampleVar) / float32(min(p.n, refFrames))
 		p.fast += (cost - p.fast) / float32(min(p.n, 4))
-		// After seeding, the long averages move at most 1/homeFrames per
-		// frame, so a shift soon after a reset is measured against the
-		// level before it rather than chased.
+		// Established references move at most 1/homeFrames per frame,
+		// so a lasting shift is measured against the level before it.
 		k := float32(min(p.n, refFrames))
 		if p.n > seedFrames {
 			k = max(k, homeFrames)
+			if p.home != CompressionModeNone {
+				// Seed from home's observations before slowing the reference;
+				// a noisy check must not become a lasting change baseline.
+				k = float32(p.n)
+				if p.n > homeFrames {
+					k = 2 * refFrames
+				}
+			}
 		}
-		p.ref += (cost - p.ref) / k
+		// Hold the reference while a sustained drift is being confirmed;
+		// otherwise it can follow the new rate before eight observations.
+		if p.drift == 0 {
+			p.ref += (cost - p.ref) / k
+		}
 		p.fastW += (write - p.fastW) / float32(min(p.n, 4))
 		p.refW += (write - p.refW) / k
 	}
@@ -294,16 +275,17 @@ func (p *CompressionPolicy) homeFrame(cost, write, ratio float32, schedule bool)
 		p.ratio += (ratio - p.ratio) / 4
 		p.refRatio += (ratio - p.refRatio) / float32(min(p.n, refFrames))
 	}
-	if p.home != CompressionModeNone && p.low >= lowGainFrames {
-		return p.dropToNone(ratio)
-	}
 
-	if p.n >= settleFrames {
+	settled := settleFrames
+	if p.home != CompressionModeNone {
+		settled = homeFrames
+	}
+	if int(p.n) >= settled && !p.shadow.dueNow() {
 		if costMoved, ratioMoved := p.regimeChanged(raw); costMoved || ratioMoved {
-			p.out, p.up, p.down = 0, 0, 0
+			p.out, p.drift, p.up, p.down = 0, 0, 0, 0
 			if costMoved {
-				// Home's own cost moved, so every estimate is stale:
-				// re-measure home, then probe its neighbors.
+				// Re-measure home before comparing candidates. A ratio change
+				// can arrive before clipped costs catch up to a changed path.
 				p.forget()
 			} else {
 				p.refRatio = p.ratio
@@ -312,9 +294,7 @@ func (p *CompressionPolicy) homeFrame(cost, write, ratio float32, schedule bool)
 			p.pending = p.neighbors()
 			// Throughput moved, so a futile verdict may be stale too.
 			p.shadow.futileLeft, p.shadow.futileGap = 0, 0
-			if p.shadow.enabled {
-				p.trial, p.leg, p.tn = p.home, 0, 0
-			}
+			p.trial, p.leg, p.tn = p.home, 0, 0
 			return p.decision(p.home, "regime")
 		}
 	}
@@ -363,10 +343,6 @@ func (p *CompressionPolicy) trialFrame(cost, write, ratio, logical, wire float32
 	if dir == dirUp && (p.tn == 1 && ratio < minGain || p.tn >= 2 && p.trialRatio() < lowGain) {
 		return p.lose("low-gain")
 	}
-	if dir == dirDown && p.low >= lowGainFrames && !p.shadow.enabled {
-		// A trial down to lz4 that is not compressing either.
-		return p.dropToNone(ratio)
-	}
 
 	n := float32(p.tn)
 	mean, tv := p.trialStats()
@@ -386,9 +362,10 @@ func (p *CompressionPolicy) trialFrame(cost, write, ratio, logical, wire float32
 		// A second rung gets half the frames: it is tried to find a
 		// clearly faster mode past a weak first rung.
 		return p.decision(p.trial, "probe")
-	case dir == dirUp && r*upMargin*upMargin < 1, dir == dirDown && r < downCredit*downCredit:
-		// Undecided at the last frame: the means decide, with twice the
-		// margins, so a near-tie settles on the cheaper codec.
+	case dir == dirUp && r*upMargin*upMargin < 1, dir == dirDown && r < downCredit:
+		// At the limit, upward checks need twice the gain. Keep the ordinary
+		// cheaper-codec credit: doubling it would overlap upward wins and
+		// make both modes win the same comparison in opposite directions.
 		return p.win(r, false)
 	case p.home == CompressionModeNone && p.leg == 0 && r < legMargin:
 		// lz4 may be no slower than none, so zstd may still beat both:
@@ -418,9 +395,9 @@ func (p *CompressionPolicy) win(r float32, clear bool) CompressionDecision {
 	p.leg = 0
 	p.mean = mean
 	p.fast, p.ref, p.sampleVar = mean, mean, v
-	p.fastW, p.refW = p.tWrite/n, p.tWrite/n
+	p.meanW, p.fastW, p.refW = p.tWrite/n, p.tWrite/n, p.tWrite/n
 	p.ratio, p.refRatio = ratio, ratio
-	p.n, p.out, p.up, p.down = p.tn, 0, 0, 0
+	p.n, p.out, p.drift, p.up, p.down = p.tn, 0, 0, 0, 0
 	// Every win checks the way back first, at once: home's cost may have
 	// gone stale while the trial ran, and a mode far slower than the new
 	// home loses that check in a frame or two, which then spaces later
@@ -438,7 +415,7 @@ func (p *CompressionPolicy) win(r float32, clear bool) CompressionDecision {
 
 // lose ends a trial and backs off its direction by what it cost.
 func (p *CompressionPolicy) lose(reason string) CompressionDecision {
-	if p.shadow.enabled && p.home == CompressionModeNone && p.trial == CompressionModeLz4 && p.leg == 0 {
+	if p.home == CompressionModeNone && p.trial == CompressionModeLz4 && p.leg == 0 {
 		// Background estimates of zstd are independent of lz4's gain or
 		// speed. No trial frame is sent, so even a losing lz4 cannot hide it.
 		p.leg, p.trial, p.tn = 1, CompressionModeZstdLevel1, 0
@@ -461,11 +438,6 @@ func (p *CompressionPolicy) lose(reason string) CompressionDecision {
 // endTrial returns to home, through the first rung if the trial was on the
 // second.
 func (p *CompressionPolicy) endTrial(reason string) CompressionDecision {
-	if p.leg == 1 {
-		p.leg = 2
-		p.trial = step(p.home, p.direction())
-		return p.decision(p.trial, reason)
-	}
 	p.leg = 0
 	p.trial = p.home
 	return p.decision(p.home, reason)
@@ -500,7 +472,8 @@ func (p *CompressionPolicy) rehome(mode CompressionMode) {
 func (p *CompressionPolicy) forget() {
 	p.mean = 0
 	p.n, p.out, p.up, p.down = 0, 0, 0, 0
-	p.sampleVar, p.fast, p.ref, p.fastW, p.refW = 0, 0, 0, 0, 0
+	p.drift = 0
+	p.sampleVar, p.fast, p.ref, p.meanW, p.fastW, p.refW = 0, 0, 0, 0, 0, 0
 	p.ratio, p.refRatio = 0, 0
 }
 
@@ -536,6 +509,13 @@ func (p *CompressionPolicy) regimeChanged(cost float32) (costMoved, ratioMoved b
 	p.up = max(0, p.up+d-k)
 	p.down = max(0, p.down-d-k)
 	costMoved = p.up > h || p.down > h
+	// Seed the short mean before asking it to confirm sustained drift.
+	if p.home != CompressionModeNone && p.n >= homeFrames && movedBy(p.mean, p.ref, driftMargin) {
+		p.drift++
+	} else {
+		p.drift = 0
+	}
+	costMoved = costMoved || p.drift >= driftFrames
 	partMoved := p.partMoved(p.fastW, p.refW) || p.partMoved(p.fast-p.fastW, p.ref-p.refW)
 	ratioMoved = p.ratio > 0 && p.refRatio > 0 && movedBy(p.ratio, p.refRatio, regimeRatio)
 	if !partMoved && !ratioMoved {
@@ -550,20 +530,59 @@ func (p *CompressionPolicy) regimeChanged(cost float32) (costMoved, ratioMoved b
 }
 
 // partMoved reports whether one part of home's cost, its write or its
-// prepare time, moved by a factor of regimePart and by more than regimeFloor
+// prepare time, moved by its mode's threshold and by more than regimeFloor
 // of the cost.
 func (p *CompressionPolicy) partMoved(fast, ref float32) bool {
-	return movedBy(fast, ref, regimePart) && abs32(fast-ref) > regimeFloor*p.ref
+	part := float32(regimePart)
+	if p.home != CompressionModeNone {
+		part = compressedRegimePart
+	}
+	return movedBy(fast, ref, part) && abs32(fast-ref) > regimeFloor*p.ref
+}
+
+// rememberChange saves the references and variance a detected change moved
+// from, while ordinary home frames refresh its baseline.
+func (p *CompressionPolicy) rememberChange(ref, writeRef, variance float32) {
+	p.tMin, p.tSum, p.tSq = ref, writeRef, variance
+}
+
+// changeRefs returns what rememberChange saved; ref is 0 for none.
+func (p *CompressionPolicy) changeRefs() (ref, writeRef, variance float32) {
+	return p.tMin, p.tSum, p.tSq
+}
+
+// changeGap is the downward check gap a detected change may skip, which
+// sets how much evidence it needs (checkConfidence).
+func (p *CompressionPolicy) changeGap() float32     { return p.tLogical }
+func (p *CompressionPolicy) setChangeGap(g float32) { p.tLogical = g }
+
+func (p *CompressionPolicy) changePersists(z float32) bool {
+	ref, writeRef, variance := p.changeRefs()
+	if ref == 0 {
+		return true
+	}
+	v := max(variance, p.sampleVar)
+	margin := max(float32(driftMargin), 1+z*sqrt32(v/float32(min(p.n, homeFrames))))
+	// Independent prepare and write jitter can average out in total cost.
+	// Allow twice its relative variance for the shorter write EMA.
+	writeSD := sqrt32(2 * v)
+	writeMargin := max(float32(driftMargin), 1+z*writeSD/sqrt32(float32(min(p.n, 4))))
+	return movedBy(p.mean, ref, margin) || movedBy(p.fastW, writeRef, writeMargin)
+}
+
+// Costly failed checks need more evidence before a change skips their
+// backoff: z rises with the gap, to 4 at maxLossGap. Under heavy noise a
+// regime detector fires often, and each check skipped past a loss gap can
+// cost many frames.
+func checkConfidence(gap float32) float32 {
+	return max(1, sqrt32(gap/maxGap))
 }
 
 // dueDirection returns the direction to probe now, or 0: a pending one once
 // home has seedFrames samples, or else one whose schedule is due once it has
 // settleFrames. When both are, it looks up first.
 func (p *CompressionPolicy) dueDirection() uint8 {
-	settle := settleFrames
-	if p.shadow.enabled {
-		settle = seedFrames
-	}
+	settle := seedFrames
 	valid := p.neighbors()
 	want := p.pending & valid
 	switch {
@@ -646,7 +665,13 @@ func (p *CompressionPolicy) decision(next CompressionMode, reason string) Compre
 	if ratio == 0 {
 		ratio = 1
 	}
-	return CompressionDecision{Next: next, Reason: reason, Ratio: ratio, ReadOverWrite: float64(p.rw)}
+	rw := float64(1)
+	if p.meanW > 0 {
+		rw = float64(max(0, p.mean-p.meanW) / p.meanW)
+	} else if p.mean > 0 {
+		rw = 9999
+	}
+	return CompressionDecision{Next: next, Reason: reason, Ratio: ratio, ReadOverWrite: rw}
 }
 
 // step returns the adaptive mode one rung from mode in dir, or mode at the
@@ -667,19 +692,6 @@ func movedBy(x, ref, factor float32) bool {
 }
 
 func sqrt32(x float32) float32 { return float32(math.Sqrt(float64(max(x, 0)))) }
-
-func safeLatencyRatio(prepare time.Duration, write time.Duration) float64 {
-	if write <= 0 {
-		if prepare <= 0 {
-			return 1.0
-		}
-		return 9999.0
-	}
-	if prepare <= 0 {
-		return 0.0
-	}
-	return float64(prepare) / float64(write)
-}
 
 func FrameCompTokenForMode(mode CompressionMode) string {
 	switch mode {

@@ -8,9 +8,10 @@ and a seeded injector decides where faults fire, so a failing seed shows
 which faults fired and where.
 
 Unlike FoundationDB, tx does not simulate scheduling. Goroutines, real TCP
-sockets, and splice cannot be made deterministic, so a seed can at most fix
-which faults fire on a given connection or file, never the order in which
-goroutines interleave. See [Reproducing a run](#reproducing-a-run).
+sockets, and splice cannot easily be made deterministic, so a seed can at most
+fix which faults fire on a given connection or file but not the order in which
+goroutines run. See [Reproducing a run](#reproducing-a-run). We would need
+an advanced technique like Antithesis to properly test this.
 
 ## Cost when disabled
 

@@ -220,158 +220,99 @@ on the receiver all overlap — keeping SSD, CPU, and NIC busy simultaneously.
 
 ## Adaptive Compression
 
-Compression helps when data compresses well and the link, not the CPU, limits
-the stream; otherwise its CPU time is overhead. With `--compress adapt`, the
-server picks each frame's codec to maximize the stream's logical throughput.
+With `--compress adapt`, the sender chooses compression per frame to maximize
+logical throughput. Compression helps when it saves more network time than it
+costs in CPU, but it cannot improve a receiver disk bottleneck.
 
 ### Frame-level adaptation
 
-Files are streamed as 4 MiB frames. After each frame the policy takes its
-logical throughput: logical bytes / (prepare + write time), where prepare
-covers the disk read and compression and write covers handing the frame to the
-connection. The policy compares throughput, not the latency ratio, because
-when the receiver's disk is the bottleneck its backpressure makes the sender
-look network-bound, yet compression cannot raise throughput.
+Files stream as 4 MiB frames. The policy measures each frame's logical bytes
+over its prepare and write time. Prepare includes disk reads, hashing, and
+compression; write includes sending and flushing the frame.
 
-Prepare time covers all of a frame's read and compression work, including the
-codec's flush on close: fast-mode lz4 compresses its blocks on other
-goroutines while it closes, so closing is where most of its time goes. It also
-covers hashing the frame on every path; a zero-copy frame hashes the copy it
-reads from its hash pipe. Write time covers the header, payload, and trailer
-writes, and the flush of earlier buffered frames that a zero-copy frame forces.
+Buffered writes can return before bytes reach the receiver. To avoid mistaking
+buffer space for network bandwidth, the policy also uses the kernel reported
+TCP delivery rate when available, falling back to a rate estimated from the connection's writes. Measured backpressure still captures a path that slows
+down. Delivery estimates and sample coverage appear in `txfer-rate` logs and `--stats`.
 
-A write returns once its bytes are in the 64 KiB response buffer or the
-socket's send buffer, before they reach the receiver, so the first frames of a
-SEND write at memory speed. An adaptive SEND therefore reads the connection's
-TCP delivery rate (`tcpi_delivery_rate` from `TCP_INFO`), and the policy sees
-each frame's write time as the larger of the measured write and the frame's
-wire bytes over that rate. The SEND reads after its first adaptive frame and
-again as it writes, after 4 MiB of wire bytes and then after twice as many
-each time, up to 32 MiB. It keeps the highest rate it has read, as BBR
-estimates bandwidth: a fresh or idle connection in slow start, or before its
-first ACK, reports a rate far below its path. A rate that is too high costs
-nothing, since a frame that waits on the path measures that wait. The
-maximum covers one SEND, so a later SEND sees a path that slowed. A rate from an
-application-limited sample is not used: it measures how fast the sender
-produced bytes, not how fast the path takes them, so it would charge a slow
-compressor's frames for its own slowness. The read reaches the socket under an
-authenticated session or a fault wrapper. A SEND with no adaptive item reads
-nothing.
+### Background sampling
 
-Without a kernel rate (a connection that is not a TCP socket, a kernel before
-4.9, or a failed read), the SEND uses the rate the connection's own writes
-showed: adaptive frames' wire bytes over their measured write time, each sum
-decayed by 7/8 per frame, kept across the connection's SENDs. Writes that
-land in buffers make it high, which only leaves the measured write in force;
-writes that wait on the path make it the path's rate. The rate is tracked
-even when the kernel's is used. When a transfer completes, the server logs a
-`txfer-rate` line after `txfer-complete`: how many files and windows reached
-the policy, how many used a background sample, and the range and mean of
-what the kernel and the server's writes said the rate was, which `--stats`
-also records.
-A read costs one `getsockopt` (about 0.4 µs) and allocates nothing after the
-connection's first.
+Workers test lz4 and zstd level 1 on samples of up to 256 KiB from bytes already
+read. They measure compression cost and ratio without rereading files or
+sending upward trials on the wire. Zstd is tested even when lz4 gains nothing,
+so the policy can detect data that benefits only from stronger compression
+such as that already compressed with lz4.
 
-Every adaptive frame is a sample except a window's last frame when no window
-of the file follows. When one follows, the last frame is a sample too, and its
-decision picks the next window's first codec.
+Sampling measures codecs the current frames cannot show: an lz4 stream tests
+only zstd. Separate limits bound codec workers and pending results, so a
+result waiting for its frame does not hold a worker. SEND never waits for
+either. Files and windows must have enough time left to use a result.
+Admission includes scheduling delays in sample latency,
+and workers skip remaining codecs when their window ends. Bounded retries
+prevent a stale latency estimate from closing sampling permanently.
 
-Codec exploration runs in the background. A sampled frame copies up to
-256 KiB from bytes already read for sending or hashing. A worker compresses
-that owned copy with **both lz4 and zstd level 1**, measuring their sizes and
-encode times. The larger sample can include repetition beyond lz4's 64 KiB
-match distance. Zstd is measured even when lz4 gains nothing.
+Uncompressed files back off sampling when neither codec can repay its CPU
+cost. A change in frame cost reopens sampling; periodic samples also detect
+changed data. Thread CPU time keeps preemption out of measured codec costs.
 
-At most one job per four CPUs, and at least two, runs across the process.
-Admission, result checks, and cleanup never wait for a worker; busy workers
-skip new requests. A canceled or finished SEND leaves an active worker owning
-its buffers until it exits. Workers retain no file descriptor and do no
-additional file or socket I/O. Only the small sample copy counts toward a
-sending frame's prepare time.
+The stream keeps its current codec while the policy compares estimated
+throughput. Repeated wins justify a switch; normal frame timings then validate
+it and restore the previous codec if it proves slower. The policy backs off
+after losing comparisons and explores again when throughput or compressibility
+changes.
 
-A file normally samples every eighth frame, by its index in the file, and
-requests each frame while a comparison needs evidence. A sample is requested
-only while the file has the frames a switch needs, through one sent in the new
-codec. During a comparison, that is the rest of the baseline (a fresh file
-only) and of **four independent winning samples**, plus that frame: nine
-frames for a fresh file. Outside a comparison, a sample can only detect
-changed data, which takes three moved samples eight frames apart before a
-comparison starts: 22 frames, or 30 before the file has a reference sample.
-Frames are counted, not bytes, since a window's last frame can be short. The
-count is an estimate: windows that are not multiples of 4 MiB cut more frames
-than it counts, and concurrent windows of one file do not see each other's
-evidence. The estimated remaining transfer time must also exceed the sampling
-budget, based on the observed send rate and the last job's wall time. A
-completed result is always used, since its cost is already spent.
+Compressed streams also check cheaper codecs on real frames: none first, then
+lz4 from zstd if none loses. Each episode first sends two frames of the
+current codec, flushed as the check's are. The faster of them replaces the
+codec's average cost as the bar only when it is higher by more than noise
+explains and the average has at least 16 frames behind it: ordinary frames
+that left their bytes buffered made the average too low, while ones that paid
+for their drains as they streamed did not, and a stall can slow a frame but
+not speed it up. Two observations at least 3% faster than the bar justify a
+switch; eight normal frames validate it and can restore the previous codec.
+Validation compares the mean raw time of every frame since the switch, check
+frames included, so a send buffer that absorbs the first frames cannot hide
+their cost. A fast response flushes its buffer after each baseline, check, and
+validation frame, rather than only when the request ends, so all of them are
+timed to the same point. Output already buffered drains first, untimed, so
+each flush times one frame's bytes. An episode sends at most 16 MiB of cheaper
+codecs and needs 28 MiB left in the file. All of a server's connections share
+a budget of about 1% of steady-state frame time for unsuccessful checks, so
+neither new connections nor new files get unpaid checks. A starting check
+charges the budget one frame in advance, which keeps most other connections
+from starting checks before its losses are known; it does not make checks
+exclusive. Detected cost changes, including 10% drift for eight home
+observations, allow an earlier check when fresh home timings confirm the
+change, without forgiving earlier losses. The confirmation needs more evidence
+the costlier the failed checks behind it. An unconfirmed change keeps their
+backoff. An adopted codec whose validated cost is more than twice from what it
+won at also allows an early check: the path changed while it validated, or the
+estimate missed a bottleneck. So does lz4 winning from zstd at a write cost no
+single path explains beside none's losing frame: the path changed during the
+check. Upward exploration stays in the background and resumes as soon as a
+check wins.
 
-The stream keeps sending in its learned *home* codec while a comparison runs.
-The candidate's estimated frame cost retains measured read/hash work, replaces
-the codec CPU cost with its sampled cost, and scales transport time by its
-sampled ratio. The sequential test compares these estimates with observed home
-costs, including noise in both. Upgrades need a 3% gain with 2.5 standard errors
-to spare; downgrades allow a 3% throughput loss for the cheaper codec. At the
-16-sample cap the means decide with 6% margins. Zstd can be selected directly
-from none after independent evidence; lz4 does not have to win first.
+### Policy state
 
-The policy validates a switch against eight normally sent frames. If their
-smoothed cost is over 10% worse than the previous mode, it restores that mode
-and backs off. When compression did not reduce write time per logical byte,
-it learns a receiver-disk floor that future estimates cannot compress away.
-A changed path gets a prompt retry rather than a long penalty based on the old
-baseline. Three actual compressed frames gaining less than 1.08:1 drop straight
-to none. Background estimates cannot measure receiver decoding directly, so
-validation remains necessary.
+Each file keeps its codec and learned policy across windows. Concurrent
+windows work on independent copies, with the last save becoming the next
+window's starting point. This avoids locking per frame, but many small
+parallel windows can slow learning. State is released when the file finishes
+or its transfer is removed.
 
-Lost comparisons back off geometrically from 24 to 256 frames, or up to 4,096
-when their estimated cost is high. Sustained changes in home cost, its read or
-write component, or sampled compressibility reset exploration. Independent
-zstd ratios also detect data that starts compressing with zstd while lz4's
-ratio stays flat. A stalled frame is clipped so it cannot decide a comparison
-or reset the schedule alone.
+Connections share their uncompressed link estimate with new files, so each
+file need not relearn the same baseline. Compression ratios and codec evidence
+stay with the file, since different files can compress differently.
 
-The policy state belongs to the file, not the window. A large file is sent as
-many windows, so a learned mode and the policy's learned state carry on from
-one to the next. The server keeps the state in the transfer, only for adaptive
-files that span more than one window:
-
-- A window loads the state only when an earlier window preceded it (its offset
-  is above zero). A resumed tail window loads, and finds nothing if the server
-  restarted.
-- A window saves its state only when another window follows, within the smaller
-  of the manifest size and the file's size on disk. A single-window file, the
-  last window of a file, a resumed tail window, and a window of a file that
-  already shrank save nothing, because no later ACK would free the entry. A
-  window saved before its file shrank stays until the transfer is reaped, one
-  entry per file. A window saves only if it changed the state it loaded, so one
-  that learned nothing (a single frame) creates or refreshes no entry. A window
-  that ends in an error after at least one frame still saves.
-- A SEND collects its items' states and applies them with its window hashes in
-  one call, under one acquisition of the transfer lock per request. Loads take
-  only the state's own mutex.
-- Each window works on its own copy, so concurrent windows of one file on
-  different connections do not lock per frame, and the last save wins.
-- An entry is freed when its file is Done or Missing (a save for such a file is
-  skipped, and a revived file starts fresh) and when the transfer is deleted or
-  reaped.
-
-A zero state is a fresh policy at `none`. The stored state remains below
-128 bytes, so map values do not require a separate allocation.
-
-The link is shared; the data is not. What a byte costs to read and send
-uncompressed, and any receiver-disk floor, is the same for every file on a
-connection, while a file's ratio and codec costs depend on its data. So each
-connection keeps the uncompressed baseline its latest file measured (home's
-cost, write time, and their spread), and a window that starts a file with no
-state of its own begins from it: its baseline counts as seeded, and its first
-comparison starts on its first frame with its own samples. A seeded file can
-switch by its fifth frame instead of its ninth, which matters when a file's
-windows run in parallel and each chain of state sees only a few frames. A
-stale baseline costs at most a switch that validation on the file's own
-frames undoes.
+A file's policy is in one of three phases. While steady, it observes its
+current codec and runs background comparisons. A check sends a cheaper codec
+on real frames. Validation measures a codec the policy adopted, from a
+comparison or a check, and can restore the previous one. A check requested
+during validation waits for it to end.
 
 ### Compression ladder
 
-The background comparison engine explores three codecs:
+The policy chooses among three codecs and can skip lz4 when zstd wins directly:
 
 ```mermaid
 flowchart LR
@@ -382,16 +323,10 @@ flowchart LR
     lz4 -->|Downgrade| none
 ```
 
-The default starting point is `none`. On slow links with compressible data, the
-server upgrades toward `zstd` and can effectively exceed line rate because
-compressed frames are smaller than the raw data. On fast networks with
-incompressible data (e.g. already-compressed media), the server stays at `none`
-or downgrades back. Occasional background samples still use bounded CPU.
-Mixed datasets (e.g. a directory with both text logs and JPEG images) see
-the server adapt frame-by-frame as data characteristics change.
-
-The client can also force a specific compression mode (`--compress none|lz4|zstd`)
-to skip adaptation.
+Every file starts at `none`. On slow networks, compressible data can exceed
+network line rate in logical bytes. Incompressible data stays uncompressed,
+with occasional background samples to detect changes. Use
+`--compress none|lz4|zstd` to force a codec and skip adaptation.
 
 ## Verification
 

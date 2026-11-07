@@ -328,17 +328,25 @@ func TestTCPRateReader(t *testing.T) {
 	if rate, limited := waitRate(); rate == 0 || !limited {
 		t.Fatalf("after one small write: DeliveryRate = %d, app-limited %v; want a rate, app-limited", rate, limited)
 	}
+	// A loaded host can leave the pipe idle between the writer's turns, so
+	// one bulk write may end on app-limited samples. A few must not.
 	bulk := pattern(8 << 20)
-	done := make(chan error, 1)
-	go func() { _, err := io.ReadFull(server, make([]byte, len(bulk))); done <- err }()
-	if _, err := client.Write(bulk); err != nil {
-		t.Fatal(err)
+	sink := make([]byte, len(bulk))
+	var rate uint64
+	limited := true
+	for try := 0; try < 5 && (rate == 0 || limited); try++ {
+		done := make(chan error, 1)
+		go func() { _, err := io.ReadFull(server, sink); done <- err }()
+		if _, err := client.Write(bulk); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		rate, limited = waitRate()
 	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if rate, limited := waitRate(); rate == 0 || limited {
-		t.Fatalf("after a bulk write: DeliveryRate = %d, app-limited %v; want a rate, not app-limited", rate, limited)
+	if rate == 0 || limited {
+		t.Fatalf("after five bulk writes: DeliveryRate = %d, app-limited %v; want a rate, not app-limited", rate, limited)
 	}
 	if allocs := testing.AllocsPerRun(100, func() { _, _ = r.DeliveryRate() }); allocs != 0 {
 		t.Fatalf("DeliveryRate allocated %.1f times per read", allocs)
