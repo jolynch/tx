@@ -16,6 +16,11 @@ const recoveryCheckFrames = 2
 // recoveryBaselineFrames home frames start each check episode.
 const recoveryBaselineFrames = 2
 
+// floorRatio is the smallest compression ratio whose loss in a check can
+// reveal a receiver-disk floor: a network path would move writes by that
+// factor, well past the 1.25 a floor allows.
+const floorRatio = 1.25 * 1.25
+
 // RecoveryFrames is the frames a file must have left to allow a check: its
 // baseline frames, at most four check frames, and a useful frame afterward.
 const RecoveryFrames = recoveryBaselineFrames + 4 + 1
@@ -31,11 +36,14 @@ const (
 // Flags qualify a phase: flagDue defers a requested check until home may
 // start one; flagAfterCheck marks a validation that follows a winning check,
 // whose frames are measured and charged to the recovery budget; flagRecheck
-// requests a check if that validation keeps the winner (pathMoved).
+// requests a check if that validation keeps the winner (pathMoved);
+// flagSmallGain marks an adopted codec that saves too few wire bytes over
+// the one it replaced to reveal a receiver-disk floor (floorRatio).
 const (
 	flagDue uint8 = 1 << iota
 	flagAfterCheck
 	flagRecheck
+	flagSmallGain
 )
 
 func (s *shadowState) due() bool { return s.flags&flagDue != 0 }
@@ -200,7 +208,7 @@ func (p *CompressionPolicy) observeRecovery(m CompressionMetrics) CompressionDec
 	} else if p.tn < recoveryCheckFrames {
 		d = p.decision(p.trial, "recovery-confirm")
 	} else {
-		previous := p.home
+		previous, previousRatio := p.home, p.ratio
 		mean := p.tSum / float32(p.tn)
 		write := p.tWrite / float32(p.tn)
 		ratio := p.trialRatio()
@@ -222,7 +230,11 @@ func (p *CompressionPolicy) observeRecovery(m CompressionMetrics) CompressionDec
 		p.shadow.phase, p.shadow.flags = phaseValidate, flagAfterCheck
 		// An unchanged write cost despite more wire bytes is an observed
 		// floor for later background comparisons, not another codec sample.
-		if p.home == CompressionModeNone && !movedBy(write, p.shadow.priorWrite, 1.25) && !movedBy(write, p.checkStartWrite(), 1.25) {
+		// Only a codec that saved enough wire bytes can tell a disk floor
+		// from noise: below floorRatio, a network path moves writes too
+		// little to tell apart.
+		if p.home == CompressionModeNone && previousRatio >= floorRatio &&
+			!movedBy(write, p.shadow.priorWrite, 1.25) && !movedBy(write, p.checkStartWrite(), 1.25) {
 			p.shadow.floor = min(write, p.shadow.priorWrite)
 		}
 		// Upward comparisons resume at once: a path change can straddle the

@@ -422,3 +422,41 @@ func TestRecoveryBudgetSharedAcrossConnections(t *testing.T) {
 		}
 	}
 }
+
+// A path whose rate changes every frame or few, as bursty links do, gives a
+// background comparison a home cost that alternates with it. Judged against
+// home on the frames it was predicted from, a codec that wins on average is
+// adopted, whichever frames the comparison happened to see.
+func TestBackgroundAlternatingPath(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  []byte // the slow regime; the fast one is the next rate up
+		k    int    // frames per half period
+	}{
+		{"32/128 MiB/s every frame", []byte{0, 0, 2, 2, 1, 0, 0}, 1},
+		{"128/512 MiB/s every frame", []byte{0, 1, 2, 2, 1, 1, 2}, 1},
+		{"32/128 MiB/s every 3 frames", []byte{0, 0, 2, 2, 1, 0, 0}, 3},
+	} {
+		slow := regimeFromBytes(tc.cfg)
+		fast := regimeFromBytes(append([]byte{tc.cfg[0], tc.cfg[1] + 1}, tc.cfg[2:]...))
+		var ty tally
+		for run := range uint64(8) {
+			s := newSim(run, 0.1)
+			p := NewCompressionPolicy()
+			mode := CompressionModeNone
+			for i := range 1100 {
+				r := slow
+				if i/tc.k%2 == 1 {
+					r = fast
+				}
+				if i >= simSettle {
+					ty.add(r, mode)
+				}
+				mode = s.step(t, p, r, mode)
+			}
+		}
+		if ty.efficiency() < 0.95 {
+			t.Errorf("%s: efficiency %.3f, want at least 0.95 (slow %v, fast %v)", tc.name, ty.efficiency(), slow, fast)
+		}
+	}
+}

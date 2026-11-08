@@ -193,6 +193,14 @@ instead of widening the current change; remove an entry when it ships.
   stop them, but the adopted codec keeps changing. Samples see the disk
   floor only after a failed validation. Repros for
   `FuzzCompressionPolicyStationary`: `"2101020020"` and `"7\".1020020"`.
+- **A disk path whose speed alternates rarely keeps its floor.**
+  `observeCost` clears the receiver-disk floor whenever one frame's write
+  takes under half of it (`s.floor > write*2`), so a disk-bound path that
+  alternates between two speeds loses the floor on its first fast frame.
+  Background samples then overestimate compression's gain and adopt lz4
+  too often. With paired comparisons, efficiency on such paths drops from
+  0.930–0.956 to 0.844–0.894 over 32 seeds. Clearing the floor only after a
+  sustained run of fast writes would keep it.
 - **Validation can pass a codec a buffer flatters.** A send buffer of B
   frames can absorb a check's frames and the first validation frames, which
   lowers the 10-frame validation mean by up to about B/10. Behind three or

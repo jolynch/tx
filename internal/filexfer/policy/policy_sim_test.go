@@ -539,6 +539,9 @@ func FuzzCompressionPolicyRegret(f *testing.F) {
 	f.Add([]byte("\xff0010020000\x020"))
 	f.Add([]byte("\xf300100200100"))
 	f.Add([]byte("\xf30aB0090001020000000")) // zstd home, then CPU bound and incompressible
+	// Low noise, found by fuzz-long in CI.
+	f.Add([]byte("010000X0000C20X00100"))  // a path 4x faster must not judge zstd against a stale baseline
+	f.Add([]byte("70\aa02X001000020000a")) // ratio 1.3: a none-lz4 coin flip must not set a disk floor
 	f.Fuzz(func(t *testing.T, in []byte) {
 		rg, ok := runRegret(t, in, simRuns)
 		if !ok {
