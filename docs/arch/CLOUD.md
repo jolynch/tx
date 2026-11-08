@@ -168,8 +168,8 @@ first byte.
 | tx fixed lz4, AES-GCM                    |          36.8 min (+52.5%) |          41.6 min (+25.5%) |
 | tx fixed zstd -1, AES-GCM                |          33.6 min (+39.4%) |           33.6 min (+1.4%) |
 | rsync, plaintext, no compression         | ≥80.0 min (≥231.7% slower) | ≥80.0 min (≥141.4% slower) |
-| rsync/SSH, AES-GCM, no compression       | ≥80.0 min (≥231.7% slower) | ≥80.0 min (≥141.4% slower) |
-| rsync/SSH, AES-GCM, ideal 2× compression |  ≥40.0 min (≥65.9% slower) |  ≥40.0 min (≥20.7% slower) |
+| rsync/SSH, AES-GCM, no compression       | ≥91.8 min (≥280.5% slower) | ≥91.8 min (≥176.9% slower) |
+| rsync/SSH, AES-GCM, ideal 2× compression |  ≥46.7 min (≥93.8% slower) |  ≥46.7 min (≥41.0% slower) |
 
 Codecs share all 16 vCPUs with reading, hashing, framing, AES-GCM, and
 socket work. The model assumes that pipeline sustains 450 MiB/s per vCPU at
@@ -178,15 +178,59 @@ or cipher throughput.
 
 The rsync rows are **optimistic lower bounds**, not benchmark results.
 They assume one TCP connection outside a cluster placement group, without
-ENA Express: [AWS caps that flow at 5 Gbps][net], or 596 MiB/s. The SSH
-configuration is `aes256-gcm@openssh.com` with SSH compression off. The
-2× row allows ideal file compression with no CPU cost. Current [rsync supports threaded zstd][rsync];
-it is not restricted to one compression core. Multiple rsync sessions or
-different network placement change these bounds.
+ENA Express: [AWS caps that flow at 5 Gbps][net], or 596 MiB/s. Each rsync
+and SSH process runs on one core, and the slowest one sets the rate. From
+measured rates (see [Model](#model)), plain rsync manages 1,020 MiB/s, so
+the flow is its limit; over SSH it manages 520 MiB/s, and an SSH process is
+the limit. SSH uses `aes256-gcm@openssh.com` with compression off. The 2×
+row assumes ideal compression with no CPU cost on either side, which halves
+the bytes SSH carries and leaves rsync's own process as the limit. Current
+[rsync supports threaded zstd][rsync]; it is not restricted to one
+compression core. Multiple rsync sessions or different network placement
+change these bounds.
 
 On incompressible data, adaptive tx matches no compression; fixed codecs
 finish later. No measured tx-versus-rsync speedup on these hosts is implied
 by the table.
+
+## Throughput scales with instance size
+
+Bigger instances get more vCPUs, more NVMe bandwidth, and more network
+bandwidth. `tx` spreads a copy across many connections and runs its pipeline on
+every core (see [Concurrency](OVERVIEW.md#concurrency)), so it keeps up as the
+network grows. A single TCP flow doesn't:
+
+![Two panels over matched i7i pairs from large to 48xlarge, with vCPUs on a log scale and baseline network assumed linear in vCPUs. (a) Sustained throughput: tx follows baseline network bandwidth from 140 to 11,921 MiB/s; plaintext rsync levels off at 596 MiB/s from 4xlarge and rsync over SSH at 520 MiB/s from 2xlarge. (b) Time to fill 80% of the receiver's SSD after a 10-minute burst: tx takes 23 to 48 minutes at every size, limited by the network from 2xlarge up; rsync grows to 16 hours and rsync over SSH to 18.4 hours on 48xlarge](plots/cloud-scaling.png)
+
+On large and xlarge, baseline network bandwidth limits all three. From
+2xlarge, one SSH process caps rsync/SSH at 520 MiB/s; from 4xlarge, one TCP
+flow caps plain rsync at 596 MiB/s, the 5 Gbps limit outside a cluster
+placement group. tx reaches **11,921 MiB/s on i7i.48xlarge**: 20 times plain
+rsync and 23 times rsync/SSH. tx's CPU limit (360 MiB/s per vCPU) and the
+NVMe rates stay above baseline network bandwidth at every size, so the
+network sets its rate. The rsync lines use the same optimistic bounds as the
+table above.
+
+Panel (b) shows how long you actually wait: the time to fill 80% of the
+receiver's SSD. It runs the same simulation as the copies above, with a
+10-minute burst on sizes that have one, then baseline, plus page cache and
+disk limits. The data is incompressible, so tx sends it uncompressed.
+
+tx fills every size in **under 50 minutes**: 26 minutes on 4xlarge and 48
+minutes for 33,528 GiB on 48xlarge. The drive grows 96 times from large to
+48xlarge, but the network grows with it, so the fill time only doubles. From 2xlarge up, the network limits tx for the
+whole fill. On large and xlarge, the burst outruns both disks: sender reads
+limit the copy first, then receiver writes once page cache fills, then
+baseline network bandwidth once the burst ends.
+
+rsync's single flow doesn't grow with the drive. From 4xlarge up, its fill
+time grows in proportion to the drive: 16 hours on 48xlarge, or 18.4 hours
+over SSH. That's two workdays waiting on one copy.
+
+Both panels assume baseline network bandwidth grows linearly with vCPUs,
+which gives 8xlarge 18.75 Gbps, twice 4xlarge. AWS lists 25 Gbps for
+8xlarge; the model uses that as its burst. 48xlarge falls a little short of
+linear: AWS lists 100 Gbps, not 112.5.
 
 ## Verification is another disk pass
 
@@ -275,15 +319,28 @@ cost per logical MiB. With the 450 MiB/s pipeline assumption at 80%
 efficiency, xlarge sustains 1,440 MiB/s uncompressed, 429 MiB/s with lz4,
 and 355 MiB/s with zstd -1. Sender and receiver CPU limits are separate.
 
-Parameters are in [cloud_figures.py](cloud_figures.py); transfer comparisons
-are in [cloud_transfer_figures.py](cloud_transfer_figures.py). Regenerate
-the [PNGs](plots/) with:
+The scaling figure uses matched [i7i][i7i] pairs. Panel (a) shows rates
+after network credits run out. vCPUs and baseline network bandwidth come from
+[AWS][so]. NVMe read and write rates scale linearly with vCPUs from the
+i7i.4xlarge measurements, one device per 16 vCPUs from 4xlarge up. Panel (b)
+runs the rsync pipelines through the same simulation, with their one-flow
+and one-core limits as a rate ceiling. That favors rsync: it gets the same
+burst and page cache as tx, and pays nothing for its file list or checksums.
+tx's 4xlarge fill takes 26.0 minutes, less than the table's 27.9, because an
+i7i sender reads faster than an i4i.
 
-```sh
-python3 docs/arch/cloud_figures.py --plot
-```
+The rsync rates come from rsync 3.2.7 (xxh128 checksums) and OpenSSH 9.6p1
+on the same desktop, copying eight 512 MiB random files between tmpfs
+directories with `--whole-file`. The best of six runs reached 1,504 MiB/s for
+local rsync, with no TCP, and 766 MiB/s over SSH with
+`aes256-gcm@openssh.com`. The model scales both by clock only, from 5.16 GHz
+to the i4i's 3.5 GHz, which gives 1,020 and 520 MiB/s. rsync runs only a few
+processes, so their sibling hyperthreads sit idle. i7i runs at 3.2 GHz on all
+cores and up to 4.0 GHz on one. tmpfs, the best of six runs, and clock-only
+scaling all favor rsync.
 
 [so]: https://docs.aws.amazon.com/ec2/latest/instancetypes/so.html
+[i7i]: https://aws.amazon.com/ec2/instance-types/i7i/
 [scm-i4i]: https://github.com/Netflix-Skunkworks/service-capacity-modeling/blob/main/service_capacity_modeling/hardware/profiles/shapes/aws/auto_i4i.json
 [scm-i7i]: https://github.com/Netflix-Skunkworks/service-capacity-modeling/blob/main/service_capacity_modeling/hardware/profiles/shapes/aws/auto_i7i.json
 [net]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-network-bandwidth.html

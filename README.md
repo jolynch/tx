@@ -6,9 +6,9 @@
 
 # `tx`: Fast file transfer for the cloud
 
-`tx` copies directories and files at line rate by fully saturating modern cloud
-hardware - SSD, NIC, and CPU - simultaneously. On large servers it achieves
-up to 10x the throughput of a simple `rsync --fsync` + [`happycache`](https://github.com/hashbrowncipher/happycache) while providing above line-rate encryption, compression,
+`tx` copies directories and files between Linux servers in the cloud at line
+rate by fully saturating modern cloud hardware - SSD, NIC, and CPU -
+simultaneously. On large servers it achieves up to 10x the throughput of a simple `rsync --fsync` + [`happycache`](https://github.com/hashbrowncipher/happycache) while providing above line-rate encryption, compression,
 and page cache transfer.
 
 Four capabilities make this possible:
@@ -42,6 +42,12 @@ Four capabilities make this possible:
   Fault-injection tests in CI drive whole transfers through network, disk,
   and syscall failures to check that a copy ends with the right bytes or
   fails loudly.
+
+`tx` builds and runs only on Linux. These optimizations use Linux-only system
+calls: zero-copy sends (`splice`, `tee`), read-ahead hints (`posix_fadvise`,
+`readahead`), background durability (`fdatasync`, `syncfs`), page cache
+transfer (`mincore`), local copies (`copy_file_range`), and the TCP delivery
+rate that adaptive compression reads from `TCP_INFO`.
 
 See [docs/README.md](docs/README.md) for the documentation index and
 [docs/arch/OVERVIEW.md](docs/arch/OVERVIEW.md) for a deeper dive.

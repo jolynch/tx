@@ -47,7 +47,25 @@ I4I_XLARGE_NVME_GIB = 937e9 / 2**30   # one 937 GB device, published (so.html)
 # Both have 16 vCPUs, 128 GiB RAM, 9.375/25 Gbps baseline/burst networking,
 # and one 3,750 GB local SSD. Netflix catalogs the same baseline and drives:
 # https://github.com/Netflix-Skunkworks/service-capacity-modeling/tree/main/service_capacity_modeling/hardware/profiles/shapes/aws
-I7I_4XLARGE = dict(vcpu=16, ram=128, net_base=9.375, net_burst=25.0, nvme=1)
+# i7i sizes, the current generation, in the same form as I4I: one 3,750 GB
+# device per 16 vCPUs from 4xlarge up (so.html, Network and Instance store
+# tables; https://aws.amazon.com/ec2/instance-types/i7i/).
+I7I = {
+    "large":    dict(vcpu=2,   ram=16,   net_base=1.171, net_burst=10.0, nvme=1),
+    "xlarge":   dict(vcpu=4,   ram=32,   net_base=2.343, net_burst=10.0, nvme=1),
+    "2xlarge":  dict(vcpu=8,   ram=64,   net_base=4.687, net_burst=12.0, nvme=1),
+    "4xlarge":  dict(vcpu=16,  ram=128,  net_base=9.375, net_burst=25.0, nvme=1),
+    "8xlarge":  dict(vcpu=32,  ram=256,  net_base=25.0,  net_burst=25.0, nvme=2),
+    "12xlarge": dict(vcpu=48,  ram=384,  net_base=28.125, net_burst=28.125, nvme=3),
+    "16xlarge": dict(vcpu=64,  ram=512,  net_base=37.5,  net_burst=37.5, nvme=4),
+    "24xlarge": dict(vcpu=96,  ram=768,  net_base=56.25, net_burst=56.25, nvme=6),
+    "48xlarge": dict(vcpu=192, ram=1536, net_base=100.0, net_burst=100.0, nvme=12),
+}
+I7I_4XLARGE = I7I["4xlarge"]
+# The scaling figure assumes baseline network bandwidth linear in vCPUs.
+# AWS lists 25 Gbps for 8xlarge, 2.7 times 4xlarge; the figure uses twice
+# 4xlarge's baseline and keeps 25 Gbps as its burst, and footnotes it.
+I7I_LINEAR = {**I7I, "8xlarge": dict(I7I["8xlarge"], net_base=2 * I7I["4xlarge"]["net_base"])}
 LOCAL_4XLARGE_GIB = 3750e9 / 2**30
 COPY_FRACTION = .80
 # Nominal sequential measurements, not universal hardware maxima. The transfer
@@ -265,6 +283,29 @@ F1_DATASET_GIB = LOCAL_4XLARGE_GIB * COPY_FRACTION
 # Transfer table: per-vCPU rate of tx's non-codec pipeline.
 TX_AES_MIBPS_PER_VCPU = 450.0    # assumed
 TX_PARALLEL_EFFICIENCY = 0.80    # assumed
+
+# Scaling figure: matched i7i pairs, large to 48xlarge, after network burst.
+# Local NVMe scales linearly with vCPUs from the i7i.4xlarge measurements.
+# One ordinary TCP flow, as rsync and rsync over SSH use, is capped at
+# 5 Gbps outside a cluster placement group, without ENA Express.
+# https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-network-bandwidth.html
+NVME_READ_PER_VCPU = RECEIVER_READ_MIBPS / 16
+NVME_WRITE_PER_VCPU = RECEIVER_WRITE_MIBPS / 16
+SINGLE_FLOW_GBPS = 5.0
+
+# rsync's one-core limits. Measured: rsync 3.2.7 (xxh128 checksums) and
+# OpenSSH 9.6p1 copying 8 x 512 MiB random files, tmpfs to tmpfs, on the
+# desktop above, with --whole-file. The best of six runs:
+#   rsync, local (no TCP)                    1,504 MiB/s
+#   rsync -e ssh, aes256-gcm, no compression   766 MiB/s
+# Each rsync and SSH process runs on its own core, so the slowest process
+# sets each pipeline's rate. Plain rsync is limited by an rsync process; over
+# SSH, an SSH process limits it per wire byte. Derated for clock only, at the
+# i4i's 3.5 GHz (i7i: 3.2 GHz all-core, 4.0 GHz on one core): rsync's few
+# processes leave sibling hyperthreads idle, so SMT_FACTOR does not apply.
+# tmpfs, best-of-six, and the clock-only derate all favor rsync.
+RSYNC_CORE_MIBPS = 1504.0 * CLOCK_FACTOR       # logical bytes
+SSH_AES_CORE_MIBPS = 766.0 * CLOCK_FACTOR      # wire bytes
 
 # Page-cache figure.
 F4_MINUTES = 30
@@ -835,6 +876,179 @@ def figure_page_cache(width=FIG_W, name="cloud-page-cache"):
     return save(fig, name)
 
 
+def scaling_model():
+    """Sustained MiB/s per matched i7i pair: tx, rsync, and rsync over SSH."""
+    names = list(I7I_LINEAR)
+    vcpu = np.array([I7I_LINEAR[n]["vcpu"] for n in names])
+    net = np.array([gbps_to_mibps(I7I_LINEAR[n]["net_base"]) for n in names])
+    disk = np.minimum(NVME_READ_PER_VCPU, NVME_WRITE_PER_VCPU) * vcpu
+    cpu = np.array([cpu_limit(v, None) for v in vcpu])
+    tx = np.minimum.reduce([cpu, net, disk])
+    flow = np.minimum(gbps_to_mibps(SINGLE_FLOW_GBPS), tx)
+    rsync = np.minimum(RSYNC_CORE_MIBPS, flow)
+    rsync_ssh = np.minimum(SSH_AES_CORE_MIBPS, rsync)
+    assert np.all(np.diff(tx) > 0) and np.all(tx >= rsync) and np.all(rsync >= rsync_ssh)
+    assert np.allclose(tx, net), "baseline network no longer binds; relabel"
+    assert RSYNC_CORE_MIBPS > flow.max() > SSH_AES_CORE_MIBPS, "limits moved; relabel"
+    return dict(names=names, vcpu=vcpu, tx=tx, rsync=rsync, rsync_ssh=rsync_ssh)
+
+
+def fill_minutes(size, cap_mibps=None):
+    """Minutes to fill COPY_FRACTION of a matched i7i receiver's SSD.
+
+    The copy is uncompressed (incompressible data), with BURST_MIN of burst
+    network bandwidth, then baseline. cap_mibps models one rsync pipeline: a
+    rate ceiling on the wire with no tx CPU limit, stepped like 64
+    connections so long copies stay fast to simulate.
+    """
+    s = I7I_LINEAR[size]
+    v = s["vcpu"]
+    total = LOCAL_4XLARGE_GIB * v / 16 * COPY_FRACTION * GIB   # SSD proportional to vCPUs
+    burst, base = gbps_to_mibps(s["net_burst"]), gbps_to_mibps(s["net_base"])
+    cap = float("inf") if cap_mibps is None else cap_mibps
+
+    def wire(t):
+        return min(cap, burst if t < BURST_MIN * 60 else base)
+
+    cache = (DIRTY_BACKGROUND_RATIO * s["ram"] * GIB, DIRTY_RATIO * s["ram"] * GIB)
+    rsync = cap_mibps is not None
+    conns = 64 if rsync else client_plan(v, s["net_burst"])["conns"]
+    vcpus = 10**6 if rsync else v
+    read = NVME_READ_PER_VCPU * v
+    r = simulate("none", wire, NVME_WRITE_PER_VCPU * v, cache, vcpus, conns, 10**7,
+                 data=INCOMPRESSIBLE, total_mib=total, sender_read_mibps=read, decode_vcpus=vcpus)
+    # Each frame's limit: the lowest of network, sender disk, and CPU, or the
+    # receiver's disk when page cache holds the rate below all three.
+    limits, cpu = [], cpu_limit(vcpus, None)
+    for t0, rate in zip(r["t0"], r["rate"]):
+        lims = {"network": wire(t0), "sender disk": read, "CPU": cpu}
+        k = min(lims, key=lims.get)
+        k = k if rate >= lims[k] * .999 else "receiver disk"
+        if k not in limits:
+            limits.append(k)
+    return r["done"] / 60, tuple(limits)
+
+
+def fill_model(m):
+    flow = gbps_to_mibps(SINGLE_FLOW_GBPS)
+    caps = {"rsync": min(flow, RSYNC_CORE_MIBPS),
+            "rsync_ssh": min(flow, RSYNC_CORE_MIBPS, SSH_AES_CORE_MIBPS)}
+    tx = [fill_minutes(n) for n in m["names"]]
+    out = {"tx": np.array([t for t, _ in tx]), "tx_limits": [lim for _, lim in tx]}
+    for k, cap in caps.items():
+        out[k] = np.array([fill_minutes(n, cap)[0] for n in m["names"]])
+    assert np.all(out["tx"] <= out["rsync"] + 1e-9) and np.all(out["rsync"] <= out["rsync_ssh"] + 1e-9)
+    return out
+
+
+def size_axis(ax, m, xs):
+    ax.set_xlim(xs[0] - .4, xs[-1] + .4)
+    # 12xlarge and 24xlarge sit close to their neighbors; label them on a lower row.
+    doubling = np.array([n not in ("12xlarge", "24xlarge") for n in m["names"]])
+    ticks = [f"{n}{'*' if n == '8xlarge' else ''}\n{v} vCPUs" for n, v in zip(m["names"], m["vcpu"])]
+    ax.set_xticks(xs[doubling], [t for t, d in zip(ticks, doubling) if d], fontsize=8)
+    ax.set_xticks(xs[~doubling], [t for t, d in zip(ticks, doubling) if not d], minor=True,
+                  fontsize=8)
+    ax.tick_params(axis="x", which="both", length=0)
+    ax.tick_params(axis="x", which="minor", pad=26)
+    ax.set_xlabel("i7i instance size, matched sender and receiver (vCPUs on a log scale)")
+
+
+def figure_scaling():
+    from matplotlib.ticker import FixedLocator, NullLocator
+    m = scaling_model()
+    f = fill_model(m)
+    xs = np.log2(m["vcpu"])          # equal steps are doublings
+    fig = new_figure(4.6, width=13)
+    ax, bx = fig.subplots(1, 2)
+    style_kw = {"tx": dict(lw=3.0, marker="o", ms=8, mec="white", mew=1.0),
+                "rsync": dict(mfc="none", mew=1.4), "rsync_ssh": dict(mfc="none", mew=1.4)}
+    names = {"tx": "tx, AES-GCM, many connections", "rsync": "rsync, plaintext, one TCP flow",
+             "rsync_ssh": "rsync over SSH, AES-GCM, one TCP flow"}
+    handles = []
+    for k in ("tx", "rsync", "rsync_ssh"):
+        handles += line(ax, xs, m[k], k, label=names[k], **style_kw[k])
+        line(bx, xs, f[k], k, **style_kw[k])
+    fig.legend(handles=handles, loc="outside upper center", ncol=3, handlelength=3.2)
+    fig.text(.005, .005, f"* Baseline network assumed linear in vCPUs: "
+             f"{I7I_LINEAR['8xlarge']['net_base']:g} Gbps on 8xlarge. AWS lists "
+             f"{I7I['8xlarge']['net_base']:g} Gbps, used here as its burst.",
+             fontsize=9, color=MUTED, fontstyle="italic", ha="left", va="bottom")
+
+    ax.set_title("(a) Sustained throughput after network burst")
+    ax.set_yscale("log")
+    ax.set_ylim(70, 25000)
+    ax.yaxis.set_major_locator(FixedLocator([100, 300, 1000, 3000, 10000]))
+    ax.yaxis.set_minor_locator(NullLocator())
+    thousands(ax)
+    size_axis(ax, m, xs)
+    ax.set_ylabel("Sustained throughput (MiB/s)")
+    arrow(ax, "baseline network\nlimits all three", xy=(xs[1] - .03, m["tx"][1] * 1.15),
+          xytext=(xs[0] - .25, 700), ha="left", va="bottom")
+    flow = gbps_to_mibps(SINGLE_FLOW_GBPS)
+    at = dict(zip(m["names"], xs))
+    arrow(ax, f"one TCP flow caps rsync at {SINGLE_FLOW_GBPS:g} Gbps\n({flow:.0f} MiB/s) outside a\ncluster placement group",
+          xy=(at["16xlarge"], flow * 1.1), xytext=(at["8xlarge"] - .35, 760), ha="left", va="bottom")
+    arrow(ax, f"one SSH process limits\nrsync/SSH to {SSH_AES_CORE_MIBPS:.0f} MiB/s",
+          xy=(at["8xlarge"], SSH_AES_CORE_MIBPS * .9), xytext=(at["8xlarge"] - .6, 260),
+          ha="left", va="top")
+    last = len(xs) - 1
+    gap, gap_ssh = (m["tx"][last] / m[k][last] for k in ("rsync", "rsync_ssh"))
+    ax.annotate("", xy=(xs[last] + .14, m["tx"][last]), xytext=(xs[last] + .14, m["rsync_ssh"][last]),
+                arrowprops=dict(arrowstyle="<|-|>", lw=.7, color=INK, shrinkA=5, shrinkB=5,
+                                mutation_scale=7))
+    label(ax, xs[last] + .02, 2400,
+          f"{gap:.0f}× rsync\n{gap_ssh:.0f}× rsync/SSH", ha="right", va="center")
+
+    bursty = [n for n in m["names"] if I7I_LINEAR[n]["net_burst"] > I7I_LINEAR[n]["net_base"]]
+    bx.set_title(f"(b) Time to fill {COPY_FRACTION:.0%} of the receiver's SSD "
+                 f"({BURST_MIN:g}-minute burst through {bursty[-1]})")
+    bx.set_yscale("log")
+    hours = [.25, .5, 1, 2, 4, 8, 16]
+    bx.set_ylim(9, 1800)
+    bx.yaxis.set_major_locator(FixedLocator([h * 60 for h in hours]))
+    bx.yaxis.set_minor_locator(NullLocator())
+    bx.set_yticklabels([f"{h * 60:.0f} min" if h < 1 else f"{h:g} h" for h in hours])
+    size_axis(bx, m, xs)
+    bx.set_ylabel("Fill time")
+    # Group neighboring sizes whose tx fills pass through the same limits.
+    groups = []
+    for i, lim in enumerate(f["tx_limits"]):
+        if groups and groups[-1][2] == lim:
+            groups[-1][1] = i
+        else:
+            groups.append([i, i, lim])
+    for a, b, lim in groups:
+        y = f["tx"][a:b + 1].min() / 1.18
+        bx.plot([xs[a] - .15, xs[b] + .15], [y, y], color=BLUE, lw=.9, marker="|", ms=5, mew=.9)
+        if len(lim) == 1:
+            label(bx, (xs[a] + xs[b]) / 2, y / 1.06, f"tx limit: {lim[0]}", ha="center",
+                  va="top", color=BLUE, fontsize=8.5)
+        else:
+            text = "tx limits: " + " \u2192 ".join(lim[:-1]) + " \u2192\n" + lim[-1]
+            label(bx, xs[a] - .3, y / 1.06, text, ha="left", va="top", color=BLUE, fontsize=8.5)
+    bx.axhline(60, color=MUTED, lw=1.0, ls=(0, (4, 3)), zorder=1)
+    bx.axhline(8 * 60, color=MUTED, lw=1.0, ls=(0, (4, 3)), zorder=1)
+    label(bx, xs[0] - .25, 8 * 60 * 1.1, "8-hour workday: might as well\n"
+          "go home and check on rsync\ntomorrow.", va="bottom", color=MUTED, fontsize=8.5)
+    label(bx, xs[0] - .25, 66, "1-hour coffee break: tx is done\nbefore you sit back down.",
+          va="bottom", color=MUTED, fontsize=8.5)
+    arrow(bx, "one flow's rate stays flat\nas the drive grows",
+          xy=(at["16xlarge"], f["rsync"][m["names"].index("16xlarge")] / 1.15),
+          xytext=(at["8xlarge"] + .1, 140), ha="left", va="top")
+    bx.annotate("", xy=(xs[last] + .14, f["rsync_ssh"][last]), xytext=(xs[last] + .14, f["tx"][last]),
+                arrowprops=dict(arrowstyle="<|-|>", lw=.7, color=INK, shrinkA=5, shrinkB=5,
+                                mutation_scale=7))
+    label(bx, xs[last] + .02, np.sqrt(f["tx"][last] * f["rsync_ssh"][last]),
+          f"{f['tx'][last]:.0f} min vs\n{f['rsync'][last] / 60:.0f} h rsync\n"
+          f"{f['rsync_ssh'][last] / 60:.1f} h rsync/SSH", ha="right", va="center")
+    for n, v, tx, rs, ssh, ftx, frs, fssh in zip(m["names"], m["vcpu"], m["tx"], m["rsync"],
+                                                  m["rsync_ssh"], f["tx"], f["rsync"], f["rsync_ssh"]):
+        print(f"Scaling {n} ({v} vCPUs): tx {tx:,.0f}, rsync {rs:,.0f}, rsync/SSH {ssh:,.0f} MiB/s; "
+              f"fill tx {ftx:.1f}, rsync {frs:.1f}, rsync/SSH {fssh:.1f} min")
+    return save(fig, "cloud-scaling")
+
+
 def verification_limits():
     """Matched-range disk-read ceilings: the slower of sender and receiver."""
     rates = [("Local NVMe · Sender limited", RECEIVER_READ_MIBPS),
@@ -870,7 +1084,7 @@ def figure_verification():
 
 
 def plot():
-    for f in (figure_burst, figure_page_cache, figure_verification):
+    for f in (figure_burst, figure_scaling, figure_page_cache, figure_verification):
         for p in f():
             print(p)
 

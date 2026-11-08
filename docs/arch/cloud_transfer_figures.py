@@ -106,24 +106,29 @@ def xlarge_case(data):
 def completion_table():
     """Minutes and percentage gaps to the best modeled secure codec switch.
 
-    Rsync rows are optimistic network-only floors, not measured performance.
-    One ordinary SSH/TCP flow is capped at 5 Gbps outside a cluster placement
-    group, without ENA Express. Compression can increase logical throughput.
+    Rsync rows are optimistic floors, not measured transfers. One ordinary
+    TCP flow is capped at 5 Gbps outside a cluster placement group, without
+    ENA Express, and rsync's and SSH's processes each get one core. SSH's
+    core and the flow carry wire bytes, so compression raises their logical
+    limits; rsync's core handles logical bytes.
     """
     cases = [burst_case(seconds) for seconds in (m.BURST_MIN * 60, m.SHORT_BURST_S)]
     best = [c["optimal"]["done"] / 60 for c in cases]
     total = m.F1_DATASET_GIB * m.GIB
-    ssh = m.gbps_to_mibps(5)
+    flow = m.gbps_to_mibps(m.SINGLE_FLOW_GBPS)
     ratio = m.LZ4_COMPRESSED["ratio"]["zstd"]
+    plain = min(m.RSYNC_CORE_MIBPS, flow)
+    ssh = min(m.RSYNC_CORE_MIBPS, m.SSH_AES_CORE_MIBPS, flow)
+    ssh_zip = min(m.RSYNC_CORE_MIBPS, ratio * m.SSH_AES_CORE_MIBPS, ratio * flow)
     rows = [("Best modeled codec switch, AES-GCM", best, False),
             ("**tx adaptive, AES-GCM**", [c["tx"]["done"] / 60 for c in cases], False),
             ("tx no compression, AES-GCM", [c["none"]["done"] / 60 for c in cases], False),
             ("tx fixed lz4, AES-GCM", [c["lz4"]["done"] / 60 for c in cases], False),
             ("tx fixed zstd -1, AES-GCM", [c["zstd"]["done"] / 60 for c in cases], False),
-            ("rsync, plaintext, no compression", [total / ssh / 60] * 2, True),
+            ("rsync, plaintext, no compression", [total / plain / 60] * 2, True),
             ("rsync/SSH, AES-GCM, no compression", [total / ssh / 60] * 2, True),
             (f"rsync/SSH, AES-GCM, ideal {ratio:.3g}× compression",
-             [total / (ssh * ratio) / 60] * 2, True)]
+             [total / ssh_zip / 60] * 2, True)]
     out = ["| Method | 10 min network burst | 30 s network burst |",
            "| --- | ---: | ---: |"]
     for name, times, floor in rows:
