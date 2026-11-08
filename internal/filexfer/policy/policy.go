@@ -192,7 +192,8 @@ type CompressionPolicy struct {
 	// Comparison slots, used by one activity at a time:
 	//   - a background comparison (trial != home): its virtual frames' sums
 	//     of clipped costs and their squares, write seconds per logical
-	//     byte, least and greatest costs, and logical and wire bytes;
+	//     byte, greatest cost, and logical and wire bytes, and the sum of
+	//     home's costs on the frames they were predicted from (homeSum);
 	//   - a check (phaseCheck): its real frames' cost, write, logical, and
 	//     wire sums, the earlier candidate's penalty (penalty), and home's
 	//     write when it started (checkStartWrite);
@@ -324,12 +325,17 @@ func (p *CompressionPolicy) homeFrame(cost, write, ratio float32, schedule bool)
 	return p.decision(p.trial, "probe-down")
 }
 
-// trialFrame records a frame of the running trial and judges it.
-func (p *CompressionPolicy) trialFrame(cost, write, ratio, logical, wire float32) CompressionDecision {
-	home := p.mean
-	if p.tn == 0 || cost < p.tMin {
-		p.tMin = cost
-	}
+// A background comparison sums home's costs in tMin.
+func (p *CompressionPolicy) homeSum() float32     { return p.tMin }
+func (p *CompressionPolicy) setHomeSum(v float32) { p.tMin = v }
+
+// trialFrame records a frame of the running trial and judges it. home is
+// home's cost on the frame the trial's cost was predicted from: the trial
+// is judged against home on the same frames, so a path that changes, or
+// alternates, during the trial moves both sides alike, rather than against
+// a mean that lags it.
+func (p *CompressionPolicy) trialFrame(cost, write, ratio, logical, wire, home float32) CompressionDecision {
+	p.setHomeSum(p.homeSum() + min(home, homeClip*p.fast))
 	p.tMax = max(p.tMax, cost)
 	p.tSum += cost
 	p.tSq += cost * cost
@@ -347,7 +353,7 @@ func (p *CompressionPolicy) trialFrame(cost, write, ratio, logical, wire float32
 	n := float32(p.tn)
 	mean, tv := p.trialStats()
 	v := max(p.sampleVar, minVar, tv)
-	r := mean / home
+	r := mean / (p.homeSum() / n)
 	se := r * sqrt32(v/n+max(p.sampleVar, minVar)/float32(min(p.n, homeFrames)))
 	bound := 1 / float32(upMargin)
 	if dir == dirDown {
@@ -425,7 +431,7 @@ func (p *CompressionPolicy) lose(reason string) CompressionDecision {
 	dir := p.direction()
 	n := float32(p.tn)
 	mean, _ := p.trialStats()
-	lost := n * (max(p.tMin, mean)/p.mean - 1)
+	lost := n * (mean/p.mean - 1)
 	if p.leg == 1 {
 		// The first rung came close to home, so the next probe of the
 		// pair costs little whatever the second rung cost.

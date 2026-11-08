@@ -153,11 +153,15 @@ func (p *CompressionPolicy) decideSampled(current CompressionMode, m Compression
 	if d, started := p.dueCheck(current, m, f); started {
 		return d
 	}
+	priorRatio := float32(1)
+	if current != CompressionModeNone {
+		priorRatio = p.ratio
+	}
 	if p.trial != p.home && sample != nil && sampleCovers(*sample, current, p.trial) {
-		reason = p.compareSample(current, m, *sample)
+		reason = p.compareSample(current, m, *sample, f.cost)
 	}
 	if p.home != current {
-		p.adopted(current)
+		p.adopted(current, priorRatio)
 		reason = "sample-won"
 	}
 	return p.decision(p.home, reason)
@@ -247,9 +251,11 @@ func (p *CompressionPolicy) validateFrame(current CompressionMode, f frameCosts)
 		recovering := s.validatingCheck()
 		previous := s.previous
 		pathMoved := s.write > 1.25*s.priorWrite
-		if previous < current && !movedBy(s.write, s.priorWrite, 1.25) {
+		if previous < current && s.flags&flagSmallGain == 0 && !movedBy(s.write, s.priorWrite, 1.25) {
 			// Wire savings did not reduce the real write cost: the
 			// receiver's disk, rather than the network, can be binding.
+			// Smaller savings move a network path's writes too little to
+			// tell apart (floorRatio).
 			s.floor = min(s.write, s.priorWrite)
 		}
 		p.rehome(previous)
@@ -429,7 +435,7 @@ func (p *CompressionPolicy) dueCheck(current CompressionMode, m CompressionMetri
 
 // compareSample advances the background comparison with a virtual frame of
 // the candidate, predicted from this frame and the sample.
-func (p *CompressionPolicy) compareSample(current CompressionMode, m CompressionMetrics, sample encoding.CodecSamples) string {
+func (p *CompressionPolicy) compareSample(current CompressionMode, m CompressionMetrics, sample encoding.CodecSamples, homeCost float32) string {
 	s := &p.shadow
 	if current == CompressionModeNone && p.trial == CompressionModeLz4 && p.tn == 0 && sample.Has(encoding.EncodingZstd) {
 		lz4 := predictedFrame(current, CompressionModeLz4, m, sample, s.floor)
@@ -441,14 +447,18 @@ func (p *CompressionPolicy) compareSample(current CompressionMode, m Compression
 	v := predictedFrame(current, p.trial, m, sample, s.floor)
 	vl := float32(v.LogicalSize)
 	return p.trialFrame(float32((v.PrepareLatency+v.WriteLatency).Seconds())/vl,
-		float32(v.WriteLatency.Seconds())/vl, vl/float32(v.WireSize), vl, float32(v.WireSize)).Reason
+		float32(v.WriteLatency.Seconds())/vl, vl/float32(v.WireSize), vl, float32(v.WireSize), homeCost).Reason
 }
 
 // adopted starts validating the codec a background comparison selected.
-func (p *CompressionPolicy) adopted(current CompressionMode) {
+// priorRatio is the previous codec's compression ratio.
+func (p *CompressionPolicy) adopted(current CompressionMode, priorRatio float32) {
 	s := &p.shadow
 	s.phase, s.flags = phaseValidate, 0
 	s.previous, s.priorCost, s.priorWrite = current, s.cost, s.write
+	if p.ratio < floorRatio*priorRatio {
+		s.flags |= flagSmallGain // win set home's ratio to the samples' estimate
+	}
 	s.cost, s.write, s.low, s.validate = 0, 0, 0, validateFrames
 	s.predicted = p.mean // win set home's mean to the samples' estimate
 }
