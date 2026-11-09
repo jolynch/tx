@@ -270,29 +270,38 @@ codec's average cost as the bar only when it is higher by more than noise
 explains and the average has at least 16 frames behind it: ordinary frames
 that left their bytes buffered made the average too low, while ones that paid
 for their drains as they streamed did not, and a stall can slow a frame but
-not speed it up. Two observations at least 3% faster than the bar justify a
-switch; eight normal frames validate it and can restore the previous codec.
-Validation compares the mean raw time of every frame since the switch, check
-frames included, so a send buffer that absorbs the first frames cannot hide
-their cost. A fast response flushes its buffer after each baseline, check, and
-validation frame, rather than only when the request ends, so all of them are
-timed to the same point. Output already buffered drains first, untimed, so
-each flush times one frame's bytes. An episode sends at most 16 MiB of cheaper
-codecs and needs 28 MiB left in the file. All of a server's connections share
-a budget of about 1% of steady-state frame time for unsuccessful checks, so
-neither new connections nor new files get unpaid checks. A starting check
-charges the budget one frame in advance, which keeps most other connections
-from starting checks before its losses are known; it does not make checks
-exclusive. Detected cost changes, including 10% drift for eight home
-observations, allow an earlier check when fresh home timings confirm the
-change, without forgiving earlier losses. The confirmation needs more evidence
-the costlier the failed checks behind it. An unconfirmed change keeps their
-backoff. An adopted codec whose validated cost is more than twice from what it
-won at also allows an early check: the path changed while it validated, or the
-estimate missed a bottleneck. So does lz4 winning from zstd at a write cost no
-single path explains beside none's losing frame: the path changed during the
-check. Upward exploration stays in the background and resumes as soon as a
-check wins.
+not speed it up. A cheaper codec wins when the mean of its check frames, at
+least two, is at least 3% faster than the bar. It loses once that mean is
+slower than the bar by two standard errors of home's noise, or after four
+frames whose mean is not 3% faster, so one noisy frame cannot end a check the
+codec is winning. Eight normal frames then validate the switch and can restore
+the previous codec. Validation compares the mean raw time of every frame since
+the switch, check frames included, so a send buffer that absorbs the first
+frames cannot hide their cost. Each frame counts at most four times the
+previous codec's cost, so one stall cannot fail a much cheaper codec. A
+validation that fails with such a capped frame is retried after 24 frames,
+doubling while it keeps failing, rather than after the full 256. A fast
+response flushes its buffer after each baseline, check, and validation frame,
+rather than only when the request ends, so all of them are timed to the same
+point. Output already buffered drains first, untimed, so each flush times one
+frame's bytes. An episode sends at most 32 MiB of cheaper codecs and needs 44
+MiB left in the file. All of a server's connections share a budget of about 1%
+of steady-state frame time for unsuccessful checks, so neither new connections
+nor new files get unpaid checks. A starting check charges the budget one frame
+in advance, which keeps most other connections from starting checks before its
+losses are known; it does not make checks exclusive. Detected cost changes,
+including 10% drift for eight home observations, allow an earlier check when
+fresh home timings confirm the change, without forgiving earlier losses. The
+confirmation needs more evidence the costlier the failed checks behind it, and
+more on an early frame: it is asked again on each frame until home has 16
+observations. An unconfirmed change keeps their backoff. An adopted codec
+whose validated cost is more than twice from what it won at also allows an
+early check, as do validated writes more than 1.5 times from the write per
+wire byte it won at: the path changed while it validated, or the estimate
+missed a bottleneck. So does lz4 winning from zstd at a write cost no single
+path explains beside none's losing frame: the path changed during the check.
+Upward exploration stays in the background and resumes as soon as a check
+wins.
 
 ### Policy state
 

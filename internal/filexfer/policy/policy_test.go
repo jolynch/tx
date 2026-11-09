@@ -647,7 +647,7 @@ func TestRecoveryChecksMeasuredThroughput(t *testing.T) {
 	}{
 		{"none wins", CompressionModeZstdLevel1, []time.Duration{12 * time.Millisecond, 12 * time.Millisecond}, CompressionModeNone},
 		{"lz4 wins", CompressionModeZstdLevel1, []time.Duration{30 * time.Millisecond, 16 * time.Millisecond, 16 * time.Millisecond}, CompressionModeLz4},
-		{"four frames lose", CompressionModeZstdLevel1, []time.Duration{12 * time.Millisecond, 25 * time.Millisecond, 12 * time.Millisecond, 25 * time.Millisecond}, CompressionModeZstdLevel1},
+		{"close frames lose after four each", CompressionModeZstdLevel1, []time.Duration{20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond}, CompressionModeZstdLevel1},
 		{"lz4 restores", CompressionModeLz4, []time.Duration{30 * time.Millisecond}, CompressionModeLz4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

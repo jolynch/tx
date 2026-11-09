@@ -10,8 +10,19 @@ import (
 
 const recoveryBudgetScale = 100
 
-// recoveryCheckFrames is how many frames a winning check candidate sends.
-const recoveryCheckFrames = 2
+// recoveryCheckFrames is how many frames a winning check candidate sends at
+// least, and maxCheckFrames at most: a candidate whose mean is above the bar,
+// but not by more than home's noise explains, keeps sending.
+const (
+	recoveryCheckFrames = 2
+	maxCheckFrames      = 4
+)
+
+// checkZ is how many standard errors of the check frames' mean above the
+// bar end a check before maxCheckFrames. A single noisy frame must not
+// restore a codec the candidate beats: each restore backs off the next
+// check, which leaves the policy in the slower codec.
+const checkZ = 2
 
 // recoveryBaselineFrames home frames start each check episode.
 const recoveryBaselineFrames = 2
@@ -22,8 +33,9 @@ const recoveryBaselineFrames = 2
 const floorRatio = 1.25 * 1.25
 
 // RecoveryFrames is the frames a file must have left to allow a check: its
-// baseline frames, at most four check frames, and a useful frame afterward.
-const RecoveryFrames = recoveryBaselineFrames + 4 + 1
+// baseline frames, check frames for none and lz4, and a useful frame
+// afterward.
+const RecoveryFrames = recoveryBaselineFrames + 2*maxCheckFrames + 1
 
 // A policy is steady, checking cheaper codecs on real frames, or
 // validating a codec it adopted.
@@ -38,12 +50,14 @@ const (
 // whose frames are measured and charged to the recovery budget; flagRecheck
 // requests a check if that validation keeps the winner (pathMoved);
 // flagSmallGain marks an adopted codec that saves too few wire bytes over
-// the one it replaced to reveal a receiver-disk floor (floorRatio).
+// the one it replaced to reveal a receiver-disk floor (floorRatio);
+// flagStalled marks a validation with a frame capped at validateClip.
 const (
 	flagDue uint8 = 1 << iota
 	flagAfterCheck
 	flagRecheck
 	flagSmallGain
+	flagStalled
 )
 
 func (s *shadowState) due() bool { return s.flags&flagDue != 0 }
@@ -176,8 +190,10 @@ func (p *CompressionPolicy) observeBaseline(cost, write float32) CompressionDeci
 	return p.decision(p.trial, "recovery-check")
 }
 
-// A candidate gets at most two frames. Both must beat the prior baseline;
-// a losing none check may be followed by lz4, but never a stronger codec.
+// A candidate wins when the mean of at least recoveryCheckFrames frames
+// beats the prior baseline, and loses once its mean is clearly above it or
+// it has sent maxCheckFrames; a losing none check may be followed by lz4,
+// but never a stronger codec.
 func (p *CompressionPolicy) observeRecovery(m CompressionMetrics) CompressionDecision {
 	cost := float32(observedLatency(m).Seconds()) / float32(m.LogicalSize)
 	if p.trial == p.home {
@@ -185,16 +201,20 @@ func (p *CompressionPolicy) observeRecovery(m CompressionMetrics) CompressionDec
 	}
 	loss := p.recoveryLoss(m)
 	penalty := p.penalty() + max(0, cost/p.shadow.priorCost-1)
+	p.setPenalty(penalty)
 	p.tn++
 	p.tSum += cost
 	p.tWrite += float32(m.WriteLatency.Seconds()) / float32(m.LogicalSize)
 	p.tLogical += float32(m.LogicalSize)
 	p.tWire += float32(m.WireSize)
 	var d CompressionDecision
-	if cost*upMargin >= p.shadow.priorCost {
+	bar := p.shadow.priorCost / upMargin
+	mean := p.tSum / float32(p.tn)
+	se := sqrt32(max(p.sampleVar, minVar) / float32(p.tn))
+	if mean >= bar*(1+checkZ*se) || mean >= bar && p.tn >= maxCheckFrames {
 		if p.home == CompressionModeZstdLevel1 && p.trial == CompressionModeNone {
+			noneWrite := p.tWrite / float32(p.tn)
 			p.trial, p.tn = CompressionModeLz4, 0
-			noneWrite := p.tWrite
 			p.clearRecoverySamples()
 			p.setPenalty(penalty)
 			p.setCheckNoneWrite(noneWrite)
@@ -205,11 +225,10 @@ func (p *CompressionPolicy) observeRecovery(m CompressionMetrics) CompressionDec
 			p.backoff(dirDown, penalty)
 			d = p.decision(p.home, "recovery-restore")
 		}
-	} else if p.tn < recoveryCheckFrames {
+	} else if p.tn < recoveryCheckFrames || mean >= bar {
 		d = p.decision(p.trial, "recovery-confirm")
 	} else {
 		previous, previousRatio := p.home, p.ratio
-		mean := p.tSum / float32(p.tn)
 		write := p.tWrite / float32(p.tn)
 		ratio := p.trialRatio()
 		p.rehome(p.trial)

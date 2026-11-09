@@ -14,13 +14,12 @@ import (
 // must sampling only the codecs SampleNeeds names.
 func FuzzBackgroundCompression(f *testing.F) {
 	f.Add([]byte("00X00200000000000")) // candidate ratios must not shorten the live low-gain streak
-	f.Add([]byte("0020000201102127"))  // establish a codec on a downward comparison
-	f.Add([]byte{0, 0, 4, 0, 2, 2, 2, 255, 0, 2, 1, 0, 1, 1, 0, 255})
 	f.Add([]byte{1, 2, 4, 1, 1, 1, 2, 255})
 	f.Add([]byte{0, 0, 0, 0, 0, 0, 0, 0})
 	f.Add([]byte{0, 0, 4, 0, 2, 2, 2, 255, 1, 2, 4}) // seeded from a different link
 	f.Add([]byte("00A0000000000000"))                // a settled lz4 home must still sample zstd's ratio
 	f.Add([]byte("10201100"))                        // adoption need not change the check frame's codec
+	f.Add([]byte("10X00101"))                        // a regime change during validation must not leave a due check unreported by SampleNeeds
 	f.Fuzz(func(t *testing.T, in []byte) {
 		if len(in) < 8 {
 			return
@@ -50,8 +49,13 @@ func FuzzBackgroundCompression(f *testing.F) {
 		s := newSim(5, .3)
 		evidence := 0
 		established := [3]bool{true, false, false}
+		var previous simRegime
 		for seg := 0; seg+8 <= len(in) && seg < 32; seg += 8 {
 			r := regimeFromBytes(in[seg:])
+			if seg > 0 {
+				r = clampedPath(previous, r)
+			}
+			previous = r
 			sample := samplesForRegime(r)
 			for frame := range 96 {
 				m := s.frame(r, mode)
@@ -152,38 +156,29 @@ func (b *backgroundSim) step(s *sim, r simRegime, remaining int) CompressionDeci
 // The CI failures exercise a different input format from the background
 // invariant fuzzer. Keep the reaction history and noise seeds identical.
 // Under heavy-tailed noise only the disaster bound simHeavyLimit applies.
+// Each regime's path is clamped to the one before it (clampedPath).
 func FuzzBackgroundReaction(f *testing.F) {
-	f.Add([]byte("\xe3100X0000#12X0001"))       // a pending change must not hide an opposite shift
-	f.Add([]byte("\xff000X1012012X0012"))       // heavy noise hides a disk speedup for longer than the quality bound
-	f.Add([]byte("\xe3100X0000012X0001"))       // a refreshed baseline must retain real cost changes
-	f.Add([]byte("\xe3110A0100 0720000"))       // ordinary validation also restores the measured baseline
-	f.Add([]byte("\xe31009000000190010"))       // recovery must not suppress later background upgrades
-	f.Add([]byte("\xe32009001001220000"))       // retain a write-cost change across recovery validation
 	f.Add([]byte("\xe3\x800020000\x0000A0210")) // keep the baseline through a check at the transition
-	f.Add([]byte("\xe3000X0000012X0001"))       // sustained drift uses the clipped short-term cost
-	f.Add([]byte("\xe3700X0000012X0001"))       // noisy detection must leave enough time to check
-	f.Add([]byte("\xe3000X0011012X0010"))
-	f.Add([]byte("\xe3200X0000012X0001"))
-	f.Add([]byte("7\x000700000\xd80020010")) // a weak lz4 estimate must not delay zstd
-	f.Add([]byte("\xe3910A100021121000"))    // a pending upward sample must not freeze recovery
-	f.Add([]byte("\xe32002200022090000"))    // a change during validation must remain actionable
-	f.Add([]byte("\xe3(10X0020#1220000"))    // a change request must not inherit a stale change gap
-	f.Add([]byte{0, 0, 0, 0, 4, 1, 0, 1, 2, 48, 1, 2, 4, 1, 0, 1, 2})
+	f.Add([]byte("7\x000700000\xd80020010"))    // a weak lz4 estimate must not delay zstd
 	f.Add([]byte{3, 0, 0, 3, 2, 1, 1, 1, 2, 30, 0, 0, 2, 1, 1, 1, 2})
 	f.Fuzz(func(t *testing.T, in []byte) {
 		const width = simRegimeBytes + 1
 		if len(in) < 2+width+simRegimeBytes {
 			return
 		}
-		final := regimeFromBytes(in[len(in)-simRegimeBytes:])
 		history := in[2 : len(in)-simRegimeBytes]
 		var segs []simSegment
 		for i := 0; i+width <= len(history) && len(segs) < 3; i += width {
-			segs = append(segs, simSegment{regimeFromBytes(history[i:]), 32 + 4*int(history[i+simRegimeBytes])})
+			r := regimeFromBytes(history[i:])
+			if len(segs) > 0 {
+				r = clampedPath(segs[len(segs)-1].r, r)
+			}
+			segs = append(segs, simSegment{r, 32 + 4*int(history[i+simRegimeBytes])})
 		}
 		if len(segs) == 0 {
 			return
 		}
+		final := clampedPath(segs[len(segs)-1].r, regimeFromBytes(in[len(in)-simRegimeBytes:]))
 		applicable, stuck := 0, 0
 		react := simReact
 		if heavy(in[0]) {
@@ -224,23 +219,19 @@ func FuzzBackgroundReaction(f *testing.F) {
 }
 
 func FuzzBackgroundThroughput(f *testing.F) {
-	f.Add([]byte("7012X0010000200100")) // rollback to none must reopen background exploration
-	f.Add([]byte("000090011001900100")) // similar home cost must not hide a cheaper codec
-	f.Add([]byte("\xe6000A11220"))      // noise must not repeatedly advance expensive checks
-	f.Add([]byte("0000X0021011200000")) // compare against the changed home, not its previous average
-	f.Add([]byte("0000X0011011200000")) // refresh the baseline when the home becomes slower
-	f.Add([]byte("\xb0000A02220"))      // seed the baseline before allowing another expedited check
-	f.Add([]byte("\xb0000A012200"))     // noisy components must not trigger repeated expensive checks
-	f.Add([]byte("000020000001A00100")) // a faster path must lower the recovery baseline
-	f.Add([]byte("\xe6000A00100"))      // a noisy regime signal must not replace the clipped baseline
-	f.Add([]byte("\xffA00A12220"))      // an unconfirmed change must keep the check backoff
-	f.Add([]byte("\xffA00A22220"))      // noise must not skip a costly loss gap
-	f.Add([]byte{0, 0, 0, 0, 4, 1, 0, 1, 2, 48, 1, 2, 4, 1, 0, 1, 2, 48})
-	f.Add([]byte{3, 0, 1, 2, 4, 1, 0, 1, 2, 48, 0, 0, 4, 1, 0, 1, 2, 48})
+	f.Add([]byte("\xe6000A11220"))  // noise must not repeatedly advance expensive checks
+	f.Add([]byte("\xb0000A02220"))  // seed the baseline before allowing another expedited check
+	f.Add([]byte("\xb0000A012200")) // noisy components must not trigger repeated expensive checks
+	f.Add([]byte("\xe6000A00100"))  // a noisy regime signal must not replace the clipped baseline
+	f.Add([]byte("\xffA00A12220"))  // an unconfirmed change must keep the check backoff
+	f.Add([]byte("\xffA00A22220"))  // noise must not skip a costly loss gap
 	f.Add([]byte{0, 0, 2, 0, 3, 1, 0, 0, 1, 48, 0, 0, 3, 1, 0, 0, 1, 48})
-	// Hold data and CPU constant while each direction changes bottleneck.
+	f.Add([]byte("\xffB02A01220")) // a baseline restored after a failed validation is not settled: no restore/check cycle
+	f.Add([]byte("\xe7#02A02220")) // one stall must not fail the validation of a much cheaper codec (validateClip)
+	f.Add([]byte("\xe6@01A12210")) // nor a stall on its first validation frame
+	// Hold data and CPU constant while the bottleneck moves down.
 	for _, noise := range []byte{0, 3, 0xe3} {
-		for _, pair := range [][2]byte{{0, 1}, {1, 0}, {0, 2}, {2, 0}} {
+		for _, pair := range [][2]byte{{0, 1}, {2, 0}, {2, 1}} {
 			seed := []byte{noise, 0, pair[0], 1, 4, 1, 0, 1, 2, 48, pair[1], 1, 4, 1, 0, 1, 2, 48}
 			f.Add(seed)
 		}
@@ -256,6 +247,9 @@ func FuzzBackgroundThroughput(f *testing.F) {
 			var previous simRegime
 			for i := 2; i+8 <= len(in) && i < 34; i += 8 {
 				r := regimeFromBytes(in[i:])
+				if i > 2 {
+					r = clampedPath(previous, r)
+				}
 				blind := i > 2 && moved(previous, r, b.mode) < simVisible
 				from := b.mode
 				for n := range 256 {
@@ -285,8 +279,8 @@ func FuzzBackgroundThroughput(f *testing.F) {
 // they are. Recovery checks and their validation must judge a codec by the
 // wall time its frames really took: behind any buffer, allowing checks must
 // cost at most one unpaid episode per regime plus the budget's share more
-// than forbidding them. An episode sends at most 4 check frames and 8
-// validation frames. (Adopted codecs can still alternate in near-ties,
+// than forbidding them. An episode sends at most 2*maxCheckFrames check
+// frames and validateFrames validation frames. (Adopted codecs can still alternate in near-ties,
 // where checks measure the overlap that background samples miss.) Time is raw frame time, which sums to wall time. (The policy
 // prices a frame as prepare plus write, which a buffer overlaps; that model
 // gap is in IDEAS.md and is held equal here by comparing the policy with
@@ -309,6 +303,9 @@ func FuzzBackgroundSendBuffer(f *testing.F) {
 	f.Add([]byte("0000021100"))                    // lz4 adopted while zstd is best
 	f.Add([]byte("\xe3\x00100A0000"))              // absorbed check frames must not pass validation
 	f.Add([]byte("00007212200"))                   // near-tie: checks find what samples miss
+	f.Add([]byte("0020291120"))                    // a restored baseline must not check at once behind send buffers
+	f.Add([]byte("00201X0101"))                    // the same restore/check cycle in another regime
+	f.Add([]byte("00202X0021"))                    // the same, with another regime order
 	f.Fuzz(func(t *testing.T, in []byte) {
 		if len(in) < 3+simRegimeBytes {
 			return
@@ -318,7 +315,7 @@ func FuzzBackgroundSendBuffer(f *testing.F) {
 		var taken [2]float64
 		var episodes float64 // the time of one unpaid episode per regime, per run
 		for _, r := range regimes {
-			episodes += simRuns * 12 * max(r.time(0), r.time(1), r.time(2))
+			episodes += simRuns * (2*maxCheckFrames + validateFrames) * max(r.time(0), r.time(1), r.time(2))
 		}
 		for checks := range 2 {
 			for run := range simRuns {

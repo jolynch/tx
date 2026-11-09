@@ -220,13 +220,38 @@ instead of widening the current change; remove an entry when it ships.
   needs a counter `FileCompression` has no room for.
 - **Heavy noise forces repeated checks.** A detected cost change starts a
   check without waiting for the budget once fresh timings confirm it, and
-  heavy-tailed noise confirms often: `"\xe3C001A0201"` and
-  `"\xff\xff102A0011"` run about 2.5 episodes per 224 frames. The early
-  restore bounds each episode once failure is certain, and confirmation
-  needs more evidence after costly losses (z up to 4). Where one losing none
-  frame costs hundreds of lz4 frames (`"\xffA00A22220"`, lz4 ratio 225),
-  throughput still averages 0.64 of the best, mostly from the first,
-  unpaid check.
+  heavy-tailed noise confirms often: `TestPolicyNoiseCalibration` counts
+  about 2.2 checks per 1,000 steady frames under heavy noise, 2.0 of them
+  forced, against 0.6 under uniform noise. They cost only about 0.2% of
+  the time, and raising the evidence they need (a z floor of 1.5 to 2.5)
+  lowered efficiency: under heavy noise, checks also rescue the policy from
+  codecs it adopted on noise. Where one losing none frame costs hundreds of
+  lz4 frames (`"\xffA00A22220"`, lz4 ratio 225), throughput still averages
+  0.64 of the best, mostly from the first, unpaid check.
+- **Checks win without a margin.** A check candidate wins once the mean of
+  two or more frames is under the bar, so under heavy noise about 0.24
+  checks per 1,000 frames adopt a codec at least 10% slower, which
+  validation then has to restore. Requiring the mean to clear the bar by
+  one standard error before the last frame cut that to 0.18 but lowered
+  efficiency in every noise class, so the bar stays as it is.
+- **Validation underweights a long check.** A winning check seeds
+  validation with its frames' mean weighted as `recoveryCheckFrames` frames,
+  though the check can send up to `maxCheckFrames`. Its good frames count
+  for less than they measured, which makes the early restore slightly too
+  eager. Storing the check's frame count would need a byte that
+  `FileCompression`'s 128-byte limit does not have.
+- **Files under 44 MiB never check.** A check episode needs
+  `RecoveryFrames` (11 frames, 44 MiB) left in the file, so small files and
+  each file's last 44 MiB keep their codec, which background samples and
+  validation still correct.
+- **Near-ties cost a steady 0.4–0.8%.** In stationary regimes, the time
+  spent in a codec under 1.1 times slower than the best costs 0.4–0.8% at
+  every noise level `TestPolicyNoiseCalibration` measures. Telling a 5%
+  difference from noise at these frame counts needs far more frames than a
+  comparison or check sends.
+- **The fuzzers' path model leaves read speed free.** `clampedPath` limits
+  how a segment's bottleneck and rate can rise, but not the sender's read
+  speed, which can still rise 16 times between segments.
 - **A check's baseline rarely corrects a noisy average.** In fast mode,
   ordinary frames can leave their bytes buffered, so home's average omits
   wire time the check's flushed frames include. The faster baseline frame
