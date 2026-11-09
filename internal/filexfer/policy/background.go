@@ -33,12 +33,12 @@ type shadowState struct {
 // validateFrames is how many ordinary frames confirm an adopted codec.
 const validateFrames = 8
 
-// validateClip caps a validation frame at this multiple of the replaced
-// codec's cost. A stall costs every codec the same time, and that cost is
-// clipped (homeClip), so one stall must not fail a much cheaper codec. A
-// send buffer delays a frame by at most its own write, so only a frame of a
-// codec far above the 10% bound reaches the cap, and that codec still loses.
-const validateClip = 4
+// validateStall marks a validation frame that takes this multiple of the
+// replaced codec's cost as a stall. Validation still counts the frame in
+// full, since it can be write time a send buffer absorbed earlier, but a
+// stall costs every codec the same time and can fail a much cheaper one, so
+// a stalled validation that fails is retried soon (flagStalled).
+const validateStall = 4
 
 const (
 	futileMargin   = 2
@@ -197,29 +197,22 @@ func (p *CompressionPolicy) observeCost(m CompressionMetrics) frameCosts {
 		write:    float32(m.WriteLatency.Seconds()) / logical,
 	}
 	observed, write := f.observed, f.write
-	o, w := observed, write
-	if s.phase == phaseValidate && s.priorCost > 0 {
-		// A stall costs every codec the same time: cap it as home's
-		// clipped cost does, but loosely enough to keep absorbed time.
-		if o > validateClip*s.priorCost {
-			s.flags |= flagStalled
-		}
-		o, w = min(o, validateClip*s.priorCost), min(w, validateClip*s.priorCost)
+	if s.phase == phaseValidate && s.priorCost > 0 && observed > validateStall*s.priorCost {
+		s.flags |= flagStalled
 	}
 	if s.cost == 0 || s.dueNow() && p.n == 0 {
-		s.cost, s.write = o, w
+		s.cost, s.write = observed, write
 	} else if s.phase == phaseValidate {
 		// A send buffer can absorb a new codec's first frames, so their raw
 		// time understates its cost until the buffer fills. Validate the
-		// mean of every frame since the switch, clipped only at
-		// validateClip: absorbed time comes back on later frames, where an
-		// average clipped like home's would hide it.
+		// mean of every frame since the switch, unclipped: absorbed time
+		// comes back on later frames, where a clipped average would hide it.
 		n := float32(validateFrames - s.validate + 1)
 		if s.validatingCheck() {
 			n += recoveryCheckFrames // Seeded with the check frames' mean.
 		}
-		s.cost += (o - s.cost) / n
-		s.write += (w - s.write) / n
+		s.cost += (observed - s.cost) / n
+		s.write += (write - s.write) / n
 	} else if s.dueNow() && p.n < seedFrames && seedStall*observed < s.cost {
 		// The re-measure so far was a stall: start it over, as home's seed does.
 		s.cost, s.write = observed, write
@@ -233,8 +226,10 @@ func (p *CompressionPolicy) observeCost(m CompressionMetrics) frameCosts {
 		s.cost += (min(observed, 2*s.cost) - s.cost) / 4
 		s.write += (write - s.write) / 4
 	}
-	if s.floor > write*2 {
-		s.floor = 0 // The path became faster than the learned disk limit.
+	if s.floor > write*2 || p.n >= homeFrames && p.meanW*driftMargin < s.floor {
+		// The path became faster than the learned disk limit: every codec
+		// writes at least the limit while the disk binds.
+		s.floor = 0
 	}
 	if s.futileLeft > 0 {
 		s.futileLeft--

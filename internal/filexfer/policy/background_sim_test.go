@@ -219,19 +219,21 @@ func FuzzBackgroundReaction(f *testing.F) {
 }
 
 func FuzzBackgroundThroughput(f *testing.F) {
-	f.Add([]byte("\xe6000A11220"))  // noise must not repeatedly advance expensive checks
-	f.Add([]byte("\xb0000A02220"))  // seed the baseline before allowing another expedited check
-	f.Add([]byte("\xb0000A012200")) // noisy components must not trigger repeated expensive checks
-	f.Add([]byte("\xe6000A00100"))  // a noisy regime signal must not replace the clipped baseline
-	f.Add([]byte("\xffA00A12220"))  // an unconfirmed change must keep the check backoff
-	f.Add([]byte("\xffA00A22220"))  // noise must not skip a costly loss gap
+	f.Add([]byte("\xe6000A11220"))      // noise must not repeatedly advance expensive checks
+	f.Add([]byte("\xb0000A02220"))      // seed the baseline before allowing another expedited check
+	f.Add([]byte("\xb0000A012200"))     // noisy components must not trigger repeated expensive checks
+	f.Add([]byte("\xe6000A00100"))      // a noisy regime signal must not replace the clipped baseline
+	f.Add([]byte("\xffA00A12220"))      // an unconfirmed change must keep the check backoff
+	f.Add([]byte("\xffA00A22220"))      // noise must not skip a costly loss gap
+	f.Add([]byte("7012X0010000200100")) // rollback to none must reopen background exploration
+	f.Add([]byte{3, 0, 1, 2, 4, 1, 0, 1, 2, 48, 0, 0, 4, 1, 0, 1, 2, 48})
 	f.Add([]byte{0, 0, 2, 0, 3, 1, 0, 0, 1, 48, 0, 0, 3, 1, 0, 0, 1, 48})
 	f.Add([]byte("\xffB02A01220")) // a baseline restored after a failed validation is not settled: no restore/check cycle
-	f.Add([]byte("\xe7#02A02220")) // one stall must not fail the validation of a much cheaper codec (validateClip)
+	f.Add([]byte("\xe7#02A02220")) // one stall must not fail the validation of a much cheaper codec for long (validateStall)
 	f.Add([]byte("\xe6@01A12210")) // nor a stall on its first validation frame
-	// Hold data and CPU constant while the bottleneck moves down.
+	// Hold data and CPU constant while the bottleneck moves at one speed.
 	for _, noise := range []byte{0, 3, 0xe3} {
-		for _, pair := range [][2]byte{{0, 1}, {2, 0}, {2, 1}} {
+		for _, pair := range [][2]byte{{0, 1}, {1, 0}, {2, 0}, {2, 1}} {
 			seed := []byte{noise, 0, pair[0], 1, 4, 1, 0, 1, 2, 48, pair[1], 1, 4, 1, 0, 1, 2, 48}
 			f.Add(seed)
 		}

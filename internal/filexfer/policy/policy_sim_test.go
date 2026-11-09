@@ -264,16 +264,39 @@ func (r simRegime) pathSpeed() float64 {
 // clampedPath keeps r's data but limits how its path may differ from prev's.
 // Real paths slow abruptly and often, as a page cache fills or a network
 // clamps, and speed up rarely and by little. So a path may slow by any
-// factor, but speeds up by at most simMaxRise, and its bottleneck moves only
-// from a fast link to the network to the disk.
+// factor and move its bottleneck either way, as a receiver disk gives way to
+// a network whose credits ran out, but speeds up by at most simMaxRise. A
+// fast link is never a minor rise, so only a CPU-bound path stays CPU-bound.
 func clampedPath(prev, r simRegime) simRegime {
-	if rank := [...]int{simNetwork: 1, simDisk: 0, simCPU: 2}; rank[r.b] > rank[prev.b] {
+	limit := simMaxRise * prev.pathSpeed()
+	if r.pathSpeed() <= limit {
+		return r
+	}
+	if r.b == simCPU {
 		r.b, r.rate = prev.b, prev.rate
 	}
 	if r.b != simCPU {
-		r.rate = min(r.rate, simMaxRise*prev.pathSpeed())
+		r.rate = min(r.rate, limit)
 	}
 	return r
+}
+
+func TestClampedPath(t *testing.T) {
+	disk, network := simRegime{b: simDisk, rate: 512 * mib}, simRegime{b: simNetwork, rate: 128 * mib}
+	cpu := simRegime{b: simCPU, rate: 2 * gib}
+	for _, tc := range []struct {
+		name          string
+		prev, r, want simRegime
+	}{
+		{"a receiver disk gives way to a slower network", disk, network, network},
+		{"a network speeds up by at most simMaxRise", network, disk, simRegime{b: simDisk, rate: simMaxRise * 128 * mib}},
+		{"a network does not become a fast link", network, cpu, network},
+		{"a fast link slows to a network", cpu, network, network},
+	} {
+		if got := clampedPath(tc.prev, tc.r); got.b != tc.want.b || got.rate != tc.want.rate {
+			t.Errorf("%s: got %v at %.0f MiB/s, want %v at %.0f MiB/s", tc.name, got.b, got.rate/mib, tc.want.b, tc.want.rate/mib)
+		}
+	}
 }
 
 // regimeFromBytes decodes bottleneck, rate, data ratio (zstd's), lz4's share
@@ -524,6 +547,8 @@ func FuzzCompressionPolicyRegret(f *testing.F) {
 	f.Add(cat(head, seg([]byte{2, 0, 3, 1, 0, 0, 1}, 200)))                                        // CPU bound, slow codecs
 	f.Add(cat(head, seg([]byte{0, 1, 2, 1, 1, 1, 2}, 200), seg([]byte{1, 1, 2, 1, 1, 1, 2}, 200))) // network then receiver disk, ratio 2
 	f.Add(cat(head, seg([]byte{0, 1, 3, 1, 1, 1, 2}, 200), seg([]byte{1, 1, 2, 1, 1, 1, 2}, 200))) // network ratio 3, then receiver disk ratio 2
+	f.Add(cat(head, seg([]byte{1, 0, 0, 1, 1, 1, 2}, 160), seg([]byte{0, 0, 3, 1, 1, 1, 2}, 160))) // receiver disk, then network
+	f.Add(cat(head, seg([]byte{1, 2, 2, 1, 1, 1, 2}, 160), seg([]byte{0, 1, 2, 1, 1, 1, 2}, 200))) // receiver disk, then a slower network (CLOUD.md)
 	f.Add(cat(head, seg([]byte{0, 1, 3, 1, 1, 1, 2}, 150), seg([]byte{0, 1, 0, 1, 1, 1, 2}, 200))) // compressible, then incompressible
 	f.Add(cat(head, seg([]byte{0, 3, 3, 1, 1, 1, 2}, 200), seg([]byte{0, 0, 3, 1, 1, 1, 2}, 200))) // burst network credits run out
 	// Heavy-tailed noise: outliers, lognormal jitter, and both.
@@ -564,6 +589,7 @@ func FuzzCompressionPolicyRegret(f *testing.F) {
 	f.Add([]byte("\xeb00002A02220"))          // a baseline restored after a failed validation is not settled: no restore/check cycle
 	f.Add([]byte("\xee0\xf9\xf900A2222\x10")) // heavy noise: a check that costs a hundred frames needs more than noise to run
 	f.Add([]byte("\xeb0c002A01220"))          // stalls that fail a much cheaper codec must not back it off for 256 frames
+	f.Add([]byte("20001120010\x940290011C"))  // a disk floor must clear when a network path writes clearly faster
 	f.Fuzz(func(t *testing.T, in []byte) {
 		rg, ok := runRegret(t, in, simRuns)
 		if !ok {
