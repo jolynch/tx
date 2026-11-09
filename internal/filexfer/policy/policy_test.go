@@ -855,26 +855,34 @@ func TestRecoveryValidatesAndRestores(t *testing.T) {
 // replaced. Validation judges every frame since the switch, so the absorbed
 // frames cannot hide that, and it restores the faster codec.
 func TestRecoveryValidationSeesThroughAbsorbedFrames(t *testing.T) {
-	p, m := recoveryFixture(CompressionModeZstdLevel1)
-	d := startCheck(t, &p, m)
-	frame := func(raw time.Duration) {
-		m.PrepareLatency, m.WriteLatency, m.FrameLatency = 0, raw, raw
-		d = p.DecideSampled(d.Next, m, nil)
-	}
-	for range 3 {
-		frame(2 * time.Millisecond)
-	}
-	if p.home != CompressionModeNone || !p.RecoveryActive() {
-		t.Fatalf("absorbed check frames did not win: %+v", d)
-	}
-	for range 7 {
-		frame(40 * time.Millisecond)
-		if d.Next != CompressionModeNone {
-			break
+	// After three absorbed check frames, the buffer returns their time
+	// spread over the next frames or in a few blocked writes. Either way
+	// the codec costs more than the 20 ms codec it replaced.
+	for name, later := range map[string][]time.Duration{
+		"spread": {40, 40, 40, 40, 40, 40, 40},
+		"bursts": {2, 122, 2, 2, 2, 122, 2},
+	} {
+		p, m := recoveryFixture(CompressionModeZstdLevel1)
+		d := startCheck(t, &p, m)
+		frame := func(raw time.Duration) {
+			m.PrepareLatency, m.WriteLatency, m.FrameLatency = 0, raw, raw
+			d = p.DecideSampled(d.Next, m, nil)
 		}
-	}
-	if d.Next != CompressionModeZstdLevel1 || d.Reason != "recovery-restore" {
-		t.Fatalf("a codec twice as slow passed validation: %+v", d)
+		for range 3 {
+			frame(2 * time.Millisecond)
+		}
+		if p.home != CompressionModeNone || !p.RecoveryActive() {
+			t.Fatalf("%s: absorbed check frames did not win: %+v", name, d)
+		}
+		for _, raw := range later {
+			frame(raw * time.Millisecond)
+			if d.Next != CompressionModeNone {
+				break
+			}
+		}
+		if d.Next != CompressionModeZstdLevel1 || d.Reason != "recovery-restore" {
+			t.Fatalf("%s: a slower codec passed validation: %+v", name, d)
+		}
 	}
 }
 

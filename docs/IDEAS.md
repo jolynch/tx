@@ -250,8 +250,15 @@ instead of widening the current change; remove an entry when it ships.
   difference from noise at these frame counts needs far more frames than a
   comparison or check sends.
 - **The fuzzers' path model leaves read speed free.** `clampedPath` limits
-  how a segment's bottleneck and rate can rise, but not the sender's read
-  speed, which can still rise 16 times between segments.
+  how fast a segment's path can rise, but not the sender's read speed,
+  which can still rise 16 times between segments.
+- **Validation cannot tell a stall from returned write work.** One frame
+  over `validateStall` times the replaced codec's cost may be a stall that
+  costs every codec the same, or write time a send buffer absorbed earlier.
+  Validation counts it in full, so a stall can fail a much cheaper codec;
+  the policy then retries it after `initialGap`. Under heavy noise that
+  costs about 0.03% of stationary efficiency over capping such frames.
+  Telling them apart needs the bytes buffered at each flush.
 - **A check's baseline rarely corrects a noisy average.** In fast mode,
   ordinary frames can leave their bytes buffered, so home's average omits
   wire time the check's flushed frames include. The faster baseline frame

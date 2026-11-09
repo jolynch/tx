@@ -277,10 +277,10 @@ frames whose mean is not 3% faster, so one noisy frame cannot end a check the
 codec is winning. Eight normal frames then validate the switch and can restore
 the previous codec. Validation compares the mean raw time of every frame since
 the switch, check frames included, so a send buffer that absorbs the first
-frames cannot hide their cost. Each frame counts at most four times the
-previous codec's cost, so one stall cannot fail a much cheaper codec. A
-validation that fails with such a capped frame is retried after 24 frames,
-doubling while it keeps failing, rather than after the full 256. A fast
+frames cannot hide their cost. A stall can still fail a much cheaper codec,
+so a validation that fails with a frame over four times the previous codec's
+cost is retried after 24 frames, doubling while it keeps failing, rather
+than after the full 256. A fast
 response flushes its buffer after each baseline, check, and validation frame,
 rather than only when the request ends, so all of them are timed to the same
 point. Output already buffered drains first, untimed, so each flush times one

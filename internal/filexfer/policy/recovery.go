@@ -51,7 +51,7 @@ const (
 // requests a check if that validation keeps the winner (pathMoved);
 // flagSmallGain marks an adopted codec that saves too few wire bytes over
 // the one it replaced to reveal a receiver-disk floor (floorRatio);
-// flagStalled marks a validation with a frame capped at validateClip.
+// flagStalled marks a validation with a frame past validateStall.
 const (
 	flagDue uint8 = 1 << iota
 	flagAfterCheck
