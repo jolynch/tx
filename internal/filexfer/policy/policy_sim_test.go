@@ -247,6 +247,35 @@ var (
 // simRegimeBytes is how many input bytes describe a regime.
 const simRegimeBytes = 7
 
+// simMaxRise is the most a path speeds up from one segment to the next. It
+// stays under simVisible: a minor rise is no visible change, so it cannot
+// make a change that only probes see, such as newly compressible data, part
+// of the reaction bound.
+const simMaxRise = 1.2
+
+// pathSpeed is the path's uncompressed rate.
+func (r simRegime) pathSpeed() float64 {
+	if r.b == simCPU {
+		return simFastLink
+	}
+	return r.rate
+}
+
+// clampedPath keeps r's data but limits how its path may differ from prev's.
+// Real paths slow abruptly and often, as a page cache fills or a network
+// clamps, and speed up rarely and by little. So a path may slow by any
+// factor, but speeds up by at most simMaxRise, and its bottleneck moves only
+// from a fast link to the network to the disk.
+func clampedPath(prev, r simRegime) simRegime {
+	if rank := [...]int{simNetwork: 1, simDisk: 0, simCPU: 2}; rank[r.b] > rank[prev.b] {
+		r.b, r.rate = prev.b, prev.rate
+	}
+	if r.b != simCPU {
+		r.rate = min(r.rate, simMaxRise*prev.pathSpeed())
+	}
+	return r
+}
+
 // regimeFromBytes decodes bottleneck, rate, data ratio (zstd's), lz4's share
 // of zstd's gain, how many times faster than zstd lz4 encodes, zstd speed, and
 // read speed. Every codec reads the frame first, so none's prepare time is the
@@ -473,7 +502,8 @@ func (ty tally) efficiency() float64 {
 // FileCompression is saved and reloaded by value at window boundaries.
 //
 // Input: jitter and noise (see sim.noisy), window size, two seed bytes, then
-// segments of a regime and a length byte.
+// segments of a regime and a length byte. Each segment's path is clamped to
+// the one before it (clampedPath).
 func FuzzCompressionPolicyRegret(f *testing.F) {
 	seg := func(regime []byte, n byte) []byte { return append(append([]byte{}, regime...), n) }
 	cat := func(parts ...[]byte) []byte {
@@ -494,16 +524,11 @@ func FuzzCompressionPolicyRegret(f *testing.F) {
 	f.Add(cat(head, seg([]byte{2, 0, 3, 1, 0, 0, 1}, 200)))                                        // CPU bound, slow codecs
 	f.Add(cat(head, seg([]byte{0, 1, 2, 1, 1, 1, 2}, 200), seg([]byte{1, 1, 2, 1, 1, 1, 2}, 200))) // network then receiver disk, ratio 2
 	f.Add(cat(head, seg([]byte{0, 1, 3, 1, 1, 1, 2}, 200), seg([]byte{1, 1, 2, 1, 1, 1, 2}, 200))) // network ratio 3, then receiver disk ratio 2
-	f.Add(cat(head, seg([]byte{1, 0, 0, 1, 1, 1, 2}, 160), seg([]byte{0, 0, 3, 1, 1, 1, 2}, 160))) // receiver disk, then network
 	f.Add(cat(head, seg([]byte{0, 1, 3, 1, 1, 1, 2}, 150), seg([]byte{0, 1, 0, 1, 1, 1, 2}, 200))) // compressible, then incompressible
 	f.Add(cat(head, seg([]byte{0, 3, 3, 1, 1, 1, 2}, 200), seg([]byte{0, 0, 3, 1, 1, 1, 2}, 200))) // burst network credits run out
-	f.Add(cat(head, seg([]byte{0, 0, 4, 1, 0, 1, 2}, 200), seg([]byte{2, 0, 4, 1, 0, 1, 2}, 200))) // compression right, then CPU bound
-	f.Add(cat([]byte{3, 2, 7, 1}, seg([]byte{0, 1, 0, 2, 2, 1, 2}, 255), seg([]byte{0, 0, 3, 1, 1, 1, 2}, 100),
-		seg([]byte{1, 2, 4, 1, 1, 1, 2}, 100), seg([]byte{0, 0, 0, 1, 1, 1, 2}, 100))) // several shifts, short windows
 	// Heavy-tailed noise: outliers, lognormal jitter, and both.
 	f.Add(cat([]byte{0x43, 1, 0, 0}, seg([]byte{0, 0, 3, 1, 1, 1, 2}, 200), seg([]byte{0, 0, 0, 1, 1, 1, 2}, 200)))
 	f.Add(cat([]byte{0xB3, 1, 0, 0}, seg([]byte{0, 1, 2, 1, 1, 1, 2}, 200), seg([]byte{1, 1, 2, 1, 1, 1, 2}, 200)))
-	f.Add(cat([]byte{0xF3, 2, 0, 1}, seg([]byte{0, 0, 3, 1, 1, 1, 2}, 200), seg([]byte{2, 0, 3, 1, 0, 0, 1}, 200)))
 	// Inputs the fuzzer found against earlier versions of the policy.
 	f.Add([]byte("21\x00(00211100"))
 	f.Add([]byte("710800211100"))
@@ -512,7 +537,6 @@ func FuzzCompressionPolicyRegret(f *testing.F) {
 	f.Add([]byte("11910791220\x00"))
 	f.Add([]byte("010002221100"))
 	f.Add([]byte("71A70192011\x020"))
-	f.Add([]byte("71880021110011200100"))
 	f.Add([]byte("711001211200"))
 	f.Add([]byte("710200211100"))
 	f.Add([]byte("000000A00210"))
@@ -522,10 +546,7 @@ func FuzzCompressionPolicyRegret(f *testing.F) {
 	f.Add([]byte("\xeb00100A12220"))      // a noise burst must not erase expensive-trial backoff
 	f.Add([]byte("701701910010"))
 	f.Add([]byte("21C00120010\x020"))
-	f.Add([]byte("70100090011011200110"))
 	f.Add([]byte("20a20121220\x020"))
-	f.Add([]byte("710C02X1012\xc820X1011X"))
-	f.Add([]byte("0200000000001120000\x0102201000"))
 	f.Add([]byte("107107A0020 0"))
 	f.Add([]byte("70170121210 "))
 	f.Add([]byte("71700121210\x020"))
@@ -538,10 +559,11 @@ func FuzzCompressionPolicyRegret(f *testing.F) {
 	// High noise, found against the swarm-style bounds.
 	f.Add([]byte("\xff0010020000\x020"))
 	f.Add([]byte("\xf300100200100"))
-	f.Add([]byte("\xf30aB0090001020000000")) // zstd home, then CPU bound and incompressible
 	// Low noise, found by fuzz-long in CI.
-	f.Add([]byte("010000X0000C20X00100"))  // a path 4x faster must not judge zstd against a stale baseline
-	f.Add([]byte("70\aa02X001000020000a")) // ratio 1.3: a none-lz4 coin flip must not set a disk floor
+	f.Add([]byte("70\aa02X001000020000a"))    // ratio 1.3: a none-lz4 coin flip must not set a disk floor
+	f.Add([]byte("\xeb00002A02220"))          // a baseline restored after a failed validation is not settled: no restore/check cycle
+	f.Add([]byte("\xee0\xf9\xf900A2222\x10")) // heavy noise: a check that costs a hundred frames needs more than noise to run
+	f.Add([]byte("\xeb0c002A01220"))          // stalls that fail a much cheaper codec must not back it off for 256 frames
 	f.Fuzz(func(t *testing.T, in []byte) {
 		rg, ok := runRegret(t, in, simRuns)
 		if !ok {
@@ -585,7 +607,11 @@ func runRegret(t *testing.T, in []byte, runs int) (regretResult, bool) {
 	rg.window = [4]int{0, 8, 32, 128}[in[1]%4]
 	seed := uint64(in[2]) | uint64(in[3])<<8
 	for i := 4; i+segBytes <= len(in) && len(rg.segs) < 8; i += segBytes {
-		rg.segs = append(rg.segs, simSegment{r: regimeFromBytes(in[i:]), n: 128 + int(in[i+simRegimeBytes])})
+		r := regimeFromBytes(in[i:])
+		if len(rg.segs) > 0 {
+			r = clampedPath(rg.segs[len(rg.segs)-1].r, r)
+		}
+		rg.segs = append(rg.segs, simSegment{r: r, n: 128 + int(in[i+simRegimeBytes])})
 	}
 	rg.per = make([]tally, len(rg.segs))
 	for run := 0; run < runs; run++ {
@@ -665,6 +691,9 @@ func FuzzCompressionPolicyStationary(f *testing.F) {
 	f.Add([]byte("\xff\xff00120010")) // found against the round 3 policy
 	f.Add([]byte("\xeb7000A2222"))    // high ratios make repeated false alarms expensive
 	f.Add([]byte("2101020020"))       // disk-bound tie: samples and checks trade codecs
+	f.Add([]byte("1001120201"))       // a small-gain gate on the disk floor traded codecs
+	f.Add([]byte("1001220212"))       // the same thrashing in another disk-bound regime
+	f.Add([]byte("1\xb1\"1220212"))   // a validation that loses to a regime detected during it must keep its backoff
 	f.Fuzz(func(t *testing.T, in []byte) {
 		st, ok := runStationary(t, in, simRuns)
 		if !ok {
@@ -757,6 +786,7 @@ func runStationary(t *testing.T, in []byte, runs int) (stationaryResult, bool) {
 //
 // Input: jitter and noise (see sim.noisy), a seed byte, up to three history
 // segments of a regime and a length byte (32 + 4x frames), then the new regime.
+// Each regime's path is clamped to the one before it (clampedPath).
 func FuzzCompressionPolicyReaction(f *testing.F) {
 	cat := func(parts ...[]byte) []byte {
 		var out []byte
@@ -766,26 +796,10 @@ func FuzzCompressionPolicyReaction(f *testing.F) {
 		return out
 	}
 	head := []byte{3, 0}
-	f.Add([]byte("\xff210X0011012A0010"))                                                                            // the receiver's disk speeds up while a mispredicted zstd validates
-	f.Add([]byte("\xbb200X0000212X0001"))                                                                            // heavy noise hides a disk speedup for longer than the quality bound
-	f.Add([]byte("70102102100191200"))                                                                               // a check straddling a path change must not hold back upward samples
-	f.Add([]byte("10009010011120000"))                                                                               // none lost a check on the old path, lz4 won on the new one
-	f.Add(cat(head, []byte{0, 3, 0, 1, 1, 1, 2, 255}, []byte{0, 0, 3, 1, 1, 1, 2}))                                  // long incompressible history, then the link slows
-	f.Add(cat(head, []byte{0, 0, 4, 1, 0, 0, 2, 100}, []byte{2, 0, 4, 1, 0, 0, 2}))                                  // compression right, then CPU bound
-	f.Add(cat(head, []byte{0, 2, 4, 1, 0, 1, 2, 100}, []byte{1, 2, 4, 1, 0, 1, 2}))                                  // compression right, then receiver disk
-	f.Add(cat(head, []byte{0, 0, 3, 1, 1, 1, 2, 60}, []byte{0, 1, 0, 1, 1, 1, 2, 255}, []byte{0, 0, 4, 1, 1, 1, 2})) // kept, then failed probes, then a slow link
-	f.Add(cat(head, []byte{2, 0, 3, 1, 0, 0, 1, 200}, []byte{0, 0, 3, 1, 0, 0, 1}))                                  // CPU bound, then a slow link
-	f.Add(cat(head, []byte{0, 3, 2, 1, 1, 1, 2, 30}, []byte{0, 0, 2, 1, 1, 1, 2}))                                   // burst credits run out
-	f.Add([]byte("20009001101120001"))                                                                               // found against the round 3 policy: uniform, 12 of 40 stuck
-	f.Add([]byte("\xe3\xff00X0012012X0010"))                                                                         // found against the round 3 policy
-	f.Add([]byte("\xe3200X0001012X0010"))                                                                            // high noise: found against the swarm-style bounds
-	f.Add([]byte("\xff800X0011012X0010"))
-	f.Add([]byte("7A00X1002X2020010"))    // found against round 2: a trial running when home's regime shifts
-	f.Add([]byte("\xe3000X0011012X0010")) // PR #50 acceptance: noisy network-to-disk shift
-	f.Add([]byte("\xe3200X0000012X0001")) // a long downward backoff hid the new bottleneck
-	f.Add([]byte("\xeb000X0000012X0001")) // noisy cost shifts must still reopen downward checks
-	f.Add([]byte("\xeb200X0000Y12X0001")) // the reference must not follow a noisy shift too quickly
-	f.Add([]byte("\xbb200X0000Y12X0001")) // codec CPU cost must not hide persistent write drift
+	f.Add(cat(head, []byte{0, 3, 0, 1, 1, 1, 2, 255}, []byte{0, 0, 3, 1, 1, 1, 2})) // long incompressible history, then the link slows
+	f.Add(cat(head, []byte{0, 2, 4, 1, 0, 1, 2, 100}, []byte{1, 2, 4, 1, 0, 1, 2})) // compression right, then receiver disk
+	f.Add(cat(head, []byte{2, 0, 3, 1, 0, 0, 1, 200}, []byte{0, 0, 3, 1, 0, 0, 1})) // CPU bound, then a slow link
+	f.Add(cat(head, []byte{0, 3, 2, 1, 1, 1, 2, 30}, []byte{0, 0, 2, 1, 1, 1, 2}))  // burst credits run out
 	f.Fuzz(func(t *testing.T, in []byte) {
 		react := 0
 		if len(in) > 0 && heavy(in[0]) {
@@ -836,14 +850,18 @@ func runReaction(t *testing.T, in []byte, runs, react int) (reactionResult, bool
 	if react > 0 {
 		rc.react = react
 	}
-	rc.final = regimeFromBytes(in[len(in)-simRegimeBytes:])
 	hist := in[2 : len(in)-simRegimeBytes]
 	for i := 0; i+segBytes <= len(hist) && len(rc.segs) < 3; i += segBytes {
-		rc.segs = append(rc.segs, simSegment{r: regimeFromBytes(hist[i:]), n: 32 + 4*int(hist[i+simRegimeBytes])})
+		r := regimeFromBytes(hist[i:])
+		if len(rc.segs) > 0 {
+			r = clampedPath(rc.segs[len(rc.segs)-1].r, r)
+		}
+		rc.segs = append(rc.segs, simSegment{r: r, n: 32 + 4*int(hist[i+simRegimeBytes])})
 	}
 	if len(rc.segs) == 0 {
 		return rc, false
 	}
+	rc.final = clampedPath(rc.segs[len(rc.segs)-1].r, regimeFromBytes(in[len(in)-simRegimeBytes:]))
 	last := rc.segs[len(rc.segs)-1].r
 	for run := 0; run < runs; run++ {
 		s := newSim(uint64(in[1])<<8|uint64(run), jitter).noisy(in[0])

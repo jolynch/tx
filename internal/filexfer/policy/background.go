@@ -33,6 +33,13 @@ type shadowState struct {
 // validateFrames is how many ordinary frames confirm an adopted codec.
 const validateFrames = 8
 
+// validateClip caps a validation frame at this multiple of the replaced
+// codec's cost. A stall costs every codec the same time, and that cost is
+// clipped (homeClip), so one stall must not fail a much cheaper codec. A
+// send buffer delays a frame by at most its own write, so only a frame of a
+// codec far above the 10% bound reaches the cap, and that codec still loses.
+const validateClip = 4
+
 const (
 	futileMargin   = 2
 	futileFirstGap = 8
@@ -70,8 +77,12 @@ func (p *CompressionPolicy) BackgroundPending() bool {
 // see changed data; lz4 needs zstd's; zstd needs none, since its frames show
 // its ratio and SEND then takes no sample.
 func (p *CompressionPolicy) SampleNeeds() encoding.SampleSet {
+	flags := p.shadow.flags
+	if p.home == CompressionModeNone && p.shadow.dueNow() {
+		flags &^= flagDue // decideSampled clears it before reading a sample
+	}
 	switch {
-	case p.shadow.flags != 0 || p.shadow.phase != phaseSteady:
+	case flags != 0 || p.shadow.phase != phaseSteady:
 		return 0
 	case p.home == CompressionModeNone && p.shadow.futileLeft > 0:
 		// No codec could pay at this link speed; see futile.
@@ -186,19 +197,32 @@ func (p *CompressionPolicy) observeCost(m CompressionMetrics) frameCosts {
 		write:    float32(m.WriteLatency.Seconds()) / logical,
 	}
 	observed, write := f.observed, f.write
+	o, w := observed, write
+	if s.phase == phaseValidate && s.priorCost > 0 {
+		// A stall costs every codec the same time: cap it as home's
+		// clipped cost does, but loosely enough to keep absorbed time.
+		if o > validateClip*s.priorCost {
+			s.flags |= flagStalled
+		}
+		o, w = min(o, validateClip*s.priorCost), min(w, validateClip*s.priorCost)
+	}
 	if s.cost == 0 || s.dueNow() && p.n == 0 {
-		s.cost, s.write = observed, write
+		s.cost, s.write = o, w
 	} else if s.phase == phaseValidate {
 		// A send buffer can absorb a new codec's first frames, so their raw
 		// time understates its cost until the buffer fills. Validate the
-		// mean of every frame since the switch, unclipped: absorbed time
-		// comes back on later frames, where a clipped average would hide it.
+		// mean of every frame since the switch, clipped only at
+		// validateClip: absorbed time comes back on later frames, where an
+		// average clipped like home's would hide it.
 		n := float32(validateFrames - s.validate + 1)
 		if s.validatingCheck() {
 			n += recoveryCheckFrames // Seeded with the check frames' mean.
 		}
-		s.cost += (observed - s.cost) / n
-		s.write += (write - s.write) / n
+		s.cost += (o - s.cost) / n
+		s.write += (w - s.write) / n
+	} else if s.dueNow() && p.n < seedFrames && seedStall*observed < s.cost {
+		// The re-measure so far was a stall: start it over, as home's seed does.
+		s.cost, s.write = observed, write
 	} else if s.dueNow() && p.n < seedFrames {
 		// Re-measure the changed home before comparing cheaper frames.
 		// Its old clipped average can still be far below the new cost.
@@ -262,10 +286,18 @@ func (p *CompressionPolicy) validateFrame(current CompressionMode, f frameCosts)
 		p.seedRecoveryBaseline(s.priorCost, s.priorWrite)
 		if previous < current {
 			gap := uint16(maxGap)
-			if pathMoved {
+			switch {
+			case pathMoved:
 				gap = initialGap // Reconsider promptly under the new path.
+			case s.flags&flagStalled != 0:
+				// Stalls can fail a much cheaper codec: retry it soon,
+				// backing off while it keeps failing.
+				gap = min(max(2*p.gap[previous], initialGap), maxGap)
 			}
 			p.gap[previous], p.wait[previous] = gap, gap
+			// The lost validation answers any pending upward probe: a regime
+			// detected while it ran measured the codec against its estimate.
+			p.pending &^= dirUp
 		}
 		s.cost, s.write = s.priorCost, s.priorWrite
 		s.phase, s.flags = phaseSteady, s.flags&flagDue
@@ -284,6 +316,15 @@ func (p *CompressionPolicy) validateFrame(current CompressionMode, f frameCosts)
 		p.rememberChange(s.predicted, p.fastW, p.sampleVar)
 	}
 	if s.validate == 0 {
+		// The codec's write at its measured ratio on the path it won on.
+		if w := p.predictedWrite() / max(p.ratio, 1); !s.validatingCheck() && w > 0 &&
+			movedBy(s.write, w, compressedRegimePart) && abs32(s.write-w) > regimeFloor*s.cost {
+			// The codec's writes moved far from what it won at: the path
+			// changed under the switch, and the codec it replaced was judged
+			// at its old cost. A cheaper codec may now win.
+			p.requestRecovery()
+			p.rememberChange(s.predicted, w, p.sampleVar)
+		}
 		if s.flags&flagRecheck != 0 {
 			p.requestRecovery()
 		}
@@ -460,8 +501,16 @@ func (p *CompressionPolicy) adopted(current CompressionMode, priorRatio float32)
 		s.flags |= flagSmallGain // win set home's ratio to the samples' estimate
 	}
 	s.cost, s.write, s.low, s.validate = 0, 0, 0, validateFrames
-	s.predicted = p.mean // win set home's mean to the samples' estimate
+	// The win set home's estimates and ratio to the samples'.
+	s.predicted = p.mean
+	p.setPredictedWrite(p.meanW * max(p.ratio, 1))
 }
+
+// While a sampled codec validates, the trial slots are free: tWire keeps
+// the write per wire byte it won at, so a ratio the samples misjudged does
+// not read as a path change.
+func (p *CompressionPolicy) predictedWrite() float32     { return p.tWire }
+func (p *CompressionPolicy) setPredictedWrite(w float32) { p.tWire = w }
 
 // predictedFrame retains measured read/hash work, substitutes the candidate's
 // sampled encode cost, and scales writes by its ratio. A receiver-disk floor

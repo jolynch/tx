@@ -198,7 +198,9 @@ type CompressionPolicy struct {
 	//     wire sums, the earlier candidate's penalty (penalty), and home's
 	//     write when it started (checkStartWrite);
 	//   - a detected change waiting to check (flagDue): the references it
-	//     moved from (changeRefs) and the check gap it may skip (changeGap).
+	//     moved from (changeRefs) and the check gap it may skip (changeGap);
+	//   - a sampled codec validating (phaseValidate): the write per wire
+	//     byte it won at (predictedWrite).
 	// Starting one activity clears the slots of the last.
 	tSum, tSq, tMin, tMax, tWrite, tLogical, tWire float32
 
@@ -568,7 +570,13 @@ func (p *CompressionPolicy) changePersists(z float32) bool {
 		return true
 	}
 	v := max(variance, p.sampleVar)
-	margin := max(float32(driftMargin), 1+z*sqrt32(v/float32(min(p.n, homeFrames))))
+	// dueCheck asks again on each frame until homeFrames, so an earlier
+	// answer needs more confidence, as in a group-sequential test: for the
+	// cumulative cost mean, all the looks together pass noise about as
+	// rarely as one look at homeFrames.
+	n := float32(min(p.n, homeFrames))
+	z *= sqrt32(homeFrames / n)
+	margin := max(float32(driftMargin), 1+z*sqrt32(v/n))
 	// Independent prepare and write jitter can average out in total cost.
 	// Allow twice its relative variance for the shorter write EMA.
 	writeSD := sqrt32(2 * v)
