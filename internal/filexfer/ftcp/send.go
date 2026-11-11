@@ -895,6 +895,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 				FrameLatency:    stats.PrepareLatency + stats.WriteLatency,
 				RecoveryAllowed: fileEnd-cursor >= policy.RecoveryFrames*defaultFileFrameLogicalSize,
 				RecoveryReady:   out.rate.recoveryReady(),
+				Bottleneck:      out.rate.bottleneck(),
 			}
 			out.rate.observeFrame(stats.LogicalSize, stats.PrepareLatency+stats.WriteLatency)
 			var sample *encoding.CodecSamples

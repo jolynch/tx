@@ -3,8 +3,10 @@ package ftcp
 import (
 	"context"
 	"io"
+	"log"
 	"math"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -71,6 +73,13 @@ type sendRateSource struct {
 	// share; nil for a SEND outside a server, which then uses own.
 	budget *policy.RecoveryBudget
 	own    policy.RecoveryBudget
+	// limits is the TCP_INFO reading that began the current bottleneck span,
+	// taken at limitsAt; span is the class the last span showed, and
+	// bottleneck the class two spans in a row last showed.
+	limits     sysio.TCPLimits
+	limitsAt   time.Time
+	span       policy.Bottleneck
+	bottleneck policy.Bottleneck
 }
 
 // withSendRateSource returns ctx carrying src for conn, looking through a
@@ -94,9 +103,9 @@ func sendRateSourceFor(ctx context.Context, out io.Writer) *sendRateSource {
 	return src
 }
 
-// readDeliveryRate reads one TCP_INFO. Tests replace it to count reads or
-// script their results.
-var readDeliveryRate = (*sysio.TCPRateReader).DeliveryRate
+// readLimits reads one TCP_INFO. Tests replace it to count reads or script
+// their results.
+var readLimits = (*sysio.TCPRateReader).Limits
 
 // kernel reports whether the connection can have a kernel delivery rate.
 func (s *sendRateSource) kernel() bool { return s.conn != nil || s.reader != nil }
@@ -105,7 +114,110 @@ func (s *sendRateSource) deliveryRate() (bytesPerSec uint64, appLimited bool) {
 	if s.reader == nil {
 		s.reader = sysio.NewTCPRateReader(s.inj, s.conn)
 	}
-	return readDeliveryRate(s.reader)
+	l := readLimits(s.reader)
+	s.classify(l, time.Now())
+	return l.DeliveryRate, l.AppLimited
+}
+
+const (
+	// classifyWindow is the least time a bottleneck reading spans. The
+	// kernel counts its limited times in jiffies, 1 to 10 ms.
+	classifyWindow = 50 * time.Millisecond
+	// classifyShare is the share of a reading's time a limit must take to
+	// name the bottleneck: busy time of wall time, and receive-window-limited
+	// time of busy time.
+	classifyShare = 0.5
+	// classifyMinBusy is the least busy time whose limits a span reads:
+	// three jiffies at HZ=100, below which the limited times are mostly
+	// rounding.
+	classifyMinBusy = 30 * time.Millisecond
+)
+
+// classify names the connection's bottleneck from the TCP_INFO reading l
+// taken at now, against the reading that began the current span. A span
+// shorter than classifyWindow keeps the previous class, and a class takes
+// effect once two spans in a row show it, since the policy acts on it at
+// once.
+func (s *sendRateSource) classify(l sysio.TCPLimits, now time.Time) {
+	if !l.OK {
+		return
+	}
+	if l.NoLimits {
+		noLimitsOnce.Do(logNoLimits)
+		return
+	}
+	if !s.limitsAt.IsZero() && l.Busy >= s.limits.Busy {
+		wall := now.Sub(s.limitsAt)
+		if wall < classifyWindow {
+			return
+		}
+		busy := l.Busy - s.limits.Busy
+		span := policy.BottleneckNetwork
+		switch {
+		case busy >= classifyMinBusy && float64(l.RwndLimited-s.limits.RwndLimited) >= classifyShare*float64(busy):
+			// Whatever time the socket was busy, the receiver set its pace,
+			// so fewer wire bytes cannot shorten it, even when the sender
+			// also left the socket idle.
+			span = policy.BottleneckReceiver
+		case float64(busy) < classifyShare*float64(wall):
+			span = policy.BottleneckSender
+		}
+		if span == s.span {
+			s.bottleneck = span
+			storeProcessBottleneck(span, now)
+		}
+		s.span = span
+	}
+	s.limits, s.limitsAt = l, now
+}
+
+// noLimitsOnce logs, once per process, that the kernel cannot name a
+// bottleneck, which otherwise shows only as frames of unknown class.
+var noLimitsOnce sync.Once
+
+func logNoLimits() {
+	log.Print("txfer-rate: kernel TCP_INFO has no busy or limited times (needs Linux 4.10); bottleneck class unknown")
+}
+
+// sendBottleneck is the last class any connection in the process reached,
+// as a policy.Bottleneck in the low byte, and the Unix millisecond it was
+// reached above it. A connection reports it until it has a class of its
+// own: without keep-alive every SEND is a new connection, which needs two
+// spans to classify itself. Another peer's class can be wrong for this one
+// for those spans; no class at all leaves a disk-bound path compressing
+// until then. It expires after classifyStale, so a class no connection
+// confirms stops applying to new ones.
+var sendBottleneck atomic.Uint64
+
+// classifyStale is how long the process's class seeds new connections
+// after a connection last reached it.
+const classifyStale = 2 * time.Second
+
+func storeProcessBottleneck(b policy.Bottleneck, now time.Time) {
+	sendBottleneck.Store(uint64(now.UnixMilli())<<8 | uint64(b))
+}
+
+// processBottleneck returns the process's class at now, or unknown once it
+// is older than classifyStale.
+func processBottleneck(now time.Time) policy.Bottleneck {
+	v := sendBottleneck.Load()
+	if now.UnixMilli()-int64(v>>8) > classifyStale.Milliseconds() {
+		return policy.BottleneckUnknown
+	}
+	return policy.Bottleneck(v & 0xff)
+}
+
+// bottleneck returns the connection's latest bottleneck class, or the
+// process's before the connection has one. A connection with no TCP socket
+// never classifies itself, so it reports none.
+func (r *sendRate) bottleneck() policy.Bottleneck {
+	if r == nil || r.src == nil || !r.src.kernel() {
+		return policy.BottleneckUnknown
+	}
+	if r.src.bottleneck != policy.BottleneckUnknown {
+		return r.src.bottleneck
+	}
+	return processBottleneck(time.Now())
 }
 
 // observe adds an adaptive frame's wire bytes and measured write time to the
