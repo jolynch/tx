@@ -27,15 +27,9 @@ const checkZ = 2
 // recoveryBaselineFrames home frames start each check episode.
 const recoveryBaselineFrames = 2
 
-// floorRatio is the smallest compression ratio whose loss in a check can
-// reveal a receiver-disk floor: a network path would move writes by that
-// factor, well past the 1.25 a floor allows.
-const floorRatio = 1.25 * 1.25
-
 // RecoveryFrames is the frames a file must have left to allow a check: its
-// baseline frames, check frames for none and lz4, and a useful frame
-// afterward.
-const RecoveryFrames = recoveryBaselineFrames + 2*maxCheckFrames + 1
+// baseline frames, its check frames, and a useful frame afterward.
+const RecoveryFrames = recoveryBaselineFrames + maxCheckFrames + 1
 
 // A policy is steady, checking cheaper codecs on real frames, or
 // validating a codec it adopted.
@@ -47,16 +41,11 @@ const (
 
 // Flags qualify a phase: flagDue defers a requested check until home may
 // start one; flagAfterCheck marks a validation that follows a winning check,
-// whose frames are measured and charged to the recovery budget; flagRecheck
-// requests a check if that validation keeps the winner (pathMoved);
-// flagSmallGain marks an adopted codec that saves too few wire bytes over
-// the one it replaced to reveal a receiver-disk floor (floorRatio);
+// whose frames are measured and charged to the recovery budget;
 // flagStalled marks a validation with a frame past validateStall.
 const (
 	flagDue uint8 = 1 << iota
 	flagAfterCheck
-	flagRecheck
-	flagSmallGain
 	flagStalled
 )
 
@@ -137,7 +126,7 @@ func (p *CompressionPolicy) DecideSampled(current CompressionMode, m Compression
 	}
 	var loss time.Duration
 	if p.shadow.validatingCheck() && current == p.home {
-		loss = p.recoveryLoss(m)
+		loss = p.recoveryLoss(m, true)
 	}
 	d := p.decideSampled(current, m, sample)
 	d.RecoveryLoss += loss
@@ -160,9 +149,6 @@ func (p *CompressionPolicy) startRecovery(write float32) CompressionDecision {
 	p.trial, p.leg, p.tn = p.home, 0, 0
 	p.pending &^= dirDown
 	p.clearRecoverySamples()
-	// Keep the latest home's write cost: a moving average alone can hide a
-	// faster path at check start.
-	p.setCheckStartWrite(write)
 	return p.decision(p.home, "recovery-baseline")
 }
 
@@ -184,9 +170,11 @@ func (p *CompressionPolicy) observeBaseline(cost, write float32) CompressionDeci
 	if p.n >= homeFrames && p.tMin > s.priorCost*(1+winZ*se) {
 		s.priorCost, s.priorWrite = p.tMin, p.tWrite
 	}
+	// A check tests none, the usual answer when a codec stops paying. A
+	// codec between home and none is reached from none by background
+	// samples, which price its encode time.
 	p.trial, p.tn = CompressionModeNone, 0
 	p.clearRecoverySamples()
-	p.setCheckStartWrite(write)
 	return p.decision(p.trial, "recovery-check")
 }
 
@@ -199,36 +187,28 @@ func (p *CompressionPolicy) observeRecovery(m CompressionMetrics) CompressionDec
 	if p.trial == p.home {
 		return p.observeBaseline(cost, float32(m.WriteLatency.Seconds())/float32(m.LogicalSize))
 	}
-	loss := p.recoveryLoss(m)
+	loss := p.recoveryLoss(m, false)
 	penalty := p.penalty() + max(0, cost/p.shadow.priorCost-1)
 	p.setPenalty(penalty)
 	p.tn++
 	p.tSum += cost
+	p.tMax = max(p.tMax, cost)
 	p.tWrite += float32(m.WriteLatency.Seconds()) / float32(m.LogicalSize)
 	p.tLogical += float32(m.LogicalSize)
 	p.tWire += float32(m.WireSize)
 	var d CompressionDecision
 	bar := p.shadow.priorCost / upMargin
-	mean := p.tSum / float32(p.tn)
+	mean := p.checkMean()
 	se := sqrt32(max(p.sampleVar, minVar) / float32(p.tn))
 	if mean >= bar*(1+checkZ*se) || mean >= bar && p.tn >= maxCheckFrames {
-		if p.home == CompressionModeZstdLevel1 && p.trial == CompressionModeNone {
-			noneWrite := p.tWrite / float32(p.tn)
-			p.trial, p.tn = CompressionModeLz4, 0
-			p.clearRecoverySamples()
-			p.setPenalty(penalty)
-			p.setCheckNoneWrite(noneWrite)
-			d = p.decision(p.trial, "recovery-check")
-		} else {
-			p.trial, p.tn = p.home, 0
-			p.shadow.phase = phaseSteady
-			p.backoff(dirDown, penalty)
-			d = p.decision(p.home, "recovery-restore")
-		}
+		p.trial, p.tn = p.home, 0
+		p.shadow.phase = phaseSteady
+		p.backoff(dirDown, penalty)
+		d = p.decision(p.home, "recovery-restore")
 	} else if p.tn < recoveryCheckFrames || mean >= bar {
 		d = p.decision(p.trial, "recovery-confirm")
 	} else {
-		previous, previousRatio := p.home, p.ratio
+		previous := p.home
 		write := p.tWrite / float32(p.tn)
 		ratio := p.trialRatio()
 		p.rehome(p.trial)
@@ -247,61 +227,50 @@ func (p *CompressionPolicy) observeRecovery(m CompressionMetrics) CompressionDec
 		p.shadow.cost, p.shadow.write, p.shadow.predicted = mean, write, mean
 		p.shadow.validate, p.shadow.low = validateFrames, 0
 		p.shadow.phase, p.shadow.flags = phaseValidate, flagAfterCheck
-		// An unchanged write cost despite more wire bytes is an observed
-		// floor for later background comparisons, not another codec sample.
-		// Only a codec that saved enough wire bytes can tell a disk floor
-		// from noise: below floorRatio, a network path moves writes too
-		// little to tell apart.
-		if p.home == CompressionModeNone && previousRatio >= floorRatio &&
-			!movedBy(write, p.shadow.priorWrite, 1.25) && !movedBy(write, p.checkStartWrite(), 1.25) {
-			p.shadow.floor = min(write, p.shadow.priorWrite)
-		}
 		// Upward comparisons resume at once: a path change can straddle the
-		// check, and a disk floor the check exposed is recorded above.
+		// check.
 		p.pending = 0
-		if p.pathMoved(previous, write, ratio) {
-			// none lost on a path the check outlived; check it again if lz4
-			// validates, rather than wait out the debt it incurred.
-			p.shadow.flags |= flagRecheck
-		}
 		d = p.decision(p.home, "recovery-won")
 	}
 	d.RecoveryLoss = loss
 	return d
 }
 
-// A check sums its frames in the comparison slots, keeps the penalty an
-// earlier candidate lost in tSq, and home's write at its start in tMax.
-func (p *CompressionPolicy) penalty() float32             { return p.tSq }
-func (p *CompressionPolicy) setPenalty(v float32)         { p.tSq = v }
-func (p *CompressionPolicy) checkStartWrite() float32     { return p.tMax }
-func (p *CompressionPolicy) setCheckStartWrite(w float32) { p.tMax = w }
-
-// After none loses a check from zstd, tMin keeps its write cost per logical
-// byte for pathMoved.
-func (p *CompressionPolicy) checkNoneWrite() float32     { return p.tMin }
-func (p *CompressionPolicy) setCheckNoneWrite(w float32) { p.tMin = w }
-
-// pathMoved reports whether lz4, winning a check from zstd after none lost,
-// wrote at a cost no single path explains. On one path, lz4's write per
-// logical byte lies between none's and none's over the ratio: a disk writes
-// logical bytes, a network wire bytes. Outside that range by regimePart, the
-// path changed between none's frame and lz4's.
-func (p *CompressionPolicy) pathMoved(previous CompressionMode, write, ratio float32) bool {
-	none := p.checkNoneWrite()
-	if previous != CompressionModeZstdLevel1 || p.home != CompressionModeLz4 || none <= 0 {
-		return false
-	}
-	return write*regimePart < none/max(1, ratio) || write > none*regimePart
-}
+// A check sums its frames in the comparison slots and keeps its penalty in
+// tSq.
+func (p *CompressionPolicy) penalty() float32     { return p.tSq }
+func (p *CompressionPolicy) setPenalty(v float32) { p.tSq = v }
 
 func (p *CompressionPolicy) clearRecoverySamples() {
 	p.tSum, p.tSq, p.tMin, p.tMax, p.tWrite, p.tLogical, p.tWire = 0, 0, 0, 0, 0, 0, 0
 }
 
-func (p *CompressionPolicy) recoveryLoss(m CompressionMetrics) time.Duration {
+// checkMean returns the running check leg's mean cost, with its greatest
+// frame counted at most homeClip times the mean of the others, as a trial's
+// is: under heavy noise one stalled frame would otherwise decide the leg.
+func (p *CompressionPolicy) checkMean() float32 {
+	n := float32(p.tn)
+	sum := p.tSum
+	if p.tn >= 2 {
+		if c := homeClip * (sum - p.tMax) / (n - 1); p.tMax > c {
+			sum += c - p.tMax
+		}
+	}
+	return sum / n
+}
+
+// recoveryLoss is a check or validation frame's excess over the codec the
+// check replaced. In validation (validating), a frame counts at most
+// validateStall times that codec's cost: it may be a stall, and charging it
+// in full would hold off checks for thousands of frames. A codec that is
+// wrong on every frame still pays for each. A check's own frames charge in
+// full, since its mean already clips one stall.
+func (p *CompressionPolicy) recoveryLoss(m CompressionMetrics, validating bool) time.Duration {
 	baseline := float64(p.shadow.priorCost) * float64(m.LogicalSize) * float64(time.Second)
 	elapsed := observedLatency(m)
+	if validating && baseline > 0 {
+		elapsed = min(elapsed, time.Duration(validateStall*baseline))
+	}
 	if baseline >= float64(elapsed) {
 		return 0
 	}

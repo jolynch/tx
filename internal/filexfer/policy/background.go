@@ -14,8 +14,8 @@ const BackgroundWinFrames = 4
 // shadowState keeps observed frame costs separate from the trial engine's
 // estimates. It contains no worker or buffer, so file state remains copyable.
 type shadowState struct {
-	cost, write, priorCost, priorWrite, floor float32 // seconds per logical byte
-	zstdRatio                                 float32
+	cost, write, priorCost, priorWrite float32 // seconds per logical byte
+	zstdRatio                          float32
 	// predicted is the adopted codec's cost per byte when it won: a
 	// sample's estimate, or the checks' measurement.
 	predicted                  float32
@@ -153,6 +153,9 @@ func (p *CompressionPolicy) decideSampled(current CompressionMode, m Compression
 		s.phase, s.flags = phaseSteady, 0
 		return p.dropToNone(f.logical / float32(m.WireSize))
 	}
+	if d, dropped := p.followBottleneck(current, m, f); dropped {
+		return d
+	}
 	if p.shadow.phase == phaseValidate {
 		if d, restored := p.validateFrame(current, f); restored {
 			return d
@@ -164,15 +167,11 @@ func (p *CompressionPolicy) decideSampled(current CompressionMode, m Compression
 	if d, started := p.dueCheck(current, m, f); started {
 		return d
 	}
-	priorRatio := float32(1)
-	if current != CompressionModeNone {
-		priorRatio = p.ratio
-	}
 	if p.trial != p.home && sample != nil && sampleCovers(*sample, current, p.trial) {
 		reason = p.compareSample(current, m, *sample, f.cost)
 	}
 	if p.home != current {
-		p.adopted(current, priorRatio)
+		p.adopted(current)
 		reason = "sample-won"
 	}
 	return p.decision(p.home, reason)
@@ -226,11 +225,6 @@ func (p *CompressionPolicy) observeCost(m CompressionMetrics) frameCosts {
 		s.cost += (min(observed, 2*s.cost) - s.cost) / 4
 		s.write += (write - s.write) / 4
 	}
-	if s.floor > write*2 || p.n >= homeFrames && p.meanW*driftMargin < s.floor {
-		// The path became faster than the learned disk limit: every codec
-		// writes at least the limit while the disk binds.
-		s.floor = 0
-	}
 	if s.futileLeft > 0 {
 		s.futileLeft--
 	}
@@ -262,21 +256,26 @@ func (p *CompressionPolicy) validateFrame(current CompressionMode, f frameCosts)
 	if s.validatingCheck() {
 		done += recoveryCheckFrames
 	}
-	if s.cost*done > s.priorCost*1.10*(done+float32(s.validate-1)) {
+	bar := s.priorCost * 1.10
+	if p.bottleneck() == BottleneckReceiver && !s.validatingCheck() {
+		// Under a receiver class a codec must deliver at least half the
+		// gain its samples predicted, as it does under a small receive
+		// window, where fewer wire bytes shorten the writes; in front of a
+		// receiver disk it gains nothing, and noise in a few frames must
+		// not pass it.
+		bar = s.priorCost
+		if s.predicted > 0 && s.predicted < s.priorCost {
+			bar = (s.priorCost + s.predicted) / 2
+		}
+	}
+	if s.cost*done > bar*(done+float32(s.validate-1)) {
 		s.validate = 1
 	}
 	s.validate--
-	if s.validate == 0 && s.cost > s.priorCost*1.10 {
+	if s.validate == 0 && s.cost > bar {
 		recovering := s.validatingCheck()
 		previous := s.previous
 		pathMoved := s.write > 1.25*s.priorWrite
-		if previous < current && s.flags&flagSmallGain == 0 && !movedBy(s.write, s.priorWrite, 1.25) {
-			// Wire savings did not reduce the real write cost: the
-			// receiver's disk, rather than the network, can be binding.
-			// Smaller savings move a network path's writes too little to
-			// tell apart (floorRatio).
-			s.floor = min(s.write, s.priorWrite)
-		}
 		p.rehome(previous)
 		p.seedRecoveryBaseline(s.priorCost, s.priorWrite)
 		if previous < current {
@@ -287,6 +286,16 @@ func (p *CompressionPolicy) validateFrame(current CompressionMode, f frameCosts)
 			case s.flags&flagStalled != 0:
 				// Stalls can fail a much cheaper codec: retry it soon,
 				// backing off while it keeps failing.
+				gap = min(max(2*p.gap[previous], initialGap), maxGap)
+			case p.bottleneck() == BottleneckReceiver && s.cost > s.priorCost:
+				// A receiver disk's writes never shrink, yet samples keep
+				// predicting that they will: back off further each time.
+				gap = min(max(2*p.gap[previous], maxGap), maxLossGap)
+				p.class |= classBackoff
+			case p.bottleneck() == BottleneckReceiver:
+				// A codec that gained, though less than half what it
+				// predicted, is likely a small receive window under
+				// noise: retry it soon, as after a stall.
 				gap = min(max(2*p.gap[previous], initialGap), maxGap)
 			}
 			p.gap[previous], p.wait[previous] = gap, gap
@@ -320,12 +329,69 @@ func (p *CompressionPolicy) validateFrame(current CompressionMode, f frameCosts)
 			p.requestRecovery()
 			p.rememberChange(s.predicted, w, p.sampleVar)
 		}
-		if s.flags&flagRecheck != 0 {
-			p.requestRecovery()
+		if pw := p.predictedLogicalWrite(); !s.validatingCheck() && pw > 0 && s.predicted > pw {
+			// Its encode time moved far from what it won at: the data
+			// changed under the switch. Its total can still match the
+			// estimate when its writes moved the other way, and a cheaper
+			// codec may now win. Confirm against the estimate.
+			if prep := s.cost - s.write; movedBy(prep, s.predicted-pw, regimePart) &&
+				abs32(prep-(s.predicted-pw)) > regimeFloor*s.cost {
+				p.requestRecovery()
+				p.rememberChange(s.predicted, pw, p.sampleVar)
+			}
 		}
 		s.phase, s.flags = phaseSteady, s.flags&flagDue
 	}
 	return CompressionDecision{}, false
+}
+
+// followBottleneck acts when the socket starts reporting a receiver that
+// paces it. A slow receiver disk writes the same logical bytes under every
+// codec, so fewer wire bytes cannot shorten its writes: a compressed codec
+// drops to none at once. A receive window below the path's bandwidth-delay
+// product reads the same, though there fewer wire bytes do shorten the
+// writes, so upward samples resume, and validation on real frames keeps a
+// codec only where it delivers half the gain its samples predicted.
+// Other classes leave the decision to frame costs. A sender class describes
+// only the codec it was read under, and checks of cheaper codecs on real
+// frames already find a sender that cannot keep up.
+func (p *CompressionPolicy) followBottleneck(current CompressionMode, m CompressionMetrics, f frameCosts) (CompressionDecision, bool) {
+	if m.Bottleneck == BottleneckUnknown {
+		// No reading, as on a new connection whose process class expired:
+		// keep the class the file last saw.
+		return CompressionDecision{}, false
+	}
+	prev := p.bottleneck()
+	p.class = m.Bottleneck | p.class&classBackoff
+	if prev == BottleneckReceiver && m.Bottleneck != BottleneckReceiver && p.class&classBackoff != 0 {
+		// Backoff a receiver disk earned must not hold another path:
+		// probe it as a new one. Backoff earned before stays.
+		for e := range p.gap {
+			p.gap[e], p.wait[e] = min(p.gap[e], maxGap), min(p.wait[e], initialGap)
+		}
+		p.class &^= classBackoff
+	}
+	if m.Bottleneck != BottleneckReceiver || prev == BottleneckReceiver {
+		return CompressionDecision{}, false
+	}
+	s := &p.shadow
+	s.futileLeft = max(s.futileLeft, futileFirstGap)
+	if p.BackgroundPending() {
+		// A pending comparison measured home on the old path.
+		p.trial, p.leg, p.tn = p.home, 0, 0
+	}
+	if current == CompressionModeNone {
+		return CompressionDecision{}, false
+	}
+	s.cost, s.write, s.validate, s.low = f.observed, f.write, 0, 0
+	s.phase, s.flags = phaseSteady, 0
+	// The pair's gap measured none's losses on another path: probe
+	// upward again after initialGap.
+	ratio := f.logical / float32(max(1, m.WireSize))
+	p.rehome(CompressionModeNone)
+	p.ratio, p.refRatio = ratio, ratio
+	p.pending, p.wait[0] = 0, initialGap
+	return p.decision(CompressionModeNone, "receiver-bound"), true
 }
 
 // futileSample stops comparing and sampling an uncompressed home while no
@@ -409,7 +475,6 @@ func (p *CompressionPolicy) observeHome(current CompressionMode, m CompressionMe
 		p.wait[p.edge(dirDown)]--
 	}
 	if reason == "regime" {
-		s.floor = 0
 		if current == CompressionModeNone && s.phase == phaseSteady {
 			// A newly useful codec is validated against the changed raw
 			// path, rather than an average still clipped near its old rate.
@@ -472,52 +537,51 @@ func (p *CompressionPolicy) dueCheck(current CompressionMode, m CompressionMetri
 // compareSample advances the background comparison with a virtual frame of
 // the candidate, predicted from this frame and the sample.
 func (p *CompressionPolicy) compareSample(current CompressionMode, m CompressionMetrics, sample encoding.CodecSamples, homeCost float32) string {
-	s := &p.shadow
 	if current == CompressionModeNone && p.trial == CompressionModeLz4 && p.tn == 0 && sample.Has(encoding.EncodingZstd) {
-		lz4 := predictedFrame(current, CompressionModeLz4, m, sample, s.floor)
-		zstd := predictedFrame(current, CompressionModeZstdLevel1, m, sample, s.floor)
+		lz4 := predictedFrame(current, CompressionModeLz4, m, sample)
+		zstd := predictedFrame(current, CompressionModeZstdLevel1, m, sample)
 		if float64(zstd.PrepareLatency+zstd.WriteLatency)*upMargin < float64(lz4.PrepareLatency+lz4.WriteLatency) {
 			p.trial, p.leg = CompressionModeZstdLevel1, 1
 		}
 	}
-	v := predictedFrame(current, p.trial, m, sample, s.floor)
+	v := predictedFrame(current, p.trial, m, sample)
 	vl := float32(v.LogicalSize)
 	return p.trialFrame(float32((v.PrepareLatency+v.WriteLatency).Seconds())/vl,
 		float32(v.WriteLatency.Seconds())/vl, vl/float32(v.WireSize), vl, float32(v.WireSize), homeCost).Reason
 }
 
 // adopted starts validating the codec a background comparison selected.
-// priorRatio is the previous codec's compression ratio.
-func (p *CompressionPolicy) adopted(current CompressionMode, priorRatio float32) {
+func (p *CompressionPolicy) adopted(current CompressionMode) {
 	s := &p.shadow
 	s.phase, s.flags = phaseValidate, 0
 	s.previous, s.priorCost, s.priorWrite = current, s.cost, s.write
-	if p.ratio < floorRatio*priorRatio {
-		s.flags |= flagSmallGain // win set home's ratio to the samples' estimate
-	}
 	s.cost, s.write, s.low, s.validate = 0, 0, 0, validateFrames
 	// The win set home's estimates and ratio to the samples'.
 	s.predicted = p.mean
 	p.setPredictedWrite(p.meanW * max(p.ratio, 1))
+	p.setPredictedLogicalWrite(p.meanW)
 }
 
-// While a sampled codec validates, the trial slots are free: tWire keeps
+// While a sampled codec validates, the trial slots are free. tWire keeps
 // the write per wire byte it won at, so a ratio the samples misjudged does
-// not read as a path change.
-func (p *CompressionPolicy) predictedWrite() float32     { return p.tWire }
-func (p *CompressionPolicy) setPredictedWrite(w float32) { p.tWire = w }
+// not read as a path change, and tMax its write per logical byte, which
+// splits its estimate into encode and write time.
+func (p *CompressionPolicy) predictedWrite() float32            { return p.tWire }
+func (p *CompressionPolicy) setPredictedWrite(w float32)        { p.tWire = w }
+func (p *CompressionPolicy) predictedLogicalWrite() float32     { return p.tMax }
+func (p *CompressionPolicy) setPredictedLogicalWrite(w float32) { p.tMax = w }
 
 // predictedFrame retains measured read/hash work, substitutes the candidate's
-// sampled encode cost, and scales writes by its ratio. A receiver-disk floor
-// learned from a failed switch is charged per logical byte, without compression.
-func predictedFrame(current, candidate CompressionMode, m CompressionMetrics, sample encoding.CodecSamples, floor float32) CompressionMetrics {
+// sampled encode cost, and scales writes by its ratio. A receiver that paces
+// the writes is the socket's to report (followBottleneck), not the
+// prediction's.
+func predictedFrame(current, candidate CompressionMode, m CompressionMetrics, sample encoding.CodecSamples) CompressionMetrics {
 	scale := float64(m.LogicalSize) / float64(sample.LogicalSize)
 	prepare := max(m.ReadLatency, m.PrepareLatency-time.Duration(float64(sample.Cost(FrameCompTokenForMode(current)))*scale))
 	prepare += time.Duration(float64(sample.Cost(FrameCompTokenForMode(candidate))) * scale)
 	currentRatio := float64(m.LogicalSize) / float64(max(1, m.WireSize))
 	ratio := float64(sample.Ratio(FrameCompTokenForMode(candidate)))
 	write := time.Duration(float64(m.WriteLatency) * currentRatio / ratio)
-	write = max(write, time.Duration(float64(floor)*float64(m.LogicalSize)*float64(time.Second)))
 	return CompressionMetrics{
 		LogicalSize: m.LogicalSize, WireSize: max(1, int64(float64(m.LogicalSize)/ratio)),
 		PrepareLatency: prepare, ReadLatency: m.ReadLatency, WriteLatency: write,
@@ -525,13 +589,13 @@ func predictedFrame(current, candidate CompressionMode, m CompressionMetrics, sa
 }
 
 // LinkPrior is what a connection's earlier files measured about sending
-// uncompressed: home's cost and write time per logical byte, their spread,
-// and any receiver-disk floor. It describes the link and the sender's reads,
+// uncompressed: home's cost and write time per logical byte and their
+// spread. It describes the link and the sender's reads,
 // not a file's data, so a new file on the connection can start from it
 // instead of seeding its own baseline. Compression ratios and codec samples
 // stay with each file.
 type LinkPrior struct {
-	mean, sampleVar, fast, ref, meanW, fastW, refW, floor float32
+	mean, sampleVar, fast, ref, meanW, fastW, refW float32
 }
 
 // Link returns the link estimate p holds: its home is none and its baseline
@@ -540,7 +604,7 @@ func (p *CompressionPolicy) Link() (LinkPrior, bool) {
 	if p.home != CompressionModeNone || p.n < seedFrames || p.mean <= 0 {
 		return LinkPrior{}, false
 	}
-	return LinkPrior{p.mean, p.sampleVar, p.fast, p.ref, p.meanW, p.fastW, p.refW, p.shadow.floor}, true
+	return LinkPrior{p.mean, p.sampleVar, p.fast, p.ref, p.meanW, p.fastW, p.refW}, true
 }
 
 // SeedLink starts a fresh policy from a connection's link estimate: home's
@@ -556,6 +620,5 @@ func (p *CompressionPolicy) SeedLink(l LinkPrior) {
 	p.mean, p.sampleVar, p.fast, p.ref, p.fastW, p.refW = l.mean, l.sampleVar, l.fast, l.ref, l.fastW, l.refW
 	p.meanW = l.meanW
 	p.n = seedFrames
-	p.shadow.floor = l.floor
 	p.trial = step(p.home, dirUp)
 }

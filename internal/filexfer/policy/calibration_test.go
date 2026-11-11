@@ -180,6 +180,11 @@ type reactionRates struct {
 }
 
 func runCalibrationReaction(before, after simRegime, noise byte, seed uint64, rates *reactionRates) {
+	if before.window {
+		// A small receive window reads as the receiver, where upward probes
+		// back off rather than follow a change (TestPolicyFollowsBottleneck).
+		return
+	}
 	s := newSim(seed, simJitters[noise%4]).noisy(noise)
 	p := NewCompressionPolicy()
 	mode := CompressionModeNone

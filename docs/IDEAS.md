@@ -142,6 +142,17 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Performance
 
+- **Let socket buffers autotune.** The client sets `SO_RCVBUF` to
+  `max(rmem_max, 4 MiB)` (`client_tcp.go`, default from
+  `MaxSocketReadBufferBytes`), and the server sets `SO_SNDBUF`
+  (`ftcp/server.go`). On Linux an explicit size is capped at
+  `rmem_max` or `wmem_max`, doubled, and turns off autotuning, which
+  otherwise grows the buffer up to `tcp_rmem[2]` or `tcp_wmem[2]`. On a
+  stock kernel that leaves a 416 KiB receive window against a 6 MiB
+  autotuning limit: about 400 MiB/s on a 1 ms path, 20 MiB/s on 20 ms.
+  Leave both unset by default, keeping `WithSocketReadBufferBytes` as an
+  opt-in, and measure two hosts with a `netem` delay. Buffer sizing from
+  `MaxSocketReadBufferBytes` elsewhere is unrelated.
 - **Bound the per-file compression state.** Entries for files that never
   complete live until the transfer is reaped, about 150 to 300 B per file. A
   client that sends a tiny first window of each of many large files and never
@@ -185,22 +196,47 @@ instead of widening the current change; remove an entry when it ships.
     bytes it holds many compressed frames and takes hundreds of frames to
     fill. Measure such regimes at steady state, or charge the bytes still
     queued at the end.
-- **Samples and checks trade codecs when the receiver's disk binds.** When
-  every codec runs at the disk's rate, background samples predict that
-  compression shortens the write and adopt zstd, and checks then find none
-  no slower and win it back. That happens about six times per 1,000 frames.
-  The checks lose little, about 0.5% of the time, so the budget does not
-  stop them, but the adopted codec keeps changing. Samples see the disk
-  floor only after a failed validation. Repros for
-  `FuzzCompressionPolicyStationary`: `"2101020020"` and `"7\".1020020"`.
-- **A disk path whose speed alternates rarely keeps its floor.**
-  `observeCost` clears the receiver-disk floor whenever one frame's write
-  takes under half of it (`s.floor > write*2`), so a disk-bound path that
-  alternates between two speeds loses the floor on its first fast frame.
-  Background samples then overestimate compression's gain and adopt lz4
-  too often. With paired comparisons, efficiency on such paths drops from
-  0.930–0.956 to 0.844–0.894 over 32 seeds. Clearing the floor only after a
-  sustained run of fast writes would keep it.
+- **Without `TCP_INFO`, disk-bound paths over-compress.** The receiver
+  class is the only way the policy recognizes a receiver disk. On a socket
+  without it, background samples predict that compression shortens the
+  write and adopt zstd, and checks win none back, about six changes per
+  1,000 frames. The fuzzers model the class, so these need `costsOnly`;
+  repros for `FuzzCompressionPolicyStationary`: `"\xeb0012A1011"`,
+  `"\xeb0011A1000"`, `"2101020020"`, and `"7\".1020020"`.
+- **A receive window below the bandwidth-delay product reads as a slow
+  receiver.** Its window holds the sender back although the receiver drains
+  at once. The policy drops to none on entering the receiver class, then
+  lets upward samples find a codec that delivers half its predicted gain.
+  Behind a disk each adoption that gained nothing doubles the wait, up to
+  4,096 frames, which costs 0.05% of uniform-noise stationary efficiency
+  and 0.4% under heavy noise in `TestPolicyNoiseCalibration`. Behind a
+  window, 512 MiB files reach 0.90 of the oracle against 0.94 on an
+  unclamped network (`TestPolicyCloudScenarios`), and where codecs gain
+  under 15% noise can refute them as a disk would, leaving runs of about
+  1,000 frames in none (`TestPolicyCompressesBehindSmallWindow`). A path that turns from a disk into a window
+  without leaving the class keeps the disk's backoff. A receiver report
+  would separate them: the client could time its socket reads against its
+  disk writes (`timedWriter`, always on) and send the split as an optional
+  key on its next SEND command line, which ignores unknown keys. ACK's
+  `recv-ms` and `sync-ms` cannot serve: the server drops them, they arrive
+  per file after the batch on the control connection, and under background
+  fsync `sync-ms` times only the queueing. `tcpi_snd_wnd` does not separate
+  the cases either: on loopback a slow reader kept advertising its full
+  window.
+- **A receiver bound by decoding can trade codecs.** Its window holds the
+  sender back under zstd, so the policy drops to none, where the network
+  may bind instead; upward samples then win zstd back after `initialGap`.
+  The sims model no receiver CPU, so this is untested.
+- **zstd never steps down to lz4 directly.** Checks test only none, so a
+  zstd home that lz4 would beat by 1.5 times or more stays in zstd while
+  zstd still beats none. A check of lz4 from zstd fixed that, but behind a
+  two-frame send buffer it adopted lz4 on a near-tie by prepare plus write,
+  where overlap made zstd 40% faster, and its checks cost more than the
+  send-buffer budget allows. Repros: `FuzzBackgroundThroughput`
+  `"A20120010020A01000"` and `"X0009000000090000001922010"` (zstd stays),
+  and `FuzzBackgroundSendBuffer` `"00200X0200"` and `"00201X0211"` (an lz4
+  check adopts lz4). Pricing codecs by overlapped time would let samples
+  compare lz4 with zstd from a zstd home.
 - **Validation can pass a codec a buffer flatters.** A send buffer of B
   frames can absorb a check's frames and the first validation frames, which
   lowers the 10-frame validation mean by up to about B/10. Behind three or
@@ -238,11 +274,11 @@ instead of widening the current change; remove an entry when it ships.
   validation with its frames' mean weighted as `recoveryCheckFrames` frames,
   though the check can send up to `maxCheckFrames`. Its good frames count
   for less than they measured, which makes the early restore slightly too
-  eager. Storing the check's frame count would need a byte that
-  `FileCompression`'s 128-byte limit does not have.
-- **Files under 44 MiB never check.** A check episode needs
-  `RecoveryFrames` (11 frames, 44 MiB) left in the file, so small files and
-  each file's last 44 MiB keep their codec, which background samples and
+  eager. Storing the check's frame count takes a byte, which fits
+  `FileCompression`'s 128-byte limit (124 bytes now).
+- **Files under 28 MiB never check.** A check episode needs
+  `RecoveryFrames` (7 frames, 28 MiB) left in the file, so small files and
+  each file's last 28 MiB keep their codec, which background samples and
   validation still correct.
 - **Near-ties cost a steady 0.4–0.8%.** In stationary regimes, the time
   spent in a codec under 1.1 times slower than the best costs 0.4–0.8% at
@@ -255,10 +291,21 @@ instead of widening the current change; remove an entry when it ships.
 - **Validation cannot tell a stall from returned write work.** One frame
   over `validateStall` times the replaced codec's cost may be a stall that
   costs every codec the same, or write time a send buffer absorbed earlier.
-  Validation counts it in full, so a stall can fail a much cheaper codec;
-  the policy then retries it after `initialGap`. Under heavy noise that
-  costs about 0.03% of stationary efficiency over capping such frames.
-  Telling them apart needs the bytes buffered at each flush.
+  Validation counts it in full, so a stall can fail a much cheaper codec.
+  A sampled codec is then retried after `initialGap`; a check's winner
+  waits for the recovery budget to repay the check's start, about 100
+  frames, and the stalled frame charges at most four of the replaced
+  codec's frames, so returned buffer work in one large frame is charged
+  only that much. Under heavy noise
+  counting such frames costs about 0.03% of stationary efficiency over
+  capping them.
+  Telling them apart needs the bytes buffered at each flush. Several stalls
+  in one validation still fail a codec many times faster and back it off
+  for 256 frames. Two fixes measured worse: validating on, up to 16
+  frames, while the mean is within two standard errors of the bar let slightly slower codecs pass
+  (heavy-noise stationary efficiency 0.9868 to 0.9813), and retrying soon
+  when the frames under four times the predicted cost pass retried slower
+  codecs (0.9846). Repro: `\xeb00\x8401A00210`.
 - **A check's baseline rarely corrects a noisy average.** In fast mode,
   ordinary frames can leave their bytes buffered, so home's average omits
   wire time the check's flushed frames include. The faster baseline frame

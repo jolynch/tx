@@ -54,7 +54,7 @@ func TestCompressionPolicyRegimeChangeResetsGap(t *testing.T) {
 	network := regime(simNetwork, 256, 16<<10, 1<<10, 512, 18.4, 30)
 	disk := regime(simDisk, 768, 16<<10, 1<<10, 512, 18.4, 30)
 	for seed := range uint64(10) {
-		s := newSim(seed, 0.3)
+		s := newSim(seed, 0.3).costsOnly()
 		p := NewCompressionPolicy()
 		mode := CompressionModeNone
 		// nextProbe is how many home frames until home's next scheduled
@@ -125,7 +125,7 @@ func TestCompressionPolicyCostlyProbesStayRare(t *testing.T) {
 		t.Fatalf("setup: want none far slower than lz4: %v", r)
 	}
 	for seed := range uint64(10) {
-		modes := scenario(t, seed, 0.3, CompressionModeNone, simSegment{r, simSettle + 4096})
+		modes := costScenario(t, seed, 0.3, CompressionModeNone, simSegment{r, simSettle + 4096})
 		if n := countIn(modes, simSettle, len(modes), CompressionModeNone); n > 6 {
 			t.Fatalf("seed %d: %d settled frames in none, want at most 6\n  %v", seed, n, r)
 		}
@@ -169,13 +169,25 @@ func TestCompressionPolicyIgnoresOneStalledFrame(t *testing.T) {
 	cpu := regime(simCPU, 0, 4<<10, 512, 256, 2.4, 3)
 	for _, stall := range []time.Duration{100 * time.Millisecond, time.Second, time.Minute} {
 		for seed := range uint64(5) {
-			s := newSim(seed, 0.1)
+			s := newSim(seed, 0.1).costsOnly()
 			p := NewCompressionPolicy()
 			mode := CompressionModeNone
 			for range 300 {
 				mode = s.step(t, p, slow, mode)
 			}
-			for p.trial != p.home || p.wait[0] < 16 || p.wait[1] < 16 {
+			// Wait for a stretch where no probe of home's neighbors is due.
+			quiet := func() bool {
+				for _, dir := range [2]uint8{dirUp, dirDown} {
+					if p.neighbors()&dir != 0 && p.wait[p.edge(dir)] < 16 {
+						return false
+					}
+				}
+				return p.trial == p.home
+			}
+			for i := 0; !quiet(); i++ {
+				if i == 1<<14 {
+					t.Fatalf("stall %v seed %d: setup: no quiet stretch (home %s, wait %v, gap %v)", stall, seed, modeName(p.home), p.wait, p.gap)
+				}
 				mode = s.step(t, p, slow, mode)
 			}
 			home := p.home
@@ -253,27 +265,6 @@ func TestBackgroundCompressionWithoutSamplesNeverProbes(t *testing.T) {
 	}
 	if !p.BackgroundPending() {
 		t.Fatal("setup: no comparison was scheduled")
-	}
-}
-
-// Normal frames expose a prediction that mistook receiver disk pressure for
-// a network limit. The policy must learn that floor and restore none.
-func TestBackgroundCompressionValidatesReceiverDisk(t *testing.T) {
-	p := NewCompressionPolicy()
-	r := regime(simDisk, 128, 4<<10, 1<<10, 512, 2, 4)
-	samples := samplesForRegime(r)
-	mode := CompressionModeNone
-	compressed := false
-	for frame := range 256 {
-		m := newSim(uint64(frame), 0).frame(r, mode)
-		mode = p.DecideSampled(mode, m, &samples).Next
-		compressed = compressed || mode != CompressionModeNone
-	}
-	if !compressed {
-		t.Fatal("setup: the estimator never made the initially optimistic switch")
-	}
-	if mode != CompressionModeNone || p.shadow.floor == 0 {
-		t.Fatalf("did not learn the receiver limit: mode %v, floor %g", mode, p.shadow.floor)
 	}
 }
 
@@ -392,8 +383,8 @@ func samplesForRegime(r simRegime) encoding.CodecSamples {
 	return encoding.CodecSamples{LogicalSize: logical, Lz4: measurement(1), Zstd: measurement(2)}
 }
 
-// A path change during validation must not become a permanent receiver-disk
-// floor. If the old baseline rejects a switch, retry under the new path.
+// A path change during validation must not block a useful codec for good.
+// If the old baseline rejects a switch, retry under the new path.
 func TestBackgroundCompressionLinkClampsDuringValidation(t *testing.T) {
 	p := NewCompressionPolicy()
 	before := regime(simNetwork, 128, 4<<10, 1<<10, 512, 1, 4)
@@ -413,8 +404,8 @@ func TestBackgroundCompressionLinkClampsDuringValidation(t *testing.T) {
 		s := samplesForRegime(after)
 		mode = p.DecideSampled(mode, newSim(uint64(i), 0).frame(after, mode), &s).Next
 	}
-	if mode != CompressionModeZstdLevel1 || p.shadow.floor != 0 {
-		t.Fatalf("clamp blocked a useful codec: mode %v floor %g", mode, p.shadow.floor)
+	if mode != CompressionModeZstdLevel1 {
+		t.Fatalf("clamp blocked a useful codec: mode %v", mode)
 	}
 }
 
@@ -638,6 +629,8 @@ func startCheck(t *testing.T, p *CompressionPolicy, m CompressionMetrics) Compre
 	return d
 }
 
+// TestRecoveryChecksMeasuredThroughput checks a check of none, judged on its
+// real frames.
 func TestRecoveryChecksMeasuredThroughput(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -645,9 +638,9 @@ func TestRecoveryChecksMeasuredThroughput(t *testing.T) {
 		costs []time.Duration
 		want  CompressionMode
 	}{
-		{"none wins", CompressionModeZstdLevel1, []time.Duration{12 * time.Millisecond, 12 * time.Millisecond}, CompressionModeNone},
-		{"lz4 wins", CompressionModeZstdLevel1, []time.Duration{30 * time.Millisecond, 16 * time.Millisecond, 16 * time.Millisecond}, CompressionModeLz4},
-		{"close frames lose after four each", CompressionModeZstdLevel1, []time.Duration{20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond}, CompressionModeZstdLevel1},
+		{"none wins from lz4", CompressionModeLz4, []time.Duration{12 * time.Millisecond, 12 * time.Millisecond}, CompressionModeNone},
+		{"none wins from zstd", CompressionModeZstdLevel1, []time.Duration{12 * time.Millisecond, 12 * time.Millisecond}, CompressionModeNone},
+		{"close frames lose after four", CompressionModeZstdLevel1, []time.Duration{20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond}, CompressionModeZstdLevel1},
 		{"lz4 restores", CompressionModeLz4, []time.Duration{30 * time.Millisecond}, CompressionModeLz4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -691,12 +684,12 @@ func TestRecoveryComparesWithFlushedBaseline(t *testing.T) {
 		want     CompressionMode
 	}{
 		{"average omitted the flush", homeFrames, [2]time.Duration{40 * ms, 40 * ms}, CompressionModeNone},
-		{"average already paid for drains", homeFrames, [2]time.Duration{20 * ms, 20 * ms}, CompressionModeZstdLevel1},
-		{"one baseline frame stalled", homeFrames, [2]time.Duration{20 * ms, 80 * ms}, CompressionModeZstdLevel1},
-		{"average too young to replace", seedFrames, [2]time.Duration{40 * ms, 40 * ms}, CompressionModeZstdLevel1},
+		{"average already paid for drains", homeFrames, [2]time.Duration{20 * ms, 20 * ms}, CompressionModeLz4},
+		{"one baseline frame stalled", homeFrames, [2]time.Duration{20 * ms, 80 * ms}, CompressionModeLz4},
+		{"average too young to replace", seedFrames, [2]time.Duration{40 * ms, 40 * ms}, CompressionModeLz4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p, m := recoveryFixture(CompressionModeZstdLevel1)
+			p, m := recoveryFixture(CompressionModeLz4)
 			p.n = tc.n
 			if d := p.DecideSampled(p.home, m, nil); d.Reason != "recovery-baseline" {
 				t.Fatalf("check did not start: %+v", d)
@@ -723,7 +716,7 @@ func TestRecoveryComparesWithFlushedBaseline(t *testing.T) {
 			if p.home != tc.want {
 				t.Fatalf("home %v after %+v, want %v", p.home, d, tc.want)
 			}
-			if tc.want == CompressionModeZstdLevel1 && lost <= 0 {
+			if tc.want == CompressionModeLz4 && lost <= 0 {
 				t.Fatal("the losing check charged nothing")
 			}
 		})
@@ -752,24 +745,6 @@ func TestRecoveryRequiresWorkAndBudget(t *testing.T) {
 				t.Fatalf("decision %+v, want check=%v", d, tc.want)
 			}
 		})
-	}
-}
-
-func TestRecoveryDoesNotInferFloorAcrossFasterPath(t *testing.T) {
-	p, m := recoveryFixture(CompressionModeZstdLevel1)
-	m.PrepareLatency, m.WriteLatency = 2*time.Millisecond, 8*time.Millisecond
-	d := startCheck(t, &p, m)
-	if d.Reason != "recovery-check" {
-		t.Fatalf("check did not start: %+v", d)
-	}
-	// These frames beat the old average after the path becomes faster.
-	// Their writes match that average, but not home's latest write cost.
-	m.PrepareLatency, m.WriteLatency = 0, 12*time.Millisecond
-	for range 2 {
-		d = p.DecideSampled(d.Next, m, nil)
-	}
-	if d.Reason != "recovery-won" || p.shadow.floor != 0 {
-		t.Fatalf("check inferred a floor from a changing path: %+v, floor=%g", d, p.shadow.floor)
 	}
 }
 
@@ -815,7 +790,7 @@ func TestRecoveryConfirmsChangeBeforeAdvancingDebt(t *testing.T) {
 }
 
 func TestRecoveryValidatesAndRestores(t *testing.T) {
-	p, m := recoveryFixture(CompressionModeZstdLevel1)
+	p, m := recoveryFixture(CompressionModeLz4)
 	d := startCheck(t, &p, m)
 	m.PrepareLatency, m.WriteLatency = 0, 12*time.Millisecond
 	for range 2 {
@@ -845,7 +820,7 @@ func TestRecoveryValidatesAndRestores(t *testing.T) {
 			t.Fatalf("validation frame %d continued after failing was certain", i)
 		}
 	}
-	if d.Next != CompressionModeZstdLevel1 || d.Reason != "recovery-restore" {
+	if d.Next != CompressionModeLz4 || d.Reason != "recovery-restore" {
 		t.Fatalf("failed validation: %+v", d)
 	}
 }
@@ -862,7 +837,7 @@ func TestRecoveryValidationSeesThroughAbsorbedFrames(t *testing.T) {
 		"spread": {40, 40, 40, 40, 40, 40, 40},
 		"bursts": {2, 122, 2, 2, 2, 122, 2},
 	} {
-		p, m := recoveryFixture(CompressionModeZstdLevel1)
+		p, m := recoveryFixture(CompressionModeLz4)
 		d := startCheck(t, &p, m)
 		frame := func(raw time.Duration) {
 			m.PrepareLatency, m.WriteLatency, m.FrameLatency = 0, raw, raw
@@ -880,7 +855,7 @@ func TestRecoveryValidationSeesThroughAbsorbedFrames(t *testing.T) {
 				break
 			}
 		}
-		if d.Next != CompressionModeZstdLevel1 || d.Reason != "recovery-restore" {
+		if d.Next != CompressionModeLz4 || d.Reason != "recovery-restore" {
 			t.Fatalf("%s: a slower codec passed validation: %+v", name, d)
 		}
 	}
@@ -949,7 +924,7 @@ func TestRecoveryDoesNotAllocate(t *testing.T) {
 }
 
 func TestRecoveryUsesObservedFrameTime(t *testing.T) {
-	p, m := recoveryFixture(CompressionModeZstdLevel1)
+	p, m := recoveryFixture(CompressionModeLz4)
 	d := p.DecideSampled(p.home, m, nil)
 	// A stale delivery-rate floor predicts a slow write, but the two real
 	// frames complete faster. Conversely, a slow observed frame must lose.

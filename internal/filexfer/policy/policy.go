@@ -232,8 +232,7 @@ type CompressionPolicy struct {
 	//     byte, greatest cost, and logical and wire bytes, and the sum of
 	//     home's costs on the frames they were predicted from (homeSum);
 	//   - a check (phaseCheck): its real frames' cost, write, logical, and
-	//     wire sums, the earlier candidate's penalty (penalty), and home's
-	//     write when it started (checkStartWrite);
+	//     wire sums, its penalty, and its greatest frame cost (tMax);
 	//   - a detected change waiting to check (flagDue): the references it
 	//     moved from (changeRefs) and the check gap it may skip (changeGap);
 	//   - a sampled codec validating (phaseValidate): the write per wire
@@ -252,7 +251,15 @@ type CompressionPolicy struct {
 	out     uint8           // consecutive frames home's write, prepare, or ratio sat outside its band
 	pending uint8           // directions to probe without waiting
 	drift   uint8           // consecutive observations of sustained cost drift
+	class   Bottleneck      // the bottleneck the last steady frame reported, and classBackoff
 }
+
+// classBackoff marks, in class, upward backoff that refuted adoptions under
+// the receiver class earned, which leaving that class undoes.
+const classBackoff Bottleneck = 1 << 7
+
+// bottleneck returns the class the last steady frame reported.
+func (p *CompressionPolicy) bottleneck() Bottleneck { return p.class &^ classBackoff }
 
 func NewCompressionPolicy() *CompressionPolicy {
 	return &CompressionPolicy{}
