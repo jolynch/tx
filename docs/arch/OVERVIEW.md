@@ -273,7 +273,10 @@ sender that cannot keep up. A new connection reports the last class any
 connection in the process reached, for up to 2 s after it was reached, until
 it has two spans of its own, since without keep-alive every SEND arrives on
 a new connection. On a socket without `TCP_INFO`, the policy decides on
-frame costs alone and cannot tell a receiver disk from the network.
+frame costs alone and cannot tell a receiver disk from the network. The
+server's `txfer-progress` and `txfer-rate` lines and `--stats` report each
+class's share of the frames, and `txfer-frame` lines name the class at
+each codec switch.
 
 ### Background sampling
 

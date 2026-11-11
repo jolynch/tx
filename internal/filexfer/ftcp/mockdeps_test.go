@@ -235,6 +235,11 @@ func (m *mockDeps) RecordTransferWindows(txferID string, rec WindowRecords) bool
 	m.rates.Sampled += rec.Rates.Sampled
 	m.rates.Kernel.N += rec.Rates.Kernel.N
 	m.rates.User.N += rec.Rates.User.N
+	c := &m.rates.Bottlenecks
+	c.Unknown += rec.Rates.Bottlenecks.Unknown
+	c.Sender += rec.Rates.Bottlenecks.Sender
+	c.Network += rec.Rates.Bottlenecks.Network
+	c.Receiver += rec.Rates.Bottlenecks.Receiver
 	for _, c := range rec.Compression {
 		m.compSaves++
 		if m.compression == nil {
