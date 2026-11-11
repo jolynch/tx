@@ -339,8 +339,8 @@ func TestSendSamplingSkipsSmallFiles(t *testing.T) {
 }
 
 // Long-distance repetition is invisible to lz4 but profitable for zstd.
-// The upward comparison must discover it without sending an lz4 trial.
-// Once zstd is established, a bounded recovery episode may check lz4.
+// The upward comparison must discover it without sending an lz4 trial, and
+// checks from zstd test none, so no frame is lz4.
 func TestSendSamplingDiscoversZstdPastLz4(t *testing.T) {
 	pattern := make([]byte, 128<<10)
 	rand.New(rand.NewSource(91)).Read(pattern)
@@ -353,7 +353,6 @@ func TestSendSamplingDiscoversZstdPastLz4(t *testing.T) {
 		t.Run(fmt.Sprintf("%d-frame windows", windowFrames), func(t *testing.T) {
 			deps, tid, path := multiWindowFile(t, data)
 			found := false
-			lz4Checks := 0
 			for first := 0; first < 20; first += windowFrames {
 				raw := sendWindow(t, deps, tid, path, first, windowFrames, pace)
 				frames, err := decodeFrameStream(raw)
@@ -365,10 +364,7 @@ func TestSendSamplingDiscoversZstdPastLz4(t *testing.T) {
 				}
 				for _, frame := range frames {
 					if frame.Header.Comp == encoding.EncodingLz4 {
-						if !found {
-							t.Fatal("an upward lz4 trial was sent before zstd was established")
-						}
-						lz4Checks++
+						t.Fatalf("sent an lz4 frame (zstd established: %v)", found)
 					}
 					lo, hi := frame.Header.Offset, frame.Header.Offset+frame.Header.Size
 					if !bytes.Equal(frame.Logical, data[lo:hi]) {
@@ -379,9 +375,6 @@ func TestSendSamplingDiscoversZstdPastLz4(t *testing.T) {
 			}
 			if !found {
 				t.Fatal("zstd was never discovered")
-			}
-			if lz4Checks > 2 {
-				t.Fatalf("short transfer sent %d lz4 check frames, want at most two", lz4Checks)
 			}
 		})
 	}
@@ -772,10 +765,10 @@ func sampledNoiseWriter(t *testing.T, wireCost int64) (*aead.MessageWriter, *aea
 	return result.session.Writer(true), cs
 }
 
-// lz4RecoveryCheck returns a zstd policy whose recovery check lost with none
-// and now checks lz4, with home's 20 ms frames as the baseline; m is home's
-// last frame and d the decision to send lz4.
-func lz4RecoveryCheck(t *testing.T) (*policy.CompressionPolicy, policy.CompressionMetrics, policy.CompressionDecision) {
+// zstdRecoveryBaseline returns a zstd policy about to start a recovery
+// check, whose first frames are recoveryBaselineFrames zstd frames timed as
+// home's baseline; m is home's last frame and d the decision to send them.
+func zstdRecoveryBaseline(t *testing.T) (*policy.CompressionPolicy, policy.CompressionMetrics, policy.CompressionDecision) {
 	t.Helper()
 	p := policy.NewCompressionPolicy()
 	m := policy.CompressionMetrics{
@@ -785,31 +778,29 @@ func lz4RecoveryCheck(t *testing.T) (*policy.CompressionPolicy, policy.Compressi
 	var d policy.CompressionDecision
 	for range 32 {
 		d = p.DecideSampled(policy.CompressionModeZstdLevel1, m, nil)
-		if d.Reason == "recovery-check" {
+		if d.Reason == "recovery-baseline" {
 			break
 		}
 	}
-	if d.Next != policy.CompressionModeNone {
-		t.Fatalf("no uncompressed check: %+v", d)
-	}
-	m.WireSize, m.WriteLatency = m.LogicalSize, time.Second
-	d = p.DecideSampled(d.Next, m, nil)
-	if d.Next != policy.CompressionModeLz4 {
-		t.Fatalf("no lz4 check after none lost: %+v", d)
+	if d.Reason != "recovery-baseline" || d.Next != policy.CompressionModeZstdLevel1 {
+		t.Fatalf("no zstd baseline: %+v", d)
 	}
 	return p, m, d
 }
 
 // A fast response buffers small compressed frames, and in a one-frame window
 // sends them only when the request ends, after the policy decided. Frames a
-// recovery check measures must still carry their wire time: on a 128 KiB/s
-// link, lz4 is far slower than the zstd baseline and must be restored, and
-// the loss charged to the server's budget.
+// recovery check measures must still carry their wire time. A check's first
+// frames are home's zstd baseline; each must report the time its bytes took
+// on a 128 KiB/s link. Its none frames then go out on a 40 MiB/s link, where
+// each takes about 100 ms against zstd's 20 ms: the check must lose, restore
+// zstd, and charge the server's budget.
 func TestRecoveryMeasuresFastResponseFlush(t *testing.T) {
 	const wireCost = int64(time.Second) / (128 << 10)
+	const checkWireCost = int64(time.Second) / (40 << 20)
 	for _, transport := range []string{"plain", "aead"} {
 		t.Run(transport, func(t *testing.T) {
-			p, _, d := lz4RecoveryCheck(t)
+			p, _, d := zstdRecoveryBaseline(t)
 			data := compressibleBytes(12 * defaultFileFrameLogicalSize)
 			deps, tid, path := multiWindowFile(t, data)
 			deps.RecordTransferWindows(tid, WindowRecords{Compression: []FileCompressionUpdate{{FileID: 1,
@@ -819,15 +810,20 @@ func TestRecoveryMeasuresFastResponseFlush(t *testing.T) {
 				t.Fatal(err)
 			}
 			var budget policy.RecoveryBudget
-			for frame := 1; frame <= 10; frame++ {
+			rec := recordFrameMetrics(t)
+			for frame := 1; frame <= 8; frame++ {
+				cost := wireCost
+				if frame > 2 {
+					cost = checkWireCost
+				}
 				var w io.Writer
 				var finish func() ([]byte, error)
 				if transport == "plain" {
 					var raw bytes.Buffer
-					w = &rateWriter{w: &raw, nsPerByte: wireCost}
+					w = &rateWriter{w: &raw, nsPerByte: cost}
 					finish = func() ([]byte, error) { return raw.Bytes(), nil }
 				} else {
-					writer, receiver := sampledNoiseWriter(t, wireCost)
+					writer, receiver := sampledNoiseWriter(t, cost)
 					type received struct {
 						raw []byte
 						err error
@@ -870,9 +866,21 @@ func TestRecoveryMeasuresFastResponseFlush(t *testing.T) {
 					t.Fatalf("frame %d differs from source", frame)
 				}
 			}
-			st, _ := deps.LoadFileCompression(tid, 1)
-			if st.Mode != policy.CompressionModeZstdLevel1 {
-				t.Fatalf("slower lz4 kept: its buffered frames' wire time escaped the check (mode %v)", st.Mode)
+			observations := rec.snapshot()
+			if len(observations) < 3 {
+				t.Fatalf("observed %d frames, want the baseline and a check", len(observations))
+			}
+			for i, o := range observations[:2] {
+				wait := time.Duration(o.WireSize * wireCost)
+				if o.WireSize == 0 || o.WriteLatency < wait || o.FrameLatency < o.PrepareLatency+wait {
+					t.Fatalf("baseline frame %d: flush wait %v missing from metrics: %+v", i, wait, o)
+				}
+			}
+			if o := observations[2]; o.WireSize != o.LogicalSize {
+				t.Fatalf("check frame was not none: %+v", o)
+			}
+			if st, _ := deps.LoadFileCompression(tid, 1); st.Mode != policy.CompressionModeZstdLevel1 {
+				t.Fatalf("a check of none slower on the wire kept mode %v, want zstd restored", st.Mode)
 			}
 			if budget.Ready() {
 				t.Fatal("the losing check charged nothing to the server's budget")
@@ -965,24 +973,23 @@ func TestRecoveryFlushTimesOnlyItsFrame(t *testing.T) {
 }
 
 // A small compressed frame reaches the socket only when its AEAD record is
-// flushed. Recovery must measure that wait when checking and validating lz4.
+// flushed. A recovery check's zstd baseline frames are small, so recovery
+// must measure that wait in them, here on a 128 KiB/s link. On a 40 MiB/s
+// link the check's none frames, too large to share a record, take about
+// 100 ms each against zstd's 20 ms: the check must lose, restore zstd, and
+// charge the budget.
 func TestRecoveryMeasuresAuthenticatedFlush(t *testing.T) {
-	for _, phase := range []string{"check", "validation"} {
-		t.Run(phase, func(t *testing.T) {
-			p, m, d := lz4RecoveryCheck(t)
-			frames := 1
-			if phase == "validation" {
-				// Resume a saved episode whose two buffered check frames won.
-				m.WireSize = m.LogicalSize / 256
-				m.PrepareLatency, m.WriteLatency = time.Millisecond, time.Millisecond
-				for range 2 {
-					d = p.DecideSampled(d.Next, m, nil)
-				}
-				if d.Reason != "recovery-won" {
-					t.Fatalf("no validation after winning checks: %+v", d)
-				}
-				frames = 8
-			}
+	for _, tc := range []struct {
+		name     string
+		frames   int
+		wireCost int64
+	}{
+		{"baseline", 2, int64(time.Second) / (128 << 10)},
+		{"check", 8, int64(time.Second) / (40 << 20)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _, d := zstdRecoveryBaseline(t)
+			frames, wireCost := tc.frames, tc.wireCost
 			data := compressibleBytes(10 * defaultFileFrameLogicalSize)
 			deps, tid, path := multiWindowFile(t, data)
 			deps.RecordTransferWindows(tid, WindowRecords{Compression: []FileCompressionUpdate{{FileID: 1,
@@ -991,7 +998,6 @@ func TestRecoveryMeasuresAuthenticatedFlush(t *testing.T) {
 			if errs[0] != nil {
 				t.Fatal(errs[0])
 			}
-			const wireCost = int64(time.Second) / (128 << 10)
 			writer, receiver := sampledNoiseWriter(t, wireCost)
 			type received struct {
 				data []byte
@@ -1043,7 +1049,7 @@ func TestRecoveryMeasuresAuthenticatedFlush(t *testing.T) {
 			if len(observations) != frames {
 				t.Fatalf("observed %d frames, want %d", len(observations), frames)
 			}
-			for _, observed := range observations {
+			for _, observed := range observations[:2] {
 				if observed.WireSize >= 60<<10 {
 					t.Fatalf("frame no longer fits one AEAD record: %+v", observed)
 				}
@@ -1052,11 +1058,19 @@ func TestRecoveryMeasuresAuthenticatedFlush(t *testing.T) {
 					t.Fatalf("flush wait %v missing from frame metrics: %+v", wait, observed)
 				}
 			}
-			if !sent.hasComp || sent.comp.State.Mode != policy.CompressionModeZstdLevel1 {
-				t.Fatalf("slower lz4 retained: %+v", sent.comp.State)
+			if !sent.hasComp {
+				t.Fatal("baseline frames left no compression state")
 			}
-			if out.rate.recoveryReady() {
-				t.Fatal("unsuccessful recovery did not charge its flush cost")
+			if tc.name == "check" {
+				if o := observations[2]; o.WireSize != o.LogicalSize {
+					t.Fatalf("check frame was not none: %+v", o)
+				}
+				if sent.comp.State.Mode != policy.CompressionModeZstdLevel1 {
+					t.Fatalf("a check of none slower on the wire kept mode %v, want zstd restored", sent.comp.State.Mode)
+				}
+				if out.rate.recoveryReady() {
+					t.Fatal("the losing check charged nothing to the server's budget")
+				}
 			}
 		})
 	}

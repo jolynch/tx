@@ -237,6 +237,44 @@ buffer space for network bandwidth, the policy also uses the kernel reported
 TCP delivery rate when available, falling back to a rate estimated from the connection's writes. Measured backpressure still captures a path that slows
 down. Delivery estimates and sample coverage appear in `txfer-rate` logs and `--stats`.
 
+### Bottleneck class
+
+A slow receiver disk and a slow network both block the sender's writes, so
+frame times alone cannot tell them apart. The same `TCP_INFO` reads also
+return how long the socket was busy and how much of that time the
+receiver's window held it back. Over a span of at least 50 ms, the
+connection names its bottleneck:
+
+| Reading | Class | Policy |
+|---|---|---|
+| Receive window held back at least half of 30 ms or more busy time | receiver | Drop to none on entering it. |
+| Busy less than half the span | sender | Decide on frame costs. |
+| Otherwise | network | Decide on frame costs. |
+
+The rows apply in order, and the thresholds span three jiffies of the kernel's
+slowest clock. A slow receiver disk writes the same logical bytes under any
+codec, so fewer wire bytes cannot shorten its writes, and compressing only
+spends CPU, even when the sender also leaves the socket idle. A receive window
+below the path's bandwidth-delay product reads the same, though there fewer
+wire bytes do shorten the writes. So the policy drops to none when a
+connection enters the receiver class, and lets upward samples resume. Under
+the receiver class a sampled codec validates only if it delivers at least half
+the gain its samples predicted, which a window clamp's shorter writes do and a
+disk's do not. A codec that gained nothing doubles the wait before the next
+adoption, up to 4,096 frames, and leaving the class ends that backoff; one
+that gained less than half, as a window clamp can under noise, is retried
+after 24 frames, doubling up to 256.
+
+A class takes effect when two spans in a row show it, and it stays with the
+connection across files. A sender or network class describes only the codec
+it was read under, so the policy leaves those to frame costs: upward samples
+already price the CPU, and checks of cheaper codecs on real frames find a
+sender that cannot keep up. A new connection reports the last class any
+connection in the process reached, for up to 2 s after it was reached, until
+it has two spans of its own, since without keep-alive every SEND arrives on
+a new connection. On a socket without `TCP_INFO`, the policy decides on
+frame costs alone and cannot tell a receiver disk from the network.
+
 ### Background sampling
 
 Workers test lz4 and zstd level 1 on samples of up to 256 KiB from bytes already
@@ -263,45 +301,49 @@ it and restore the previous codec if it proves slower. The policy backs off
 after losing comparisons and explores again when throughput or compressibility
 changes.
 
-Compressed streams also check cheaper codecs on real frames: none first, then
-lz4 from zstd if none loses. Each episode first sends two frames of the
-current codec, flushed as the check's are. The faster of them replaces the
-codec's average cost as the bar only when it is higher by more than noise
-explains and the average has at least 16 frames behind it: ordinary frames
-that left their bytes buffered made the average too low, while ones that paid
-for their drains as they streamed did not, and a stall can slow a frame but
-not speed it up. A cheaper codec wins when the mean of its check frames, at
-least two, is at least 3% faster than the bar. It loses once that mean is
-slower than the bar by two standard errors of home's noise, or after four
-frames whose mean is not 3% faster, so one noisy frame cannot end a check the
-codec is winning. Eight normal frames then validate the switch and can restore
-the previous codec. Validation compares the mean raw time of every frame since
-the switch, check frames included, so a send buffer that absorbs the first
-frames cannot hide their cost. A stall can still fail a much cheaper codec,
-so a validation that fails with a frame over four times the previous codec's
-cost is retried after 24 frames, doubling while it keeps failing, rather
-than after the full 256. A fast
-response flushes its buffer after each baseline, check, and validation frame,
-rather than only when the request ends, so all of them are timed to the same
-point. Output already buffered drains first, untimed, so each flush times one
-frame's bytes. An episode sends at most 32 MiB of cheaper codecs and needs 44
-MiB left in the file. All of a server's connections share a budget of about 1%
-of steady-state frame time for unsuccessful checks, so neither new connections
-nor new files get unpaid checks. A starting check charges the budget one frame
-in advance, which keeps most other connections from starting checks before its
-losses are known; it does not make checks exclusive. Detected cost changes,
-including 10% drift for eight home observations, allow an earlier check when
-fresh home timings confirm the change, without forgiving earlier losses. The
-confirmation needs more evidence the costlier the failed checks behind it, and
-more on an early frame: it is asked again on each frame until home has 16
-observations. An unconfirmed change keeps their backoff. An adopted codec
-whose validated cost is more than twice from what it won at also allows an
-early check, as do validated writes more than 1.5 times from the write per
-wire byte it won at: the path changed while it validated, or the estimate
-missed a bottleneck. So does lz4 winning from zstd at a write cost no single
-path explains beside none's losing frame: the path changed during the check.
-Upward exploration stays in the background and resumes as soon as a check
-wins.
+Compressed streams also check none on real frames, the usual answer when a
+codec stops paying. A codec between home and none is reached from none by
+background samples, which price its encode time; a check of lz4 from zstd
+would run behind send buffers that flatter it. Each episode first sends two
+frames of the current codec, flushed as the check's are. The faster of them
+replaces the codec's average cost as the bar only when it is higher by more
+than noise explains and the average has at least 16 frames behind it: ordinary
+frames that left their bytes buffered made the average too low, while ones
+that paid for their drains as they streamed did not, and a stall can slow a
+frame but not speed it up. A cheaper codec wins when the mean of its check
+frames, at least two, is at least 3% faster than the bar. As in an upward
+trial, that mean counts its greatest frame at most twice the mean of the
+others, so one stall cannot decide a check after its first frame. It loses
+once that mean is slower than the bar by two standard errors of home's noise,
+or after four frames whose mean is not 3% faster, so one noisy frame cannot
+end a check the codec is winning. Eight normal frames then validate the switch
+and can restore the previous codec. Validation compares the mean raw time of
+every frame since the switch, check frames included, so a send buffer that
+absorbs the first frames cannot hide their cost. A stall can still fail a much
+cheaper codec, so a sampled codec whose validation fails with a frame over
+four times the previous codec's cost is retried after 24 frames, doubling
+while it keeps failing, rather than after the full 256. In a check's
+validation, such a frame charges the recovery budget as four of the previous
+codec's frames. A fast response flushes its buffer after each baseline, check,
+and validation frame, rather than only when the request ends, so all of them
+are timed to the same point. Output already buffered drains first, untimed, so
+each flush times one frame's bytes. An episode sends at most 16 MiB
+uncompressed and needs 28 MiB left in the file. All of a server's connections
+share a budget of about 1% of steady-state frame time for unsuccessful checks,
+so neither new connections nor new files get unpaid checks. A starting check
+charges the budget one frame in advance, which keeps most other connections
+from starting checks before its losses are known; it does not make checks
+exclusive. Detected cost changes, including 10% drift for eight home
+observations, allow an earlier check when fresh home timings confirm the
+change, without forgiving earlier losses. The confirmation needs more evidence
+the costlier the failed checks behind it, and more on an early frame: it is
+asked again on each frame until home has 16 observations. An unconfirmed
+change keeps their backoff. An adopted codec whose validated cost is more than
+twice from what it won at also allows an early check, as do validated writes
+more than 1.5 times from the write per wire byte it won at, or encode time
+more than twice from the encode time it won at: the path or the data changed
+while it validated, or the estimate missed a bottleneck. Upward exploration
+stays in the background and resumes as soon as a check wins.
 
 ### Policy state
 

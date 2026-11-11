@@ -13,7 +13,18 @@ import (
 // ran in.
 func scenario(t *testing.T, seed uint64, jitter float64, start CompressionMode, segs ...simSegment) []CompressionMode {
 	t.Helper()
-	s := newSim(seed, jitter)
+	return runScenario(t, newSim(seed, jitter), start, segs...)
+}
+
+// costScenario is scenario without a bottleneck reading, so the policy
+// infers the bottleneck from frame costs alone.
+func costScenario(t *testing.T, seed uint64, jitter float64, start CompressionMode, segs ...simSegment) []CompressionMode {
+	t.Helper()
+	return runScenario(t, newSim(seed, jitter).costsOnly(), start, segs...)
+}
+
+func runScenario(t *testing.T, s *sim, start CompressionMode, segs ...simSegment) []CompressionMode {
+	t.Helper()
 	p := NewCompressionPolicy()
 	mode := start
 	var modes []CompressionMode
