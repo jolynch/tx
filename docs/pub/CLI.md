@@ -616,11 +616,20 @@ line:
 `rates` totals the adaptive windows whose frames reached the compression
 policy: `files` (counted on their window at offset 0), `windows`, `sampled`
 (windows that used a background codec sample), and for `kernel` (the TCP
-delivery rate) and `userspace` (the rate the server's own writes showed)
-the `n`, `min_bps`, `max_bps`, and `sum_bps` of each window's last reading.
+delivery rate) and `userspace` (the rate the server's own writes showed) the
+`n`, `min_bps`, `max_bps`, and `sum_bps` of each window's last reading.
 `userspace_over_kernel_sum` and `_n` give their mean ratio where a window
-had both. The server also logs these at completion, after `txfer-complete`,
-as a `txfer-rate` line.
+had both. `bottleneck_frames` counts the windows' frames by the bottleneck
+class their connection's `TCP_INFO` reported: `unknown`, `sender`,
+`network`, and `receiver`. The server also logs these at completion, after
+`txfer-complete`, as a `txfer-rate` line, whose `bottleneck=` field gives
+each class's share of the frames, such as `[net 92% rcv  6% snd  2%]`, in
+three characters each (`99+` for all, `<1%` for a trace), and whose
+`frames=` field counts those frames. Frames of no known class count only
+toward the total. The server's `txfer-progress` lines end
+with the same bracket for the frames sent since the previous line, and
+`txfer-frame` lines name the class with `bottleneck=` when the codec
+switches.
 
 `t` is unix nanoseconds. SIGTERM and SIGINT stop the server cleanly: the
 listener closes, progress targets get their final write, and the `end` and

@@ -274,8 +274,8 @@ func TestSendDeliveryRateReads(t *testing.T) {
 
 // TestSendReportsWindowRates checks a SEND leaves a rate record for each
 // window whose frame reached the policy: a file counts on its window at
-// offset 0, and each record carries the kernel's reading and the rate the
-// writes showed.
+// offset 0, each record carries the kernel's reading and the rate the
+// writes showed, and every decided frame counts under its bottleneck class.
 func TestSendReportsWindowRates(t *testing.T) {
 	data := make([]byte, defaultFileFrameLogicalSize+1<<10)
 	rand.New(rand.NewSource(5)).Read(data)
@@ -287,9 +287,13 @@ func TestSendReportsWindowRates(t *testing.T) {
 		fmt.Sprintf(`fd=3 %s comp=none`, strconv.Quote(path)),
 	}
 	deps := &mockDeps{filePath: path}
+	frames := recordFrameMetrics(t)
 	sendOverLoopback(t, deps, nil, items...)
 	if r := deps.rates; r.Windows != 2 || r.Files != 2 || r.Kernel.N != 2 || r.User.N != 2 {
 		t.Fatalf("rates %+v; want 2 windows and files, each with both readings", r)
+	}
+	if got, want := deps.rates.Bottlenecks.Total(), int64(len(frames.snapshot())); got != want || got == 0 {
+		t.Fatalf("bottleneck classes count %d frames (%+v), want the %d the policy decided", got, deps.rates.Bottlenecks, want)
 	}
 	// A client retry resends file 1's first window: one more window, but
 	// still two files.

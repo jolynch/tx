@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"strings"
 
 	intencoding "github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/policy"
@@ -74,11 +75,87 @@ func (m *managedTransfer) dropAllCompression() {
 // the server's own writes showed, each 0 when it had none. FirstWindow marks
 // the window at offset 0, whose file the transfer then counts once however
 // often that window is sent; Sampled marks a window that used a background
-// codec sample.
+// codec sample. Classes counts its decided frames by the bottleneck class
+// they reported, indexed by policy.Bottleneck.
 type WindowRate struct {
 	FileID               uint64
 	FirstWindow, Sampled bool
 	KernelBps, UserBps   uint64
+	Classes              [4]uint32
+}
+
+// ClassCounts counts adaptive frames by the bottleneck class their
+// connection reported.
+type ClassCounts struct {
+	Unknown  int64 `json:"unknown,omitempty"`
+	Sender   int64 `json:"sender,omitempty"`
+	Network  int64 `json:"network,omitempty"`
+	Receiver int64 `json:"receiver,omitempty"`
+}
+
+func (c *ClassCounts) add(frames [4]uint32) {
+	c.Unknown += int64(frames[policy.BottleneckUnknown])
+	c.Sender += int64(frames[policy.BottleneckSender])
+	c.Network += int64(frames[policy.BottleneckNetwork])
+	c.Receiver += int64(frames[policy.BottleneckReceiver])
+}
+
+func (c *ClassCounts) merge(o ClassCounts) {
+	c.Unknown += o.Unknown
+	c.Sender += o.Sender
+	c.Network += o.Network
+	c.Receiver += o.Receiver
+}
+
+// since returns the frames counted after o, an earlier snapshot of c.
+func (c ClassCounts) since(o ClassCounts) ClassCounts {
+	return ClassCounts{c.Unknown - o.Unknown, c.Sender - o.Sender, c.Network - o.Network, c.Receiver - o.Receiver}
+}
+
+// Total is the frames counted.
+func (c ClassCounts) Total() int64 { return c.Unknown + c.Sender + c.Network + c.Receiver }
+
+// formatClasses renders c as "[net 92% rcv  6% snd  2%]": each known
+// class's share of all the frames in three characters ("99+" for all,
+// "<1%" for a trace), largest first, nonzero only. Frames of no known class
+// count toward the total but not in the bracket, so its shares can sum to
+// less than 100%. It returns "" when no frame has a known class.
+func formatClasses(c ClassCounts) string {
+	total := c.Total()
+	if total <= c.Unknown {
+		return ""
+	}
+	type share struct {
+		label string
+		n     int64
+	}
+	shares := [3]share{{"net", c.Network}, {"rcv", c.Receiver}, {"snd", c.Sender}}
+	// Insertion sort, stable, so ties keep the order above.
+	for i := 1; i < len(shares); i++ {
+		for j := i; j > 0 && shares[j].n > shares[j-1].n; j-- {
+			shares[j], shares[j-1] = shares[j-1], shares[j]
+		}
+	}
+	var b strings.Builder
+	b.WriteByte('[')
+	for _, sh := range shares {
+		if sh.n == 0 {
+			continue
+		}
+		if b.Len() > 1 {
+			b.WriteByte(' ')
+		}
+		switch pct := (sh.n*100 + total/2) / total; {
+		case pct >= 100:
+			fmt.Fprintf(&b, "%s 99+", sh.label)
+		case pct == 0:
+			fmt.Fprintf(&b, "%s <1%%", sh.label)
+		default:
+			fmt.Fprintf(&b, "%s %2d%%", sh.label, pct)
+		}
+	}
+	b.WriteByte(']')
+	return b.String()
 }
 
 // RateStats summarizes one estimate's nonzero readings, in bytes per second.
@@ -133,6 +210,8 @@ type RateSummary struct {
 	User     RateStats `json:"userspace"`
 	RatioSum float64   `json:"userspace_over_kernel_sum,omitempty"`
 	RatioN   int64     `json:"userspace_over_kernel_n,omitempty"`
+	// Bottlenecks counts the windows' decided frames by bottleneck class.
+	Bottlenecks ClassCounts `json:"bottleneck_frames,omitzero"`
 }
 
 // Add counts one window. Files is the store's: it counts distinct files
@@ -149,6 +228,7 @@ func (r *RateSummary) Add(w WindowRate) {
 		r.RatioSum += float64(w.UserBps) / float64(w.KernelBps)
 		r.RatioN++
 	}
+	r.Bottlenecks.add(w.Classes)
 }
 
 func (r *RateSummary) merge(o RateSummary) {
@@ -159,6 +239,7 @@ func (r *RateSummary) merge(o RateSummary) {
 	r.User.merge(o.User)
 	r.RatioSum += o.RatioSum
 	r.RatioN += o.RatioN
+	r.Bottlenecks.merge(o.Bottlenecks)
 }
 
 // formatRates is the line a completed transfer logs after txfer-complete
@@ -175,8 +256,12 @@ func formatRates(id string, numFiles int, r RateSummary) string {
 	if r.RatioN > 0 {
 		ratio = fmt.Sprintf("%.2fx", r.RatioSum/float64(r.RatioN))
 	}
-	return fmt.Sprintf("txfer-rate: tid=%s files=%d/%d windows=%d sampled=%d kernel=%s userspace=%s userspace/kernel=%s",
+	line := fmt.Sprintf("txfer-rate: tid=%s files=%d/%d windows=%d sampled=%d kernel=%s userspace=%s userspace/kernel=%s",
 		id, r.Files, numFiles, r.Windows, r.Sampled, stats(r.Kernel), stats(r.User), ratio)
+	if classes := formatClasses(r.Bottlenecks); classes != "" {
+		line += fmt.Sprintf(" bottleneck=%s frames=%d", classes, r.Bottlenecks.Total())
+	}
+	return line
 }
 
 // TransferRates returns the transfer's rate summary so far.

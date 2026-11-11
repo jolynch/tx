@@ -898,6 +898,7 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 				Bottleneck:      out.rate.bottleneck(),
 			}
 			out.rate.observeFrame(stats.LogicalSize, stats.PrepareLatency+stats.WriteLatency)
+			windowRate.Classes[metrics.Bottleneck]++
 			var sample *encoding.CodecSamples
 			// A completed sample is already paid for; it was admitted only
 			// while it could still change the codec.
@@ -920,12 +921,13 @@ func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID str
 				prevComp := policy.FrameCompTokenForMode(currentMode)
 				nextComp := policy.FrameCompTokenForMode(decision.Next)
 				log.Printf(
-					"txfer-frame: tid=%s fid=%d switching compression %s->%s reason=%s ratio=%.3f read_over_write=%.3f",
+					"txfer-frame: tid=%s fid=%d switching compression %s->%s reason=%s bottleneck=%s ratio=%.3f read_over_write=%.3f",
 					txferID,
 					item.FileID,
 					prevComp,
 					nextComp,
 					decision.Reason,
+					metrics.Bottleneck,
 					decision.Ratio,
 					decision.ReadOverWrite,
 				)

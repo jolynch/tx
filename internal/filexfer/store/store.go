@@ -121,6 +121,9 @@ type managedTransfer struct {
 	// and ratedFiles holds the files it has counted; compMu guards both.
 	rates      RateSummary
 	ratedFiles idset.Set
+	// loggedClasses is rates.Bottlenecks at the last progress line, so the
+	// next shows the classes since; mu guards it.
+	loggedClasses ClassCounts
 }
 
 // Store holds transfer state for a server. There is no process-wide
@@ -1325,8 +1328,18 @@ func (m *managedTransfer) progressLineLocked(now time.Time) (string, bool) {
 	}
 	bytesPct = float64(t.DoneSize) * 100.0 / float64(t.TotalSize)
 
+	// The bottleneck classes of the adaptive frames since the last line.
+	m.compMu.Lock()
+	classes := m.rates.Bottlenecks
+	m.compMu.Unlock()
+	suffix := formatClasses(classes.since(m.loggedClasses))
+	m.loggedClasses = classes
+	if suffix != "" {
+		suffix = " " + suffix
+	}
+
 	return fmt.Sprintf(
-		"txfer-progress:[%s] [%s/%s](%5.1f%%) [%s/%s](%5.1f%%) elapsed=%4s rate=%s",
+		"txfer-progress:[%s] [%s/%s](%5.1f%%) [%s/%s](%5.1f%%) elapsed=%4s rate=%s%s",
 		t.ID,
 		intencoding.HumanCount(t.Done, progressLogCountWidth),
 		intencoding.HumanCount(uint64(t.NumFiles), progressLogCountWidth),
@@ -1336,6 +1349,7 @@ func (m *managedTransfer) progressLineLocked(now time.Time) (string, bool) {
 		bytesPct,
 		elapsed.Truncate(time.Second),
 		intencoding.HumanRateFixedWidth(rate, progressLogRateWidth),
+		suffix,
 	), true
 }
 
