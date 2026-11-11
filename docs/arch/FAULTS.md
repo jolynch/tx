@@ -56,7 +56,7 @@ call sites, and socket setters keep their `setsockopt` gate there too.
 | `copy_file_range` | `sysio.CopyFileRange` | daemonless local copies |
 | `mmap`, `mincore`, `fadvise` | `sysio.Mmap`, `Mincore`, `Fadvise` | page-cache probe, restore, and eviction |
 | `setsockopt` | `Sys` before TCP socket setters | `SetNoDelay`, socket buffer sizes, and `TCP_USER_TIMEOUT` on dial and accept; `TCP_NOTSENT_LOWAT` on probes |
-| `getsockopt` | `sysio.TCPRateReader` | an adaptive SEND's `TCP_INFO` delivery-rate reads |
+| `getsockopt` | `sysio.TCPRateReader` | an adaptive SEND's `TCP_INFO` delivery-rate and bottleneck reads |
 
 Ungated adapters cover TCP byte counts, idle-socket peeks, descriptor close,
 unmapping, system memory, metadata extraction, and directory or progress
@@ -205,8 +205,10 @@ tests check it.
 NET `rate` stands in for a connection in slow start or on a slower path
 without shaping the network: a reading drawn from
 `TX_FAULTS_NET='rate=0.3:β(20ms,50ms,100ms,200ms)'` reports 5 to 50 MiB/s.
-SYS `getsockopt.fail` leaves a SEND with no kernel rate, as on another
-platform, so it runs on the rate the server measures from its own writes.
+SYS `getsockopt.fail` leaves a SEND with no kernel rate and no bottleneck
+class, as on another platform, so it runs on the rate the server measures
+from its own writes, and the policy compares frame costs alone. NET `rate`
+replaces only the delivery rate; the class still comes from the socket.
 
 TCP turns lost, duplicated, or reordered packets into delay. NET `drop`,
 `dup`, and `reorder` break that contract on purpose, as middleboxes, offload

@@ -155,6 +155,43 @@ type CompressionMetrics struct {
 	RecoveryAllowed bool
 	// RecoveryReady reports whether the connection has repaid past check losses.
 	RecoveryReady bool
+	// Bottleneck is what the connection's socket reports limited its
+	// sending recently, or BottleneckUnknown without a reading.
+	Bottleneck Bottleneck
+}
+
+// Bottleneck is what limits a connection's sending, as its TCP socket
+// reports it.
+type Bottleneck uint8
+
+const (
+	// BottleneckUnknown means no reading: the policy decides on frame
+	// costs alone.
+	BottleneckUnknown Bottleneck = iota
+	// BottleneckSender means the socket sat idle: reading or encoding could
+	// not keep the path busy. No rule acts on it; checks of cheaper codecs
+	// on real frames find such a sender.
+	BottleneckSender
+	// BottleneckNetwork means the path itself, its congestion window or
+	// pacing, held the bytes back, so compression can help.
+	BottleneckNetwork
+	// BottleneckReceiver means the receiver's window held the bytes back.
+	// Usually the receiver drains slower than the path delivers, and
+	// compression cannot help; but a receive window below the path's
+	// bandwidth-delay product reads the same, and there it does.
+	BottleneckReceiver
+)
+
+func (b Bottleneck) String() string {
+	switch b {
+	case BottleneckSender:
+		return "sender"
+	case BottleneckNetwork:
+		return "network"
+	case BottleneckReceiver:
+		return "receiver"
+	}
+	return "unknown"
 }
 
 type CompressionDecision struct {
