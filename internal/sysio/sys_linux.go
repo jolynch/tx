@@ -288,18 +288,55 @@ func NewTCPRateReader(inj *faults.Injector, conn *net.TCPConn) *TCPRateReader {
 // fails. The kernel keeps the most recent sample that was not
 // application-limited unless a limited one is higher.
 func (r *TCPRateReader) DeliveryRate() (bytesPerSec uint64, appLimited bool) {
+	l := r.Limits()
+	return l.DeliveryRate, l.AppLimited
+}
+
+// TCPLimits is one TCP_INFO reading of what limits a socket's sending. The
+// limited times are cumulative over the connection's life, so a caller
+// compares two readings.
+type TCPLimits struct {
+	// DeliveryRate and AppLimited are as DeliveryRate returns them.
+	DeliveryRate uint64
+	AppLimited   bool
+	// Busy is the time the socket had data to send; RwndLimited the part of
+	// it the peer's receive window held back, and SndbufLimited the part the
+	// send buffer did. Network-limited time is the rest.
+	Busy, RwndLimited, SndbufLimited time.Duration
+	// NoLimits reports a kernel whose TCP_INFO lacks the busy and limited
+	// times (before Linux 4.10): they read zero, and only the delivery rate
+	// is real.
+	NoLimits bool
+	// OK reports a successful read; every other field is zero without one.
+	OK bool
+}
+
+// tcpInfoLimitsEnd is how much of struct tcp_info a kernel must fill to
+// report the busy and limited times.
+var tcpInfoLimitsEnd = uint32(unsafe.Offsetof(unix.TCPInfo{}.Sndbuf_limited) + unsafe.Sizeof(unix.TCPInfo{}.Sndbuf_limited))
+
+// Limits reads TCP_INFO once and returns what limited the socket's sending.
+// The NET rate kind can replace its delivery rate, as in DeliveryRate.
+func (r *TCPRateReader) Limits() TCPLimits {
 	if r == nil || r.raw == nil {
-		return 0, false
+		return TCPLimits{}
 	}
 	if r.inj.Sys(faults.SysGetsockopt) != nil {
-		return 0, false
+		return TCPLimits{}
 	}
 	r.ok = false
 	if err := r.raw.Control(r.read); err != nil || !r.ok {
-		return 0, false
+		return TCPLimits{}
 	}
 	flags := *(*uint8)(unsafe.Add(unsafe.Pointer(&r.info), tcpInfoAppLimitedByte))
-	return r.inj.DeliveryRate(r.info.Delivery_rate, flags&tcpInfoAppLimitedMask != 0)
+	l := TCPLimits{NoLimits: r.size < tcpInfoLimitsEnd, OK: true}
+	if !l.NoLimits {
+		l.Busy = time.Duration(r.info.Busy_time) * time.Microsecond
+		l.RwndLimited = time.Duration(r.info.Rwnd_limited) * time.Microsecond
+		l.SndbufLimited = time.Duration(r.info.Sndbuf_limited) * time.Microsecond
+	}
+	l.DeliveryRate, l.AppLimited = r.inj.DeliveryRate(r.info.Delivery_rate, flags&tcpInfoAppLimitedMask != 0)
+	return l
 }
 
 // SetTCPUserTimeout sets TCP_USER_TIMEOUT on conn: the kernel closes the

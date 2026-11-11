@@ -297,10 +297,11 @@ func TestTCPByteCounts(t *testing.T) {
 	}
 }
 
-// TestTCPRateReader checks the delivery rate and its app-limited bit. One
-// small write on an idle socket is an app-limited sample, by the kernel's
-// definition; a bulk write that keeps the send queue full is not. A read
-// allocates nothing once the reader is built.
+// TestTCPRateReader checks the delivery rate and its app-limited bit, and
+// the limits a bulk write leaves. One small write on an idle socket is an
+// app-limited sample, by the kernel's definition; a bulk write that keeps
+// the send queue full is not. A read allocates nothing once the reader is
+// built.
 func TestTCPRateReader(t *testing.T) {
 	client, server := tcpPair(t)
 	_ = server.SetDeadline(time.Now().Add(callTimeout))
@@ -350,6 +351,27 @@ func TestTCPRateReader(t *testing.T) {
 	}
 	if allocs := testing.AllocsPerRun(100, func() { _, _ = r.DeliveryRate() }); allocs != 0 {
 		t.Fatalf("DeliveryRate allocated %.1f times per read", allocs)
+	}
+	// Bulk writes keep the socket busy, and the limited times are parts of
+	// that. The kernel counts busy time in jiffies, so on a 100 or 250 Hz
+	// kernel one fast loopback write can still read zero: write until it
+	// does not.
+	l := r.Limits()
+	for deadline := time.Now().Add(2 * time.Second); l.OK && l.Busy == 0 && time.Now().Before(deadline); l = r.Limits() {
+		done := make(chan error, 1)
+		go func() { _, err := io.ReadFull(server, sink); done <- err }()
+		if _, err := client.Write(bulk); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !l.OK || l.NoLimits || l.Busy <= 0 || l.RwndLimited > l.Busy || l.SndbufLimited > l.Busy {
+		t.Fatalf("Limits after bulk writes = %+v; want a busy socket and limits within busy time", l)
+	}
+	if allocs := testing.AllocsPerRun(100, func() { _ = r.Limits() }); allocs != 0 {
+		t.Fatalf("Limits allocated %.1f times per read", allocs)
 	}
 }
 
