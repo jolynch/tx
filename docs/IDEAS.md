@@ -505,6 +505,12 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Testing
 
+- **`TestServeAdmissionBusy` flakes under load.** Its last loop dials four
+  times in a row right after one dial succeeds, assuming every earlier
+  connection has returned its handshake permit; on a saturated machine one
+  has not yet, and the test fails with `server at handshake capacity`. It
+  passes alone. Retry each of the four dials until the deadline, as the
+  loop before them does.
 - **The policy sim does not model a fast response's buffer.** Recovery
   checks flush fast responses so home and candidates are timed to the same
   point, but the sim times every frame completely, so its fuzzers cannot
