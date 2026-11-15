@@ -1460,14 +1460,10 @@ func (c *Client) downloadSubBatch(
 	pendingAcks := make([]AcknowledgeFileProgressRequest, 0, len(plans))
 	ackProgresses := make([]seqAckProgress, 0, len(plans))
 	var (
-		frameBuf        []byte
-		releaseFrameBuf func()
+		frameBuf    []byte
+		frameBufPtr *[]byte
 	)
-	defer func() {
-		if releaseFrameBuf != nil {
-			releaseFrameBuf()
-		}
-	}()
+	defer func() { bufpool.Put(frameBufPtr) }()
 
 	// One hasher serves every file of the sub-batch; a hasher per file is
 	// 1.2 KiB of garbage per file.
@@ -1562,7 +1558,7 @@ func (c *Client) downloadSubBatch(
 				return nil, nil, nil, fmt.Errorf("frame for file %d declares %d bytes at offset %d, past its size %d", plan.entry.ID, frameMeta.Size, offset, plan.entry.Size)
 			}
 			if frameBuf == nil {
-				frameBuf, releaseFrameBuf = c.acquireFrameReadBuffer(frameMeta.MaxWireSizeHint)
+				frameBuf, frameBufPtr = c.acquireFrameReadBuffer(frameMeta.MaxWireSizeHint)
 			}
 
 			payloadReader.R, payloadReader.N = br, frameMeta.WireSize
@@ -2180,8 +2176,8 @@ func (c *Client) downloadSplitWindowTraced(
 		return writer.Close()
 	}
 
-	frameBuf, releaseFrameBuf := c.acquireFrameReadBuffer(meta.MaxWireSizeHint)
-	defer releaseFrameBuf()
+	frameBuf, frameBufPtr := c.acquireFrameReadBuffer(meta.MaxWireSizeHint)
+	defer bufpool.Put(frameBufPtr)
 
 	windowHasher := xxh3.New128()
 	copyErr := copyStreamWithProgress(io.MultiWriter(writer, windowHasher), reader, frameBuf, func(written int64) error {
@@ -3102,17 +3098,19 @@ func effectiveFrameReadBufferSize(baseSize int, maxWireHint int64, capSize int) 
 	return target
 }
 
-func (c *Client) acquireFrameReadBuffer(maxWireHint int64) ([]byte, func()) {
+// acquireFrameReadBuffer returns a frame read buffer and the pooled pointer
+// behind it, which the caller passes to bufpool.Put once, after its last use.
+func (c *Client) acquireFrameReadBuffer(maxWireHint int64) ([]byte, *[]byte) {
 	size := effectiveFrameReadBufferSize(c.FrameBufferBytes, maxWireHint, c.MaxFrameReadBufferBytes)
-	buf, release, err := bufpool.Acquire(size)
+	p, err := bufpool.Get(size)
 	if err != nil {
 		// Unreachable: effectiveFrameReadBufferSize floors the size above zero
 		// and clamps it to bufpool.MaxBucket. Kept so a future change to either
 		// bound degrades to an unpooled buffer rather than failing every frame
-		// read.
-		return make([]byte, size), func() {}
+		// read. bufpool.Put ignores the nil pointer.
+		return make([]byte, size), nil
 	}
-	return buf, release
+	return (*p)[:size], p
 }
 
 func (c *Client) acquireScratchBuffer(sizeHint int) *bytes.Buffer {
@@ -3429,7 +3427,7 @@ type fileStream struct {
 	sawTerminalOK bool
 	closed        bool
 	pending       *FileFrameMeta
-	releaseBr     func()
+	brBufPtr      *[]byte // pooled buffer behind br, put back on Close
 }
 
 type readerWithCloser struct {
@@ -3581,7 +3579,7 @@ func (c *Client) newFileStreamTraced(respBody io.ReadCloser, ageIdentity string,
 	}
 
 	bufferHint := c.fileStreamBufferHint(requested, firstMeta.Size)
-	readBuf, release := c.acquireFrameReadBuffer(bufferHint)
+	readBuf, readBufPtr := c.acquireFrameReadBuffer(bufferHint)
 	stream := &fileStream{
 		respBody:  respBody,
 		br:        newPooledLineReader(probe, readBuf),
@@ -3592,11 +3590,11 @@ func (c *Client) newFileStreamTraced(respBody io.ReadCloser, ageIdentity string,
 		arrival:   time.Now(),
 		meta:      &FileFrameMeta{},
 		pending:   &firstMeta,
-		releaseBr: release,
+		brBufPtr:  readBufPtr,
 		requested: requested,
 	}
 	if err := stream.openNextFrame(); err != nil {
-		release()
+		bufpool.Put(readBufPtr)
 		return nil, nil, err
 	}
 	return stream, stream.meta, nil
@@ -3688,10 +3686,8 @@ func (s *fileStream) Close() error {
 	if s.logical != nil {
 		logicalErr = s.logical.Close()
 	}
-	if s.releaseBr != nil {
-		s.releaseBr()
-		s.releaseBr = nil
-	}
+	bufpool.Put(s.brBufPtr)
+	s.brBufPtr = nil
 	bodyErr := s.respBody.Close()
 	if logicalErr != nil {
 		return logicalErr

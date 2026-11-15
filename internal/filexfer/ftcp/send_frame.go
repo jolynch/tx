@@ -164,12 +164,12 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 		payloadWriter = compWriter
 	} else {
 		if stagedDirectWrite {
-			staging, releaseStaging, stageErr := bufpool.Acquire(bufpool.BucketSize(args.FrameSize))
+			stagingPtr, stageErr := bufpool.Get(bufpool.BucketSize(args.FrameSize))
 			if stageErr != nil {
 				return frameStreamStats{}, stageErr
 			}
-			defer releaseStaging()
-			stagingBuf = bytes.NewBuffer(staging[:0])
+			defer bufpool.Put(stagingPtr)
+			stagingBuf = bytes.NewBuffer((*stagingPtr)[:0])
 			payloadWriter = stagingBuf
 		} else {
 			if err := writeFrameHeader(args.Output, args, args.FrameSize, timedWrites); err != nil {
@@ -354,11 +354,12 @@ func streamFramePayloadZeroCopyWithSyscalls(fd *os.File, fileOffset *int64, args
 	growPipeBestEffort(args.Faults, srcW, args.PipeSizeBytes)
 
 	copyBufSize := bufpool.BucketSize(int64(args.PipeSizeBytes))
-	copyBuf, releaseCopyBuf, err := bufpool.Acquire(copyBufSize)
+	copyBufPtr, err := bufpool.Get(copyBufSize)
 	if err != nil {
 		return frameStreamStats{}, err
 	}
-	defer releaseCopyBuf()
+	defer bufpool.Put(copyBufPtr)
+	copyBuf := (*copyBufPtr)[:copyBufSize]
 
 	if err := args.Faults.Sys(faults.SysDup); err != nil {
 		return frameStreamStats{}, err
