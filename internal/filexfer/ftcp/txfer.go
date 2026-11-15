@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -18,99 +19,110 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
-type txferRequest struct {
-	Directory   string
-	Verbose     bool
+// manifestHints are the transfer hints TXFER and SYNC share. The manifest
+// header echoes all but Comp, which selects the response body's codec.
+type manifestHints struct {
 	Mode        string
 	LinkMbps    int64
 	Concurrency int
 	DeadlineMS  int64
-	PageCache   bool
 	Comp        string
-	CacheMap    string // "none" or "send"
 }
 
+type txferRequest struct {
+	manifestHints
+	Directory string
+	Verbose   bool
+	PageCache bool
+	CacheMap  string // "none" or "send"
+}
+
+var txferOptions = []string{"directory", "verbose", "mode", "link-mbps", "concurrency", "deadline-ms", "cache-map", "comp"}
+
+var errGentleCacheMap error = protocolErr{code: "BAD_REQUEST", message: "cache-map is not supported with gentle mode"}
+
 func parseTXFERRequest(req Request) (txferRequest, error) {
-	if req.Verb != VerbTXFER {
-		return txferRequest{}, protocolErr{code: "BAD_COMMAND", message: "not TXFER"}
+	p, err := manifestParams(req, VerbTXFER, txferOptions)
+	if err != nil {
+		return txferRequest{}, err
+	}
+	r := txferRequest{Directory: p["directory"], CacheMap: "none"}
+	r.Verbose = p["verbose"] == "1" || strings.EqualFold(p["verbose"], "true")
+	switch strings.ToLower(strings.TrimSpace(p["cache-map"])) {
+	case "", "none":
+	case "send":
+		r.CacheMap, r.PageCache = "send", true
+	case "recv":
+		return txferRequest{}, protocolErr{code: "UNSUPPORTED_CACHE_MAP", message: "cache-map=recv not supported on TXFER"}
+	default:
+		return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "cache-map must be none or send"}
+	}
+	if err := r.parseMode(p); err != nil {
+		return txferRequest{}, err
+	}
+	if r.Mode == "gentle" && r.CacheMap != "none" {
+		return txferRequest{}, errGentleCacheMap
+	}
+	if err := r.parseLimits(p); err != nil {
+		return txferRequest{}, err
+	}
+	return r, nil
+}
+
+// manifestParams returns the options of a TXFER or SYNC request after
+// checking its verb, its option names, and that it names a directory.
+func manifestParams(req Request, verb Verb, options []string) (map[string]string, error) {
+	name := verb.String()
+	if req.Verb != verb {
+		return nil, protocolErr{code: "BAD_COMMAND", message: "not " + name}
 	}
 	if len(req.Params) != 1 {
-		return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid TXFER arguments"}
+		return nil, protocolErr{code: "BAD_REQUEST", message: "invalid " + name + " arguments"}
 	}
 	p := req.Params[0]
 	for key := range p {
-		switch key {
-		case "directory", "verbose", "mode", "link-mbps", "concurrency", "deadline-ms", "cache-map", "comp":
-		default:
-			return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "unknown TXFER option"}
+		if !slices.Contains(options, key) {
+			return nil, protocolErr{code: "BAD_REQUEST", message: "unknown " + name + " option"}
 		}
 	}
-	directory := p["directory"]
-	if strings.TrimSpace(directory) == "" {
-		return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing TXFER directory"}
+	if strings.TrimSpace(p["directory"]) == "" {
+		return nil, protocolErr{code: "BAD_REQUEST", message: "missing " + name + " directory"}
 	}
-	verbose := false
-	if raw := p["verbose"]; raw != "" {
-		if raw == "1" || strings.EqualFold(raw, "true") {
-			verbose = true
-		}
+	return p, nil
+}
+
+// parseMode and parseLimits are separate because TXFER checks its cache map
+// between them and SYNC checks it after both, and each verb keeps its order.
+func (h *manifestHints) parseMode(p map[string]string) error {
+	h.Mode = strings.ToLower(strings.TrimSpace(p["mode"]))
+	if h.Mode != "fast" && h.Mode != "gentle" {
+		return protocolErr{code: "BAD_REQUEST", message: "mode must be fast or gentle"}
 	}
-	cacheMap := "none"
-	if raw := strings.ToLower(strings.TrimSpace(p["cache-map"])); raw != "" {
-		switch raw {
-		case "none":
-			cacheMap = "none"
-		case "send":
-			cacheMap = "send"
-		case "recv":
-			return txferRequest{}, protocolErr{code: "UNSUPPORTED_CACHE_MAP", message: "cache-map=recv not supported on TXFER"}
-		default:
-			return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "cache-map must be none or send"}
-		}
+	return nil
+}
+
+func (h *manifestHints) parseLimits(p map[string]string) error {
+	var err error
+	if h.LinkMbps, err = strconv.ParseInt(strings.TrimSpace(p["link-mbps"]), 10, 64); err != nil || h.LinkMbps < 0 {
+		return protocolErr{code: "BAD_REQUEST", message: "link-mbps must be >= 0"}
 	}
-	pageCache := cacheMap == "send"
-	mode := strings.ToLower(strings.TrimSpace(p["mode"]))
-	if mode != "fast" && mode != "gentle" {
-		return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "mode must be fast or gentle"}
+	if h.Concurrency, err = strconv.Atoi(strings.TrimSpace(p["concurrency"])); err != nil || h.Concurrency <= 0 {
+		return protocolErr{code: "BAD_REQUEST", message: "concurrency must be > 0"}
 	}
-	if mode == "gentle" && cacheMap != "none" {
-		return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "cache-map is not supported with gentle mode"}
-	}
-	linkMbps, err := strconv.ParseInt(strings.TrimSpace(p["link-mbps"]), 10, 64)
-	if err != nil || linkMbps < 0 {
-		return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "link-mbps must be >= 0"}
-	}
-	concurrency, err := strconv.Atoi(strings.TrimSpace(p["concurrency"]))
-	if err != nil || concurrency <= 0 {
-		return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "concurrency must be > 0"}
-	}
-	var deadlineMS int64
 	if raw := strings.TrimSpace(p["deadline-ms"]); raw != "" {
-		deadlineMS, err = strconv.ParseInt(raw, 10, 64)
-		if err != nil || deadlineMS < 0 {
-			return txferRequest{}, protocolErr{code: "BAD_REQUEST", message: "deadline-ms must be >= 0"}
+		if h.DeadlineMS, err = strconv.ParseInt(raw, 10, 64); err != nil || h.DeadlineMS < 0 {
+			return protocolErr{code: "BAD_REQUEST", message: "deadline-ms must be >= 0"}
 		}
 	}
-	comp := strings.ToLower(strings.TrimSpace(p["comp"]))
-	if comp == "" {
-		comp = encoding.EncodingZstd
-	}
-	switch comp {
+	h.Comp = strings.ToLower(strings.TrimSpace(p["comp"]))
+	switch h.Comp {
+	case "":
+		h.Comp = encoding.EncodingZstd
 	case "none", encoding.EncodingZstd:
 	default:
-		return txferRequest{}, protocolErr{code: "UNSUPPORTED_COMP", message: "supported comp values: none, zstd"}
+		return protocolErr{code: "UNSUPPORTED_COMP", message: "supported comp values: none, zstd"}
 	}
-	return txferRequest{
-		Directory:   directory,
-		Verbose:     verbose,
-		Mode:        mode,
-		LinkMbps:    linkMbps,
-		Concurrency: concurrency,
-		DeadlineMS:  deadlineMS,
-		PageCache:   pageCache,
-		CacheMap:    cacheMap,
-		Comp:        comp,
-	}, nil
+	return nil
 }
 
 func handleTXFERWithCallback(ctx context.Context, req Request, out io.Writer, deps Deps, onCreated func(string)) error {
@@ -118,81 +130,244 @@ func handleTXFERWithCallback(ctx context.Context, req Request, out io.Writer, de
 	if err != nil {
 		return err
 	}
-	requestPath := cleanRequestPath(parsed.Directory)
-	parsed.Directory, err = resolveUnderRoot(deps.Root(), parsed.Directory)
+	root, err := resolveUnderRoot(deps.Root(), parsed.Directory)
 	if err != nil {
 		return err
 	}
-	isDir, err := validatePath(parsed.Directory)
+	isDir, err := validatePath(root)
 	if err != nil {
 		return protocolErr{code: "UNPROCESSABLE", message: err.Error()}
 	}
-
-	root := filepath.Clean(parsed.Directory)
-	var singleFileName string
+	var file string
+	updates := 1000
 	if !isDir {
-		singleFileName = filepath.Base(root)
-		root = filepath.Dir(root)
+		root, file = filepath.Dir(root), filepath.Base(root)
+		updates = 2 // the root and the file
 	}
-	transfer, err := deps.NewTransfer(root, 0, 0, store.WithRequestPath(requestPath))
+	transferID, err := newManifestTransfer(deps, root, parsed.Directory, parsed.manifestHints, onCreated)
 	if err != nil {
-		return protocolErr{code: "INTERNAL", message: "failed to initialize transfer"}
+		return err
 	}
-	if onCreated != nil {
-		onCreated(transfer.ID)
-	}
-	if ok := deps.SetTransferHints(transfer.ID, parsed.Mode, parsed.LinkMbps, parsed.Concurrency); !ok {
-		return protocolErr{code: "INTERNAL", message: "failed to persist transfer hints"}
-	}
-	if parsed.DeadlineMS > 0 {
-		deps.SetTransferDeadline(transfer.ID, parsed.DeadlineMS)
-	}
-	manifestMode := parsed.Mode
-	manifestLinkMbps := parsed.LinkMbps
-	manifestConcurrency := parsed.Concurrency
-	if stored, ok := deps.GetTransferSummary(transfer.ID); ok {
-		if strings.TrimSpace(stored.Mode) != "" {
-			manifestMode = strings.ToLower(strings.TrimSpace(stored.Mode))
-		}
-		if stored.LinkMbps >= 0 {
-			manifestLinkMbps = stored.LinkMbps
-		}
-		if stored.Concurrency > 0 {
-			manifestConcurrency = stored.Concurrency
-		}
-	}
-	cleanupTransfer := true
+	keep := false
 	defer func() {
-		if cleanupTransfer {
-			deps.DeleteTransfer(transfer.ID)
+		if !keep {
+			deps.DeleteTransfer(transferID)
 		}
 	}()
 
 	cw := encoding.NewFramedBodyWriter(out, parsed.Comp, encoding.DefaultBodyChunkSize, encoding.DefaultBodyFlushInterval)
-	var encodeErr error
-	if singleFileName != "" {
-		encodeErr = encodeSingleFileManifest(cw, transfer.ID, root, singleFileName, manifestMode, manifestLinkMbps, manifestConcurrency, parsed.DeadlineMS, parsed.PageCache, deps)
+	e := newManifestEmitter(cw, deps, transferID, root, updates)
+	defer e.close()
+	if err := e.start(parsed.manifestHints); err != nil {
+		return manifestErr(err)
+	}
+	if file != "" {
+		err = encodeSingleFileManifest(e, file, parsed.PageCache)
 	} else {
-		encodeErr = encodeManifest(cw, transfer.ID, root, manifestMode, manifestLinkMbps, manifestConcurrency, parsed.DeadlineMS, parsed.Verbose, parsed.PageCache, deps)
+		err = encodeManifest(e, parsed.Verbose, parsed.PageCache)
 	}
-	if encodeErr != nil {
-		if isBrokenPipe(encodeErr) {
-			return nil
-		}
-		return protocolErr{code: "BAD_REQUEST", message: encodeErr.Error()}
+	if err != nil {
+		return manifestErr(err)
 	}
+	e.close()
+	deps.ClipTransfer(transferID)
 	if err := cw.Close(); err != nil {
 		if isBrokenPipe(err) {
 			return nil
 		}
 		return protocolErr{code: "INTERNAL", message: "flush manifest frames: " + err.Error()}
 	}
-	cleanupTransfer = false
+	keep = true
 	return nil
+}
+
+// manifestErr maps an error from writing a manifest: a closed connection ends
+// the request quietly, and anything else is BAD_REQUEST.
+func manifestErr(err error) error {
+	if isBrokenPipe(err) {
+		return nil
+	}
+	return protocolErr{code: "BAD_REQUEST", message: err.Error()}
 }
 
 func handleTXFER(ctx context.Context, req Request, out io.Writer, deps Deps) error {
 	return handleTXFERWithCallback(ctx, req, out, deps, nil)
+}
+
+// newManifestTransfer creates the transfer a TXFER or SYNC manifest describes
+// and stores its hints.
+func newManifestTransfer(deps Deps, root, requested string, h manifestHints, onCreated func(string)) (string, error) {
+	transfer, err := deps.NewTransfer(root, 0, 0, store.WithRequestPath(cleanRequestPath(requested)))
+	if err != nil {
+		return "", protocolErr{code: "INTERNAL", message: "failed to initialize transfer"}
+	}
+	if onCreated != nil {
+		onCreated(transfer.ID)
+	}
+	if !deps.SetTransferHints(transfer.ID, h.Mode, h.LinkMbps, h.Concurrency) {
+		return "", protocolErr{code: "INTERNAL", message: "failed to persist transfer hints"}
+	}
+	if h.DeadlineMS > 0 {
+		deps.SetTransferDeadline(transfer.ID, h.DeadlineMS)
+	}
+	return transfer.ID, nil
+}
+
+// manifestEmitter writes a manifest's entries, front-coding each path and
+// mtime against the previous entry's, and registers each entry's file state
+// with the transfer.
+type manifestEmitter struct {
+	w          io.Writer
+	deps       Deps
+	transferID string
+	root       string
+	verbose    bool // write every path and mtime in full
+	nextID     uint64
+	prevPath   string
+	prevMtime  string
+	updates    chan TransferFileStateUpdate
+	done       <-chan struct{}
+}
+
+func newManifestEmitter(w io.Writer, deps Deps, transferID, root string, capacity int) *manifestEmitter {
+	updates := make(chan TransferFileStateUpdate, capacity)
+	return &manifestEmitter{
+		w:          w,
+		deps:       deps,
+		transferID: transferID,
+		root:       root,
+		nextID:     1,
+		updates:    updates,
+		done:       deps.RegisterTransferFileState(transferID, updates, TransferStateStarted),
+	}
+}
+
+// start writes the header and the root directory's entry.
+func (e *manifestEmitter) start(h manifestHints) error {
+	header := encoding.FormatManifestHeader(encoding.ManifestHeader{
+		TransferID:  e.transferID,
+		Mode:        h.Mode,
+		LinkMbps:    h.LinkMbps,
+		Concurrency: h.Concurrency,
+		DeadlineMS:  h.DeadlineMS,
+	})
+	if _, err := io.WriteString(e.w, header+"\n"); err != nil {
+		return err
+	}
+	info, err := os.Stat(e.root)
+	if err != nil {
+		return err
+	}
+	root := filepath.Clean(e.root)
+	return e.write(encoding.ManifestEntry{
+		Type:       encoding.EntryTypeDir,
+		ID:         encoding.RootFileID,
+		Mtime:      info.ModTime().UnixNano(),
+		Mode:       encoding.NormalizeManifestMode(info.Mode()),
+		Path:       root,
+		LinkTarget: -1,
+	}, root)
+}
+
+// emit writes entry, which is relative to the root, with the next file ID.
+func (e *manifestEmitter) emit(entry encoding.ManifestEntry) error {
+	entry.ID = e.nextID
+	e.nextID++
+	return e.write(entry, filepath.Join(e.root, entry.Path))
+}
+
+func (e *manifestEmitter) write(entry encoding.ManifestEntry, fullPath string) error {
+	prevPath, prevMtime := e.prevPath, e.prevMtime
+	if e.verbose {
+		prevPath, prevMtime = "", ""
+	}
+	line, _, mtime, err := encoding.MarshalManifestEntry(entry, prevPath, prevMtime)
+	if err != nil {
+		return err
+	}
+	e.updates <- TransferFileStateUpdate{
+		FileID:    entry.ID,
+		EntryType: entry.Type,
+		PathHash:  xxh3.Hash128([]byte(fullPath)),
+		FileSize:  entry.Size,
+	}
+	if _, err := io.WriteString(e.w, line+"\n"); err != nil {
+		return err
+	}
+	e.prevPath, e.prevMtime = entry.Path, mtime
+	return nil
+}
+
+// attachPageCache records blob as the page-cache map of the entry emit
+// writes next.
+func (e *manifestEmitter) attachPageCache(entry *encoding.ManifestEntry, blob []byte) {
+	entry.PageCache = blob
+	e.deps.SetTransferPageCache(e.transferID, e.nextID, blob)
+}
+
+// close ends file-state registration and waits for it to finish. Calls after
+// the first do nothing.
+func (e *manifestEmitter) close() {
+	if e.updates == nil {
+		return
+	}
+	close(e.updates)
+	<-e.done
+	e.updates = nil
+}
+
+// encodeSingleFileManifest emits the one file a single-file TXFER names.
+func encodeSingleFileManifest(e *manifestEmitter, filename string, pageCache bool) error {
+	fullPath := filepath.Join(e.root, filename)
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		return err
+	}
+	entry := encoding.ManifestEntry{
+		Type:       encoding.EntryTypeFile,
+		Size:       info.Size(),
+		Mtime:      info.ModTime().UnixNano(),
+		Mode:       encoding.NormalizeManifestMode(info.Mode()),
+		Path:       filename,
+		LinkTarget: -1,
+	}
+	if pageCache && info.Size() > 0 {
+		var ce pagecache.CacheEntry
+		if loadErr := ce.Load(fullPath); loadErr == nil && !ce.Empty() {
+			if blob, mErr := encoding.EncodePageCacheEntry(&ce); mErr == nil && len(blob) > 0 {
+				e.attachPageCache(&entry, blob)
+			}
+		}
+	}
+	return e.emit(entry)
+}
+
+// encodeManifest walks the root and emits every entry under it.
+func encodeManifest(e *manifestEmitter, verbose bool, pageCache bool) error {
+	e.verbose = verbose
+	var pages map[string]*pagecache.CacheEntry
+	if pageCache {
+		// LoadDirectory keys its result map by absolute paths (it calls
+		// filepath.Abs internally) while WalkManifestEntries below yields
+		// FullPath in whatever form the root was passed. Normalize once so the
+		// two lookups agree even when the server was launched with a relative
+		// chroot.
+		if absRoot, absErr := filepath.Abs(e.root); absErr == nil {
+			e.root = absRoot
+		}
+		pages, _ = pagecache.LoadDirectory(e.root, 0)
+	}
+	return encoding.WalkManifestEntries(e.root, func(result encoding.WalkResult) error {
+		entry := result.Entry
+		if pages != nil && entry.Type == encoding.EntryTypeFile && entry.Size > 0 {
+			if ce, ok := pages[result.FullPath]; ok && !ce.Empty() {
+				if blob, mErr := encoding.EncodePageCacheEntry(ce); mErr == nil && len(blob) > 0 {
+					e.attachPageCache(&entry, blob)
+				}
+			}
+		}
+		return e.emit(entry)
+	})
 }
 
 // cleanRequestPath is the requested path as the client sees it under the
@@ -236,254 +411,6 @@ func validatePath(path string) (isDir bool, err error) {
 	}
 	fd.Close()
 	return false, nil
-}
-
-func encodeSingleFileManifest(
-	w io.Writer,
-	transferID string,
-	root string,
-	filename string,
-	mode string,
-	linkMbps int64,
-	concurrency int,
-	deadlineMS int64,
-	pageCache bool,
-	deps Deps,
-) error {
-	fullPath := filepath.Join(root, filename)
-	info, err := os.Stat(fullPath)
-	if err != nil {
-		return err
-	}
-
-	header := encoding.FormatManifestHeader(encoding.ManifestHeader{
-		TransferID:  transferID,
-		Mode:        mode,
-		LinkMbps:    linkMbps,
-		Concurrency: concurrency,
-		DeadlineMS:  deadlineMS,
-	})
-	header += "\n"
-
-	if _, err := io.WriteString(w, header); err != nil {
-		return err
-	}
-
-	rootInfo, err := os.Stat(root)
-	if err != nil {
-		return err
-	}
-	rootEntry := encoding.ManifestEntry{
-		Type:       encoding.EntryTypeDir,
-		ID:         encoding.RootFileID,
-		Size:       0,
-		Mtime:      rootInfo.ModTime().UnixNano(),
-		Mode:       encoding.NormalizeManifestMode(rootInfo.Mode()),
-		Path:       filepath.Clean(root),
-		LinkTarget: -1,
-	}
-	rootLine, prevPath, prevMtime, err := encoding.MarshalManifestEntry(rootEntry, "", "")
-	if err != nil {
-		return err
-	}
-	if _, err := io.WriteString(w, rootLine+"\n"); err != nil {
-		return err
-	}
-
-	entry := encoding.ManifestEntry{
-		Type:       encoding.EntryTypeFile,
-		ID:         1,
-		Size:       info.Size(),
-		Mtime:      info.ModTime().UnixNano(),
-		Mode:       encoding.NormalizeManifestMode(info.Mode()),
-		Path:       filename,
-		LinkTarget: -1,
-	}
-	if pageCache && info.Size() > 0 {
-		var ce pagecache.CacheEntry
-		if loadErr := ce.Load(fullPath); loadErr == nil && !ce.Empty() {
-			if blob, mErr := encoding.EncodePageCacheEntry(&ce); mErr == nil && len(blob) > 0 {
-				entry.PageCache = blob
-				deps.SetTransferPageCache(transferID, 1, blob)
-			}
-		}
-	}
-	line, _, _, err := encoding.MarshalManifestEntry(entry, prevPath, prevMtime)
-	if err != nil {
-		return err
-	}
-	line += "\n"
-
-	updatesCh := make(chan TransferFileStateUpdate, 2)
-	done := deps.RegisterTransferFileState(transferID, updatesCh, TransferStateStarted)
-	closedUpdates := false
-	closeUpdates := func() {
-		if closedUpdates {
-			return
-		}
-		close(updatesCh)
-		<-done
-		closedUpdates = true
-	}
-	defer func() {
-		closeUpdates()
-	}()
-
-	updatesCh <- TransferFileStateUpdate{
-		FileID:    encoding.RootFileID,
-		EntryType: encoding.EntryTypeDir,
-		PathHash:  xxh3.Hash128([]byte(filepath.Clean(root))),
-		FileSize:  0,
-	}
-	updatesCh <- TransferFileStateUpdate{
-		FileID:    entry.ID,
-		EntryType: encoding.EntryTypeFile,
-		PathHash:  xxh3.Hash128([]byte(filepath.Clean(fullPath))),
-		FileSize:  info.Size(),
-	}
-
-	if _, err := io.WriteString(w, line); err != nil {
-		return err
-	}
-	closeUpdates()
-	deps.ClipTransfer(transferID)
-	return nil
-}
-
-func encodeManifest(
-	w io.Writer,
-	transferID string,
-	root string,
-	mode string,
-	linkMbps int64,
-	concurrency int,
-	deadlineMS int64,
-	verbose bool,
-	pageCache bool,
-	deps Deps,
-) error {
-	header := encoding.FormatManifestHeader(encoding.ManifestHeader{
-		TransferID:  transferID,
-		Mode:        mode,
-		LinkMbps:    linkMbps,
-		Concurrency: concurrency,
-		DeadlineMS:  deadlineMS,
-	})
-	header += "\n"
-
-	prevPath := ""
-	prevMtime := ""
-	updatesCh := make(chan TransferFileStateUpdate, 1000)
-	done := deps.RegisterTransferFileState(transferID, updatesCh, TransferStateStarted)
-	closedUpdates := false
-	closeUpdates := func() {
-		if closedUpdates {
-			return
-		}
-		close(updatesCh)
-		<-done
-		closedUpdates = true
-	}
-	defer func() {
-		closeUpdates()
-	}()
-	fileID := uint64(1)
-	rootInfo, err := os.Stat(root)
-	if err != nil {
-		return err
-	}
-
-	if _, err := io.WriteString(w, header); err != nil {
-		return err
-	}
-
-	rootEntry := encoding.ManifestEntry{
-		Type:       encoding.EntryTypeDir,
-		ID:         encoding.RootFileID,
-		Size:       0,
-		Mtime:      rootInfo.ModTime().UnixNano(),
-		Mode:       encoding.NormalizeManifestMode(rootInfo.Mode()),
-		Path:       filepath.Clean(root),
-		LinkTarget: -1,
-	}
-	rootLine, nextPath, nextMtime, err := encoding.MarshalManifestEntry(rootEntry, prevPath, prevMtime)
-	if err != nil {
-		return err
-	}
-	rootLine += "\n"
-	updatesCh <- TransferFileStateUpdate{
-		FileID:    encoding.RootFileID,
-		EntryType: encoding.EntryTypeDir,
-		PathHash:  xxh3.Hash128([]byte(filepath.Clean(root))),
-		FileSize:  0,
-	}
-	if _, err := io.WriteString(w, rootLine); err != nil {
-		return err
-	}
-	prevPath = nextPath
-	prevMtime = nextMtime
-
-	emitEntry := func(entry encoding.ManifestEntry) error {
-		entry.ID = fileID
-		prevP := prevPath
-		prevM := prevMtime
-		if verbose {
-			prevP = ""
-			prevM = ""
-		}
-		line, _, mtimeRaw, err := encoding.MarshalManifestEntry(entry, prevP, prevM)
-		if err != nil {
-			return err
-		}
-		line += "\n"
-
-		fullPath := filepath.Clean(filepath.Join(root, entry.Path))
-		updatesCh <- TransferFileStateUpdate{
-			FileID:    entry.ID,
-			EntryType: entry.Type,
-			PathHash:  xxh3.Hash128([]byte(fullPath)),
-			FileSize:  entry.Size,
-		}
-		if _, err := io.WriteString(w, line); err != nil {
-			return err
-		}
-		prevPath = entry.Path
-		prevMtime = mtimeRaw
-		fileID++
-		return nil
-	}
-
-	var loadedFilePages map[string]*pagecache.CacheEntry
-	if pageCache {
-		// LoadDirectory keys its result map by absolute paths (it calls
-		// filepath.Abs internally) while WalkManifestEntries below yields
-		// FullPath in whatever form `root` was passed. Normalize once so the
-		// two lookups agree even when the server was launched with a relative
-		// chroot.
-		if absRoot, absErr := filepath.Abs(root); absErr == nil {
-			root = absRoot
-		}
-		loadedFilePages, _ = pagecache.LoadDirectory(root, 0)
-	}
-
-	err = encoding.WalkManifestEntries(root, func(result encoding.WalkResult) error {
-		entry := result.Entry
-		if loadedFilePages != nil && entry.Type == encoding.EntryTypeFile && entry.Size > 0 {
-			if ce, ok := loadedFilePages[result.FullPath]; ok && !ce.Empty() {
-				if blob, mErr := encoding.EncodePageCacheEntry(ce); mErr == nil && len(blob) > 0 {
-					entry.PageCache = blob
-					deps.SetTransferPageCache(transferID, uint64(fileID), blob)
-				}
-			}
-		}
-		return emitEntry(entry)
-	})
-	if err != nil {
-		return err
-	}
-	closeUpdates()
-	deps.ClipTransfer(transferID)
-	return nil
 }
 
 func isBrokenPipe(err error) bool {

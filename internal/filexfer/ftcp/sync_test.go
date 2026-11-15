@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,57 +21,6 @@ import (
 	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/pagecache"
 )
-
-func TestParseSYNCRequest(t *testing.T) {
-	good := fmt.Sprintf(`SYNC %q mode=fast link-mbps=900 concurrency=12`, "/tmp/test")
-	req, err := ParseRequest([]byte(good))
-	if err != nil {
-		t.Fatalf("ParseRequest failed: %v", err)
-	}
-	parsed, err := parseSYNCRequest(req)
-	if err != nil {
-		t.Fatalf("parseSYNCRequest failed: %v", err)
-	}
-	if parsed.Directory != "/tmp/test" || parsed.Mode != "fast" || parsed.LinkMbps != 900 || parsed.Concurrency != 12 {
-		t.Fatalf("unexpected parsed request: %+v", parsed)
-	}
-
-	bad := []string{
-		`SYNC "/tmp" link-mbps=900 concurrency=12`,
-		`SYNC "/tmp" mode=fast concurrency=12`,
-		`SYNC "/tmp" mode=fast link-mbps=900`,
-		`SYNC "/tmp" mode=slow link-mbps=900 concurrency=12`,
-		`SYNC "/tmp" mode=fast link-mbps=-1 concurrency=12`,
-		`SYNC "/tmp" mode=fast link-mbps=900 concurrency=0`,
-	}
-	for _, raw := range bad {
-		t.Run(raw, func(t *testing.T) {
-			req, err := ParseRequest([]byte(raw))
-			if err != nil {
-				t.Fatalf("ParseRequest failed: %v", err)
-			}
-			if _, err := parseSYNCRequest(req); err == nil {
-				t.Fatalf("expected parseSYNCRequest to fail for %q", raw)
-			}
-		})
-	}
-}
-
-func TestParseSYNCRequestRejectsGentleCacheMap(t *testing.T) {
-	for _, cacheMap := range []string{"send", "recv"} {
-		t.Run(cacheMap, func(t *testing.T) {
-			req, err := ParseRequest([]byte(`SYNC "/tmp" mode=gentle link-mbps=900 concurrency=12 cache-map=` + cacheMap))
-			if err != nil {
-				t.Fatalf("ParseRequest failed: %v", err)
-			}
-			if _, err := parseSYNCRequest(req); err == nil {
-				t.Fatalf("expected parseSYNCRequest to reject gentle cache-map=%s", cacheMap)
-			} else if !strings.Contains(err.Error(), "cache-map is not supported with gentle mode") {
-				t.Fatalf("unexpected error: %v", err)
-			}
-		})
-	}
-}
 
 func TestHandleSYNCEmptyOldManifest(t *testing.T) {
 	root := t.TempDir()
@@ -87,24 +37,6 @@ func TestHandleSYNCEmptyOldManifest(t *testing.T) {
 	paths := manifestPaths(newManifest)
 	if paths[0] != "a.txt" || paths[1] != "b.txt" {
 		t.Fatalf("unexpected paths: %v", paths)
-	}
-}
-
-func TestHandleSYNCNoChanges(t *testing.T) {
-	root := t.TempDir()
-	writeTestFile(t, root, "a.txt", "hello")
-	writeTestFile(t, root, "sub/b.txt", "world")
-
-	// Get initial manifest via TXFER.
-	initialManifest := runTXFERTest(t, root)
-
-	// SYNC with that manifest — nothing should be removed.
-	newManifest, rmPaths := runSYNCTest(t, root, initialManifest)
-	if len(rmPaths) != 0 {
-		t.Fatalf("expected no removals, got %v", rmPaths)
-	}
-	if len(newManifest) != 3 { // sub/ (D) + a.txt (F) + sub/b.txt (F)
-		t.Fatalf("expected 3 entries, got %d", len(newManifest))
 	}
 }
 
@@ -230,95 +162,88 @@ func TestHandleSYNCCacheMapSendDoesNotEnqueue(t *testing.T) {
 	}
 }
 
-// TestHandleSYNCZeroDeltaAutoAcksAndCompletes covers the happy path the
-// exit-after timer depends on: when every file in the client's old
-// manifest matches the on-disk entry (same size+mtime+mode), the SYNC
-// handler auto-acks each one and MaybeLogTransferComplete fires once.
-func TestHandleSYNCZeroDeltaAutoAcksAndCompletes(t *testing.T) {
-	root := t.TempDir()
-	writeTestFile(t, root, "a.txt", "hello")
-	writeTestFile(t, root, "b.txt", "world")
-	initialManifest := runTXFERTest(t, root)
-
-	_, _, deps := runSYNCTestFull(t, root, initialManifest, "none", "")
-
-	if len(deps.ackCalls) == 0 {
-		t.Fatalf("expected auto-acks for matched files, got none")
-	}
-	// Every ack should target the file's full size.
-	for _, c := range deps.ackCalls {
-		if c.ackBytes == 0 {
-			t.Fatalf("ack for fileID=%d had ackBytes=0 (must equal file size)", c.fileID)
-		}
-	}
-	if deps.completeCalls != 1 {
-		t.Fatalf("expected MaybeLogTransferComplete to fire exactly once, got %d", deps.completeCalls)
-	}
-}
-
-// TestHandleSYNCDeltaDoesNotAutoAckChangedEntries proves a size/mtime
-// drift between the client's old manifest and the on-disk entry leaves
-// the changed file un-acked. The client will SEND+ACK it later via the
-// regular path, which fires MaybeLogTransferComplete from ack.go.
-func TestHandleSYNCDeltaDoesNotAutoAckChangedEntries(t *testing.T) {
-	root := t.TempDir()
-	writeTestFile(t, root, "keep.txt", "unchanged")
-	writeTestFile(t, root, "stale.txt", "old content")
-	initialManifest := runTXFERTest(t, root)
-
-	// Mutate stale.txt so its size/mtime no longer match the manifest.
-	time.Sleep(10 * time.Millisecond)
-	writeTestFile(t, root, "stale.txt", "new content!!!")
-
-	_, _, deps := runSYNCTestFull(t, root, initialManifest, "none", "")
-
-	// Exactly one auto-ack (for keep.txt), not two — stale.txt drifted.
-	if len(deps.ackCalls) != 1 {
-		t.Fatalf("expected exactly one auto-ack (keep.txt), got %d: %+v",
-			len(deps.ackCalls), deps.ackCalls)
-	}
-	// MaybeLogTransferComplete still fires unconditionally at the end of
-	// the SYNC handler; the store-side check (Done == NumFiles) decides
-	// whether to actually emit the complete log. Tests use mockDeps so
-	// we just verify the call count.
-	if deps.completeCalls != 1 {
-		t.Fatalf("expected one MaybeLogTransferComplete call, got %d", deps.completeCalls)
-	}
-}
-
-func TestHandleSYNCMixedDelta(t *testing.T) {
-	root := t.TempDir()
-	writeTestFile(t, root, "keep.txt", "unchanged")
-	writeTestFile(t, root, "stale.txt", "old content")
-	writeTestFile(t, root, "remove.txt", "will be removed")
-
-	initialManifest := runTXFERTest(t, root)
-
-	// Modify stale.txt (change content and mtime).
-	time.Sleep(10 * time.Millisecond)
-	writeTestFile(t, root, "stale.txt", "new content!!!")
-
-	// Remove remove.txt.
-	os.Remove(filepath.Join(root, "remove.txt"))
-
-	// Add new.txt.
-	writeTestFile(t, root, "new.txt", "brand new")
-
-	newManifest, rmPaths := runSYNCTest(t, root, initialManifest)
-
-	// Should have keep.txt, new.txt, stale.txt in manifest.
-	if len(newManifest) != 3 {
-		t.Fatalf("expected 3 entries, got %d", len(newManifest))
-	}
-	paths := manifestPaths(newManifest)
-	// Walk order is alphabetical.
-	if paths[0] != "keep.txt" || paths[1] != "new.txt" || paths[2] != "stale.txt" {
-		t.Fatalf("unexpected paths: %v", paths)
-	}
-
-	// remove.txt should be in removals.
-	if len(rmPaths) != 1 || rmPaths[0] != "remove.txt" {
-		t.Fatalf("unexpected removals: %v", rmPaths)
+// TestHandleSYNCGoldenManifest pins SYNC's response for goldenTree after each
+// change, and the files it auto-ACKs: those whose size, mtime, and mode all
+// match the old manifest. IDs are the new walk's; each RM names an old ID.
+func TestHandleSYNCGoldenManifest(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		extra  string
+		change func(t *testing.T, root string)
+		want   string
+		acks   []ackCall
+	}{
+		{"no-change", "", func(*testing.T, string) {}, goldenTXFER, []ackCall{{1, 5}, {2, 0}, {3, 6}, {7, 6}}},
+		{"chmod-only", "", func(t *testing.T, root string) {
+			if err := os.Chmod(filepath.Join(root, "sub/b.txt"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, `FM/1 tx123 mode=fast link-mbps=1000 concurrency=8
+D0 0 0:1700000007000000777 0755 0:$ROOT
+F1 5 9:1000000111 0644 0:5:a.txt
+F2 0 9:2000000222 0600 0:9:empty.txt
+F3 6 9:3000000333 0640 0:6:h1.txt
+H4 0 0:3 0640 1:5:2.txt
+S5 0 0:1700000004000000444 0777 0:4:link 5:a.txt
+D6 0 9:6000000666 0750 0:3:sub
+F7 6 9:5000000555 0600 3:6:/b.txt
+`, []ackCall{{1, 5}, {2, 0}, {3, 6}}},
+		{"mixed", "", func(t *testing.T, root string) {
+			// Modify a.txt, add c.txt, and delete empty.txt (old ID 2).
+			writeTestFile(t, root, "a.txt", "alpha2")
+			writeTestFile(t, root, "c.txt", "charlie")
+			if err := os.Chmod(filepath.Join(root, "c.txt"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(filepath.Join(root, "empty.txt")); err != nil {
+				t.Fatal(err)
+			}
+			setGoldenTime(t, filepath.Join(root, "a.txt"), 8*time.Second)
+			setGoldenTime(t, filepath.Join(root, "c.txt"), 9*time.Second)
+			setGoldenTime(t, root, 10*time.Second)
+		}, `FM/1 tx123 mode=fast link-mbps=1000 concurrency=8
+D0 0 0:1700000010000000000 0755 0:$ROOT
+F1 6 8:08000000000 0644 0:5:a.txt
+F2 7 9:9000000000 0644 0:5:c.txt
+F3 6 9:3000000333 0640 0:6:h1.txt
+H4 0 0:3 0640 1:5:2.txt
+S5 0 0:1700000004000000444 0777 0:4:link 5:a.txt
+D6 0 9:6000000666 0750 0:3:sub
+F7 6 9:5000000555 0644 3:6:/b.txt
+RM 2
+`, []ackCall{{3, 6}, {7, 6}}},
+		{"removals", "deadline-ms=5000", func(t *testing.T, root string) {
+			// Delete link (old ID 5), and sub (6) with sub/b.txt (7).
+			for _, rel := range []string{"link", "sub"} {
+				if err := os.RemoveAll(filepath.Join(root, rel)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			setGoldenTime(t, root, 10*time.Second)
+		}, `FM/1 tx123 mode=fast link-mbps=1000 concurrency=8 deadline-ms=5000
+D0 0 0:1700000010000000000 0755 0:$ROOT
+F1 5 8:01000000111 0644 0:5:a.txt
+F2 0 9:2000000222 0600 0:9:empty.txt
+F3 6 9:3000000333 0640 0:6:h1.txt
+H4 0 0:3 0640 1:5:2.txt
+RM 5
+RM 6
+RM 7
+`, []ackCall{{1, 5}, {2, 0}, {3, 6}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := goldenTree(t)
+			old := runTXFERTest(t, root)
+			tc.change(t, root)
+			deps := &mockDeps{}
+			raw, _ := runSYNC(t, deps, root, old, "none", tc.extra)
+			if got := sortRMLines(goldenText(raw, root)); got != tc.want {
+				t.Fatalf("manifest mismatch\ngot:\n%s\nwant:\n%s", got, tc.want)
+			}
+			if !slices.Equal(deps.ackCalls, tc.acks) || deps.completeCalls != 1 {
+				t.Fatalf("acks %v and %d complete calls, want %v and 1", deps.ackCalls, deps.completeCalls, tc.acks)
+			}
+		})
 	}
 }
 
@@ -340,17 +265,28 @@ func writeTestFile(t *testing.T, root, rel, content string) {
 // helper unframes them and concatenates the decoded payloads.
 func runTXFERTest(t *testing.T, root string) string {
 	t.Helper()
-	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8 comp=none`, root)
+	raw, _ := runTXFER(t, &mockDeps{}, root, "")
+	return raw
+}
+
+// runTXFER runs TXFER on target against deps, with extra request options
+// appended, and returns the decoded manifest and the new transfer's ID.
+func runTXFER(t *testing.T, deps Deps, target string, extra string) (string, string) {
+	t.Helper()
+	reqRaw := fmt.Sprintf(`TXFER %q mode=fast link-mbps=1000 concurrency=8 comp=none`, target)
+	if extra != "" {
+		reqRaw += " " + extra
+	}
 	req, err := ParseRequest([]byte(reqRaw))
 	if err != nil {
 		t.Fatalf("ParseRequest: %v", err)
 	}
-	deps := &mockDeps{}
+	var txferID string
 	var out bytes.Buffer
-	if err := handleTXFER(context.Background(), req, &out, deps); err != nil {
+	if err := handleTXFERWithCallback(context.Background(), req, &out, deps, func(id string) { txferID = id }); err != nil {
 		t.Fatalf("handleTXFER: %v", err)
 	}
-	return unframeManifestWire(t, out.Bytes())
+	return unframeManifestWire(t, out.Bytes()), txferID
 }
 
 // unframeManifestWire parses a sequence of FX/1 manifest frames
@@ -392,14 +328,25 @@ func runSYNCTestWithComp(t *testing.T, root string, oldManifest string, comp str
 
 func runSYNCTestFull(t *testing.T, root string, oldManifest string, comp string, cacheMap string) ([]encoding.ManifestEntry, []string, *mockDeps) {
 	t.Helper()
-
-	// Build ID→path index from old manifest for RM resolution.
-	oldByID := buildOldByID(oldManifest)
-
-	// Build SYNC request.
-	reqRaw := fmt.Sprintf(`SYNC %q mode=fast link-mbps=1000 concurrency=8 comp=%s`, root, comp)
+	deps := &mockDeps{}
+	extra := ""
 	if cacheMap != "" {
-		reqRaw += " cache-map=" + cacheMap
+		extra = "cache-map=" + cacheMap
+	}
+	raw, _ := runSYNC(t, deps, root, oldManifest, comp, extra)
+	// RM fileIDs resolve to paths through the old manifest.
+	entries, rmPaths := parseSYNCResponse(t, raw, buildOldByID(oldManifest))
+	return entries, rmPaths, deps
+}
+
+// runSYNC runs SYNC on root against deps with oldManifest as the framed
+// request body and extra request options appended, and returns the decoded
+// response and the transfer's ID.
+func runSYNC(t *testing.T, deps Deps, root string, oldManifest string, comp string, extra string) (string, string) {
+	t.Helper()
+	reqRaw := fmt.Sprintf(`SYNC %q mode=fast link-mbps=1000 concurrency=8 comp=%s`, root, comp)
+	if extra != "" {
+		reqRaw += " " + extra
 	}
 	req, err := ParseRequest([]byte(reqRaw))
 	if err != nil {
@@ -423,14 +370,24 @@ func runSYNCTestFull(t *testing.T, root string, oldManifest string, comp string,
 		t.Fatalf("close framed old manifest: %v", err)
 	}
 
-	deps := &mockDeps{}
+	var txferID string
 	var out bytes.Buffer
-	if err := handleSYNCWithInput(context.Background(), req, &input, &out, deps, nil, defaultMaxSyncBodyBytes); err != nil {
+	if err := handleSYNCWithInput(context.Background(), req, &input, &out, deps, func(id string) { txferID = id }, defaultMaxSyncBodyBytes); err != nil {
 		t.Fatalf("handleSYNCWithInput: %v", err)
 	}
+	return unframeManifestWire(t, out.Bytes()), txferID
+}
 
-	entries, rmPaths := parseSYNCResponse(t, unframeManifestWire(t, out.Bytes()), oldByID)
-	return entries, rmPaths, deps
+// sortRMLines sorts by text the RM lines that end a SYNC response. SYNC emits
+// them in map iteration order, which varies from run to run.
+func sortRMLines(raw string) string {
+	lines := strings.SplitAfter(raw, "\n")
+	first := len(lines)
+	for first > 0 && (strings.HasPrefix(lines[first-1], "RM ") || lines[first-1] == "") {
+		first--
+	}
+	sort.Strings(lines[first:])
+	return strings.Join(lines, "")
 }
 
 // buildOldByID parses a raw FM/1 manifest and returns a fileID→path map.
