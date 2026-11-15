@@ -101,6 +101,11 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
 
 - Completion requires clean `gofmt`, `go vet ./...`, and `go test ./...`; run
   `-race` for packages involving goroutines.
+- A check that the race detector distorts (allocation counts, `sync.Pool`
+  reuse, timing) sits behind a `race` or `!race` build constraint, usually
+  through the `raceEnabled` flag of a `raceflag_race_test.go` and
+  `raceflag_norace_test.go` pair. `make unit` reruns every package with a
+  race-constrained test file without `-race`, so the check still runs in CI.
 - When you find a bug, performance idea, or test gap outside the current task,
   add it to [IDEAS.md](docs/IDEAS.md) instead of widening the change.
 - Never commit. Leave finished work staged (`git add`) for review; the
@@ -167,7 +172,7 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
 make lint         # golangci-lint: raw IO stays behind the fault gates
 make lint-check   # proves each lint rule fires and each exclusion holds (~3 min, several cores)
 make test         # build + unit + acceptance
-make unit         # go test -race ./...
+make unit         # go test -race ./..., then race-gated packages without it
 make fuzz-short   # unit-test replacements; 5s each
 make fuzz-long    # whole-system properties; 30s each
 make acceptance   # fuzz-short, then fuzz-long
