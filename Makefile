@@ -58,8 +58,17 @@ build: vet
 
 test: build unit acceptance
 
+# A package whose test files change under -race (a race or !race build
+# constraint) skips or loosens checks the race detector distorts, such as
+# allocation counts and sync.Pool reuse, so unit reruns it without -race.
+TEST_FILES = '{{.ImportPath}} {{.TestGoFiles}} {{.XTestGoFiles}}'
+
 unit:
 	go test -race ./...
+	plain=$$(go list -f $(TEST_FILES) ./...) && \
+	race=$$(go list -race -f $(TEST_FILES) ./...) && \
+	pkgs=$$(printf '%s\n%s\n' "$$plain" "$$race" | sort | uniq -u | cut -d' ' -f1 | sort -u) && \
+	{ [ -z "$$pkgs" ] || go test $$pkgs; }
 
 # Every fuzz test in the repo must be listed in fuzz-short or fuzz-long. To
 # pick a tier, probe the new test with -fuzztime=10s: if it is still reporting
