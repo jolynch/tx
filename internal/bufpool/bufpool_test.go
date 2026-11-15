@@ -33,17 +33,17 @@ func TestBucketSizeLadder(t *testing.T) {
 	}
 }
 
-func TestAcquireReturnsRequestedLengthFromBucketCapacity(t *testing.T) {
-	buf, release, err := Acquire(5000)
+func TestGetReturnsBucketLengthAndCapacity(t *testing.T) {
+	p, err := Get(5000)
 	if err != nil {
-		t.Fatalf("Acquire: %v", err)
+		t.Fatalf("Get: %v", err)
 	}
-	defer release()
-	if len(buf) != 5000 {
-		t.Errorf("len = %d, want 5000", len(buf))
+	defer Put(p)
+	if len(*p) != 16*kiB {
+		t.Errorf("len = %d, want the 16 KiB bucket", len(*p))
 	}
-	if cap(buf) != 16*kiB {
-		t.Errorf("cap = %d, want the 16 KiB bucket", cap(buf))
+	if cap(*p) != 16*kiB {
+		t.Errorf("cap = %d, want the 16 KiB bucket", cap(*p))
 	}
 }
 
@@ -65,71 +65,106 @@ func TestGetPutDoNotAllocate(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("Get/Put allocated %.1f times", allocs)
 	}
-	if _, err := Get(0); err == nil {
-		t.Fatal("Get(0) succeeded")
-	}
-	if _, err := Get(MaxBucket + 1); err == nil {
-		t.Fatal("Get above MaxBucket succeeded")
-	}
 }
 
-func TestAcquireRejectsNonPositive(t *testing.T) {
-	for _, n := range []int{0, -1} {
-		if _, _, err := Acquire(n); err == nil {
-			t.Errorf("Acquire(%d) succeeded, want an error", n)
+// BucketSize clamps, so servicing a request above MaxBucket would slice past
+// the clamped capacity. Get reports it instead: a size this large was not
+// bounded upstream, and quietly satisfying it is the failure mode the pool
+// exists to prevent.
+func TestGetRejectsInvalidSizes(t *testing.T) {
+	for _, n := range []int{0, -1, MaxBucket + 1} {
+		if p, err := Get(n); err == nil {
+			t.Errorf("Get(%d) succeeded with %d bytes, want an error", n, len(*p))
 		}
 	}
-}
-
-func TestReleaseIsIdempotent(t *testing.T) {
-	_, release, err := Acquire(1024)
+	p, err := Get(MaxBucket)
 	if err != nil {
-		t.Fatalf("Acquire: %v", err)
+		t.Fatalf("Get at exactly MaxBucket failed: %v", err)
 	}
-	release()
-	release() // must not double-Put the same buffer into the pool
+	if len(*p) != MaxBucket {
+		t.Fatalf("len = %d, want %d", len(*p), MaxBucket)
+	}
+	Put(p)
 }
 
+// A buffer Put back keeps its bucket length and capacity, and is the one the
+// next Get on the same goroutine receives. This is also the control for
+// TestPutDropsOversizedAndNonBucketBuffers: it shows that pointer identity
+// detects a pooled buffer.
 func TestBuffersRoundTripThroughThePool(t *testing.T) {
-	buf, release, err := Acquire(4 * kiB)
+	p, err := Get(4 * kiB)
 	if err != nil {
-		t.Fatalf("Acquire: %v", err)
+		t.Fatalf("Get: %v", err)
 	}
-	marker := byte(0xAB)
-	buf[0] = marker
-	release()
+	// Put restores the full bucket length of a buffer that was resliced.
+	*p = (*p)[:10]
+	Put(p)
 
-	// sync.Pool may discard buffers; only bucket capacity is guaranteed.
+	// sync.Pool may discard buffers; only bucket length and capacity are
+	// guaranteed.
 	for i := 0; i < 100; i++ {
-		b, rel, err := Acquire(4 * kiB)
+		q, err := Get(4 * kiB)
 		if err != nil {
-			t.Fatalf("Acquire: %v", err)
+			t.Fatalf("Get: %v", err)
 		}
-		if cap(b) != 4*kiB {
-			t.Fatalf("cap = %d, want 4 KiB", cap(b))
+		if len(*q) != 4*kiB || cap(*q) != 4*kiB {
+			t.Fatalf("len, cap = %d, %d, want 4 KiB", len(*q), cap(*q))
 		}
-		rel()
+		Put(q)
 	}
+
+	if raceEnabled {
+		t.Skip("the race detector makes sync.Pool drop buffers at random")
+	}
+	// Put and Get use the current P's private slot, which no other P can take.
+	// If the goroutine moves to another P between them, Get misses the buffer,
+	// so allow a few attempts.
+	const attempts = 10
+	for i := 0; i < attempts; i++ {
+		p, err := Get(16 * kiB)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		(*p)[0] = 0xAB
+		Put(p)
+		q, err := Get(16 * kiB)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		Put(q)
+		if q == p && (*q)[0] == 0xAB {
+			return
+		}
+	}
+	t.Fatalf("Get after Put returned a different buffer in all %d attempts, want the one put back", attempts)
 }
 
-// Oversized buffers must not remain pooled.
-func TestReleaseDropsOversizedAndNonBucketBuffers(t *testing.T) {
-	// A non-bucket capacity is not pooled.
-	Release(make([]byte, 1234))
+// Buffers not sized to a bucket, or above the pooling limit, must not remain
+// pooled.
+func TestPutDropsOversizedAndNonBucketBuffers(t *testing.T) {
+	odd := make([]byte, 1234)
+	Put(&odd)
 	if _, ok := pools.Load(1234); ok {
 		t.Error("a non-bucket size got its own pool")
 	}
-	// Releasing buffers above the cap must not create a pool.
-	for i := 0; i < 5; i++ {
-		Release(make([]byte, MaxBucket))
+	// Put judges the capacity, not the length.
+	short := make([]byte, 4*kiB, 5000)
+	Put(&short)
+	if _, ok := pools.Load(5000); ok {
+		t.Error("a non-bucket capacity got its own pool")
 	}
+
+	// A bucket above maxPooledBytes is left to the garbage collector. Take the
+	// pool's next buffer straight after the Put: had the Put pooled it, that
+	// would be the same pointer, as TestBuffersRoundTripThroughThePool shows.
+	big := make([]byte, MaxBucket)
+	Put(&big)
 	if p, ok := pools.Load(MaxBucket); ok {
-		if got, isBuf := p.(*sync.Pool).Get().([]byte); isBuf && len(got) == MaxBucket {
-			// Value alone cannot distinguish a new buffer from a pooled one.
-			Release(got)
+		if got, isBuf := p.(*sync.Pool).Get().(*[]byte); isBuf && got == &big {
+			t.Errorf("a %d-byte buffer was pooled above the %d-byte limit", MaxBucket, maxPooledBytes)
 		}
 	}
-	Release(nil)
+	Put(nil)
 }
 
 // allocatedBytes reports heap bytes allocated while fn runs.
@@ -231,13 +266,96 @@ func TestGrowingWriteAndLimitReader(t *testing.T) {
 	}
 }
 
+// A second Release must not put the buffer back twice: the pool would then
+// hand the same memory to two later Growing values.
 func TestGrowingReleaseIsIdempotent(t *testing.T) {
 	g, err := NewGrowing(0)
 	if err != nil {
 		t.Fatalf("NewGrowing: %v", err)
 	}
+	if _, err := g.Write([]byte("x")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
 	g.Release()
 	g.Release()
+
+	// Both copies of a double Put sit at the front of the pool, behind at most
+	// the one buffer already in its private slot, so four Gets reach them.
+	var held [4]*Growing
+	for i := range held {
+		h, err := NewGrowing(0)
+		if err != nil {
+			t.Fatalf("NewGrowing: %v", err)
+		}
+		defer h.Release()
+		if _, err := h.Write([]byte{byte(i)}); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		held[i] = h
+	}
+	for i := range held {
+		for j := i + 1; j < len(held); j++ {
+			if &held[i].Bytes()[0] == &held[j].Bytes()[0] {
+				t.Fatalf("Growing values %d and %d share a buffer after a double Release", i, j)
+			}
+		}
+	}
+}
+
+// Growing moves between buckets with Get and Put alone: once the pool is warm,
+// a NewGrowing, Writes that cross two bucket boundaries, and a Release
+// allocate only the *Growing itself.
+func TestGrowingDoesNotAllocatePerBucket(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector makes sync.Pool drop buffers at random")
+	}
+	chunk := make([]byte, 64*kiB)
+	run := func() {
+		g, err := NewGrowing(0) // 64 KiB bucket
+		if err != nil {
+			t.Fatalf("NewGrowing: %v", err)
+		}
+		_, _ = g.Write(chunk) // fills the 64 KiB bucket
+		_, _ = g.Write(chunk) // steps to 128 KiB
+		_, _ = g.Write(chunk) // steps to 256 KiB
+		if g.Len() != 3*len(chunk) || cap(g.Bytes()) != 256*kiB {
+			t.Fatalf("Len, cap = %d, %d, want %d bytes in the 256 KiB bucket", g.Len(), cap(g.Bytes()), 3*len(chunk))
+		}
+		g.Release()
+	}
+	run() // warm the 64, 128, and 256 KiB pools
+	if allocs := testing.AllocsPerRun(100, run); allocs > 1 {
+		t.Fatalf("NewGrowing, two bucket steps, and Release allocated %.1f times, want at most 1 (the *Growing)", allocs)
+	}
+}
+
+// ReadFrom's one-byte probe at a full bucket must not allocate either: a warm
+// NewGrowing, a ReadFrom that grows through two buckets, and a Release
+// allocate only the *Growing itself.
+func TestGrowingReadFromDoesNotAllocatePerBucket(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector makes sync.Pool drop buffers at random")
+	}
+	payload := make([]byte, 3*64*kiB)
+	r := bytes.NewReader(nil)
+	run := func() {
+		r.Reset(payload)
+		g, err := NewGrowing(0) // 64 KiB bucket
+		if err != nil {
+			t.Fatalf("NewGrowing: %v", err)
+		}
+		if _, err := g.ReadFrom(r); err != nil {
+			t.Fatalf("ReadFrom: %v", err)
+		}
+		if g.Len() != len(payload) || cap(g.Bytes()) != 256*kiB {
+			t.Fatalf("Len, cap = %d, %d, want %d bytes in the 256 KiB bucket", g.Len(), cap(g.Bytes()), len(payload))
+		}
+		g.Release()
+	}
+	run() // warm the 64, 128, and 256 KiB pools
+	if allocs := testing.AllocsPerRun(100, run); allocs > 1 {
+		t.Fatalf("NewGrowing, ReadFrom through two buckets, and Release allocated %.1f times, want at most 1 (the *Growing)", allocs)
+	}
 }
 
 // zeroReader supplies endless zero bytes without materializing a source, so a
@@ -325,22 +443,4 @@ func TestGrowingExactlyMaxBucketSucceeds(t *testing.T) {
 	if n != MaxBucket {
 		t.Fatalf("read %d bytes, want %d", n, MaxBucket)
 	}
-}
-
-// BucketSize clamps, so a larger request used to slice past the clamped
-// capacity and panic. It must report the problem instead: a size this large was
-// not bounded upstream, and silently servicing it is the failure mode the pool
-// exists to prevent.
-func TestAcquireAboveMaxBucketReturnsError(t *testing.T) {
-	if _, _, err := Acquire(MaxBucket + 1); err == nil {
-		t.Fatal("Acquire above MaxBucket succeeded, want an error")
-	}
-	buf, release, err := Acquire(MaxBucket)
-	if err != nil {
-		t.Fatalf("Acquire at exactly MaxBucket failed: %v", err)
-	}
-	if len(buf) != MaxBucket {
-		t.Fatalf("len = %d, want %d", len(buf), MaxBucket)
-	}
-	release()
 }

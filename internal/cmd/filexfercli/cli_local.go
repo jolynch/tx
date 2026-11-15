@@ -840,11 +840,12 @@ func discardLocalFile(le localEntry, w localWrite) error {
 // assumes both fds are positioned at offset 0 (true when invoked with nothing
 // copied yet).
 func localCopyFileBuffered(dst, src *os.File, onBytes func(int64)) (int64, error) {
-	buf, release, err := bufpool.Acquire(localCopyBufferBytes)
+	p, err := bufpool.Get(localCopyBufferBytes)
 	if err != nil {
 		return 0, err
 	}
-	defer release()
+	defer bufpool.Put(p)
+	buf := (*p)[:localCopyBufferBytes]
 	var copied int64
 	for {
 		n, rerr := src.Read(buf)
@@ -1114,12 +1115,13 @@ func runLocalGetCLI(a localGetArgs, stdout, stderr io.Writer) int {
 
 	start := time.Now()
 	if a.outputPath == "-" {
-		buf, release, acqErr := bufpool.Acquire(localCopyBufferBytes)
+		p, acqErr := bufpool.Get(localCopyBufferBytes)
 		if acqErr != nil {
 			fmt.Fprintf(stderr, "get failed: %v\n", acqErr)
 			return 1
 		}
-		defer release()
+		defer bufpool.Put(p)
+		buf := (*p)[:localCopyBufferBytes]
 		if _, err := io.CopyBuffer(stdout, src, buf); err != nil {
 			fmt.Fprintf(stderr, "get failed: %v\n", err)
 			return 1

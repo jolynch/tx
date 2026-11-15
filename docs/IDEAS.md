@@ -410,10 +410,11 @@ instead of widening the current change; remove an entry when it ships.
   fix removes the unused limiter, but repeated throughput probes still compete
   with SEND and make observed-link rates noisy. Measure probe scheduling before
   using those samples for more tuning.
-- **`bufpool.Acquire` allocates a release closure.** `Get`/`Put` are
-  allocation-free, but `Acquire` returns a new closure per call, and
-  `Release` boxes a pointer for a bare slice. Move the per-frame callers
-  (`send.go`, the client's frame buffers) to `Get`/`Put`.
+- **zstd helpers return a release closure.** `CompressZstdPooled` and
+  `DecompressZstdN` in `codec.go` return `out.Release`, a method value that
+  allocates per call. Returning the `*bufpool.Growing` and letting the
+  caller call `Release` would remove it. `NewGrowing` still allocates its
+  `Growing`; reaching zero needs a caller-owned `Growing` reset per chunk.
 - **Probes bypass the pools.** `probeTCP` dials directly, and a fast-mode
   throughput probe opens one connection per server CPU, in both the transfer
   and converge phases of `tx recv copy`. Probe over pooled connections, or

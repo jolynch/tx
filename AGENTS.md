@@ -116,9 +116,8 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
   existing pool, to a fresh `make` or `new` per call:
   - `internal/bufpool`: size-bucketed byte buffers (4 KiB to 64 MiB, with
     64 KiB, 128 KiB, and 256 KiB the common I/O sizes). `Get`/`Put` pool a
-    `*[]byte` and allocate nothing, so per-record and per-message paths use
-    them; `Acquire` returns a release closure, fine per request. `Growing`
-    sizes a buffer by bytes actually received.
+    `*[]byte` and allocate nothing; `Put` each pointer exactly once, after
+    its last use. `Growing` sizes a buffer by bytes actually received.
   - `internal/aead`: takes its record buffers from `bufpool` (`Get`/`Put`)
     and clears any plaintext in them before `Put`.
   - `internal/filexfer/encoding/codec.go`: pooled zstd encoders and decoders
