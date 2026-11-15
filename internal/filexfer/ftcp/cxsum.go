@@ -359,12 +359,12 @@ func hashChecksumRange(fd io.ReaderAt, offset int64, size int64, algorithms []st
 		return finalChecksumTokens(algorithms, full128, full64), nil
 	}
 	if len(buf) == 0 {
-		pooled, release, err := bufpool.Acquire(int(checksumReadBufferSize))
+		p, err := bufpool.Get(int(checksumReadBufferSize))
 		if err != nil {
 			return nil, err
 		}
-		defer release()
-		buf = pooled
+		defer bufpool.Put(p)
+		buf = (*p)[:checksumReadBufferSize]
 	}
 	reader := io.NewSectionReader(fd, offset, size)
 	remaining := size

@@ -1415,6 +1415,42 @@ func TestEffectiveFrameReadBufferSize(t *testing.T) {
 	}
 }
 
+// acquireFrameReadBuffer returns exactly the effective size, even where that
+// is not a pool bucket: the 32 KiB floor, or a cap between buckets.
+func TestAcquireFrameReadBufferLengthIsEffectiveSize(t *testing.T) {
+	tests := []struct {
+		name string
+		base int
+		hint int64
+		cap  int
+		want int
+	}{
+		{name: "32 KiB floor", base: 1024, hint: 1024, cap: 64 * 1024 * 1024, want: 32 * 1024},
+		{name: "hint inside one bucket", base: 8 * 1024 * 1024, hint: 100 * 1024, cap: 64 * 1024 * 1024, want: 128 * 1024},
+		{name: "3 MiB cap below a larger hint", base: 8 * 1024 * 1024, hint: 16 * 1024 * 1024, cap: 3 * 1024 * 1024, want: 3 * 1024 * 1024},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Client{FrameBufferBytes: tc.base, MaxFrameReadBufferBytes: tc.cap}
+			want := effectiveFrameReadBufferSize(c.FrameBufferBytes, tc.hint, c.MaxFrameReadBufferBytes)
+			if want != tc.want {
+				t.Fatalf("effectiveFrameReadBufferSize = %d, want %d; the case no longer covers %s", want, tc.want, tc.name)
+			}
+			buf, p := c.acquireFrameReadBuffer(tc.hint)
+			if p == nil {
+				t.Fatal("acquireFrameReadBuffer fell back to an unpooled buffer")
+			}
+			defer bufpool.Put(p)
+			if len(buf) != want {
+				t.Fatalf("len(buf) = %d, want the effective size %d", len(buf), want)
+			}
+			if bucket := bufpool.BucketSize(int64(want)); cap(*p) != bucket {
+				t.Fatalf("cap(*p) = %d, want the %d-byte bucket", cap(*p), bucket)
+			}
+		})
+	}
+}
+
 func TestFileStreamBufferHint(t *testing.T) {
 	client := NewClient(
 		"127.0.0.1:3453",
@@ -4573,10 +4609,10 @@ func TestEffectiveFrameReadBufferSizeClampsToLargestBucket(t *testing.T) {
 			t.Errorf("capSize=%d produced %d, above the %d bucket ceiling", capSize, got, bufpool.MaxBucket)
 		}
 		// And the result must still be something the pool will serve.
-		if _, release, err := bufpool.Acquire(got); err != nil {
+		if p, err := bufpool.Get(got); err != nil {
 			t.Errorf("capSize=%d produced %d which the pool rejects: %v", capSize, got, err)
 		} else {
-			release()
+			bufpool.Put(p)
 		}
 	}
 }

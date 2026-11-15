@@ -171,11 +171,12 @@ func drainProbePayload(in io.Reader, total int64, sts0 *int64) error {
 	if remaining <= 0 {
 		return nil
 	}
-	buf, release, err := bufpool.Acquire(probeCopyBufferBytes)
+	p, err := bufpool.Get(probeCopyBufferBytes)
 	if err != nil {
 		return err
 	}
-	defer release()
+	defer bufpool.Put(p)
+	buf := (*p)[:probeCopyBufferBytes]
 	for remaining > 0 {
 		step := int64(len(buf))
 		if step > remaining {
