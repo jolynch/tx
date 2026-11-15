@@ -136,6 +136,19 @@ instead of widening the current change; remove an entry when it ships.
   next round downloads all 40 again. Under a steady per-file fault rate, a
   large batch of small files can stop making progress. ACK the files read
   before the failure.
+- **A relative chroot breaks TXFER and SYNC.** `tx send tree ./data` keeps
+  the root relative (`WithRoot` only cleans it), and `validatePath` rejects
+  any path that is not absolute, so every TXFER and SYNC fails with
+  `UNPROCESSABLE path must be an absolute path`. Make the root absolute in
+  `WithRoot` or in `main`, then drop the `filepath.Abs` workaround in
+  `encodeManifest`. `TestEncodeManifestEmitsPageCacheWithRelativeRoot` calls
+  `encodeManifest` directly, bypassing `validatePath`, so it suggests
+  relative chroots work when they do not.
+- **Manifest errors carry the wrong code.** TXFER and SYNC report a failed
+  stat, walk, or write while building the manifest as `BAD_REQUEST`, and
+  SYNC's `RM` lines return the raw error, which `writeErrFrame` renders as
+  `ERR ERR <msg>`. Neither is a client error; report them as `INTERNAL`,
+  which also changes the `cmd_end` event's `err`.
 - **Repair within the same run.** A verify mismatch marks the file and exits
   1, and the next run fetches it. The run could instead refetch and reverify
   the mismatching files before it exits.
@@ -538,6 +551,10 @@ instead of widening the current change; remove an entry when it ships.
   The authentication deadline leaves no margin over the floor when the
   machine is busy. Give the handshake a margin above the floor, or make the
   test's throttle independent of scheduling delay.
+- **The mock never drains file-state updates.**
+  `mockDeps.RegisterTransferFileState` never reads its channel, so a
+  mock-backed TXFER or SYNC over more entries than the channel holds (1000)
+  deadlocks. Drain it into a slice the tests can check.
 - **Report listener setup failures in authentication tests.**
   `TestServeRejectsInvalidAllowlist` ignores a `net.Listen` error and then
   uses the nil listener. It panics when loopback sockets are unavailable;
@@ -658,9 +675,21 @@ instead of widening the current change; remove an entry when it ships.
   verbs) mix several concerns, as do `cli_test.go` and `client_test.go`.
   Split along those seams; the 2026-05 split of `cli.go` into per-command
   files is the model.
-- **TXFER and SYNC repeat setup code.** Their transfer setup overlaps, and the
-  close-the-updates-channel closure is copied three times in `txfer.go` and
-  `sync.go`.
+- **Pass hints to `NewTransfer`.** `newManifestTransfer` creates a
+  transfer, then sets its hints and deadline in two more calls, so
+  `onCreated` and STATUS can see a transfer with no hints yet. A
+  `store.WithHints` option would set them before the transfer is published,
+  including the `observedEMA` seed. `SetTransferHints` and
+  `SetTransferDeadline` would then leave `store.Interface`, since this is
+  their only production caller. It would also stop a failed
+  `SetTransferHints` from leaking the transfer, which `newManifestTransfer`
+  returns before the caller defers `DeleteTransfer`.
+- **TXFER stores page-cache maps nothing reads.** With `cache-map=send`,
+  `attachPageCache` calls `SetTransferPageCache` for each file, which takes
+  the transfer lock per file and keeps every blob, but only tests read
+  `Transfer.PageCache`; SYNC sends the same maps without storing them.
+  Remove the field and `SetTransferPageCache`, or give the stored maps a
+  reader.
 - **Short forms for common auth flags.** The client has `-t` for
   `--auth-token` and `-k` for `--keys`, but `tx send tree` has no short form
   for `--require-auth-token`, the usual way to start an authenticated

@@ -8,23 +8,17 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
-	"github.com/jolynch/tx/internal/filexfer/store"
 	"github.com/jolynch/tx/internal/pagecache"
 	"github.com/zeebo/xxh3"
 )
 
 type syncRequest struct {
-	Directory   string
-	Mode        string
-	LinkMbps    int64
-	Concurrency int
-	DeadlineMS  int64
-	Comp        string
-	CacheMap    string // "none" (default), "send", or "recv"
+	manifestHints
+	Directory string
+	CacheMap  string // "none" (default), "send", or "recv"
 }
 
 type oldEntry struct {
@@ -36,74 +30,32 @@ type oldEntry struct {
 	seen   bool
 }
 
+var syncOptions = []string{"directory", "mode", "link-mbps", "concurrency", "deadline-ms", "comp", "cache-map"}
+
 func parseSYNCRequest(req Request) (syncRequest, error) {
-	if req.Verb != VerbSYNC {
-		return syncRequest{}, protocolErr{code: "BAD_COMMAND", message: "not SYNC"}
+	p, err := manifestParams(req, VerbSYNC, syncOptions)
+	if err != nil {
+		return syncRequest{}, err
 	}
-	if len(req.Params) != 1 {
-		return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "invalid SYNC arguments"}
+	r := syncRequest{Directory: p["directory"]}
+	if err := r.parseMode(p); err != nil {
+		return syncRequest{}, err
 	}
-	p := req.Params[0]
-	for key := range p {
-		switch key {
-		case "directory", "mode", "link-mbps", "concurrency", "deadline-ms", "comp", "cache-map":
-		default:
-			return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "unknown SYNC option"}
-		}
+	if err := r.parseLimits(p); err != nil {
+		return syncRequest{}, err
 	}
-	directory := p["directory"]
-	if strings.TrimSpace(directory) == "" {
-		return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "missing SYNC directory"}
-	}
-	mode := strings.ToLower(strings.TrimSpace(p["mode"]))
-	if mode != "fast" && mode != "gentle" {
-		return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "mode must be fast or gentle"}
-	}
-	linkMbps, err := strconv.ParseInt(strings.TrimSpace(p["link-mbps"]), 10, 64)
-	if err != nil || linkMbps < 0 {
-		return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "link-mbps must be >= 0"}
-	}
-	concurrency, err := strconv.Atoi(strings.TrimSpace(p["concurrency"]))
-	if err != nil || concurrency <= 0 {
-		return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "concurrency must be > 0"}
-	}
-	var deadlineMS int64
-	if raw := strings.TrimSpace(p["deadline-ms"]); raw != "" {
-		deadlineMS, err = strconv.ParseInt(raw, 10, 64)
-		if err != nil || deadlineMS < 0 {
-			return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "deadline-ms must be >= 0"}
-		}
-	}
-	comp := strings.ToLower(strings.TrimSpace(p["comp"]))
-	if comp == "" {
-		comp = encoding.EncodingZstd
-	}
-	switch comp {
-	case "none", encoding.EncodingZstd:
-	default:
-		return syncRequest{}, protocolErr{code: "UNSUPPORTED_COMP", message: "supported comp values: none, zstd"}
-	}
-	cacheMap := strings.ToLower(strings.TrimSpace(p["cache-map"]))
-	if cacheMap == "" {
-		cacheMap = "none"
-	}
-	switch cacheMap {
+	r.CacheMap = strings.ToLower(strings.TrimSpace(p["cache-map"]))
+	switch r.CacheMap {
+	case "":
+		r.CacheMap = "none"
 	case "none", "send", "recv":
 	default:
 		return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "cache-map must be none, send, or recv"}
 	}
-	if mode == "gentle" && cacheMap != "none" {
-		return syncRequest{}, protocolErr{code: "BAD_REQUEST", message: "cache-map is not supported with gentle mode"}
+	if r.Mode == "gentle" && r.CacheMap != "none" {
+		return syncRequest{}, errGentleCacheMap
 	}
-	return syncRequest{
-		Directory:   directory,
-		Mode:        mode,
-		LinkMbps:    linkMbps,
-		Concurrency: concurrency,
-		DeadlineMS:  deadlineMS,
-		Comp:        comp,
-		CacheMap:    cacheMap,
-	}, nil
+	return r, nil
 }
 
 // handleSYNCCommand is the placeholder in the handlers map. The real work
@@ -117,20 +69,17 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	if err != nil {
 		return err
 	}
-	requestPath := cleanRequestPath(parsed.Directory)
-	parsed.Directory, err = resolveUnderRoot(deps.Root(), parsed.Directory)
+	root, err := resolveUnderRoot(deps.Root(), parsed.Directory)
 	if err != nil {
 		return err
 	}
-	isDir, err := validatePath(parsed.Directory)
+	isDir, err := validatePath(root)
 	if err != nil {
 		return protocolErr{code: "UNPROCESSABLE", message: err.Error()}
 	}
 	if !isDir {
 		return protocolErr{code: "UNPROCESSABLE", message: "sync requires a directory, not a file"}
 	}
-
-	root := filepath.Clean(parsed.Directory)
 
 	// Read the framed old-manifest body from the input stream and parse it.
 	// The body is capped because the index built from it has to be held whole:
@@ -152,110 +101,22 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 		return err
 	}
 
-	// Create transfer and set hints (same pattern as TXFER).
-	transfer, err := deps.NewTransfer(root, 0, 0, store.WithRequestPath(requestPath))
+	transferID, err := newManifestTransfer(deps, root, parsed.Directory, parsed.manifestHints, onTransferCreated)
 	if err != nil {
-		return protocolErr{code: "INTERNAL", message: "failed to initialize transfer"}
+		return err
 	}
-	if onTransferCreated != nil {
-		onTransferCreated(transfer.ID)
-	}
-	if ok := deps.SetTransferHints(transfer.ID, parsed.Mode, parsed.LinkMbps, parsed.Concurrency); !ok {
-		return protocolErr{code: "INTERNAL", message: "failed to persist transfer hints"}
-	}
-	if parsed.DeadlineMS > 0 {
-		deps.SetTransferDeadline(transfer.ID, parsed.DeadlineMS)
-	}
-	manifestMode := parsed.Mode
-	manifestLinkMbps := parsed.LinkMbps
-	manifestConcurrency := parsed.Concurrency
-	if stored, ok := deps.GetTransferSummary(transfer.ID); ok {
-		if strings.TrimSpace(stored.Mode) != "" {
-			manifestMode = strings.ToLower(strings.TrimSpace(stored.Mode))
-		}
-		if stored.LinkMbps >= 0 {
-			manifestLinkMbps = stored.LinkMbps
-		}
-		if stored.Concurrency > 0 {
-			manifestConcurrency = stored.Concurrency
-		}
-	}
-	cleanupTransfer := true
+	keep := false
 	defer func() {
-		if cleanupTransfer {
-			deps.DeleteTransfer(transfer.ID)
+		if !keep {
+			deps.DeleteTransfer(transferID)
 		}
 	}()
 
-	// Wrap the output writer with a chunked manifest writer so FM/1 and RM
-	// lines flow through FX/1 + FXT/1 frames with per-frame compression,
-	// matching TXFER's response framing.
+	// FM/1 and RM lines flow through FX/1 + FXT/1 frames with per-frame
+	// compression, matching TXFER's response framing.
 	cw := encoding.NewFramedBodyWriter(out, parsed.Comp, encoding.DefaultBodyChunkSize, encoding.DefaultBodyFlushInterval)
-
-	// Write FM/1 header.
-	hdr := encoding.FormatManifestHeader(encoding.ManifestHeader{
-		TransferID:  transfer.ID,
-		Mode:        manifestMode,
-		LinkMbps:    manifestLinkMbps,
-		Concurrency: manifestConcurrency,
-		DeadlineMS:  parsed.DeadlineMS,
-	})
-	if _, err := io.WriteString(cw, hdr+"\n"); err != nil {
-		if isBrokenPipe(err) {
-			return nil
-		}
-		return err
-	}
-
-	// Walk filesystem and emit manifest entries.
-	updatesCh := make(chan TransferFileStateUpdate, 1000)
-	done := deps.RegisterTransferFileState(transfer.ID, updatesCh, TransferStateStarted)
-	closedUpdates := false
-	closeUpdates := func() {
-		if closedUpdates {
-			return
-		}
-		close(updatesCh)
-		<-done
-		closedUpdates = true
-	}
-	defer func() {
-		closeUpdates()
-	}()
-	fileID := uint64(1)
-	prevPath := ""
-	prevMtime := ""
-	rootInfo, err := os.Stat(root)
-	if err != nil {
-		return protocolErr{code: "BAD_REQUEST", message: err.Error()}
-	}
-	rootEntry := encoding.ManifestEntry{
-		Type:       encoding.EntryTypeDir,
-		ID:         encoding.RootFileID,
-		Size:       0,
-		Mtime:      rootInfo.ModTime().UnixNano(),
-		Mode:       encoding.NormalizeManifestMode(rootInfo.Mode()),
-		Path:       filepath.Clean(root),
-		LinkTarget: -1,
-	}
-	rootLine, nextPath, nextMtime, err := encoding.MarshalManifestEntry(rootEntry, prevPath, prevMtime)
-	if err != nil {
-		return protocolErr{code: "BAD_REQUEST", message: err.Error()}
-	}
-	updatesCh <- TransferFileStateUpdate{
-		FileID:    encoding.RootFileID,
-		EntryType: encoding.EntryTypeDir,
-		PathHash:  xxh3.Hash128([]byte(filepath.Clean(root))),
-		FileSize:  0,
-	}
-	if _, err := io.WriteString(cw, rootLine+"\n"); err != nil {
-		if isBrokenPipe(err) {
-			return nil
-		}
-		return err
-	}
-	prevPath = nextPath
-	prevMtime = nextMtime
+	e := newManifestEmitter(cw, deps, transferID, root, 1000)
+	defer e.close()
 
 	// restoreBatch accumulates {path, decoded snapshot} pairs from the
 	// walk when cache-map=recv is set. After the walk completes the
@@ -263,38 +124,28 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 	// SYNC handler never blocks on the bounded restore-pool channel.
 	var restoreBatch []pagecache.TouchEntry
 
-	// matchedAcks records F entries the client's old manifest agrees with
-	// (same size + mtime + mode) and will therefore not re-fetch. After
-	// the walk finishes we auto-ack each one so the SYNC's transfer Done
-	// count tracks the deltas the client will actually ACK via SEND.
-	type autoAck struct {
-		fileID uint64
-		size   int64
-	}
-	var matchedAcks []autoAck
+	// acks holds the F entries the client's old manifest agrees with and
+	// will therefore not re-fetch. After the walk they are acknowledged so
+	// the transfer's Done count tracks the deltas the client will ACK.
+	var acks []AckEntry
 
-	// fullMatch mirrors the client's manifestEntryMatches check for
-	// regular files: identical size + mtime + mode means the client
-	// already has the file and will skip it.
-	fullMatch := func(old *oldEntry, e encoding.ManifestEntry) bool {
-		return old.size == e.Size && old.mtime == e.Mtime && old.mode == e.Mode
+	if err := e.start(parsed.manifestHints); err != nil {
+		return manifestErr(err)
 	}
-
-	emitSyncEntry := func(result encoding.WalkResult) error {
+	err = encoding.WalkManifestEntries(root, func(result encoding.WalkResult) error {
 		entry := result.Entry
-		entry.ID = fileID
 		// Mark in pathIndex that this path still exists on disk.
-		pathHash := xxh3.Hash128([]byte(entry.Path))
-		matched, isMatch := pathIndex[pathHash]
+		matched, isMatch := pathIndex[xxh3.Hash128([]byte(entry.Path))]
 		if isMatch {
 			matched.seen = true
 		}
 
-		// F entries that match in full are "already done" from the
-		// client's perspective; queue them up to be auto-acked once
-		// the file-state goroutine has populated their slots.
-		if entry.Type == encoding.EntryTypeFile && isMatch && fullMatch(matched, entry) {
-			matchedAcks = append(matchedAcks, autoAck{fileID: entry.ID, size: entry.Size})
+		// This mirrors the client's manifestEntryMatches check for regular
+		// files: identical size, mtime, and mode mean the client already
+		// has the file and will skip it.
+		if entry.Type == encoding.EntryTypeFile && isMatch &&
+			matched.size == entry.Size && matched.mtime == entry.Mtime && matched.mode == entry.Mode {
+			acks = append(acks, AckEntry{TxferID: transferID, FileID: e.nextID, AckBytes: entry.Size})
 		}
 
 		// Attach pc:<hex> per the echo-vs-probe rule when a cache map was
@@ -327,37 +178,10 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 				}
 			}
 		}
-
-		line, _, mtimeRaw, err := encoding.MarshalManifestEntry(entry, prevPath, prevMtime)
-		if err != nil {
-			return err
-		}
-		line += "\n"
-
-		fullPath := filepath.Clean(filepath.Join(root, entry.Path))
-		updatesCh <- TransferFileStateUpdate{
-			FileID:    entry.ID,
-			EntryType: entry.Type,
-			PathHash:  xxh3.Hash128([]byte(fullPath)),
-			FileSize:  entry.Size,
-		}
-		if _, err := io.WriteString(cw, line); err != nil {
-			return err
-		}
-		prevPath = entry.Path
-		prevMtime = mtimeRaw
-		fileID++
-		return nil
-	}
-
-	walkErr := encoding.WalkManifestEntries(root, func(result encoding.WalkResult) error {
-		return emitSyncEntry(result)
+		return e.emit(entry)
 	})
-	if walkErr != nil {
-		if isBrokenPipe(walkErr) {
-			return nil
-		}
-		return protocolErr{code: "BAD_REQUEST", message: walkErr.Error()}
+	if err != nil {
+		return manifestErr(err)
 	}
 
 	// Emit RM lines for old paths no longer on disk.
@@ -366,8 +190,7 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 		if old.seen {
 			continue
 		}
-		rmLine := fmt.Sprintf("RM %d\n", old.fileID)
-		if _, err := io.WriteString(cw, rmLine); err != nil {
+		if _, err := fmt.Fprintf(cw, "RM %d\n", old.fileID); err != nil {
 			if isBrokenPipe(err) {
 				return nil
 			}
@@ -382,25 +205,21 @@ func handleSYNCWithInput(ctx context.Context, req Request, in io.Reader, out io.
 		return protocolErr{code: "INTERNAL", message: "flush manifest frames: " + err.Error()}
 	}
 	if len(restoreBatch) > 0 {
-		deps.EnqueueCacheRestoreBatch(transfer.ID, restoreBatch)
+		deps.EnqueueCacheRestoreBatch(transferID, restoreBatch)
 	}
 	// Drain the file-state goroutine before auto-acking so the slots
 	// the acks index into have been populated with their FileSize.
-	closeUpdates()
-	if len(matchedAcks) > 0 {
-		acks := make([]AckEntry, len(matchedAcks))
-		for i, m := range matchedAcks {
-			acks[i] = AckEntry{TxferID: transfer.ID, FileID: m.fileID, AckBytes: m.size}
-		}
+	e.close()
+	if len(acks) > 0 {
 		deps.AcknowledgeTransferFiles(acks)
 	}
-	deps.ClipTransfer(transfer.ID)
+	deps.ClipTransfer(transferID)
 	// Zero-delta SYNC: Done == NumFiles right now, so this fires the
 	// transfer-complete log and the exit-after wrapper restarts the
 	// shutdown timer. For a delta SYNC this is a no-op; the trailing
 	// SEND+ACK cycle will hit the same path from ack.go.
-	deps.MaybeLogTransferComplete(transfer.ID)
-	cleanupTransfer = false
+	deps.MaybeLogTransferComplete(transferID)
+	keep = true
 	return nil
 }
 
