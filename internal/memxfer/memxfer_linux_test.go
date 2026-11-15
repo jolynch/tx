@@ -152,6 +152,12 @@ func TestDupACKReachesServerTwice(t *testing.T) {
 		if p, m := e.Pending(), e.Mismatched(); len(p) > 0 || len(m) > 0 {
 			t.Fatalf("pending %v, mismatched %v", p, m)
 		}
+		// The server emits cmd_end after writing the ACK response, so the
+		// round can return first. Its handler emits conn_close after that,
+		// and stop waits for every conn_close.
+		if err := e.stop(); err != nil {
+			t.Fatal(err)
+		}
 		return int(n.Load())
 	}
 	clean := acks(nil)
