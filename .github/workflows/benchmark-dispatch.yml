@@ -1,0 +1,42 @@
+name: Dispatch desktop benchmarks
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  dispatch:
+    if: github.repository == 'jolynch/tx'
+    runs-on: ubuntu-latest
+    environment: benchmark-dispatch
+    timeout-minutes: 2
+    steps:
+      - name: Trigger private benchmark workflow
+        shell: bash
+        env:
+          BENCHMARK_DISPATCH_TOKEN: ${{ secrets.BENCHMARK_DISPATCH_TOKEN }}
+        run: |
+          if [[ -z "$BENCHMARK_DISPATCH_TOKEN" ]]; then
+            echo '::error::Set BENCHMARK_DISPATCH_TOKEN in the benchmark-dispatch environment.'
+            exit 1
+          fi
+
+          payload=$(jq -nc --arg sha "$GITHUB_SHA" '{ref: "main", inputs: {tx_sha: $sha}}')
+          if ! response=$(curl --fail --silent --show-error --max-time 20 \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'Content-Type: application/json' \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            --header "Authorization: Bearer $BENCHMARK_DISPATCH_TOKEN" \
+            --data "$payload" \
+            "$GITHUB_API_URL/repos/jolynch/tx-benchmarks/actions/workflows/desktop-performance.yml/dispatches"); then
+            echo '::error::Could not dispatch the private benchmark workflow.'
+            exit 1
+          fi
+
+          printf 'Dispatched benchmarks for tx commit `%s`.\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          if run_url=$(jq -er '.html_url | select(type == "string")' <<< "$response") &&
+            [[ "$run_url" =~ ^https://github\.com/jolynch/tx-benchmarks/actions/runs/[0-9]+$ ]]; then
+            printf '\n[View the private benchmark run](%s)\n' "$run_url" >> "$GITHUB_STEP_SUMMARY"
+          fi
