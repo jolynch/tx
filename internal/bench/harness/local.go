@@ -137,6 +137,8 @@ Exits with recv-copy's exit code.
 		}
 		return reportErr(stderr, err)
 	case <-ctx.Done():
+		stopSend()
+		<-sendErr
 		return reportErr(stderr, ctx.Err())
 	}
 	recv.server, recv.benchRemote = info.addr, info.benchRemote

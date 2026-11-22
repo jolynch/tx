@@ -159,3 +159,10 @@ the `get` / `status` subcommands. FTCP wire-format details live in
 go build ./cmd/tx
 go test ./...
 ```
+
+## Performance history
+
+[Latest benchmark results](https://github.com/jolynch/tx/blob/benchmark-results/README.md)
+· [Reproduce the suite](bench/README.md#published-performance-suite)
+
+[![SSD copy throughput over tx main](https://raw.githubusercontent.com/jolynch/tx/benchmark-results/ssd-throughput.png)](https://github.com/jolynch/tx/blob/benchmark-results/README.md)
