@@ -1,6 +1,6 @@
 # tx performance history
 
-Latest: [ba38237](https://github.com/jolynch/tx/commit/ba38237d42e52c1f1b68fe26e682a2f77df85887) (2026-11-22).
+Latest: [7355cd2](https://github.com/jolynch/tx/commit/7355cd2e4b6fc39f3a2674137737f993dcee85bc) (2026-11-22).
 
 One point per `main` merge: the median, with repeats as dots and min–max whiskers. Red and green lines mark sustained shifts. A dashed line means the benchmark changed; dotted, the machine.
 
@@ -15,7 +15,7 @@ None detected.
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout ba38237d42e52c1f1b68fe26e682a2f77df85887 && make build
+git checkout 7355cd2e4b6fc39f3a2674137737f993dcee85bc && make build
 DATA=/path/on/the/drive/under/test
 
 # ssd-large
@@ -38,7 +38,7 @@ DATA=/path/on/the/drive/under/test
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout ba38237d42e52c1f1b68fe26e682a2f77df85887
+git checkout 7355cd2e4b6fc39f3a2674137737f993dcee85bc
 
 # transfer
 TX_BENCH_THROUGHPUT_CPUS=4,16 TX_BENCH_THROUGHPUT_ENCRYPT=none,aes,chacha20 TX_BENCH_THROUGHPUT_MIN_WALL=5s TX_BENCH_THROUGHPUT_SIZE=256MiB go test -count=1 -timeout 10m -run '^TestTransferCostRatio$' -v ./internal/bench
@@ -65,7 +65,7 @@ Same command as [Transfer, plaintext](#transfer-plaintext).
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout ba38237d42e52c1f1b68fe26e682a2f77df85887
+git checkout 7355cd2e4b6fc39f3a2674137737f993dcee85bc
 
 # verify
 TX_VERIFY_BYTES=268435456 TX_VERIFY_CONCURRENCY=4 TX_VERIFY_IO_DEPTH=4 TX_VERIFY_IO_LATENCY= go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkVerifyInMemory$/^(4KiB|1MiB|16MiB)$/^cpus=8$/^c=4$' ./internal/cmd/filexfercli
@@ -80,7 +80,7 @@ TX_VERIFY_BYTES=268435456 TX_VERIFY_CONCURRENCY=4 TX_VERIFY_IO_DEPTH=4 TX_VERIFY
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout ba38237d42e52c1f1b68fe26e682a2f77df85887
+git checkout 7355cd2e4b6fc39f3a2674137737f993dcee85bc
 
 # frames
 go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkSendFramePayload$/^(zerocopy|buffered)$/^(4KiB|1MiB)$' ./internal/filexfer/ftcp
@@ -95,7 +95,7 @@ go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkSend
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout ba38237d42e52c1f1b68fe26e682a2f77df85887
+git checkout 7355cd2e4b6fc39f3a2674137737f993dcee85bc
 
 # cipher
 go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^Benchmark(Encrypt|Decrypt)Throughput$/^1MiB$/^(aesgcm|chacha20poly1305)$' ./internal/aead
@@ -112,7 +112,7 @@ go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkWrap
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout ba38237d42e52c1f1b68fe26e682a2f77df85887
+git checkout 7355cd2e4b6fc39f3a2674137737f993dcee85bc
 
 # handshake
 go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkHandshake$/^(token|age)$/^(aes|chacha20)$' ./internal/aead
@@ -127,7 +127,7 @@ go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkHand
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout ba38237d42e52c1f1b68fe26e682a2f77df85887
+git checkout 7355cd2e4b6fc39f3a2674137737f993dcee85bc
 
 # ack
 go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkServePlaintextACKBody$' ./internal/filexfer/ftcp
@@ -146,6 +146,4 @@ go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkSpli
 Flagged when the 8 measured commits before and after don't overlap and their medians differ by at least 5% and 4× the median absolute deviation. Needs three commits after; never spans a dashed or dotted line.
 
 </details>
-
-Not measured: 7355cd2.
 
