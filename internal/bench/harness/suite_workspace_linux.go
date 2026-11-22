@@ -9,11 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/jolynch/tx/internal/bench/dataset"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
@@ -24,16 +26,38 @@ const (
 	suitePrepPrefix = ".prep-"
 	suiteCopyPrefix = ".copy-"
 	suiteDirMarker  = ".tx-bench-suite"
+	// suiteSmokeParent holds smoke workspaces made without --data-root. It is
+	// under the checkout, not the system temp directory, which is often a
+	// tmpfs whose pages cannot be evicted for a cold copy.
+	suiteSmokeParent = "bench/data"
 )
+
+// suiteStatFS reads free space; tests replace it to simulate a full disk.
+var suiteStatFS = dataset.StatFS
+
+type suiteWorkspaceOptions struct {
+	Root    string // --data-root; empty makes a temporary smoke workspace
+	Out     string // canonical result directory, which must lie outside Root
+	Profile string
+	Cases   []suiteCase // the SSD cases whose references to validate
+	Log     io.Writer   // notes about cache repairs
+	// Evictable rejects a root whose filesystem cannot evict cached pages,
+	// before anything is written there.
+	Evictable bool
+}
 
 type suiteWorkspace struct {
 	locks      []*os.File
 	temp       string
+	top        string // the locked root as given, before any smoke/ subdirectory
 	root       string
 	sources    string
 	scratch    string
 	filesystem suiteFilesystem
 	references map[string]*dataset.BenchJSON
+	log        io.Writer
+	escalate   <-chan struct{} // closed on a second interrupt
+	grace      time.Duration   // SIGTERM-to-SIGKILL grace; zero means suiteKillGrace
 }
 
 type suiteFilesystem struct {
@@ -41,8 +65,12 @@ type suiteFilesystem struct {
 	mount  uint64
 }
 
-func openSuiteWorkspace(root, out, profile string, cases []suiteCase) (*suiteWorkspace, error) {
-	w := &suiteWorkspace{references: make(map[string]*dataset.BenchJSON)}
+func openSuiteWorkspace(opts suiteWorkspaceOptions) (*suiteWorkspace, error) {
+	root, out, profile, cases := opts.Root, opts.Out, opts.Profile, opts.Cases
+	w := &suiteWorkspace{references: make(map[string]*dataset.BenchJSON), log: opts.Log}
+	if w.log == nil {
+		w.log = io.Discard
+	}
 	ready := false
 	defer func() {
 		if !ready {
@@ -50,8 +78,16 @@ func openSuiteWorkspace(root, out, profile string, cases []suiteCase) (*suiteWor
 		}
 	}()
 	if root == "" {
+		if opts.Evictable {
+			if err := checkEviction(filepath.Dir(suiteSmokeParent)); err != nil {
+				return nil, err
+			}
+		}
+		if err := os.MkdirAll(suiteSmokeParent, 0o755); err != nil {
+			return nil, err
+		}
 		var err error
-		w.temp, err = os.MkdirTemp("", "tx-bench-smoke-")
+		w.temp, err = os.MkdirTemp(suiteSmokeParent, "suite-smoke-")
 		if err != nil {
 			return nil, err
 		}
@@ -60,6 +96,16 @@ func openSuiteWorkspace(root, out, profile string, cases []suiteCase) (*suiteWor
 	root, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
+	}
+	if opts.Evictable {
+		// Resolve symlinked parents first: StatFS matches /proc/mounts by path.
+		resolved, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkEviction(resolved); err != nil {
+			return nil, err
+		}
 	}
 	fs, err := suiteDirFilesystem(root)
 	if err != nil {
@@ -74,7 +120,10 @@ func openSuiteWorkspace(root, out, profile string, cases []suiteCase) (*suiteWor
 	if err := w.lockRoot(root); err != nil {
 		return nil, err
 	}
-	w.root = root
+	if rel, err := filepath.Rel(root, out); err == nil && filepath.IsLocal(rel) {
+		return nil, usageErrorf("output directory must be outside the suite root %s", root)
+	}
+	w.top, w.root = root, root
 	if profile == "smoke" && w.temp == "" {
 		w.root = filepath.Join(root, "smoke")
 		if err := w.makeDir(w.root); err != nil {
@@ -88,10 +137,6 @@ func openSuiteWorkspace(root, out, profile string, cases []suiteCase) (*suiteWor
 	w.sources = filepath.Join(w.root, "sources")
 	w.scratch = filepath.Join(w.root, "scratch")
 	for _, dir := range []string{w.sources, w.scratch} {
-		rel, err := filepath.Rel(dir, out)
-		if err == nil && filepath.IsLocal(rel) {
-			return nil, fmt.Errorf("output directory must be outside %s", dir)
-		}
 		if err := w.claimDir(dir); err != nil {
 			return nil, err
 		}
@@ -238,14 +283,20 @@ func (w *suiteWorkspace) prepareReferences(profile string, cases []suiteCase) er
 			missing += c.Bytes
 			continue
 		case err != nil:
+			// A symlink or another filesystem here is not ours to remove.
 			return err
 		}
 		d, err := w.readReference(entry, c)
-		if err != nil {
-			return fmt.Errorf("validate cached reference %s: %w", entry, err)
+		if err == nil {
+			err = d.CheckStat()
 		}
-		if err := d.CheckStat(); err != nil {
-			return fmt.Errorf("validate cached files in %s: %w", entry, err)
+		if err != nil {
+			fmt.Fprintf(w.log, "Cached reference %s is invalid (%v); provisioning it again\n", entry, err)
+			if err := w.quarantine(entry); err != nil {
+				return fmt.Errorf("remove invalid cached reference: %w", err)
+			}
+			missing += c.Bytes
+			continue
 		}
 		runs := filepath.Join(d.Dir, runsDir)
 		if err := w.removeTree(runs); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -257,15 +308,109 @@ func (w *suiteWorkspace) prepareReferences(profile string, cases []suiteCase) er
 	if profile == "full" {
 		needed += 64 * suiteGiB
 	}
-	fs, err := dataset.StatFS(w.root)
+	fs, err := suiteStatFS(w.root)
 	if err != nil {
 		return err
+	}
+	if fs.Available < needed {
+		// References for other recipes only matter to the commits that
+		// made them. Remove them only when this run needs their space.
+		if err := w.removeStaleReferences(cases); err != nil {
+			return err
+		}
+		if fs, err = suiteStatFS(w.root); err != nil {
+			return err
+		}
 	}
 	if fs.Available < needed {
 		return fmt.Errorf("%s has %s available; suite needs %s for references, scratch, and headroom",
 			w.root, encoding.HumanBytes(fs.Available), encoding.HumanBytes(needed))
 	}
 	return nil
+}
+
+// quarantine moves a cache entry under a staging prefix, so an interrupted
+// removal is reclaimed by the next run, then removes it.
+func (w *suiteWorkspace) quarantine(entry string) error {
+	hold, err := os.MkdirTemp(w.sources, suitePrepPrefix+"stale-")
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(entry, filepath.Join(hold, filepath.Base(entry))); err != nil {
+		_ = os.Remove(hold)
+		return err
+	}
+	return w.removeTree(hold)
+}
+
+// removeStaleReferences removes cache entries for these case IDs whose recipe
+// hash differs from the current one.
+func (w *suiteWorkspace) removeStaleReferences(cases []suiteCase) error {
+	entries, err := os.ReadDir(w.sources)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		for _, c := range cases {
+			// Entries are <id>-<20 hex digits>.
+			hash, ok := strings.CutPrefix(e.Name(), c.ID+"-")
+			if !ok || !e.IsDir() || !isSuiteHash(hash) || e.Name() == filepath.Base(w.cacheEntry(c)) {
+				continue
+			}
+			fmt.Fprintf(w.log, "Removing reference %s for an earlier recipe\n", e.Name())
+			if err := w.quarantine(filepath.Join(w.sources, e.Name())); err != nil {
+				return fmt.Errorf("remove stale reference: %w", err)
+			}
+			break
+		}
+	}
+	return nil
+}
+
+func isSuiteHash(s string) bool {
+	if len(s) != 20 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+// checkEviction rejects a workspace whose filesystem keeps file pages
+// cached regardless of posix_fadvise, so a cold copy is impossible.
+func checkEviction(root string) error {
+	fs, err := dataset.StatFS(root)
+	if err != nil {
+		return err
+	}
+	if fs.IgnoresFadvise() || fs.Type == "tmpfs" || fs.Type == "ramfs" {
+		return usageErrorf("%s is on %s, which cannot evict cached pages for a cold copy; choose a --data-root on a disk-backed filesystem", root, fs.Type)
+	}
+	return nil
+}
+
+// recheckReference rehashes a reference after a copy that mismatched it. A
+// reference that fails its own check is removed so the next run provisions
+// it again, and recheckReference reports true: the copy measured a damaged
+// source, not tx. Otherwise the mismatch stands as tx's.
+func (w *suiteWorkspace) recheckReference(ctx context.Context, c suiteCase, bench, source string, log *os.File) (damaged bool) {
+	checkCtx, cancel := context.WithTimeout(ctx, suiteSSDTimeout)
+	defer cancel()
+	args := []string{bench, "prep", "--check", source}
+	err := w.run(checkCtx, log, suiteCommand{args: args, harness: true, workspace: true})
+	switch {
+	case err == nil:
+		fmt.Fprintln(log, "The reference passed its check; the mismatch is in the copy.")
+		return false
+	case ctx.Err() != nil || checkCtx.Err() != nil:
+		fmt.Fprintf(log, "Reference check did not finish: %v\n", err)
+		return false
+	}
+	fmt.Fprintf(log, "The reference failed its check (%v); removing it\n", err)
+	if err := w.quarantine(w.cacheEntry(c)); err != nil {
+		fmt.Fprintf(log, "Could not remove the reference: %v\n", err)
+	}
+	delete(w.references, c.ID)
+	return true
 }
 
 func (w *suiteWorkspace) cacheEntry(c suiteCase) string {
@@ -286,7 +431,8 @@ func (w *suiteWorkspace) reference(ctx context.Context, c suiteCase, bench strin
 	}
 	defer os.RemoveAll(staging)
 	source := filepath.Join(staging, "source")
-	if err := runSuiteCommand(ctx, log, append([]string{bench}, c.prepArgs(source)...), nil, true); err != nil {
+	prep := suiteCommand{args: append([]string{bench}, c.prepArgs(source)...), harness: true, workspace: true}
+	if err := w.run(ctx, log, prep); err != nil {
 		return "", nil, fmt.Errorf("prepare reference: %w", err)
 	}
 	d, err := w.loadReference(source, c)
