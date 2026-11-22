@@ -184,14 +184,14 @@ bench-throughput:
 
 .PHONY: bench-suite bench-suite-commands bench-suite-build
 export BENCH_SUITE ?= smoke
-export BENCH_SUITE_ROOT ?=
+export BENCH_SUITE_DATA_ROOT ?=
 export BENCH_SUITE_OUT ?= bench/results/suite
 
 bench-suite-build:
 	@GOFLAGS= GOWORK=off go build -o tx-bench ./cmd/tx-bench
 
 bench-suite: bench-suite-build
-	@exec ./tx-bench suite --profile "$$BENCH_SUITE" --ssd-root "$$BENCH_SUITE_ROOT" --out "$$BENCH_SUITE_OUT"
+	@exec ./tx-bench suite --profile "$$BENCH_SUITE" --data-root "$$BENCH_SUITE_DATA_ROOT" --out "$$BENCH_SUITE_OUT"
 
 bench-suite-commands: bench-suite-build
 	@./tx-bench suite --profile "$$BENCH_SUITE" --describe

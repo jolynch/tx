@@ -26,10 +26,13 @@ Run from the tx checkout root on Linux. Build and run the driver with
 `make bench-suite`, or invoke the built driver directly.
 
 - `--profile smoke|full` selects the workloads and defaults to `smoke`.
-- `--ssd-root DIR` selects an existing, dedicated SSD root. Full requires
-  this flag. Smoke uses a temporary workspace when the flag is omitted.
-- `--out DIR` selects an empty result directory and defaults to
-  `bench/results/suite`.
+- `--data-root DIR` selects an existing, dedicated directory for reference
+  trees and copy scratch, on any disk. Full requires this flag. Smoke uses a
+  temporary directory under `bench/data/` when the flag is omitted. The
+  directory must be on a filesystem that can evict cached pages, so tmpfs,
+  ramfs, and ZFS are refused.
+- `--out DIR` selects an empty result directory outside the data root and
+  defaults to `bench/results/suite`.
 - `--describe` prints the reproduction commands.
 
 See [the public suite guide](../../bench/README.md#published-performance-suite)

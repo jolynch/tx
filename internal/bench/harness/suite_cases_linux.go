@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -167,7 +168,7 @@ func describeSuite(out io.Writer, cases []suiteCase) {
 	for _, c := range cases {
 		fmt.Fprintf(out, "\n# %s\n", c.ID)
 		if c.Kind == "ssd" {
-			fmt.Fprintln(out, "# Choose a fresh SOURCE and DEST on the same SSD for this case.")
+			fmt.Fprintln(out, "# Choose a fresh SOURCE and DEST on the same drive for this case.")
 			fmt.Fprintf(out, "./tx-bench %s\n", shellVars.Replace(suiteShellArgs(c.prepArgs("$SOURCE"))))
 			fmt.Fprintln(out, "fingerprint=$(jq -er .fingerprint \"$SOURCE/bench.json\")")
 			metrics := "$SUITE_OUT/" + c.ID + ".json"
@@ -201,10 +202,14 @@ func suiteShellCommand(argv []string, env map[string]string) string {
 	return strings.Join(append(assignments, suiteShellArgs(argv)), " ")
 }
 
-func checkSuiteBenchmarks(path string, series []string, repeats int) error {
+// checkSuiteBenchmarks reads go test output after a successful run. A series
+// with every repetition is present; one with none is missing from the tested
+// commit, since go test exits cleanly when a -bench filter matches nothing.
+// A partial or unexpected series is an error.
+func checkSuiteBenchmarks(path string, series []string, repeats int) (missing []string, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer f.Close()
 	want := make(map[string]int, len(series))
@@ -219,25 +224,52 @@ func checkSuiteBenchmarks(path string, series []string, repeats int) error {
 		}
 		fields := strings.Fields(line)
 		if len(fields) < 4 || len(fields)%2 != 0 {
-			return fmt.Errorf("malformed benchmark result %q", line)
+			return nil, fmt.Errorf("malformed benchmark result %q", line)
 		}
 		iterations, err := strconv.Atoi(fields[1])
 		if err != nil || iterations < 1 {
-			return fmt.Errorf("invalid benchmark iteration count in %q", line)
+			return nil, fmt.Errorf("invalid benchmark iteration count in %q", line)
 		}
 		name := fields[0]
 		if want[name] == 0 {
-			return fmt.Errorf("unexpected benchmark result %s", name)
+			return nil, fmt.Errorf("unexpected benchmark result %s", name)
 		}
 		want[name]--
 	}
 	if err := scanner.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	for _, name := range series {
-		if missing := want[name]; missing != 0 {
-			return fmt.Errorf("%s is missing %d of %d samples", name, missing, repeats)
+		switch left := want[name]; left {
+		case 0:
+		case repeats:
+			missing = append(missing, name)
+		default:
+			return nil, fmt.Errorf("%s is missing %d of %d samples", name, left, repeats)
 		}
 	}
-	return nil
+	return missing, nil
+}
+
+// suiteGoPackageExists reports whether the tested commit has test files in a
+// relative package path such as ./internal/aead.
+func suiteGoPackageExists(pkg string) bool {
+	matches, _ := filepath.Glob(filepath.Join(filepath.FromSlash(pkg), "*_test.go"))
+	return len(matches) > 0
+}
+
+// suiteGridExists reports whether the tested commit has the make target and
+// test that the transfer grid runs.
+func suiteGridExists() bool {
+	makefile, err := os.ReadFile("Makefile")
+	if err != nil || !strings.Contains("\n"+string(makefile), "\nbench-throughput:") {
+		return false
+	}
+	tests, _ := filepath.Glob(filepath.Join("internal", "bench", "*_test.go"))
+	for _, path := range tests {
+		if body, err := os.ReadFile(path); err == nil && strings.Contains(string(body), "func TestTransferCostRatio(") {
+			return true
+		}
+	}
+	return false
 }

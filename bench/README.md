@@ -64,29 +64,53 @@ make bench                  # go test -bench, results in bench/results/latest.tx
 
 On Linux, run `make bench-suite` for a smoke run on at least two available
 CPUs. The full suite needs at least 16 available CPUs and runs the in-memory
-Go benchmarks followed by three same-drive SSD copies.
+Go benchmarks followed by three same-drive copies on the data root.
 
 ```bash
-make bench-suite BENCH_SUITE=full BENCH_SUITE_ROOT="/path/to/dedicated SSD" \
+make bench-suite BENCH_SUITE=full BENCH_SUITE_DATA_ROOT="/path/to/bench data" \
   BENCH_SUITE_OUT="/path/to/fresh results"
 make bench-suite-commands BENCH_SUITE=full
 ```
 
-Use an existing, dedicated SSD directory for `BENCH_SUITE_ROOT` and reserve
-about 450 GiB for initial provisioning. The suite locks this root, verifies
-new references before publishing them under `sources/`, and reuses them by
-recipe and fingerprint. It reclaims interrupted runs' staging trees and copy
-scratch on the next run. Each full run copies about 258 GiB. Smoke runs use a
-temporary workspace by default. Set `BENCH_SUITE_ROOT` to reuse smoke sources
-under its `smoke/` subdirectory.
+`BENCH_SUITE_DATA_ROOT` is an existing directory dedicated to the suite's
+reference trees and copy scratch. Any disk works; the results describe the
+drive you choose. Reserve about 450 GiB for a first full run. The suite
+locks the data root, verifies new references before publishing them under
+`sources/`, and reuses them by recipe and fingerprint. A copy child holds the
+lock while it runs, so a later suite cannot reclaim a copy that outlived an
+interrupted one. The suite reclaims interrupted runs' staging trees and copy
+scratch on the next run. It provisions a cached reference again when its
+metadata no longer matches, or when it fails a rehash after a copy
+mismatched it. It removes references for earlier recipes only when it needs
+their space. Each full run copies about 258 GiB.
 
-Each SSD case requests 0% source cache warmth, measures a single copy with
-compression and encryption disabled, and runs the full destination oracle
-after timing. The suite records the realized file count and mean size from
-the seeded reference and prints the copy rate in MiB/s.
+Smoke runs use a temporary data root under `bench/data/` by default. Set
+`BENCH_SUITE_DATA_ROOT` to reuse smoke references under its `smoke/`
+subdirectory. The suite refuses a data root on tmpfs, ramfs, or ZFS, which
+cannot evict cached pages, and an output directory inside the data root. On
+a checkout on one of those filesystems, set `BENCH_SUITE_DATA_ROOT` for
+smoke runs too.
+
+Each copy case (`ssd-small`, `ssd-varied`, `ssd-large`) requests 0% source
+cache warmth, measures a single copy with compression and encryption
+disabled, and runs the full destination oracle after timing. A copy whose
+source was more than 1% cached at the start measured memory rather than the
+drive, and is recorded as `setup_failed`. The suite records the realized
+file count and mean size from the seeded reference and prints the copy rate
+in MiB/s.
+
+On the first SIGINT or SIGTERM, the suite stops its current child: it sends
+SIGTERM to a copy or prep and kills the child's process group after 2
+minutes. A second signal kills that process group at once.
 
 Use an empty `BENCH_SUITE_OUT` for each run. It defaults to
 `bench/results/suite` and holds raw logs, metrics, and `suite.json` with the
 workload definitions. `status.json` records each case's outcome after the
-suite finishes. The command listing uses `jq` to read each dataset's
-fingerprint for manual reproduction.
+suite finishes: `ok`, `failed`, or `build_failed`. A case is `setup_failed`
+when its reference could not be provisioned, its source stayed cached, or a
+copy mismatched a reference that then failed its own rehash. It measured
+nothing, and the scheduler may retry it. A case is `missing` when the
+tested commit doesn't define its benchmark or test, and `partial` when it
+defines only some of a Go case's benchmarks. Neither counts as a failure, so
+the suite can measure older commits. The command listing uses `jq` to read
+each dataset's fingerprint for manual reproduction.

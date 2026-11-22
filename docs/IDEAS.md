@@ -629,6 +629,28 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Code health
 
+- **The suite records no build provenance.** `suite.json` names no tx SHA,
+  dirty state, or Go version; the private workflow adds `environment.json`,
+  but a manual run has nothing. The suite also passes `GOMAXPROCS`, `GODEBUG`,
+  and `GOEXPERIMENT` through to its children without recording them. Record
+  `go version -m` of the built `tx` and those variables in `suite.json`.
+- **Make expands `$` in suite paths.** `BENCH_SUITE_DATA_ROOT`, `BENCH_SUITE_OUT`,
+  and `THROUGHPUT_OUT` are exported make variables, so make expands a `$` in
+  their values before the recipe sees them. Spaces work. Read them with
+  `$(value ...)` or pass them through the environment only.
+- **Killing a suite copy's process group misses `tx recv copy`.** The
+  harness starts each tx in its own process group, and `tx recv copy` has
+  no stdin lifeline, so it survives a SIGKILL of `tx-bench local` and keeps
+  writing to the scratch destination until it finishes. After a copy
+  timeout the suite moves on, so the orphan can contend with the next SSD
+  case it times. It holds the workspace lock fd, so the next suite cannot
+  start meanwhile. Give it a
+  lifeline, or have the harness forward the kill.
+- **Suite children outside the SSD cases can outlive a killed suite.**
+  `Pdeathsig` reaches only the direct child; a SIGKILLed suite leaves `go
+  test` binaries and `make` grandchildren running. They do not touch the
+  workspace, but they load the machine until they finish.
+
 - **The IO lint has known gaps.** forbidigo matches calls by name, so it cannot
   see a method reached through an embedded `*os.File` or `net.Dialer`, or
   through an interface such as `interface{ Sync() error }`, or an open through
