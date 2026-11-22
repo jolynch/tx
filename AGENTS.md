@@ -198,7 +198,7 @@ go run ./cmd/tx-bench local -s 256MiB -n 1
   control connection pools.
 - `cmd/tx`: binary entry point for `send` and `recv`.
 - `cmd/tx-bench`: the benchmark harness binary (`prep`, `remote send-tree`,
-  `remote recv-copy`, `local`, `report`); see the tx-bench docs.
+  `remote recv-copy`, `local`, `report`, `suite`); see the tx-bench docs.
 - `internal/cmd/filexfercli`: recv-side copy/get/status orchestration, remote
   transfers, resume/sync, and daemonless local copies.
 - `internal/cliflags`: shared flags, short/long aliases, repeatable strings,

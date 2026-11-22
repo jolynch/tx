@@ -59,3 +59,34 @@ checks correctness, shutdown, and resource budgets; CI runs it at 5GiB.
 ```bash
 make bench                  # go test -bench, results in bench/results/latest.txt
 ```
+
+## Published performance suite
+
+On Linux, run `make bench-suite` for a smoke run on at least two available
+CPUs. The full suite needs at least 16 available CPUs and runs the in-memory
+Go benchmarks followed by three same-drive SSD copies.
+
+```bash
+make bench-suite BENCH_SUITE=full BENCH_SUITE_ROOT="/path/to/dedicated SSD" \
+  BENCH_SUITE_OUT="/path/to/fresh results"
+make bench-suite-commands BENCH_SUITE=full
+```
+
+Use an existing, dedicated SSD directory for `BENCH_SUITE_ROOT` and reserve
+about 450 GiB for initial provisioning. The suite locks this root, verifies
+new references before publishing them under `sources/`, and reuses them by
+recipe and fingerprint. It reclaims interrupted runs' staging trees and copy
+scratch on the next run. Each full run copies about 258 GiB. Smoke runs use a
+temporary workspace by default. Set `BENCH_SUITE_ROOT` to reuse smoke sources
+under its `smoke/` subdirectory.
+
+Each SSD case requests 0% source cache warmth, measures a single copy with
+compression and encryption disabled, and runs the full destination oracle
+after timing. The suite records the realized file count and mean size from
+the seeded reference and prints the copy rate in MiB/s.
+
+Use an empty `BENCH_SUITE_OUT` for each run. It defaults to
+`bench/results/suite` and holds raw logs, metrics, and `suite.json` with the
+workload definitions. `status.json` records each case's outcome after the
+suite finishes. The command listing uses `jq` to read each dataset's
+fingerprint for manual reproduction.

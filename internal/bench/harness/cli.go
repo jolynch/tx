@@ -1,5 +1,5 @@
 // Package harness implements the tx-bench commands: prep, remote send-tree,
-// remote recv-copy, local, and report. It forks real tx processes, supervises
+// remote recv-copy, local, report, and suite. It forks real tx processes, supervises
 // them, and verifies their results; it never speaks FTCP itself. See
 // docs/bench/OVERVIEW.md.
 package harness
@@ -40,6 +40,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return RunLocalCLI(ctx, args[1:], stdout, stderr)
 	case "report":
 		return RunReportCLI(args[1:], stdout, stderr)
+	case "suite":
+		return runSuiteCLI(ctx, args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		printUsage(stderr)
 		return exitOK
@@ -57,6 +59,7 @@ Commands:
   remote     Benchmark tx between two hosts (send-tree, recv-copy)
   local      Run remote send-tree and recv-copy against each other on this host
   report     Print the benchmark report from recv-copy metrics and traces
+  suite      Run the public benchmark suite (Linux)
 
 Run 'tx-bench <command> --help' for command-specific options.
 `)

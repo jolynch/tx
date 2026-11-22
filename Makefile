@@ -29,7 +29,7 @@ BENCH_OUT ?= bench/acceptance
 THROUGHPUT_SIZE ?= 256MiB
 # Comma-separated server CPU counts; empty covers 2, 4, 8, ... up to the host.
 THROUGHPUT_CPUS ?=
-THROUGHPUT_OUT ?= bench/throughput
+export THROUGHPUT_OUT ?= bench/throughput
 # Session encryption modes to measure: none, aes, chacha20.
 THROUGHPUT_ENCRYPT ?= none,aes
 
@@ -175,7 +175,23 @@ bench-acceptance-dials:
 # more than TX_BENCH_THROUGHPUT_MAX_RATIO times the CPU of 16 MiB files for the
 # same bytes, and writes THROUGHPUT_OUT/throughput.json.
 bench-throughput:
+	out="$$THROUGHPUT_OUT"; \
+	case "$$out" in ""|/*) ;; *) out="$$PWD/$$out" ;; esac; \
 	TX_BENCH_THROUGHPUT_SIZE=$(THROUGHPUT_SIZE) TX_BENCH_THROUGHPUT_CPUS=$(THROUGHPUT_CPUS) \
 		TX_BENCH_THROUGHPUT_ENCRYPT=$(THROUGHPUT_ENCRYPT) \
-		TX_BENCH_THROUGHPUT_OUT=$(abspath $(THROUGHPUT_OUT)) \
+		TX_BENCH_THROUGHPUT_OUT="$$out" \
 		go test -count=1 -timeout 10m -run '^TestTransferCostRatio$$' -v ./internal/bench
+
+.PHONY: bench-suite bench-suite-commands bench-suite-build
+export BENCH_SUITE ?= smoke
+export BENCH_SUITE_ROOT ?=
+export BENCH_SUITE_OUT ?= bench/results/suite
+
+bench-suite-build:
+	@GOFLAGS= GOWORK=off go build -o tx-bench ./cmd/tx-bench
+
+bench-suite: bench-suite-build
+	@exec ./tx-bench suite --profile "$$BENCH_SUITE" --ssd-root "$$BENCH_SUITE_ROOT" --out "$$BENCH_SUITE_OUT"
+
+bench-suite-commands: bench-suite-build
+	@./tx-bench suite --profile "$$BENCH_SUITE" --describe

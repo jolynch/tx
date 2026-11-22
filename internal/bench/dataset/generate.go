@@ -21,6 +21,10 @@ import (
 // maxFillPct is how full generation may leave a filesystem without --fill.
 const maxFillPct = 95
 
+// GeneratorRevision identifies the seeded layout and file contents. Bump it
+// when either changes so the benchmark suite provisions fresh references.
+const GeneratorRevision = 1
+
 // GenerateOptions describes a generated dataset.
 type GenerateOptions struct {
 	BenchDir     string

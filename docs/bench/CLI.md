@@ -15,9 +15,25 @@ Commands:
   remote     Benchmark tx between two hosts (send-tree, recv-copy)
   local      Run remote send-tree and recv-copy against each other on this host
   report     Print the benchmark report from recv-copy metrics and traces
+  suite      Run the public benchmark suite (Linux)
 
 Run 'tx-bench <command> --help' for command-specific options.
 ```
+
+### `tx-bench suite`
+
+Run from the tx checkout root on Linux. Build and run the driver with
+`make bench-suite`, or invoke the built driver directly.
+
+- `--profile smoke|full` selects the workloads and defaults to `smoke`.
+- `--ssd-root DIR` selects an existing, dedicated SSD root. Full requires
+  this flag. Smoke uses a temporary workspace when the flag is omitted.
+- `--out DIR` selects an empty result directory and defaults to
+  `bench/results/suite`.
+- `--describe` prints the reproduction commands.
+
+See [the public suite guide](../../bench/README.md#published-performance-suite)
+for CPU and disk requirements.
 
 ### `tx-bench prep`
 
