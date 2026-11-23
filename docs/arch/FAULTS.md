@@ -335,8 +335,8 @@ The tests never touch a disk: memxfer keeps files in memfds, and the tree
 copy runs on tmpfs (`/dev/shm`, or `TX_PBT_TMPFS`), skipping when neither
 is tmpfs. They sit outside `acceptance`, because they fail whenever they
 find a bug, and they stay in `pbt-faults` once they pass, where their swarms
-get longer budgets than `fuzz-long` gives. CI's `fault-injection`
-job runs `make -k pbt-faults PBT_EXCLUDE=known`: every kind except the
+get longer budgets than `fuzz-long` gives. CI's `fault-injection` jobs
+run each property's target with `PBT_EXCLUDE=known`: every kind except the
 `PBT_KNOWN` ones behind recorded failures. That list is empty now. Add a
 kind to it while its bug is open, and remove it once fixed, so CI keeps it
 fixed.

@@ -533,6 +533,20 @@ instead of widening the current change; remove an entry when it ships.
   stream, and output earlier items left buffered. Byte-accounting tests in
   `send_sampling_test.go` and table tests in `policy_test.go` cover the
   known cases; a buffer in the sim would let the fuzzers search for others.
+- **CI could buy more fuzzing with the time sharding freed.** Each fuzz
+  suite runs on its own runner, so the slowest suite sets CI's wall time,
+  and the faster suites and the pbt jobs (about 2 minutes of fuzzing each)
+  have room to spare. Raising `PBTTIME`, or `FUZZTIME_LONG` for the smaller
+  suites, would explore further without slowing the pipeline.
+- **Fuzz jobs rebuild race binaries from a cold cache.** Every CI job shares
+  one setup-go cache key, which a fast job such as `lint` usually saves, so
+  each fuzz job compiles its targets from scratch: about 9s per target.
+  Per-suite cache keys would save a minute or two per job.
+- **Fuzz registration is a convention, not a check.** A lint step could diff
+  every `func Fuzz*` against the Makefile's fuzz lines, and every
+  `fuzz-long-*` target against `FUZZ_LONG_SUITES`, and fail on one that is
+  missing. On a CI fuzz failure, uploading `testdata/fuzz/` as an
+  artifact would make the repro one download.
 
 - **No fault slows a link per byte.** NET `delay` sleeps per read and write
   call, and a buffered 4 MiB frame is one write, so it barely slows a bulk

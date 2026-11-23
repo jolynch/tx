@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# A new push to a pull request cancels its older run; runs on main finish.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   unit:
     runs-on: ubuntu-latest
@@ -35,20 +40,27 @@ jobs:
       - name: Reject //nolint that could switch off depguard
         run: ./scripts/lint-nolint
 
-  acceptance:
+  # The Makefile lists the suites (make ci-matrix), so a new one runs here
+  # without editing this file.
+  suites:
     runs-on: ubuntu-latest
+    outputs:
+      acceptance: ${{ steps.matrix.outputs.acceptance }}
+      faults: ${{ steps.matrix.outputs.faults }}
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-          cache-dependency-path: "**/go.sum"
-      - name: Run acceptance tests
-        run: make acceptance
+      - id: matrix
+        run: make -s ci-matrix >> "$GITHUB_OUTPUT"
 
-  fault-injection:
+  # Each fuzz suite runs on its own runner.
+  acceptance:
+    name: acceptance (${{ matrix.suite }})
+    needs: suites
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(needs.suites.outputs.acceptance) }}
     steps:
       - uses: actions/checkout@v4
       - name: Set up Go
@@ -56,8 +68,28 @@ jobs:
         with:
           go-version: "1.26"
           cache-dependency-path: "**/go.sum"
-      - name: Run fault-injection properties
-        run: make -k pbt-faults PBT_EXCLUDE=known
+      - name: Run ${{ matrix.suite }}
+        run: make ${{ matrix.suite }}
+
+  # Each property runs on its own runner. fail-fast: false keeps the others
+  # running past a failure, as make -k pbt-faults does.
+  fault-injection:
+    name: fault-injection (${{ matrix.suite }})
+    needs: suites
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(needs.suites.outputs.faults) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: "**/go.sum"
+      - name: Run ${{ matrix.suite }}
+        run: make ${{ matrix.suite }} PBT_EXCLUDE=known
 
   bench:
     runs-on: ubuntu-latest
