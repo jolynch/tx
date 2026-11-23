@@ -2,6 +2,8 @@ package dataset
 
 import (
 	"archive/zip"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,17 +12,21 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/zeebo/xxh3"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 )
 
-// SilesiaArchiveURL is where missing corpus files are downloaded from.
-var SilesiaArchiveURL = "http://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip"
+const (
+	// SilesiaArchiveURL is where missing corpus files are downloaded from.
+	SilesiaArchiveURL    = "https://mattmahoney.net/dc/silesia.zip"
+	silesiaArchiveSize   = 67633896
+	silesiaArchiveSHA256 = "7d1dd71bfecda66a0ca30d863ed031809f67ecf12717a60fe72c1cc39e28434e"
+)
 
-// silesiaHTTPClient is replaced by tests.
-var silesiaHTTPClient = http.DefaultClient
+var silesiaHTTPClient = &http.Client{Timeout: 5 * time.Minute}
 
 // DefaultSilesiaCache is $XDG_CACHE_HOME/tx-bench/silesia, falling back to
 // ~/.cache.
@@ -109,12 +115,16 @@ func downloadCorpus(cacheDir string, names []string, logf func(string, ...any)) 
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	n, err := io.Copy(tmp, resp.Body)
+	digest := sha256.New()
+	n, err := io.Copy(io.MultiWriter(tmp, digest), io.LimitReader(resp.Body, silesiaArchiveSize+1))
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
 		return fmt.Errorf("download silesia archive: %w", err)
+	}
+	if n != silesiaArchiveSize || hex.EncodeToString(digest.Sum(nil)) != silesiaArchiveSHA256 {
+		return fmt.Errorf("silesia archive does not match the published copy")
 	}
 	logf("silesia: downloaded %s", encoding.HumanBytes(n))
 
@@ -148,18 +158,17 @@ func extractZipFile(f *zip.File, dst string) error {
 		return err
 	}
 	defer rc.Close()
-	tmp := dst + ".tmp"
-	out, err := os.Create(tmp)
+	out, err := os.CreateTemp(filepath.Dir(dst), ".silesia-file-")
 	if err != nil {
 		return err
 	}
+	defer os.Remove(out.Name())
 	if _, err := io.Copy(out, rc); err != nil {
 		out.Close()
-		os.Remove(tmp)
 		return err
 	}
 	if err := out.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, dst)
+	return os.Rename(out.Name(), dst)
 }

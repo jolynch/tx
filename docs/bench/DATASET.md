@@ -66,11 +66,13 @@ Generation checks free space first and refuses to fill the filesystem past
 | `rand`                     | ChaCha8 stream (`math/rand/v2`) seeded with `xxh3(seed, part, index)`. Incompressible. |
 | `silesia[:a+b+…]`          | The named [Silesia](http://sun.aei.polsl.pl/~sdeor/silesia.html) corpus files, concatenated in the order given into a ring buffer. Each file starts at a seeded offset into the ring and repeats it, so files differ while staying realistically compressible. No names means `dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+xml+x-ray`. |
 
-Silesia originals are downloaded once into `--silesia-cache` (default
-`$XDG_CACHE_HOME/tx-bench/silesia`). For air-gapped hosts, place the unzipped
-files there by hand. A failed download names the missing files, the cache
-directory, and the archive URL, so pre-seeding is one copy away. `bench.json` records each original's xxh128, so a dataset
-regenerated elsewhere is checked against the same corpus.
+`tx-bench` downloads Silesia originals from the [HTTPS mirror](https://mattmahoney.net/dc/silesia.html)
+and checks the archive's SHA-256 before extracting them into `--silesia-cache`
+(default `$XDG_CACHE_HOME/tx-bench/silesia`). For air-gapped hosts, place the
+unzipped files there by hand. A failed download names the missing files,
+the cache directory, and the archive URL. `bench.json` records each
+original's xxh128, so a dataset regenerated elsewhere is checked against
+the same corpus.
 
 This fixes two problems in the old `bench generate`: specs repeated each
 other's bytes (every spec reseeded with 1), and specs writing to one directory

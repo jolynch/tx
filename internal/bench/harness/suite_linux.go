@@ -9,9 +9,11 @@ import (
 	"io"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +23,10 @@ import (
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 )
 
+// suiteResultsFormat is the suite.json format version, mirrored in
+// bench/suite-results-format for external runners.
+const suiteResultsFormat = 2
+
 const (
 	suiteBuildTimeout = 10 * time.Minute
 	suiteGoTimeout    = 5 * time.Minute
@@ -28,15 +34,38 @@ const (
 	suiteSSDTimeout   = 30 * time.Minute
 )
 
+// worstCase is the longest a case can run under its timeouts.
+func (c suiteCase) worstCase() time.Duration {
+	switch c.Kind {
+	case "grid":
+		return suiteGridTimeout
+	case "ssd":
+		// Prep, copy, and a reference recheck, each with SIGTERM grace.
+		return 3 * (suiteSSDTimeout + suiteKillGrace)
+	}
+	return suiteGoTimeout
+}
+
+// suiteWorstCase is the longest the suite can run: the build plus every case.
+func suiteWorstCase(cases []suiteCase) time.Duration {
+	total := suiteBuildTimeout
+	for _, c := range cases {
+		total += c.worstCase()
+	}
+	return total
+}
+
 func runSuiteCLI(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	cf := cliflags.New("suite")
 	cf.SetOutput(stderr)
 	var profile, root, out string
 	var describe bool
+	var deadlineRaw string
 	cf.StringVar(&profile, "", "profile", "smoke", "Workloads: smoke|full")
 	cf.StringVar(&root, "", "data-root", "", "Existing directory for reference trees and copy scratch, required for full; smoke uses a temporary one under bench/data/")
 	cf.StringVar(&out, "", "out", "bench/results/suite", "Empty result directory outside the data root")
 	cf.BoolVar(&describe, "", "describe", false, "Print commands without running the workloads")
+	cf.StringVar(&deadlineRaw, "", "deadline", "0", "Skip cases that could not finish within this long of the start, such as 450m; 0 means no limit")
 	cf.FlagSet().Usage = func() {
 		fmt.Fprintln(stderr, "usage: tx-bench suite [options]\n\nRun from the tx checkout root on Linux.")
 		cf.PrintDefaults(stderr)
@@ -48,18 +77,29 @@ func runSuiteCLI(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		return reportErr(stderr, usageErrorf("suite takes no positional arguments and requires --profile smoke or full"))
 	}
 	settings := suiteSettings(profile)
-	spec := suiteManifest{Version: 1, Profile: profile, Cases: settings.cases()}
+	spec := suiteManifest{Version: suiteResultsFormat, Profile: profile, Cases: settings.cases()}
+	if err := checkSuiteIDs(spec.Cases); err != nil {
+		return reportErr(stderr, err)
+	}
 	if describe {
 		describeSuite(stdout, spec.Cases)
 		return exitOK
 	}
-	if err := runSuite(ctx, out, root, &spec, settings, stdout); err != nil {
+	deadline, err := time.ParseDuration(deadlineRaw)
+	if err != nil || deadline < 0 {
+		return reportErr(stderr, usageErrorf("--deadline takes a nonnegative duration such as 450m, got %q", deadlineRaw))
+	}
+	var end time.Time
+	if deadline > 0 {
+		end = time.Now().Add(deadline)
+	}
+	if err := runSuite(ctx, out, root, end, &spec, settings, stdout); err != nil {
 		return reportErr(stderr, err)
 	}
 	return exitOK
 }
 
-func runSuite(ctx context.Context, out, root string, spec *suiteManifest, settings suiteProfile, stdout io.Writer) error {
+func runSuite(ctx context.Context, out, root string, end time.Time, spec *suiteManifest, settings suiteProfile, stdout io.Writer) error {
 	minCPUs := 2
 	if spec.Profile == "full" {
 		minCPUs = 16
@@ -126,8 +166,14 @@ func runSuite(ctx context.Context, out, root string, spec *suiteManifest, settin
 			status[c.ID] = "build_failed"
 			continue
 		}
+		if !end.IsZero() && time.Until(end) < c.worstCase() {
+			fmt.Fprintf(stdout, "Skipping %s: it could take %s and %s remain before the deadline\n",
+				c.ID, c.worstCase(), time.Until(end).Round(time.Second))
+			status[c.ID] = suiteSkipped
+			continue
+		}
 		fmt.Fprintf(stdout, "Running %s\n", c.ID)
-		outcome, err := w.runCase(ctx, c, settings.Repeats, bench, tx, out, stdout)
+		outcome, err := w.runCase(ctx, c, bench, tx, out, stdout)
 		var setup suiteSetupError
 		switch {
 		case errors.As(err, &setup):
@@ -195,13 +241,14 @@ const (
 	suiteOK      = "ok"
 	suitePartial = "partial" // some expected Go series are not in this commit
 	suiteMissing = "missing" // the whole workload is not in this commit
+	suiteSkipped = "skipped" // the case could not finish before --deadline
 )
 
 // suiteSetupFailed marks a case whose reference could not be provisioned or
 // validated. It measured nothing, so the scheduler retries the commit.
 const suiteSetupFailed = "setup_failed"
 
-func (w *suiteWorkspace) runCase(ctx context.Context, c *suiteCase, repeats int, bench, tx, out string, stdout io.Writer) (outcome string, result error) {
+func (w *suiteWorkspace) runCase(ctx context.Context, c *suiteCase, bench, tx, out string, stdout io.Writer) (outcome string, result error) {
 	log, err := os.OpenFile(filepath.Join(out, c.ID+".log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		return "", err
@@ -222,18 +269,19 @@ func (w *suiteWorkspace) runCase(ctx context.Context, c *suiteCase, repeats int,
 		}
 		ctx, cancel := context.WithTimeout(ctx, suiteGridTimeout)
 		defer cancel()
-		env := maps.Clone(*c.Env)
-		env["THROUGHPUT_OUT"] = out
-		if err := w.run(ctx, log, suiteCommand{args: c.Argv, env: env}); err != nil {
+		raw := filepath.Join(out, c.ID)
+		if err := os.Mkdir(raw, 0o755); err != nil {
 			return "", err
 		}
-		var grid struct {
-			Pass bool `json:"pass"`
+		env := maps.Clone(c.Env)
+		env["THROUGHPUT_OUT"] = raw
+		runErr := w.run(ctx, log, suiteCommand{args: c.Argv, env: env})
+		samples, passed, err := readSuiteGrid(filepath.Join(raw, "throughput.json"), *c)
+		c.Samples = samples
+		if err := errors.Join(runErr, err); err != nil {
+			return "", err
 		}
-		if err := readJSON(filepath.Join(out, "throughput.json"), &grid); err != nil {
-			return "", fmt.Errorf("read throughput grid: %w", err)
-		}
-		if !grid.Pass {
+		if !passed {
 			return "", fmt.Errorf("throughput grid did not pass its CPU cost ratio gate")
 		}
 		return suiteOK, nil
@@ -244,10 +292,11 @@ func (w *suiteWorkspace) runCase(ctx context.Context, c *suiteCase, repeats int,
 		}
 		ctx, cancel := context.WithTimeout(ctx, suiteGoTimeout)
 		defer cancel()
-		if err := w.run(ctx, log, suiteCommand{args: c.Argv, env: *c.Env}); err != nil {
+		if err := w.run(ctx, log, suiteCommand{args: c.Argv, env: c.Env}); err != nil {
 			return "", err
 		}
-		missing, err := checkSuiteBenchmarks(log.Name(), c.Series, repeats)
+		samples, missing, err := readSuiteBenchmarks(log.Name(), *c)
+		c.Samples = samples
 		switch {
 		case err != nil:
 			return "", err
@@ -273,10 +322,8 @@ func (w *suiteWorkspace) copyCase(ctx context.Context, c *suiteCase, bench, tx, 
 		}
 		return suiteSetupError{err}
 	}
-	c.Files = reference.Files
-	c.MeanFileBytes = float64(reference.Bytes) / float64(reference.Files)
-	mean := encoding.HumanBytes(int64(c.MeanFileBytes))
-	fmt.Fprintf(log, "Source layout: %d files, mean size %s\n", c.Files, mean)
+	mean := encoding.HumanBytes(reference.Bytes / int64(reference.Files))
+	fmt.Fprintf(log, "Source layout: %d files, mean size %s\n", reference.Files, mean)
 	dest, err := os.MkdirTemp(w.scratch, suiteCopyPrefix+c.ID+"-")
 	if err != nil {
 		return suiteSetupError{err}
@@ -287,9 +334,13 @@ func (w *suiteWorkspace) copyCase(ctx context.Context, c *suiteCase, bench, tx, 
 	defer cancelCopy()
 	args := append([]string{bench}, c.copyArgs(tx, reference.Fingerprint, metrics, source, dest)...)
 	err = w.run(copyCtx, log, suiteCommand{args: args, harness: true, workspace: true})
-	var run report.Run
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == exitColdSetup {
+		return suiteSetupError{fmt.Errorf("could not prepare a cold source cache (see %s)", log.Name())}
+	}
+	var runs []report.Run
 	if err == nil {
-		run, err = suiteCopyMetrics(metrics, *c, reference.Fingerprint)
+		runs, err = suiteCopyMetrics(metrics, *c, reference)
 	}
 	if err != nil {
 		if ctx.Err() == nil && suiteCopyMismatched(metrics) && w.recheckReference(ctx, *c, bench, source, log) {
@@ -297,8 +348,24 @@ func (w *suiteWorkspace) copyCase(ctx context.Context, c *suiteCase, bench, tx, 
 		}
 		return err
 	}
-	fmt.Fprintf(io.MultiWriter(stdout, log), "%s: %.2f MiB/s, %d files, mean size %s\n",
-		c.ID, run.RateBps()/suiteMiB, c.Files, mean)
+	c.Samples = make(suiteSamples)
+	c.Details = &suiteCopyDetails{
+		Fingerprint: reference.Fingerprint, Files: reference.Files, Bytes: reference.Bytes,
+		Windows: make(map[string]int64),
+	}
+	for _, run := range runs {
+		rate := run.RateBps() / suiteMiB
+		c.Samples[c.ID] = append(c.Samples[c.ID], suiteSample{
+			"MiB/s": rate, "files/s": float64(run.Files) / (float64(run.WallNS) / 1e9),
+			"copy_ns": float64(run.WallNS), "verify_ns": float64(run.Verify.DurNS),
+		})
+		c.Details.HotPercent = max(c.Details.HotPercent, run.Cache.HotPct)
+		for codec, count := range run.Windows {
+			c.Details.Windows[codec] += count
+		}
+		fmt.Fprintf(io.MultiWriter(stdout, log), "%s run %s: %.2f MiB/s, %d files, mean size %s\n",
+			c.ID, run.Label, rate, reference.Files, mean)
+	}
 	return nil
 }
 
@@ -309,30 +376,36 @@ type suiteSetupError struct{ err error }
 func (e suiteSetupError) Error() string { return e.err.Error() }
 func (e suiteSetupError) Unwrap() error { return e.err }
 
-// suiteMaxHotPct is the most measured source residency a cold copy accepts.
-const suiteMaxHotPct = 1.0
-
-func suiteCopyMetrics(path string, c suiteCase, fingerprint string) (report.Run, error) {
+func suiteCopyMetrics(path string, c suiteCase, reference *dataset.BenchJSON) ([]report.Run, error) {
 	var m report.Metrics
 	if err := readJSON(path, &m); err != nil {
-		return report.Run{}, fmt.Errorf("read copy metrics: %w", err)
+		return nil, fmt.Errorf("read copy metrics: %w", err)
 	}
-	if len(m.Runs) != 1 {
-		return report.Run{}, fmt.Errorf("expected one measured copy, got %d runs", len(m.Runs))
+	if len(m.Runs) != c.Repeats {
+		return nil, fmt.Errorf("expected %d measured copies, got %d runs", c.Repeats, len(m.Runs))
 	}
-	run, ds := m.Runs[0], m.Header.Dataset
-	if ds.Fingerprint != fingerprint || ds.Files != c.Files || ds.Bytes != c.Bytes ||
-		m.Header.Compress != "none" || m.Header.Encrypt != "none" ||
-		!run.Measured || !run.OK() || run.WallNS <= 0 || run.Bytes != c.Bytes || run.Files != int64(c.Files) ||
-		!run.Cache.Prepped || run.Cache.Warm != "0%" || run.Verify.Mode != "full" || run.Verify.Mismatches != 0 ||
-		run.Verify.Bytes != c.Bytes || run.Verify.Files != c.Files {
-		return report.Run{}, fmt.Errorf("copy metrics lack a complete measured run with full verification")
+	ds := m.Header.Dataset
+	if ds.Fingerprint != reference.Fingerprint || ds.Files != reference.Files || ds.Bytes != c.Bytes {
+		return nil, fmt.Errorf("copy metrics do not describe the suite dataset")
 	}
-	if !(run.Cache.HotPct <= suiteMaxHotPct) {
-		// The host, not tx, failed to make the source cold: retry it.
-		return report.Run{}, suiteSetupError{fmt.Errorf("source was %.1f%% cached before a cold copy; the filesystem did not evict it", run.Cache.HotPct)}
+	for i, run := range m.Runs {
+		if run.Label != strconv.Itoa(i+1) || !run.Measured || !run.OK() || run.ExitCode != 0 ||
+			run.WallNS <= 0 || run.Bytes != c.Bytes || run.Files != int64(reference.Files) ||
+			!run.Cache.Prepped || run.Cache.Warm != "0%" || run.Cache.HotPct < 0 ||
+			run.Verify.Mode != "full" || run.Verify.Mismatches != 0 || run.Verify.DurNS <= 0 || len(run.Windows) == 0 ||
+			run.Verify.Bytes != c.Bytes || run.Verify.Files != reference.Files {
+			return nil, fmt.Errorf("copy %d lacks a complete measured run with full verification", i+1)
+		}
+		if run.Cache.HotPct > suiteMaxHotPct {
+			return nil, suiteSetupError{fmt.Errorf("source was %.1f%% cached before copy %d; the filesystem did not evict it", run.Cache.HotPct, i+1)}
+		}
+		for _, count := range run.Windows {
+			if count <= 0 || count > run.Bytes {
+				return nil, fmt.Errorf("copy %d has invalid codec frame counts", i+1)
+			}
+		}
 	}
-	return run, nil
+	return m.Runs, nil
 }
 
 // suiteCopyMismatched reports whether a copy's metrics record destination

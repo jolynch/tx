@@ -64,7 +64,7 @@ make bench                  # go test -bench, results in bench/results/latest.tx
 
 On Linux, run `make bench-suite` for a smoke run on at least two available
 CPUs. The full suite needs at least 16 available CPUs and runs the in-memory
-Go benchmarks followed by three same-drive copies on the data root.
+Go benchmarks followed by the four SSD workloads on the data root.
 
 ```bash
 make bench-suite BENCH_SUITE=full BENCH_SUITE_DATA_ROOT="/path/to/bench data" \
@@ -74,15 +74,16 @@ make bench-suite-commands BENCH_SUITE=full
 
 `BENCH_SUITE_DATA_ROOT` is an existing directory dedicated to the suite's
 reference trees and copy scratch. Any disk works; the results describe the
-drive you choose. Reserve about 450 GiB for a first full run. The suite
+drive you choose. Reserve about 200 GiB for a first full run. The suite
 locks the data root, verifies new references before publishing them under
 `sources/`, and reuses them by recipe and fingerprint. A copy child holds the
 lock while it runs, so a later suite cannot reclaim a copy that outlived an
 interrupted one. The suite reclaims interrupted runs' staging trees and copy
 scratch on the next run. It provisions a cached reference again when its
 metadata no longer matches, or when it fails a rehash after a copy
-mismatched it. It removes references for earlier recipes only when it needs
-their space. Each full run copies about 258 GiB.
+mismatched it. It removes references for earlier recipes and retired
+workloads only when it needs their space. Each full run writes 258 GiB of
+destination payload.
 
 Smoke runs use a temporary data root under `bench/data/` by default. Set
 `BENCH_SUITE_DATA_ROOT` to reuse smoke references under its `smoke/`
@@ -91,26 +92,63 @@ cannot evict cached pages, and an output directory inside the data root. On
 a checkout on one of those filesystems, set `BENCH_SUITE_DATA_ROOT` for
 smoke runs too.
 
-Each copy case (`ssd-small`, `ssd-varied`, `ssd-large`) requests 0% source
-cache warmth, measures a single copy with compression and encryption
-disabled, and runs the full destination oracle after timing. A copy whose
-source was more than 1% cached at the start measured memory rather than the
-drive, and is recorded as `setup_failed`. The suite records the realized
-file count and mean size from the seeded reference and prints the copy rate
-in MiB/s.
+| Workload | Full dataset per copy |
+|----------|-----------------------|
+| `ssd-small` | 2 GiB of random data in 16 KiB files |
+| `ssd-large` | 40 GiB of random data in 2 GiB files |
+| `ssd-mixed` | 32 GiB split equally by bytes between random files and compressible Silesia files |
+| `ssd-compressible` | 12 GiB of Silesia data |
+
+The full Silesia recipes draw file sizes from 128 MiB to 1 GiB. The mixed
+recipe splits its random bytes between small files of 4 KiB to 256 KiB
+and large files of 1 GiB. The [dataset guide](../docs/bench/DATASET.md#sources)
+describes the Silesia cache.
+
+Each workload runs three measured copies with the tested tx's compression
+and encryption defaults. Before each copy, the harness clears the
+destination and evicts every source page it can. After timing, it runs
+full destination verification. Eviction is advisory, so if more than 10% of
+the source stays cached, the suite stops before that copy and records
+`setup_failed`. It prints each
+copy's rate in MiB/s and records separate copy and verification times and
+the client frame counts by codec.
 
 On the first SIGINT or SIGTERM, the suite stops its current child: it sends
 SIGTERM to a copy or prep and kills the child's process group after 2
 minutes. A second signal kills that process group at once.
 
 Use an empty `BENCH_SUITE_OUT` for each run. It defaults to
-`bench/results/suite` and holds raw logs, metrics, and `suite.json` with the
-workload definitions. `status.json` records each case's outcome after the
-suite finishes: `ok`, `failed`, or `build_failed`. A case is `setup_failed`
+`bench/results/suite` and holds raw logs, metrics, and the suite results.
+`status.json` records each case's outcome after the suite finishes. A
+case may be `ok`, `failed`, or `build_failed`. A case is `setup_failed`
 when its reference could not be provisioned, its source stayed cached, or a
 copy mismatched a reference that then failed its own rehash. It measured
 nothing, and the scheduler may retry it. A case is `missing` when the
 tested commit doesn't define its benchmark or test, and `partial` when it
 defines only some of a Go case's benchmarks. Neither counts as a failure, so
-the suite can measure older commits. The command listing uses `jq` to read
-each dataset's fingerprint for manual reproduction.
+the suite can measure older commits. A case is `skipped` when its worst-case
+time no longer fits before `--deadline`; it measured nothing and is not
+retried. The scheduled run passes `--deadline 450m`, so a case added past
+that budget is skipped instead of timing out the job. `--describe`
+prints each case's worst case and the total. The command listing uses `jq`
+to read each dataset's fingerprint for manual reproduction.
+
+[`suite-results-format`](suite-results-format) identifies the `suite.json`
+format for external runners. The report contains the profile and a list of
+cases with unique IDs. Each case declares its configuration, an `identity`,
+and optional chart definitions. The `identity` holds the settings shared by
+every series in the case but not the list of series, so a consumer can track
+each series across commits while cases gain or lose series. Its `samples` maps each series to an array of measurements
+whose keys identify the metrics. SSD samples include `MiB/s`, `files/s`,
+`copy_ns`, and `verify_ns`. The SSD `details` include the dataset
+fingerprint, file and byte counts, the highest pre-copy cache residency
+across repeats, and `windows`, which totals frames by client-reported codec.
+A chart declares an ID, a title, an optional series prefix, and `metrics`,
+which maps each charted metric to the direction that counts as better: `inc`
+or `dec`. Metric keys that start with `ns/` or end in `_ns` are durations in
+nanoseconds.
+Cases can share a chart ID and title to group related results. Keep case
+IDs stable across revisions of a workload and use a new ID for a distinct
+workload. Every case carries a `revision` for its kind
+(`suiteGoRevision`, `suiteGridRevision`, `suiteSSDRevision`). Bump it when
+harness code changes what that kind measures or how it times it.

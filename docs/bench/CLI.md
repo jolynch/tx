@@ -33,7 +33,11 @@ Run from the tx checkout root on Linux. Build and run the driver with
   ramfs, and ZFS are refused.
 - `--out DIR` selects an empty result directory outside the data root and
   defaults to `bench/results/suite`.
-- `--describe` prints the reproduction commands.
+- `--deadline DURATION` skips each case whose worst-case time no longer fits
+  before that long after the start, recording it as `skipped`. `0`, the
+  default, sets no limit.
+- `--describe` prints the reproduction commands and each case's worst-case
+  time.
 
 See [the public suite guide](../../bench/README.md#published-performance-suite)
 for CPU and disk requirements.
@@ -204,7 +208,7 @@ Behavior:
   - --metrics streams: .jsonl and text get one record per run as it completes
     (a FIFO works, for exporting); .json is rewritten after each run
   - Exit codes: 0 ok, 1 failed run(s), 2 usage or --expect mismatch,
-    3 corruption (stops immediately and keeps DST)
+    3 corruption (stops immediately and keeps DST), 4 cold cache setup failed
 
 Options:
   -w, --warmup int                 Unmeasured runs before measuring (default 1)
@@ -227,6 +231,8 @@ Options:
       --server-wait string         How long to wait for a prep acknowledgement or
                                    runs/server-<tid>.json (default "2m")
       --fail-fast                  Stop at the first failed run (default false)
+      --require-cold-cache string  Stop before copying if more than PCT of the source is
+                                   cached, such as 10%; empty disables (default "")
       --keep                       Keep DST after the last run (default false)
       --forever                    After the warmups, copy and verify until interrupted
                                    instead of --iterations times; metrics default to
