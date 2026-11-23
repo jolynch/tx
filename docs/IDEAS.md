@@ -6,6 +6,11 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Bugs
 
+- **A background-sync growth can go unlogged.** After dispatching a batch,
+  `backgroundSyncer.run` updates the threshold with a nil `stderr`
+  (`internal/fsync/fsync.go`). When pending bytes grew meanwhile, that call
+  raises the threshold and the peak silently, and the next logging call
+  finds the threshold already set. Pass `stderr` there too.
 - **Trailer user and group names can corrupt the line.** The server turns
   spaces in `meta:user` and `meta:group` into `_`, but passes other bytes
   through: a `\n` ends the trailer early, and a `\r` either stays inside the

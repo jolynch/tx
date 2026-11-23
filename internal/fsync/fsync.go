@@ -589,11 +589,14 @@ func clampInt64(v int64, min int64, max int64) int64 {
 	return v
 }
 
+// updateBatchThreshold sets the batch threshold and, when stderr is
+// non-nil, logs growth past the peak. Only the caller whose swap sets the
+// threshold raises the peak, which starts equal to it, so a caller finding
+// the threshold already set cannot raise the peak first and hide the log.
 func (bs *backgroundSyncer) updateBatchThreshold(threshold int64, stderr io.Writer) {
 	for {
 		current := bs.currentBatch.Load()
 		if current == threshold {
-			updateMaxAtomic(&bs.peakBatch, threshold)
 			return
 		}
 		if !bs.currentBatch.CompareAndSwap(current, threshold) {
