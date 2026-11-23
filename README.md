@@ -1,6 +1,6 @@
 # tx performance history
 
-Latest: [7355cd2](https://github.com/jolynch/tx/commit/7355cd2e4b6fc39f3a2674137737f993dcee85bc) (2026-11-22).
+Latest: [a401b18](https://github.com/jolynch/tx/commit/a401b18e6c8ec5325de0a0737bde9586bca1fa05) (2026-11-22).
 
 One point per `main` merge: the median, with repeats as dots and min–max whiskers. Red and green lines mark sustained shifts. A dashed line means the benchmark changed; dotted, the machine.
 
@@ -8,138 +8,65 @@ One point per `main` merge: the median, with repeats as dots and min–max whisk
 
 None detected.
 
-## SSD copies
+## Latest SSD copies
 
-![SSD copies](ssd-throughput.png)
+Median and range across measured copies.
 
-<details><summary>Commands</summary>
-
-~~~bash
-git checkout 7355cd2e4b6fc39f3a2674137737f993dcee85bc && make build
-DATA=/path/on/the/drive/under/test
-
-# ssd-large
-./tx-bench prep --size 128GiB --mix rand=100%@2GiB --seed 1 --check "$DATA/ssd-large-src"
-./tx-bench local --tx ./tx --auth off --cache-warm 0% --expect 769d4550fd9ac281 --oracle full -w 0 -n 1 "$DATA/ssd-large-src" "$DATA/ssd-large-dst" -- --compress none --encrypt none
-# ssd-small
-./tx-bench prep --size 2GiB --mix rand=100%@16KiB --seed 1 --check "$DATA/ssd-small-src"
-./tx-bench local --tx ./tx --auth off --cache-warm 0% --expect 44c4cc0c5b8e9dc2 --oracle full -w 0 -n 1 "$DATA/ssd-small-src" "$DATA/ssd-small-dst" -- --compress none --encrypt none
-# ssd-varied
-./tx-bench prep --size 128GiB --mix rand=100%@128MiB..1324MiB --seed 1 --check "$DATA/ssd-varied-src"
-./tx-bench local --tx ./tx --auth off --cache-warm 0% --expect cdde786b5ca1e0f5 --oracle full -w 0 -n 1 "$DATA/ssd-varied-src" "$DATA/ssd-varied-dst" -- --compress none --encrypt none
-~~~
-
-</details>
-
-## Transfer, plaintext
-
-![Transfer, plaintext](transfer-none.png)
-
-<details><summary>Commands</summary>
-
-~~~bash
-git checkout 7355cd2e4b6fc39f3a2674137737f993dcee85bc
-
-# transfer
-TX_BENCH_THROUGHPUT_CPUS=4,16 TX_BENCH_THROUGHPUT_ENCRYPT=none,aes,chacha20 TX_BENCH_THROUGHPUT_MIN_WALL=5s TX_BENCH_THROUGHPUT_SIZE=256MiB go test -count=1 -timeout 10m -run '^TestTransferCostRatio$' -v ./internal/bench
-~~~
-
-</details>
-
-## Transfer, AES-GCM
-
-![Transfer, AES-GCM](transfer-aes.png)
-
-Same command as [Transfer, plaintext](#transfer-plaintext).
-
-## Transfer, ChaCha20-Poly1305
-
-![Transfer, ChaCha20-Poly1305](transfer-chacha20.png)
-
-Same command as [Transfer, plaintext](#transfer-plaintext).
-
-## Verification
-
-![Verification](verification.png)
-
-<details><summary>Commands</summary>
-
-~~~bash
-git checkout 7355cd2e4b6fc39f3a2674137737f993dcee85bc
-
-# verify
-TX_VERIFY_BYTES=268435456 TX_VERIFY_CONCURRENCY=4 TX_VERIFY_IO_DEPTH=4 TX_VERIFY_IO_LATENCY= go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkVerifyInMemory$/^(4KiB|1MiB|16MiB)$/^cpus=8$/^c=4$' ./internal/cmd/filexfercli
-~~~
-
-</details>
-
-## Sender frames
-
-![Sender frames](sender-frames.png)
-
-<details><summary>Commands</summary>
-
-~~~bash
-git checkout 7355cd2e4b6fc39f3a2674137737f993dcee85bc
-
-# frames
-go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkSendFramePayload$/^(zerocopy|buffered)$/^(4KiB|1MiB)$' ./internal/filexfer/ftcp
-~~~
-
-</details>
+| Workload | Throughput (MiB/s) | Copy time | Verification time | Most-used codec by frame count |
+| --- | --- | --- | --- | --- |
+| Compressible files | 2,037 (1,608–3,024) | 6.03 s (4.06–7.64) | 0.186 s (0.182–0.189) | none (100.0%) |
+| Large files | 3,185 (3,162–3,199) | 12.9 s (12.8–13) | 6.61 s (6.45–6.66) | none (100.0%) |
+| Mixed files | 1,500 (1,288–1,541) | 21.8 s (21.3–25.4) | 4.72 s (4.71–5.07) | none (100.0%) |
+| Small files | 297 (296–300) | 6.9 s (6.83–6.93) | 0.59 s (0.589–0.594) | none (100.0%) |
 
 ## Ciphers and codecs
 
 ![Ciphers and codecs](codecs.png)
 
-<details><summary>Commands</summary>
+## Control path
 
-~~~bash
-git checkout 7355cd2e4b6fc39f3a2674137737f993dcee85bc
-
-# cipher
-go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^Benchmark(Encrypt|Decrypt)Throughput$/^1MiB$/^(aesgcm|chacha20poly1305)$' ./internal/aead
-# codec
-go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkWrapDecompressedReader$/^(zstd|lz4)$' ./internal/bench
-~~~
-
-</details>
+![Control path](control-path.png)
 
 ## Handshake
 
 ![Handshake](handshake.png)
 
-<details><summary>Commands</summary>
+## Sender frames
+
+![Sender frames](sender-frames.png)
+
+## SSD copies
+
+![SSD copies](ssd-throughput.png)
+
+## SSD copy and verification times
+
+![SSD copy and verification times](ssd-timings.png)
+
+## Transfer, AES-GCM
+
+![Transfer, AES-GCM](transfer-aes.png)
+
+## Transfer, ChaCha20-Poly1305
+
+![Transfer, ChaCha20-Poly1305](transfer-chacha20.png)
+
+## Transfer, plaintext
+
+![Transfer, plaintext](transfer-none.png)
+
+## Verification
+
+![Verification](verification.png)
+
+## Reproduce the workloads
+
+Print the commands from the measured checkout.
 
 ~~~bash
-git checkout 7355cd2e4b6fc39f3a2674137737f993dcee85bc
-
-# handshake
-go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkHandshake$/^(token|age)$/^(aes|chacha20)$' ./internal/aead
+git checkout a401b18e6c8ec5325de0a0737bde9586bca1fa05
+make bench-suite-commands BENCH_SUITE=full
 ~~~
-
-</details>
-
-## Control path
-
-![Control path](control-path.png)
-
-<details><summary>Commands</summary>
-
-~~~bash
-git checkout 7355cd2e4b6fc39f3a2674137737f993dcee85bc
-
-# ack
-go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkServePlaintextACKBody$' ./internal/filexfer/ftcp
-# ack-store
-go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkTransferStoreAckBatch$' ./internal/bench
-# request
-go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkRequestRecords$/^(short-paths|long-paths)$' ./internal/filexfer/ftcp
-# split
-go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkSplitEncodedRequests$/^(short-paths|long-paths)$' .
-~~~
-
-</details>
 
 <details><summary>How shifts are detected</summary>
 
