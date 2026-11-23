@@ -1,4 +1,4 @@
-.PHONY: all lint lint-check acceptance fuzz-short fuzz-long pbt-faults pbt-faults-clean pbt-memxfer pbt-tree pbt-pool vet build test unit bench bench-acceptance bench-acceptance-dials bench-throughput
+.PHONY: all lint lint-check acceptance ci-matrix fuzz-short fuzz-long fuzz-long-policy fuzz-long-wire fuzz-long-state pbt-faults pbt-faults-clean pbt-memxfer pbt-tree pbt-pool vet build test unit bench bench-acceptance bench-acceptance-dials bench-throughput
 
 FUZZTIME_SHORT ?= 5s
 FUZZTIME_LONG ?= 30s
@@ -70,9 +70,10 @@ unit:
 	pkgs=$$(printf '%s\n%s\n' "$$plain" "$$race" | sort | uniq -u | cut -d' ' -f1 | sort -u) && \
 	{ [ -z "$$pkgs" ] || go test $$pkgs; }
 
-# Every fuzz test in the repo must be listed in fuzz-short or fuzz-long. To
-# pick a tier, probe the new test with -fuzztime=10s: if it is still reporting
-# `new interesting:` at 10s it belongs in fuzz-long, otherwise fuzz-short.
+# Every fuzz test in the repo must be listed in fuzz-short or one of the
+# fuzz-long suites (FUZZ_LONG_SUITES). To pick a tier, probe the new test
+# with -fuzztime=10s: if it is still reporting `new interesting:` at 10s it
+# belongs in fuzz-long, otherwise fuzz-short.
 #
 # scripts/fuzz fails when a package and target fuzz nothing, which plain
 # `go test -fuzz=X` would let pass silently.
@@ -96,10 +97,16 @@ fuzz-short:
 	$(FUZZ) -race ./internal/bench/dataset FuzzSelectWarmBlocks $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 
 # Properties still finding new coverage past 10s. CI gives them a larger
-# budget to keep exploring.
+# budget to keep exploring, and runs each suite as its own job (ci-matrix).
+# Add a target to the suite of its area, and split a suite whose CI job grows
+# well past 5 minutes. The suites run one at a time, even under make -j, so
+# fuzzers never compete for cores.
+FUZZ_LONG_SUITES := fuzz-long-policy fuzz-long-wire fuzz-long-state
 fuzz-long:
-	$(FUZZ) -race ./internal/filexfer/ftcp FuzzChecksumFrameMatchesWriteFrame $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
-	$(FUZZ) -race ./internal/stats FuzzFitBeta $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	for s in $(FUZZ_LONG_SUITES); do $(MAKE) $$s || exit 1; done
+
+# Compression policy controllers and the distributions behind them.
+fuzz-long-policy:
 	$(FUZZ) ./internal/filexfer/policy FuzzCompressionPolicyRegret $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) ./internal/filexfer/policy FuzzCompressionPolicyStationary $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) ./internal/filexfer/policy FuzzCompressionPolicyReaction $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
@@ -107,37 +114,55 @@ fuzz-long:
 	$(FUZZ) ./internal/filexfer/policy FuzzBackgroundReaction $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) ./internal/filexfer/policy FuzzBackgroundThroughput $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) ./internal/filexfer/policy FuzzBackgroundSendBuffer $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
-	$(FUZZ) -race ./internal/faults FuzzSpecRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
-	$(FUZZ) -race . FuzzTCPConnPool $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
-	$(FUZZ) -race ./internal/aead FuzzReadRecords $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
-	$(FUZZ) -race ./internal/filexfer/encoding FuzzManifestEntryRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/stats FuzzFitBeta $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+
+# Protocol: framing, encodings, the record layer, and FTCP handlers.
+fuzz-long-wire:
+	$(FUZZ) -race ./internal/filexfer/ftcp FuzzChecksumFrameMatchesWriteFrame $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/ftcp FuzzFramedItemRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/ftcp FuzzFramedBodyHeader $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/ftcp FuzzSync $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/ftcp FuzzResolveUnderRoot $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/ftcp FuzzServeZeroCopySEND $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG) -parallel=1
+	$(FUZZ) -race ./internal/filexfer/encoding FuzzManifestEntryRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/aead FuzzReadRecords $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/cmd/filexfercli FuzzChecksumFrameParsing $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+
+# Client and server state: the connection pool, the store, verification,
+# fault specs, events, and the benchmark tooling.
+fuzz-long-state:
+	$(FUZZ) -race . FuzzTCPConnPool $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/store FuzzStoreStateCounts $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/filexfer/store FuzzAckMissingRevival $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+	$(FUZZ) -race ./internal/cmd/filexfercli FuzzCopyVerifyDetectsCorruption $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG) -parallel=4
+	$(FUZZ) -race ./internal/faults FuzzSpecRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/events FuzzAppendJSON $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/bench/report FuzzTraceRecordText $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/bench/dataset FuzzFilesTSVRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/bench/dataset FuzzVerifyDetectsCorruption $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
-	$(FUZZ) -race ./internal/cmd/filexfercli FuzzCopyVerifyDetectsCorruption $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG) -parallel=4
-	$(FUZZ) -race ./internal/cmd/filexfercli FuzzChecksumFrameParsing $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
+
+# ci-matrix prints the CI job matrices as JSON, so a suite added to
+# FUZZ_LONG_SUITES or PBT_SUITES runs in CI without editing ci.yml.
+comma := ,
+json_list = [$(subst " ","$(comma)",$(foreach s,$(1),"$(s)"))]
+ci-matrix:
+	@echo 'acceptance=$(call json_list,fuzz-short $(FUZZ_LONG_SUITES))'
+	@echo 'faults=$(call json_list,$(PBT_SUITES))'
 
 # Fault-injection properties (docs/arch/FAULTS.md). They are not part of
 # acceptance: they fail whenever they find a bug, and they stay here once
-# they pass, with longer budgets than fuzz-long. CI's fault-injection job
-# runs them with PBT_EXCLUDE=known, so a kind removed from PBT_KNOWN stays
+# they pass, with longer budgets than fuzz-long. CI runs each property as
+# its own job with PBT_EXCLUDE=known, so a kind removed from PBT_KNOWN stays
 # fixed.
 # They skip unless TX_PBT_FAULTS is set, so their seeds never fail make unit.
 # TestTreeCopyUnderFaults sweeps random seeds for PBTTIME instead of fuzzing,
 # since its CLI copies can outlast the fuzzer's 10s limit per input. Each
 # property is its own target, so make -k pbt-faults runs every one past a
 # failing one, and still fails.
-pbt-faults: pbt-memxfer pbt-tree pbt-pool
-pbt-faults pbt-memxfer pbt-tree pbt-pool: export TX_PBT_FAULTS := 1
-pbt-faults pbt-memxfer pbt-tree pbt-pool: export TX_PBT_FAULTS_EXCLUDE := $(subst known,$(PBT_KNOWN),$(PBT_EXCLUDE))
+PBT_SUITES := pbt-memxfer pbt-tree pbt-pool
+pbt-faults: $(PBT_SUITES)
+pbt-faults $(PBT_SUITES): export TX_PBT_FAULTS := 1
+pbt-faults $(PBT_SUITES): export TX_PBT_FAULTS_EXCLUDE := $(subst known,$(PBT_KNOWN),$(PBT_EXCLUDE))
 pbt-faults-clean:
 	rm -rf $(PBTCACHE)
 pbt-memxfer: pbt-faults-clean

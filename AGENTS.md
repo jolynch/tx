@@ -44,8 +44,8 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
   timing/expiry, and goroutine lifecycle. Models: `FuzzCommonPrefixLen` in
   `internal/utils/strings_test.go` and `FuzzSync` in
   `internal/filexfer/ftcp/sync_test.go`.
-- **Register every fuzz test in the Makefile, in `fuzz-short`, `fuzz-long`, or
-  `pbt-faults`.**
+- **Register every fuzz test in the Makefile, in `fuzz-short`, a `fuzz-long-*`
+  suite, or `pbt-faults`.**
   Verify its package path and confirm `go test -fuzz=X` reports a real `execs:`
   count; unmatched targets exit successfully without fuzzing.
   - `fuzz-short` — property tests standing in for unit tests: one function or
@@ -54,6 +54,13 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
   - `fuzz-long` — end-to-end properties driving the whole system, which keep
     reaching new states the longer they run. Model: `FuzzSync`, which walks
     TXFER → modify → SYNC and checks the result against the real filesystem.
+    It has three suites, which CI runs as separate jobs: `fuzz-long-policy`
+    (compression policy and its distributions), `fuzz-long-wire` (protocol,
+    framing, and FTCP handlers), and `fuzz-long-state` (pool, store,
+    verification, and tooling). Add a test to the suite of its area, and
+    split a suite whose CI job grows well past 5 minutes. CI builds its job
+    matrix from `FUZZ_LONG_SUITES` and `PBT_SUITES` (`make ci-matrix`), so a
+    new suite or pbt target needs no workflow change.
   - Classify a new fuzz test by measuring, not guessing. Probe it for 10s:
     `go test -run=^$ -fuzz=FuzzX -fuzztime=10s ./that/pkg`, and watch
     `new interesting:`. Still finding new coverage at 10s → `fuzz-long`, where
@@ -69,10 +76,10 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
     transfers under the `internal/faults` catalog. Model:
     `FuzzMemTransferUnderFaults`. They begin with `faults.SkipUnlessPBT`, so
     they run only under `make pbt-faults`, and they sit outside `acceptance`
-    because they fail when they find a bug. CI's `fault-injection` job runs
-    `make -k pbt-faults PBT_EXCLUDE=known`, which leaves out the kinds in
-    `PBT_KNOWN` (empty now): add a kind there while its bug is open, and
-    remove it once fixed, so CI keeps it fixed. The kinds in
+    because they fail when they find a bug. CI's `fault-injection` jobs run
+    each target in `PBT_SUITES` with `PBT_EXCLUDE=known`, which leaves out
+    the kinds in `PBT_KNOWN` (empty now): add a kind there while its bug is
+    open, and remove it once fixed, so CI keeps it fixed. The kinds in
     `faults.UndetectedKinds()` have a verify-backed contract: without
     `--verify` they may leave wrong bytes in the files they fired on, and
     with it the next run repairs them. Go's fuzzer stops any input past 10s
@@ -174,7 +181,7 @@ make lint-check   # proves each lint rule fires and each exclusion holds (~3 min
 make test         # build + unit + acceptance
 make unit         # go test -race ./..., then race-gated packages without it
 make fuzz-short   # unit-test replacements; 5s each
-make fuzz-long    # whole-system properties; 30s each
+make fuzz-long    # whole-system properties, 30s each; fuzz-long-* runs one suite
 make acceptance   # fuzz-short, then fuzz-long
 make pbt-faults   # fault-injection properties; fail when they find a bug
 make bench        # Go microbenchmarks; pre-commit only (pegs the machine)
