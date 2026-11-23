@@ -140,11 +140,13 @@ lists) keep it, because a client may store TXFER frames as-is.
 - `size` is the logical uncompressed bytes covered by this frame.
 - `wsize` is the exact payload byte count that follows the header newline.
 - For `comp=none`, `size` must equal `wsize`, except in `CXSUM` frames: they
-  carry no payload (`wsize=0`), and `size` is the length of the checksummed
-  range.
+  carry no payload (`wsize=0`, and receivers reject any other value), and
+  `size` is the length of the checksummed range.
 - For `comp=zstd|lz4`, decompressed bytes must equal `size`.
-- Trailer `hash=<algo>:<value>`, when present, is used for frame-integrity
-  validation/logging.
+- Trailer `hash=<algo>:<value>` is required on framed-body and `CXSUM`
+  frames. Receivers reject a frame whose hash is missing or wrong, so a
+  corrupted `CXSUM` response fails rather than reporting a wrong range
+  checksum.
 
 ## Error Handling
 

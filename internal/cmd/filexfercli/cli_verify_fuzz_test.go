@@ -369,12 +369,16 @@ func TestChecksumFrameParserCompatibility(t *testing.T) {
 	}
 }
 
-// FuzzChecksumFrameParsing uses the real encoder as an oracle, with unknown
-// fields, spacing, and overwritten header properties added to the response.
+// FuzzChecksumFrameParsing uses the real encoder as an oracle, adds unknown
+// fields, spacing, and overwritten header properties to its response, and
+// recomputes the frame hash. It then flips one bit, as a plaintext session
+// can: the parse must fail or return the same results, so a corrupted
+// file-hash never blames a correct file.
 func FuzzChecksumFrameParsing(f *testing.F) {
-	f.Add(uint64(1), int64(0), int64(4096), "user=name", uint8(0))
-	f.Add(uint64(math.MaxUint64), int64(math.MaxInt64), int64(0), "a user\n", uint8(31))
-	f.Fuzz(func(t *testing.T, id uint64, offset, size int64, user string, extras uint8) {
+	f.Add(uint64(1), int64(0), int64(4096), "user=name", uint8(0), uint32(0))
+	f.Add(uint64(math.MaxUint64), int64(math.MaxInt64), int64(0), "a user\n", uint8(31), uint32(0))
+	f.Add(uint64(1), int64(0), int64(4096), "user=name", uint8(0), uint32(198*8)) // file-hash "…01" to "…00"
+	f.Fuzz(func(t *testing.T, id uint64, offset, size int64, user string, extras uint8, flip uint32) {
 		offset &= math.MaxInt64
 		size &= math.MaxInt64
 		user = strings.NewReplacer("\r", "_", "\n", "_", " ", "_").Replace(user)
@@ -387,14 +391,24 @@ func FuzzChecksumFrameParsing(f *testing.F) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		header, rest, _ := strings.Cut(out.String(), "\n")
+		header, trailer, _ := strings.Cut(out.String(), "\n")
 		header = strings.Replace(header, " offset=", " offset=bad size=-1 wsize=bad offset=", 1)
 		header = "  " + header + strings.Repeat(" unknown=x=y", int(extras%32)) + "  "
-		got, err := readChecksumResults(strings.NewReader(header + "\n" + rest + "OK\n"))
+		prefix, _, err := encoding.SplitTrailerPrefixAndHash(strings.TrimSuffix(trailer, "\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := []byte(header + "\n" + prefix + " hash=" + encoding.FrameHashToken(header, nil, prefix) + "\nOK\n")
 		want := []checksumResult{{FileID: id, Offset: offset, Size: size, FileHashToken: hash,
 			Metadata: &tx.FileTrailerMetadata{Size: size, MtimeNS: offset, Mode: "0644", UID: "1000", GID: "1001", User: user, Group: user}}}
+		got, err := readChecksumResults(bytes.NewReader(resp))
 		if err != nil || !reflect.DeepEqual(got, want) {
 			t.Fatalf("got=%+v err=%v, want=%+v", got, err, want)
+		}
+		bit := int(flip % uint32(len(resp)*8))
+		resp[bit/8] ^= 1 << (bit % 8)
+		if got, err := readChecksumResults(bytes.NewReader(resp)); err == nil && !reflect.DeepEqual(got, want) {
+			t.Fatalf("bit %d flipped: got=%+v, want an error or %+v", bit, got, want)
 		}
 	})
 }
