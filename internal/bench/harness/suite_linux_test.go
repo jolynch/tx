@@ -5,6 +5,7 @@ package harness
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,8 +24,8 @@ import (
 func TestSuiteBenchmarkSamples(t *testing.T) {
 	const name = "BenchmarkVerifyInMemory/4KiB/cpus=8/c=4-8"
 	const other = "BenchmarkVerifyInMemory/1MiB/cpus=8/c=4-8"
-	const sample = name + "  1  42 ns/op\n"
-	const otherSample = other + "  1  42 ns/op\n"
+	const sample = name + "  1  42 ns/op  1048.576 MB/s\n"
+	const otherSample = other + "  1  23 ns/op  1048.576 MB/s\n"
 	for _, tc := range []struct {
 		label   string
 		log     string
@@ -37,18 +38,65 @@ func TestSuiteBenchmarkSamples(t *testing.T) {
 		{"missing repetition", sample + sample, nil, "missing 1 of 3 samples"},
 		{"wrong CPU", strings.ReplaceAll(sample, "-8", "-2"), nil, "unexpected benchmark result"},
 		{"extra repetition", strings.Repeat(sample, 4), nil, "unexpected benchmark result"},
+		{"missing metric", name + "  1  42 ns/op\n", nil, "lacks the MiB/s metric"},
+		{"nonfinite metric", strings.Replace(sample, "42", "NaN", 1), nil, "invalid ns/op value"},
 	} {
 		t.Run(tc.label, func(t *testing.T) {
 			log := filepath.Join(t.TempDir(), "case.log")
 			if err := os.WriteFile(log, []byte(tc.log), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			missing, err := checkSuiteBenchmarks(log, []string{name, other}, 3)
+			c := suiteCase{Series: []string{name, other}, Repeats: 3,
+				Charts: []suiteChart{chart("verification", "Verification", "ns/op", "MiB/s")}}
+			samples, missing, err := readSuiteBenchmarks(log, c)
 			if tc.err == "" && err != nil || tc.err != "" && (err == nil || !strings.Contains(err.Error(), tc.err)) {
 				t.Fatalf("error = %v; want %q", err, tc.err)
 			}
-			if tc.err == "" && !slices.Equal(missing, tc.missing) && !(len(tc.missing) == 0 && len(missing) == 0) {
+			if tc.err == "" && !slices.Equal(missing, tc.missing) {
 				t.Fatalf("missing = %q; want %q", missing, tc.missing)
+			}
+			if err == nil && len(samples[name]) != 0 &&
+				(len(samples[name]) != 3 || samples[name][0]["ns/op"] != 42 || samples[name][0]["MiB/s"] != 1000) {
+				t.Fatalf("unexpected samples: %v", samples)
+			}
+		})
+	}
+}
+
+func TestSuiteGridSamples(t *testing.T) {
+	c := suiteCase{gridSize: "16MiB", gridCPUs: "2", gridModes: "none,aes"}
+	var sizes []string
+	for _, size := range []int64{4 << 10, 16 << 10, 64 << 10, 1 << 20, 16 << 20} {
+		sizes = append(sizes, fmt.Sprintf(`{"file_size":%d,"mib_per_sec":12,"core_sec_per_gib":2,"cost_ratio":1}`, size))
+	}
+	for _, tc := range []struct {
+		name    string
+		modes   []string // empty omits the encrypt key
+		samples int      // zero expects a validation error
+	}{
+		{"modern", []string{`"none"`, `"aes"`}, 10},
+		{"no encrypt key", []string{""}, 0},
+		{"missing encrypted row", []string{`"none"`}, 0},
+		{"mixed raw formats", []string{"", `"aes"`}, 0},
+		{"null encrypt", []string{"null"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var rows []string
+			for _, mode := range tc.modes {
+				var encrypt string
+				if mode != "" {
+					encrypt = `,"encrypt":` + mode
+				}
+				rows = append(rows, fmt.Sprintf(`{"cpus":2%s,"sizes":[%s]}`, encrypt, strings.Join(sizes, ",")))
+			}
+			raw := fmt.Sprintf(`{"pass":true,"copy_bytes":16777216,"rows":[%s]}`, strings.Join(rows, ","))
+			path := filepath.Join(t.TempDir(), "throughput.json")
+			if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			samples, pass, err := readSuiteGrid(path, c)
+			if tc.samples == 0 && err == nil || tc.samples > 0 && (err != nil || !pass || len(samples) != tc.samples) {
+				t.Fatalf("got %d samples (pass=%v, error=%v), want %d samples or a validation error", len(samples), pass, err, tc.samples)
 			}
 		})
 	}
@@ -123,29 +171,149 @@ func openSmokeWorkspace(root, out string) (*suiteWorkspace, error) {
 	return openSuiteWorkspace(suiteWorkspaceOptions{Root: root, Out: out, Profile: "smoke"})
 }
 
-func TestSuiteCopyResidency(t *testing.T) {
-	c := ssdCase("ssd-small", "16MiB", "rand=100%@16KiB", 16*suiteMiB)
-	c.Files = 1024
-	for _, tc := range []struct {
-		hot float64
-		ok  bool
-	}{{0, true}, {suiteMaxHotPct, true}, {37.5, false}, {100, false}} {
-		var m report.Metrics
-		m.Header.Compress, m.Header.Encrypt = "none", "none"
-		m.Header.Dataset = report.Dataset{Fingerprint: "f", Files: c.Files, Bytes: c.Bytes}
-		run := report.Run{Measured: true, Status: report.StatusOK, WallNS: 1, Bytes: c.Bytes, Files: int64(c.Files)}
-		run.Cache = report.Cache{Prepped: true, Warm: "0%", HotPct: tc.hot}
-		run.Verify = report.Verify{Mode: "full", Bytes: c.Bytes, Files: c.Files}
-		m.Runs = []report.Run{run}
-		path := filepath.Join(t.TempDir(), "m.json")
-		if err := dataset.WriteJSONAtomic(path, m); err != nil {
+func TestSuiteResultsFormat(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "bench", "suite-results-format"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(data)); got != strconv.Itoa(suiteResultsFormat) {
+		t.Fatalf("bench/suite-results-format is %q, want %d", got, suiteResultsFormat)
+	}
+}
+
+func TestSuiteChartDirections(t *testing.T) {
+	for _, profile := range []string{"smoke", "full"} {
+		for _, c := range suiteSettings(profile).cases() {
+			if len(c.Charts) == 0 {
+				t.Errorf("%s %s has no charts", profile, c.ID)
+			}
+			for _, chart := range c.Charts {
+				for metric, better := range chart.Metrics {
+					if better != "inc" && better != "dec" {
+						t.Errorf("%s %s chart %s: metric %s has direction %q, want inc or dec",
+							profile, c.ID, chart.ID, metric, better)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestSuiteCaseIdentity(t *testing.T) {
+	for _, profile := range []string{"smoke", "full"} {
+		for _, c := range suiteSettings(profile).cases() {
+			if len(c.Identity) == 0 || c.Revision < 1 {
+				t.Fatalf("%s %s lacks an identity or revision", profile, c.ID)
+			}
+			// A case's identity must not change when a series is added, so it
+			// cannot name any series or the -bench filter that selects them.
+			raw, err := json.Marshal(c.Identity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range c.Series {
+				if strings.Contains(string(raw), strings.TrimSuffix(name, "-"+strconv.Itoa(suiteSettings(profile).CPUs))) {
+					t.Errorf("%s %s identity names series %s", profile, c.ID, name)
+				}
+			}
+			if strings.Contains(string(raw), "-bench") {
+				t.Errorf("%s %s identity includes the -bench filter", profile, c.ID)
+			}
+		}
+	}
+}
+
+func TestSuiteSSDWorkloads(t *testing.T) {
+	for _, profile := range []string{"smoke", "full"} {
+		cases := suiteSettings(profile).SSD
+		if len(cases) != 4 {
+			t.Fatalf("%s defines %d SSD workloads, want four", profile, len(cases))
+		}
+		if err := checkSuiteIDs(cases); err != nil {
 			t.Fatal(err)
 		}
-		_, err := suiteCopyMetrics(path, c, "f")
-		var setup suiteSetupError
-		if (err == nil) != tc.ok || err != nil && !errors.As(err, &setup) {
-			t.Errorf("hot %.1f%%: error = %v; want ok=%v, or a retryable setup error", tc.hot, err, tc.ok)
+		var total int64
+		for _, c := range cases {
+			if c.Repeats != 3 {
+				t.Fatalf("%s %s has %d repeats", profile, c.ID, c.Repeats)
+			}
+			total += c.Bytes * int64(c.Repeats)
+			mix, err := dataset.ParseMix(c.Recipe.Mix)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := dataset.Plan(mix, c.Bytes, c.Recipe.Seed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var compressible int64
+			sizes := make(map[int64]bool)
+			for _, p := range plan {
+				if p.Part.Source.Kind != dataset.SourceSilesia {
+					continue
+				}
+				compressible += p.Budget
+				for _, size := range p.Sizes {
+					if size <= 100*suiteMiB || size > suiteGiB {
+						t.Errorf("%s %s has a Silesia file outside the target range: %d bytes", profile, c.ID, size)
+					}
+					sizes[size] = true
+				}
+			}
+			want := map[string]int64{"ssd-mixed": c.Bytes / 2, "ssd-compressible": c.Bytes}[c.ID]
+			if compressible != want || want > 0 && len(sizes) < 2 {
+				t.Errorf("%s %s has %d compressible bytes and %d distinct compressible sizes, want %d bytes",
+					profile, c.ID, compressible, len(sizes), want)
+			}
 		}
+		if profile == "full" && total != 258*suiteGiB {
+			t.Errorf("full suite copies %d bytes, want 258 GiB", total)
+		}
+	}
+}
+
+func TestSuiteCopyResidency(t *testing.T) {
+	c := suiteSettings("smoke").SSD[0]
+	reference := &dataset.BenchJSON{Fingerprint: "f", Files: 1024, Bytes: c.Bytes}
+	for _, tc := range []struct {
+		name           string
+		hot            float64
+		missingWindows bool
+		err            string
+		setup          bool
+	}{
+		{"cold", 0, false, "", false},
+		{"maximum residency", suiteMaxHotPct, false, "", false},
+		{"hot", 37.5, false, "source was 37.5% cached before copy 3", true},
+		{"fully resident", 100, false, "source was 100.0% cached before copy 3", true},
+		{"missing codec stats", 0, true, "copy 3 lacks a complete measured run", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var m report.Metrics
+			m.Header.Compress, m.Header.Encrypt = "adapt", "auto"
+			m.Header.Dataset = report.Dataset{Fingerprint: reference.Fingerprint, Files: reference.Files, Bytes: c.Bytes}
+			for i := range c.Repeats {
+				run := report.Run{Label: strconv.Itoa(i + 1), Measured: true, Status: report.StatusOK, WallNS: 1,
+					Bytes: c.Bytes, Files: int64(reference.Files), Windows: map[string]int64{"none": int64(reference.Files)}}
+				run.Cache = report.Cache{Prepped: true, Warm: "0%"}
+				run.Verify = report.Verify{Mode: "full", Bytes: c.Bytes, Files: reference.Files, DurNS: 1}
+				m.Runs = append(m.Runs, run)
+			}
+			m.Runs[c.Repeats-1].Cache.HotPct = tc.hot
+			if tc.missingWindows {
+				m.Runs[c.Repeats-1].Windows = nil
+			}
+			path := filepath.Join(t.TempDir(), "m.json")
+			if err := dataset.WriteJSONAtomic(path, m); err != nil {
+				t.Fatal(err)
+			}
+			_, err := suiteCopyMetrics(path, c, reference)
+			var setup suiteSetupError
+			if tc.err == "" && err != nil || tc.err != "" && (err == nil || !strings.Contains(err.Error(), tc.err)) ||
+				errors.As(err, &setup) != tc.setup {
+				t.Errorf("error = %v, want %q (retryable=%v)", err, tc.err, tc.setup)
+			}
+		})
 	}
 }
 
@@ -311,12 +479,19 @@ func TestSuiteCacheRepair(t *testing.T) {
 			t.Fatal(err)
 		}
 		stale := filepath.Join(w.sources, cases[0].ID+"-00000000000000000000")
+		retired := filepath.Join(w.sources, "ssd-retired-00000000000000000000")
 		other := filepath.Join(w.sources, "unrelated-00000000000000000000")
 		w.close()
-		for _, dir := range []string{stale, other} {
-			if err := os.Mkdir(dir, 0o755); err != nil {
+		for _, dir := range []string{stale, retired} {
+			if err := dataset.ClaimDir(filepath.Join(dir, "source"), dataset.BenchMarker); err != nil {
 				t.Fatal(err)
 			}
+			if err := dataset.WriteJSONAtomic(filepath.Join(dir, "reference.json"), "0123456789abcdef"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Mkdir(other, 0o755); err != nil {
+			t.Fatal(err)
 		}
 		defer func(orig func(string) (dataset.FSInfo, error)) { suiteStatFS = orig }(suiteStatFS)
 		available := int64(1 << 50)
@@ -326,19 +501,23 @@ func TestSuiteCacheRepair(t *testing.T) {
 			t.Fatal(err)
 		}
 		w.close()
-		if _, err := os.Stat(stale); err != nil {
-			t.Fatalf("stale entry removed with space to spare: %v", err)
+		for _, entry := range []string{stale, retired} {
+			if _, err := os.Stat(entry); err != nil {
+				t.Fatalf("stale entry removed with space to spare: %v", err)
+			}
 		}
 		available = 0
 		if w, err := open(root); err == nil {
 			w.close()
 			t.Fatal("opened a workspace without space")
 		}
-		if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("stale entry kept under space pressure: stat error = %v", err)
+		for _, entry := range []string{stale, retired} {
+			if _, err := os.Stat(entry); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("stale entry kept under space pressure: stat error = %v", err)
+			}
 		}
 		if _, err := os.Stat(other); err != nil {
-			t.Fatalf("removed an entry for another case: %v", err)
+			t.Fatalf("removed an unowned entry: %v", err)
 		}
 	})
 	t.Run("output inside the root", func(t *testing.T) {

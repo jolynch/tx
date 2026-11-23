@@ -3,11 +3,11 @@
 package harness
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +18,23 @@ import (
 const suiteMiB = 1 << 20
 const suiteGiB = 1 << 30
 
+const suiteSSDRepeats = 3
+
+// suiteMaxHotPct is the most of an SSD source that may stay cached before a
+// copy. The harness evicts every page it can, but fadvise is advisory.
+const suiteMaxHotPct = 10.0
+
+// Measurement revisions by case kind. Bump one when harness code changes what
+// that kind measures or how it times it, so the report starts a new segment
+// instead of showing the change as a tx regression.
+const (
+	suiteGoRevision   = 1
+	suiteGridRevision = 1
+	suiteSSDRevision  = 1
+)
+
+var suiteID = regexp.MustCompile(`^[a-z][a-z0-9-]{0,47}$`)
+
 type suiteManifest struct {
 	Version int         `json:"version"`
 	Profile string      `json:"profile"`
@@ -25,17 +42,50 @@ type suiteManifest struct {
 }
 
 type suiteCase struct {
-	ID     string             `json:"id"`
-	Kind   string             `json:"kind"`
-	Argv   []string           `json:"argv,omitempty"`
-	Env    *map[string]string `json:"env,omitempty"`
-	Series []string           `json:"series,omitempty"`
-	Bytes  int64              `json:"bytes,omitempty"`
-	Recipe *suiteRecipe       `json:"recipe,omitempty"`
-	Flags  []string           `json:"flags,omitempty"`
+	ID       string            `json:"id"`
+	Kind     string            `json:"kind"`
+	Label    string            `json:"label,omitempty"`
+	Argv     []string          `json:"argv,omitempty"`
+	Env      map[string]string `json:"env,omitempty"`
+	Series   []string          `json:"series,omitempty"`
+	Repeats  int               `json:"repeats,omitempty"`
+	Revision int               `json:"revision,omitempty"`
+	// Identity holds the settings that define every series in the case, not
+	// the list of series, so adding a series keeps the others' history.
+	Identity map[string]any `json:"identity"`
+	Bytes    int64          `json:"bytes,omitempty"`
+	Recipe   *suiteRecipe   `json:"recipe,omitempty"`
+	Charts   []suiteChart   `json:"charts,omitempty"`
 
-	Files         int     `json:"files,omitempty"`
-	MeanFileBytes float64 `json:"mean_file_bytes,omitempty"`
+	Samples suiteSamples      `json:"samples,omitempty"`
+	Details *suiteCopyDetails `json:"details,omitempty"`
+
+	gridSize, gridCPUs, gridModes string
+}
+
+type suiteChart struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	// Metrics maps each charted metric to the direction that counts as
+	// better: "inc" or "dec".
+	Metrics map[string]string `json:"metrics"`
+	Prefix  string            `json:"prefix,omitempty"`
+}
+
+// suiteBetter is the direction that counts as better for each metric the
+// suite charts. A chart that judges a metric the other way sets its own entry.
+var suiteBetter = map[string]string{
+	"MiB/s": "inc", "files/s": "inc",
+	"core-s/GiB": "dec", "ratio": "dec", "allocs/op": "dec", "B/op": "dec",
+	"ns/op": "dec", "ns/ack": "dec", "copy_ns": "dec", "verify_ns": "dec",
+}
+
+func chart(id, title string, metrics ...string) suiteChart {
+	c := suiteChart{ID: id, Title: title, Metrics: make(map[string]string, len(metrics))}
+	for _, metric := range metrics {
+		c.Metrics[metric] = suiteBetter[metric]
+	}
+	return c
 }
 
 type suiteRecipe struct {
@@ -58,24 +108,33 @@ type suiteProfile struct {
 	SSD         []suiteCase
 }
 
-func ssdCase(id, size, mix string, bytes int64) suiteCase {
+func ssdCase(id, label, size, mix string, bytes int64) suiteCase {
 	return suiteCase{
-		ID: id, Kind: "ssd", Bytes: bytes,
+		ID: id, Kind: "ssd", Label: label, Bytes: bytes, Repeats: suiteSSDRepeats, Revision: suiteSSDRevision,
 		Recipe: &suiteRecipe{Size: size, Mix: mix, Seed: dataset.DefaultSeed, Revision: dataset.GeneratorRevision},
-		Flags:  []string{"--compress", "none", "--encrypt", "none"},
+		Identity: map[string]any{
+			"size": size, "mix": mix, "seed": dataset.DefaultSeed, "generator": dataset.GeneratorRevision,
+			"bytes": bytes, "repeats": suiteSSDRepeats,
+		},
+		Charts: []suiteChart{
+			chart("ssd-throughput", "SSD copies", "MiB/s"),
+			chart("ssd-timings", "SSD copy and verification times", "copy_ns", "verify_ns"),
+		},
 	}
 }
 
 func suiteSettings(profile string) suiteProfile {
+	const silesiaSizes = "128MiB..1GiB"
 	if profile == "smoke" {
 		return suiteProfile{
 			CPUs: 2, Repeats: 1, BenchTime: "1x",
 			GridSize: "16MiB", GridCPUs: "2", GridEncrypt: "none", GridMinWall: "1ms",
 			VerifyBytes: 16 * suiteMiB, VerifyConc: 1,
 			SSD: []suiteCase{
-				ssdCase("ssd-small", "16MiB", "rand=100%@16KiB", 16*suiteMiB),
-				ssdCase("ssd-varied", "32MiB", "rand=100%@128KiB..1324KiB", 32*suiteMiB),
-				ssdCase("ssd-large", "32MiB", "rand=100%@16MiB", 32*suiteMiB),
+				ssdCase("ssd-small", "Small files", "16MiB", "rand=100%@16KiB", 16*suiteMiB),
+				ssdCase("ssd-large", "Large files", "32MiB", "rand=100%@16MiB", 32*suiteMiB),
+				ssdCase("ssd-mixed", "Mixed files", "512MiB", "rand=25%@16KiB,rand=25%@32MiB,silesia=50%@128MiB..160MiB", 512*suiteMiB),
+				ssdCase("ssd-compressible", "Compressible files", "512MiB", "silesia=100%@128MiB..160MiB", 512*suiteMiB),
 			},
 		}
 	}
@@ -84,66 +143,101 @@ func suiteSettings(profile string) suiteProfile {
 		GridSize: "256MiB", GridCPUs: "4,16", GridEncrypt: "none,aes,chacha20", GridMinWall: "5s",
 		VerifyBytes: 256 * suiteMiB, VerifyConc: 4,
 		SSD: []suiteCase{
-			ssdCase("ssd-small", "2GiB", "rand=100%@16KiB", 2*suiteGiB),
-			ssdCase("ssd-varied", "128GiB", "rand=100%@128MiB..1324MiB", 128*suiteGiB),
-			ssdCase("ssd-large", "128GiB", "rand=100%@2GiB", 128*suiteGiB),
+			ssdCase("ssd-small", "Small files", "2GiB", "rand=100%@16KiB", 2*suiteGiB),
+			ssdCase("ssd-large", "Large files", "40GiB", "rand=100%@2GiB", 40*suiteGiB),
+			ssdCase("ssd-mixed", "Mixed files", "32GiB", "rand=25%@4KiB..256KiB,rand=25%@1GiB,silesia=50%@"+silesiaSizes, 32*suiteGiB),
+			ssdCase("ssd-compressible", "Compressible files", "12GiB", "silesia=100%@"+silesiaSizes, 12*suiteGiB),
 		},
 	}
 }
 
 func (p suiteProfile) cases() []suiteCase {
 	cpus, conc := strconv.Itoa(p.CPUs), strconv.Itoa(p.VerifyConc)
-	bench := func(id, pkg, filter string, env map[string]string, names ...string) suiteCase {
-		if env == nil {
-			env = map[string]string{}
-		}
+	bench := func(id, pkg, filter string, env map[string]string, chart suiteChart, names ...string) suiteCase {
 		for i := range names {
 			names[i] += "-" + cpus
 		}
 		return suiteCase{
-			ID: id, Kind: "go",
+			ID: id, Kind: "go", Repeats: p.Repeats, Revision: suiteGoRevision, Charts: []suiteChart{chart},
 			Argv: []string{"go", "test", "-run=^$", "-cpu=" + cpus, "-benchmem",
 				"-benchtime=" + p.BenchTime, "-count=" + strconv.Itoa(p.Repeats), "-bench=" + filter, pkg},
-			Env: &env, Series: names,
+			Env: env, Series: names,
+			Identity: map[string]any{
+				"pkg": pkg, "cpu": p.CPUs, "benchtime": p.BenchTime, "count": p.Repeats, "env": env,
+			},
 		}
 	}
 	verifySuffix := "/cpus=" + cpus + "/c=" + conc
 	gridEnv := map[string]string{"TX_BENCH_THROUGHPUT_MIN_WALL": p.GridMinWall}
+	grid := suiteCase{
+		ID: "transfer", Kind: "grid", Env: gridEnv, Revision: suiteGridRevision,
+		Argv: []string{"make", "bench-throughput", "THROUGHPUT_SIZE=" + p.GridSize,
+			"THROUGHPUT_CPUS=" + p.GridCPUs, "THROUGHPUT_ENCRYPT=" + p.GridEncrypt},
+		Identity: map[string]any{"size": p.GridSize, "min_wall": p.GridMinWall},
+		gridSize: p.GridSize, gridCPUs: p.GridCPUs, gridModes: p.GridEncrypt,
+	}
+	modeTitles := map[string]string{"none": "plaintext", "aes": "AES-GCM", "chacha20": "ChaCha20-Poly1305"}
+	for _, mode := range strings.Split(p.GridEncrypt, ",") {
+		page := chart("transfer-"+mode, "Transfer, "+modeTitles[mode], "MiB/s", "core-s/GiB", "ratio")
+		page.Prefix = mode + "/"
+		grid.Charts = append(grid.Charts, page)
+	}
 	return append([]suiteCase{
-		{ID: "transfer", Kind: "grid", Env: &gridEnv, Argv: []string{
-			"make", "bench-throughput", "THROUGHPUT_SIZE=" + p.GridSize,
-			"THROUGHPUT_CPUS=" + p.GridCPUs, "THROUGHPUT_ENCRYPT=" + p.GridEncrypt,
-		}},
+		grid,
 		bench("verify", "./internal/cmd/filexfercli",
 			"^BenchmarkVerifyInMemory$/^(4KiB|1MiB|16MiB)$/^cpus="+cpus+"$/^c="+conc+"$",
 			map[string]string{
 				"TX_VERIFY_BYTES": strconv.FormatInt(p.VerifyBytes, 10), "TX_VERIFY_CONCURRENCY": conc,
 				"TX_VERIFY_IO_DEPTH": "4", "TX_VERIFY_IO_LATENCY": "",
 			},
+			chart("verification", "Verification", "MiB/s", "core-s/GiB"),
 			"BenchmarkVerifyInMemory/4KiB"+verifySuffix, "BenchmarkVerifyInMemory/1MiB"+verifySuffix,
 			"BenchmarkVerifyInMemory/16MiB"+verifySuffix),
 		bench("frames", "./internal/filexfer/ftcp",
 			"^BenchmarkSendFramePayload$/^(zerocopy|buffered)$/^(4KiB|1MiB)$", nil,
+			chart("sender-frames", "Sender frames", "MiB/s", "allocs/op"),
 			"BenchmarkSendFramePayload/zerocopy/4KiB", "BenchmarkSendFramePayload/buffered/4KiB",
 			"BenchmarkSendFramePayload/zerocopy/1MiB", "BenchmarkSendFramePayload/buffered/1MiB"),
 		bench("cipher", "./internal/aead",
 			"^Benchmark(Encrypt|Decrypt)Throughput$/^1MiB$/^(aesgcm|chacha20poly1305)$", nil,
+			chart("codecs", "Ciphers and codecs", "MiB/s", "allocs/op"),
 			"BenchmarkEncryptThroughput/1MiB/aesgcm", "BenchmarkEncryptThroughput/1MiB/chacha20poly1305",
 			"BenchmarkDecryptThroughput/1MiB/aesgcm", "BenchmarkDecryptThroughput/1MiB/chacha20poly1305"),
 		bench("handshake", "./internal/aead", "^BenchmarkHandshake$/^(token|age)$/^(aes|chacha20)$", nil,
+			chart("handshake", "Handshake", "ns/op", "allocs/op"),
 			"BenchmarkHandshake/token/aes", "BenchmarkHandshake/token/chacha20",
 			"BenchmarkHandshake/age/aes", "BenchmarkHandshake/age/chacha20"),
 		bench("codec", "./internal/bench", "^BenchmarkWrapDecompressedReader$/^(zstd|lz4)$", nil,
+			chart("codecs", "Ciphers and codecs", "MiB/s", "allocs/op"),
 			"BenchmarkWrapDecompressedReader/zstd", "BenchmarkWrapDecompressedReader/lz4"),
 		bench("split", ".", "^BenchmarkSplitEncodedRequests$/^(short-paths|long-paths)$", nil,
+			chart("control-path", "Control path", "ns/op", "B/op"),
 			"BenchmarkSplitEncodedRequests/short-paths", "BenchmarkSplitEncodedRequests/long-paths"),
 		bench("request", "./internal/filexfer/ftcp", "^BenchmarkRequestRecords$/^(short-paths|long-paths)$", nil,
+			chart("control-path", "Control path", "ns/op", "B/op"),
 			"BenchmarkRequestRecords/short-paths", "BenchmarkRequestRecords/long-paths"),
 		bench("ack", "./internal/filexfer/ftcp", "^BenchmarkServePlaintextACKBody$", nil,
+			chart("control-path", "Control path", "ns/op", "B/op"),
 			"BenchmarkServePlaintextACKBody"),
 		bench("ack-store", "./internal/bench", "^BenchmarkTransferStoreAckBatch$", nil,
+			chart("control-path", "Control path", "ns/op", "B/op", "ns/ack"),
 			"BenchmarkTransferStoreAckBatch"),
 	}, p.SSD...)
+}
+
+func checkSuiteIDs(cases []suiteCase) error {
+	seen := make(map[string]bool, len(cases))
+	for _, c := range cases {
+		switch c.ID {
+		case "build", "suite", "status", "environment":
+			return fmt.Errorf("reserved suite case ID %q", c.ID)
+		}
+		if c.ID == "suite" || !suiteID.MatchString(c.ID) || seen[c.ID] {
+			return fmt.Errorf("invalid or duplicate suite case ID %q", c.ID)
+		}
+		seen[c.ID] = true
+	}
+	return nil
 }
 
 func (c suiteCase) prepArgs(source string) []string {
@@ -152,9 +246,9 @@ func (c suiteCase) prepArgs(source string) []string {
 }
 
 func (c suiteCase) copyArgs(tx, fingerprint, metrics, source, dest string) []string {
-	return append([]string{"local", "--tx", tx, "--auth", "off", "--cache-warm", "0%",
-		"--expect", fingerprint, "--oracle", "full", "-w", "0", "-n", "1",
-		"--metrics", metrics, source, dest, "--"}, c.Flags...)
+	return []string{"local", "--tx", tx, "--auth", "off", "--cache-warm", "0%",
+		"--require-cold-cache", strconv.FormatFloat(suiteMaxHotPct, 'g', -1, 64) + "%", "--expect", fingerprint, "--oracle", "full", "-w", "0", "-n", strconv.Itoa(c.Repeats),
+		"--metrics", metrics, source, dest}
 }
 
 func describeSuite(out io.Writer, cases []suiteCase) {
@@ -165,8 +259,9 @@ func describeSuite(out io.Writer, cases []suiteCase) {
 		"'$SOURCE'", `"$SOURCE"`, "'$DEST'", `"$DEST"`,
 		"'$fingerprint'", `"$fingerprint"`,
 	)
+	fmt.Fprintf(out, "# Worst case %s, including the build.\n", suiteWorstCase(cases))
 	for _, c := range cases {
-		fmt.Fprintf(out, "\n# %s\n", c.ID)
+		fmt.Fprintf(out, "\n# %s (worst case %s)\n", c.ID, c.worstCase())
 		if c.Kind == "ssd" {
 			fmt.Fprintln(out, "# Choose a fresh SOURCE and DEST on the same drive for this case.")
 			fmt.Fprintf(out, "./tx-bench %s\n", shellVars.Replace(suiteShellArgs(c.prepArgs("$SOURCE"))))
@@ -177,9 +272,9 @@ func describeSuite(out io.Writer, cases []suiteCase) {
 			fmt.Fprintf(out, "./tx-bench %s\n", shellVars.Replace(cmd))
 			continue
 		}
-		cmd := suiteShellCommand(c.Argv, *c.Env)
+		cmd := suiteShellCommand(c.Argv, c.Env)
 		if c.Kind == "grid" {
-			cmd = `THROUGHPUT_OUT="$SUITE_OUT" ` + cmd
+			cmd = `THROUGHPUT_OUT="$SUITE_OUT/` + c.ID + `" ` + cmd
 		}
 		fmt.Fprintf(out, "%s >\"$SUITE_OUT/%s.log\" 2>&1\n", cmd, c.ID)
 	}
@@ -200,55 +295,6 @@ func suiteShellCommand(argv []string, env map[string]string) string {
 	}
 	sort.Strings(assignments)
 	return strings.Join(append(assignments, suiteShellArgs(argv)), " ")
-}
-
-// checkSuiteBenchmarks reads go test output after a successful run. A series
-// with every repetition is present; one with none is missing from the tested
-// commit, since go test exits cleanly when a -bench filter matches nothing.
-// A partial or unexpected series is an error.
-func checkSuiteBenchmarks(path string, series []string, repeats int) (missing []string, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	want := make(map[string]int, len(series))
-	for _, name := range series {
-		want[name] = repeats
-	}
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "Benchmark") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 4 || len(fields)%2 != 0 {
-			return nil, fmt.Errorf("malformed benchmark result %q", line)
-		}
-		iterations, err := strconv.Atoi(fields[1])
-		if err != nil || iterations < 1 {
-			return nil, fmt.Errorf("invalid benchmark iteration count in %q", line)
-		}
-		name := fields[0]
-		if want[name] == 0 {
-			return nil, fmt.Errorf("unexpected benchmark result %s", name)
-		}
-		want[name]--
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	for _, name := range series {
-		switch left := want[name]; left {
-		case 0:
-		case repeats:
-			missing = append(missing, name)
-		default:
-			return nil, fmt.Errorf("%s is missing %d of %d samples", name, left, repeats)
-		}
-	}
-	return missing, nil
 }
 
 // suiteGoPackageExists reports whether the tested commit has test files in a

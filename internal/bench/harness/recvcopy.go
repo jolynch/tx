@@ -37,6 +37,8 @@ type recvFlags struct {
 	goTrace     string
 	serverWait  string
 	failFast    bool
+	requireCold string
+	maxHotPct   float64 // parsed --require-cold-cache; negative disables
 	keep        bool
 	forever     bool
 	stopSender  bool
@@ -57,6 +59,7 @@ func (r *recvFlags) register(cf *cliflags.Flags) {
 	cf.StringVar(&r.goTrace, "", "go-trace", "", "Write runtime/trace output of each tx recv copy (tx --trace) to PATH.<run>")
 	cf.StringVar(&r.serverWait, "", "server-wait", "2m", "How long to wait for a prep acknowledgement or runs/server-<tid>.json")
 	cf.BoolVar(&r.failFast, "", "fail-fast", false, "Stop at the first failed run")
+	cf.StringVar(&r.requireCold, "", "require-cold-cache", "", "Stop before copying if more than PCT of the source is cached, such as 10%; empty disables")
 	cf.BoolVar(&r.keep, "", "keep", false, "Keep DST after the last run")
 	cf.BoolVar(&r.forever, "", "forever", false, "After the warmups, copy and verify until interrupted instead of --iterations times; metrics default to .jsonl")
 	cf.BoolVar(&r.stopSender, "", "stop-sender", false, "After the last run, fetch runs/stop so send-tree records it and exits")
@@ -117,7 +120,7 @@ Behavior:
   - --metrics streams: .jsonl and text get one record per run as it completes
     (a FIFO works, for exporting); .json is rewritten after each run
   - Exit codes: 0 ok, 1 failed run(s), 2 usage or --expect mismatch,
-    3 corruption (stops immediately and keeps DST)
+    3 corruption (stops immediately and keeps DST), 4 cold cache setup failed
 
 `)
 		cf.PrintDefaults(stderr)
@@ -202,6 +205,9 @@ func runRecvCopy(ctx context.Context, cfg recvConfig) error {
 	serverWait, err := time.ParseDuration(f.serverWait)
 	if err != nil || serverWait <= 0 {
 		return usageErrorf("--server-wait %q must be a positive duration", f.serverWait)
+	}
+	if cfg.flags.maxHotPct, err = parseMaxHotPct(f.requireCold); err != nil {
+		return err
 	}
 	rssEvery, err := time.ParseDuration(f.rssInterval)
 	if err != nil || rssEvery <= 0 {
@@ -620,10 +626,18 @@ func (r *receiver) oneRun(ctx context.Context, label string, measured, first boo
 		// handling a prep or flush, so without an acknowledged prep there is
 		// nothing to wait for; the next prep or the final flush records it.
 		run.Status, run.Error = report.StatusFailed, "unknown cache state: "+err.Error()
+		if f.maxHotPct >= 0 {
+			return run, exitError{code: exitColdSetup, err: errors.New(run.Error)}
+		}
 		return run, nil
 	}
 	run.Cache = report.Cache{Prepped: true, Warm: pj.Cache.Warm, Skew: pj.Cache.Skew, HotPct: pj.Cache.HotPct, MetaCold: pj.Cache.MetaCold,
 		PrepMS: pj.Cache.DurationMS, Changed: pj.Changed}
+	if f.maxHotPct >= 0 && run.Cache.HotPct > f.maxHotPct {
+		run.Status = report.StatusFailed
+		run.Error = fmt.Sprintf("source cache was %.2f%% resident before copy %s", run.Cache.HotPct, label)
+		return run, exitError{code: exitColdSetup, err: errors.New(run.Error)}
+	}
 	if prevRun != nil {
 		r.attachSender(ctx, prevRun)
 	}
@@ -736,7 +750,7 @@ func (r *receiver) oneRun(ctx context.Context, label string, measured, first boo
 		}
 	}
 	run.Verify = report.Verify{Mode: f.oracle, Entries: res.Entries, Files: res.Files, Bytes: res.Bytes,
-		Mismatches: res.MismatchCount + res.ExcusedCount, DurNS: res.DurationMillis * int64(time.Millisecond)}
+		Mismatches: res.MismatchCount + res.ExcusedCount, DurNS: int64(res.Duration)}
 	for _, m := range append(slices.Clone(res.Mismatches), res.Excused...) {
 		run.Verify.Paths = append(run.Verify.Paths, m.String())
 	}
@@ -837,4 +851,17 @@ func (r *receiver) header() report.Header {
 		h.SenderArgs = r.cfg.senderArgs
 	}
 	return h
+}
+
+// parseMaxHotPct parses --require-cold-cache: a percent from 0% to 100%, or
+// empty for no limit, which it returns as -1.
+func parseMaxHotPct(raw string) (float64, error) {
+	if raw == "" {
+		return -1, nil
+	}
+	pct, err := strconv.ParseFloat(strings.TrimSuffix(raw, "%"), 64)
+	if !strings.HasSuffix(raw, "%") || err != nil || !(pct >= 0 && pct <= 100) {
+		return 0, usageErrorf("--require-cold-cache %q must be a percent from 0%% to 100%%", raw)
+	}
+	return pct, nil
 }

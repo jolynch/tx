@@ -343,25 +343,39 @@ func (w *suiteWorkspace) quarantine(entry string) error {
 	return w.removeTree(hold)
 }
 
-// removeStaleReferences removes cache entries for these case IDs whose recipe
-// hash differs from the current one.
+// removeStaleReferences reclaims owned entries for older recipes or retired cases.
 func (w *suiteWorkspace) removeStaleReferences(cases []suiteCase) error {
+	keep := make(map[string]bool, len(cases))
+	for _, c := range cases {
+		keep[filepath.Base(w.cacheEntry(c))] = true
+	}
 	entries, err := os.ReadDir(w.sources)
 	if err != nil {
 		return err
 	}
 	for _, e := range entries {
-		for _, c := range cases {
-			// Entries are <id>-<20 hex digits>.
-			hash, ok := strings.CutPrefix(e.Name(), c.ID+"-")
-			if !ok || !e.IsDir() || !isSuiteHash(hash) || e.Name() == filepath.Base(w.cacheEntry(c)) {
-				continue
-			}
-			fmt.Fprintf(w.log, "Removing reference %s for an earlier recipe\n", e.Name())
-			if err := w.quarantine(filepath.Join(w.sources, e.Name())); err != nil {
-				return fmt.Errorf("remove stale reference: %w", err)
-			}
-			break
+		name := e.Name()
+		sep := strings.LastIndexByte(name, '-') // <id>-<20 hex digits>
+		if !e.IsDir() || keep[name] || sep < 0 || !suiteID.MatchString(name[:sep]) || !isSuiteHash(name[sep+1:]) {
+			continue
+		}
+		entry := filepath.Join(w.sources, name)
+		source := filepath.Join(entry, "source")
+		marker := filepath.Join(entry, "reference.json")
+		if w.checkDir(entry) != nil || w.checkDir(source) != nil ||
+			checkSuiteRegular(filepath.Join(source, dataset.BenchMarker)) != nil || checkSuiteRegular(marker) != nil {
+			continue
+		}
+		var fingerprint string
+		if err := readJSON(marker, &fingerprint); err != nil || len(fingerprint) != 16 {
+			continue
+		}
+		if _, err := hex.DecodeString(fingerprint); err != nil {
+			continue
+		}
+		fmt.Fprintf(w.log, "Removing stale reference %s\n", name)
+		if err := w.quarantine(entry); err != nil {
+			return fmt.Errorf("remove stale reference: %w", err)
 		}
 	}
 	return nil

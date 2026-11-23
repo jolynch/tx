@@ -176,6 +176,7 @@ func (r *recvFlags) registerLocal(cf *cliflags.Flags) {
 	cf.StringVar(&r.goTrace, "", "go-trace", "", "Write runtime/trace output of each tx recv copy (tx --trace) to PATH.<run>")
 	cf.StringVar(&r.serverWait, "", "server-wait", "2m", "How long to wait for a prep acknowledgement or runs/server-<tid>.json")
 	cf.BoolVar(&r.failFast, "", "fail-fast", false, "Stop at the first failed run")
+	cf.StringVar(&r.requireCold, "", "require-cold-cache", "", "Stop before copying if more than PCT of the source is cached, such as 10%; empty disables")
 	cf.BoolVar(&r.keep, "", "keep", false, "Keep DST after the last run")
 	cf.BoolVar(&r.forever, "", "forever", false, "After the warmups, copy and verify until interrupted instead of --iterations times; metrics default to .jsonl")
 }

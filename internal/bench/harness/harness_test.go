@@ -163,6 +163,24 @@ func TestLocalEndToEnd(t *testing.T) {
 	}
 }
 
+func TestLocalRejectsWarmSourceBeforeCopy(t *testing.T) {
+	dir := t.TempDir()
+	source, dest := filepath.Join(dir, "source"), filepath.Join(dir, "dest")
+	metrics := filepath.Join(dir, "runs.json")
+	result := runLocal(t, "-s", "1MiB", "-m", tinyMix, "-c", "100%", "-w", "0", "-n", "3",
+		"--require-cold-cache", "1%", "-o", metrics, source, dest)
+	if result.code != exitColdSetup || !strings.Contains(result.stderr, "source cache was") {
+		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", result.code, result.stdout, result.stderr)
+	}
+	record, err := report.ReadMetrics(metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record.Runs) != 1 || record.Runs[0].Bytes != 0 || record.Runs[0].TID != "" {
+		t.Fatalf("warm source launched a copy: %+v", record.Runs)
+	}
+}
+
 func TestLocalReadOnlyImportedDirectoryStartsFreshRuns(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores directory permissions, so the read-only case cannot occur")
@@ -611,5 +629,18 @@ func TestLifelineEndsOrphanedSender(t *testing.T) {
 	}
 	if data, _ := os.ReadFile(stats); !strings.Contains(string(data), `"exit":"exit-with:stdin"`) {
 		t.Fatalf("stats lack the exit-with:stdin exit:\n%s", data)
+	}
+}
+
+func TestParseMaxHotPct(t *testing.T) {
+	for raw, want := range map[string]float64{"": -1, "0%": 0, "10%": 10, "2.5%": 2.5, "100%": 100} {
+		if got, err := parseMaxHotPct(raw); err != nil || got != want {
+			t.Errorf("parseMaxHotPct(%q) = %v, %v; want %v", raw, got, err, want)
+		}
+	}
+	for _, raw := range []string{"10", "-1%", "101%", "NaN%", "%", "ten%"} {
+		if _, err := parseMaxHotPct(raw); err == nil {
+			t.Errorf("parseMaxHotPct(%q) succeeded", raw)
+		}
 	}
 }

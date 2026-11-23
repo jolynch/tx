@@ -26,6 +26,7 @@ const (
 	exitFailedRuns = 1
 	exitUsage      = 2
 	exitCorruption = 3
+	exitColdSetup  = 4
 )
 
 // usageError is reported with exit code 2.

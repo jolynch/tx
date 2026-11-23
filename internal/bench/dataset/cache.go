@@ -189,20 +189,29 @@ type CacheResult struct {
 // Residency measures the share of the dataset's pages resident in the page
 // cache with mincore, as a percentage.
 func Residency(paths []string, sizes []int64) float64 {
+	percent, _ := probeResidency(paths, sizes, false)
+	return math.Round(percent*10) / 10
+}
+
+func probeResidency(paths []string, sizes []int64, requireComplete bool) (float64, error) {
 	page := int64(pagecache.PageSize())
 	var resident, total int64
 	for i, p := range paths {
 		pages := (sizes[i] + page - 1) / page
 		total += pages
 		var e pagecache.CacheEntry
-		if err := e.Load(p); err == nil {
-			resident += int64(e.NumResidentPages())
+		if err := e.Load(p); err != nil {
+			if requireComplete {
+				return 0, fmt.Errorf("measure cache residency of %s: %w", p, err)
+			}
+			continue
 		}
+		resident += int64(e.NumResidentPages())
 	}
 	if total == 0 {
-		return 0
+		return 0, nil
 	}
-	return math.Round(float64(resident)*1000/float64(total)) / 10
+	return float64(resident) * 100 / float64(total), nil
 }
 
 // SetCache evicts every dataset page and warms the selected set. With an
@@ -212,7 +221,6 @@ func SetCache(ctx context.Context, d *Dataset, w WarmSpec, seed int64, jobs int)
 	paths, sizes := d.Files()
 	res := CacheResult{Warm: w.Raw, Skew: w.Skew, BlockBytes: w.Block}
 	finish := func() (CacheResult, error) {
-		res.HotPct = Residency(paths, sizes)
 		if w.DropMD {
 			if err := os.WriteFile("/proc/sys/vm/drop_caches", []byte("2\n"), 0); err != nil {
 				return res, fmt.Errorf("--cache-drop-meta: write /proc/sys/vm/drop_caches (requires root): %w", err)
@@ -225,10 +233,15 @@ func SetCache(ctx context.Context, d *Dataset, w WarmSpec, seed int64, jobs int)
 		return res, nil
 	}
 	if w.Unset {
+		res.HotPct = Residency(paths, sizes)
 		return finish()
 	}
-	if fs, err := StatFS(d.DataRoot()); err == nil && fs.IgnoresFadvise() {
-		res.Warnings = append(res.Warnings, fmt.Sprintf("%s is on %s, which ignores fadvise; --cache-warm cannot be honored", d.DataRoot(), fs.Type))
+	canEvict := true
+	if fs, err := StatFS(d.DataRoot()); err == nil {
+		if fs.IgnoresFadvise() {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("%s is on %s, which ignores fadvise; --cache-warm cannot be honored", d.DataRoot(), fs.Type))
+		}
+		canEvict = !fs.IgnoresFadvise() && fs.Type != "tmpfs" && fs.Type != "ramfs"
 	}
 	mem, err := ReadMemInfo()
 	if err != nil {
@@ -244,17 +257,45 @@ func SetCache(ctx context.Context, d *Dataset, w WarmSpec, seed int64, jobs int)
 	}
 	res.TargetBytes, res.Clamped = target, clamped
 
-	ev, err := pagecache.EvictPaths(ctx, func(yield func(string) bool) {
-		for _, p := range paths {
-			if !yield(p) {
-				return
+	evict := func() error {
+		ev, err := pagecache.EvictPaths(ctx, func(yield func(string) bool) {
+			for _, p := range paths {
+				if !yield(p) {
+					return
+				}
 			}
+		}, jobs)
+		res.Evicted = ev.Evicted
+		if err == nil && target == 0 && canEvict && ev.Errors > 0 {
+			return fmt.Errorf("could not evict cache for %d source files", ev.Errors)
 		}
-	}, jobs)
-	if err != nil {
+		return err
+	}
+	if err := evict(); err != nil {
 		return res, err
 	}
-	res.Evicted = ev.Evicted
+	if target == 0 {
+		// Zero-copy sends can leave the kernel holding source pages after
+		// the sender exits, and DONTNEED skips pages still in use. Retry
+		// advisory eviction outside the copy timer until nothing is cached.
+		for delay := 250 * time.Millisecond; ; delay *= 2 {
+			res.HotPct, err = probeResidency(paths, sizes, canEvict)
+			if err != nil {
+				return res, err
+			}
+			if !canEvict || res.HotPct == 0 || delay > 16*time.Second {
+				return finish()
+			}
+			select {
+			case <-ctx.Done():
+				return res, ctx.Err()
+			case <-time.After(delay):
+			}
+			if err := evict(); err != nil {
+				return res, err
+			}
+		}
+	}
 	if after, err := ReadMemInfo(); err == nil && target > after.Available {
 		res.Warnings = append(res.Warnings, fmt.Sprintf("warm set %s exceeds MemAvailable %s; hot_pct will show the shortfall",
 			encoding.HumanBytes(target), encoding.HumanBytes(after.Available)))
@@ -265,6 +306,7 @@ func SetCache(ctx context.Context, d *Dataset, w WarmSpec, seed int64, jobs int)
 	if err != nil {
 		return res, err
 	}
+	res.HotPct = Residency(paths, sizes)
 	return finish()
 }
 

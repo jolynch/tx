@@ -254,8 +254,10 @@ go run ./cmd/tx-bench local -s 256MiB -n 1
 - `internal/bench`: Go microbenchmarks only (tests). `internal/bench/dataset`
   generates, imports, and verifies datasets and sets page-cache state;
   `internal/bench/harness` supervises forked tx processes for each tx-bench
-  command; `internal/bench/report` owns the metrics schema, the report, and
-  trace analysis.
+  command, and `suite` defines the published workloads (bump a kind's
+  revision constant when the harness changes how that kind measures);
+  `internal/bench/report` owns the metrics schema, the report, and trace
+  analysis.
 - The [documentation map](#documentation-map) links the authoritative design,
   wire-format, and CLI references.
 
