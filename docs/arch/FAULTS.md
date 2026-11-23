@@ -180,7 +180,7 @@ tests check it.
 | NET    | `reset`                      | each read and write; later reads fail as reset                       | loud error; the pool evicts; ACK retries; resume converges                   |
 | NET    | `partial`                    | each write: a prefix, then a reset                                   | loud error                                                                   |
 | NET    | `eof`                        | each read: the stream ends early, and later writes fail with `EPIPE` | premature EOF is an error, never success                                     |
-| NET    | `flip`                       | each read: one bit                                                   | AEAD tag, framed-body checksum, window hash; plaintext lines are unprotected |
+| NET    | `flip`                       | each read: one bit                                                   | AEAD tag, framed-body/CXSUM hash, window hash; plaintext lines unprotected   |
 | NET    | `drop`                       | each read: a span removed                                            | as `flip`, plus frame offsets and lengths                                    |
 | NET    | `dup`                        | each read: a span delivered twice                                    | as `drop`; a duplicated `OK` must not end a second request                   |
 | NET    | `reorder`                    | each read: two adjacent spans swapped                                | as `flip`                                                                    |

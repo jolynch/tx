@@ -282,7 +282,9 @@ Verification fails immediately on:
 - local sample read failure
 - `CXSUM` request failure before a forced timeout path decides to stop
 - checksum response mismatch
-- malformed checksum response or range mismatch
+- malformed checksum response, including a `CXSUM` frame whose trailer hash
+  is missing or wrong
+- range mismatch
 
 Budgeted verification may still succeed with `[partial-ok]` when:
 

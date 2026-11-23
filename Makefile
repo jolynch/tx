@@ -92,7 +92,6 @@ fuzz-short:
 	$(FUZZ) -race . FuzzChecksumStreamReuse $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race . FuzzManifestEntryByID $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race ./internal/cmd/filexfercli FuzzVerifyCursor $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
-	$(FUZZ) -race ./internal/cmd/filexfercli FuzzChecksumFrameParsing $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race ./internal/bench/dataset FuzzPlan $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race ./internal/bench/dataset FuzzSelectWarmBlocks $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 
@@ -124,6 +123,7 @@ fuzz-long:
 	$(FUZZ) -race ./internal/bench/dataset FuzzFilesTSVRoundTrip $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/bench/dataset FuzzVerifyDetectsCorruption $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 	$(FUZZ) -race ./internal/cmd/filexfercli FuzzCopyVerifyDetectsCorruption $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG) -parallel=4
+	$(FUZZ) -race ./internal/cmd/filexfercli FuzzChecksumFrameParsing $(FUZZTIME_LONG) $(FUZZDEADLINE_LONG)
 
 # Fault-injection properties (docs/arch/FAULTS.md). They are not part of
 # acceptance: they fail whenever they find a bug, and they stay here once

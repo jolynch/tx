@@ -571,6 +571,10 @@ func FuzzMemTransferUnderFaults(f *testing.F) {
 	// seed#14: undetected faults leave a wrong file that verify finds and a
 	// refetch repairs
 	f.Add(uint64(208), uint8(0), uint8(0x10), uint8(faults.PBTSwarm))
+	// seed#15: a NET flip in a plaintext CXSUM response must fail verify,
+	// not blame a correct file. Only under -race, as pbt-faults runs it,
+	// does the flip reliably land on a CXSUM response.
+	f.Add(uint64(38), uint8(0), uint8(0x43), uint8(faults.PBTSwarm))
 	f.Fuzz(func(t *testing.T, seed uint64, modeByte, flags, faultSet uint8) {
 		deadline := time.Now().Add(inputDeadline)
 		// limit clamps a step's limit to the time left in the input.

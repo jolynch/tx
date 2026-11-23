@@ -29,6 +29,7 @@ import (
 	"github.com/jolynch/tx/internal/fsync"
 	"github.com/jolynch/tx/internal/txstats"
 	"github.com/jolynch/tx/internal/utils"
+	"github.com/zeebo/xxh3"
 )
 
 func startTracing(path string, stderr io.Writer) (stop func()) {
@@ -1509,9 +1510,13 @@ type checksumResult struct {
 	Metadata      *tx.FileTrailerMetadata
 }
 
+// readChecksumResults parses a CXSUM response. It checks each frame's
+// trailer hash, over the header line and trailer prefix, so a corrupted
+// response fails rather than blaming a correct file for a wrong range hash.
 func readChecksumResults(reader io.Reader) ([]checksumResult, error) {
 	br := bufio.NewReader(reader)
 	results := make([]checksumResult, 0, 8)
+	frameHash := xxh3.New()
 	for {
 		headerLine, err := br.ReadString('\n')
 		if err != nil {
@@ -1534,16 +1539,21 @@ func readChecksumResults(reader io.Reader) ([]checksumResult, error) {
 		if err != nil {
 			return nil, err
 		}
-		if header.WireSize > 0 {
-			if _, err := io.CopyN(io.Discard, br, header.WireSize); err != nil {
-				return nil, fmt.Errorf("discard checksum frame payload: %w", err)
-			}
+		if header.WireSize != 0 {
+			return nil, fmt.Errorf("checksum frame for file %d has a payload (wsize=%d)", header.FileID, header.WireSize)
 		}
+		frameHash.Reset()
+		_, _ = frameHash.WriteString(trimmedHeader)
+		_, _ = frameHash.WriteString("\n")
 		trailerLine, err := br.ReadString('\n')
 		if err != nil {
 			return nil, fmt.Errorf("read checksum frame trailer: %w", err)
 		}
-		trailer, err := parseChecksumFrameTrailer(strings.TrimRight(trailerLine, "\r\n"))
+		trailerPrefix, err := checkChecksumFrameHash(frameHash, strings.TrimRight(trailerLine, "\r\n"))
+		if err != nil {
+			return nil, fmt.Errorf("checksum frame for file %d: %w", header.FileID, err)
+		}
+		trailer, err := parseChecksumFrameTrailer(trailerPrefix)
 		if err != nil {
 			return nil, err
 		}
@@ -1558,6 +1568,26 @@ func readChecksumResults(reader io.Reader) ([]checksumResult, error) {
 			Metadata:      trailer.Metadata,
 		})
 	}
+}
+
+// checkChecksumFrameHash adds the trailer prefix to h, which already holds
+// the header line and its newline, and checks the sum against the
+// trailer's xxh64 hash token, which must be present. It returns the prefix.
+func checkChecksumFrameHash(h *xxh3.Hasher, trailer string) (string, error) {
+	prefix, token, err := encoding.SplitTrailerPrefixAndHash(trailer)
+	if err != nil {
+		return "", err
+	}
+	if token == "" {
+		return "", errors.New("missing trailer hash")
+	}
+	_, _ = h.WriteString(prefix)
+	algo, digest, _ := strings.Cut(token, ":")
+	got, err := strconv.ParseUint(digest, 16, 64)
+	if want := h.Sum64(); algo != "xxh64" || len(digest) != 16 || err != nil || got != want {
+		return "", fmt.Errorf("trailer hash mismatch: want=xxh64:%016x got=%s", want, token)
+	}
+	return prefix, nil
 }
 
 func isChecksumOKLine(line string) bool {
