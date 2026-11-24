@@ -61,9 +61,11 @@ func runSuiteCLI(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	var profile, root, out string
 	var describe bool
 	var deadlineRaw string
+	var keepUnusedRaw string
 	cf.StringVar(&profile, "", "profile", "smoke", "Workloads: smoke|full")
 	cf.StringVar(&root, "", "data-root", "", "Existing directory for reference trees and copy scratch, required for full; smoke uses a temporary one under bench/data/")
 	cf.StringVar(&out, "", "out", "bench/results/suite", "Empty result directory outside the data root")
+	cf.StringVar(&keepUnusedRaw, "", "keep-unused", "168h", "Remove references the profile no longer uses once no run has used them for this long; 0 keeps them until a run needs their space")
 	cf.BoolVar(&describe, "", "describe", false, "Print commands without running the workloads")
 	cf.StringVar(&deadlineRaw, "", "deadline", "0", "Skip cases that could not finish within this long of the start, such as 450m; 0 means no limit")
 	cf.FlagSet().Usage = func() {
@@ -93,13 +95,25 @@ func runSuiteCLI(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	if deadline > 0 {
 		end = time.Now().Add(deadline)
 	}
-	if err := runSuite(ctx, out, root, end, &spec, settings, stdout); err != nil {
+	keepUnused, err := time.ParseDuration(keepUnusedRaw)
+	if err != nil || keepUnused < 0 {
+		return reportErr(stderr, usageErrorf("--keep-unused takes a nonnegative duration such as 168h, got %q", keepUnusedRaw))
+	}
+	if err := runSuite(ctx, suiteRun{out: out, root: root, end: end, keepUnused: keepUnused}, &spec, settings, stdout); err != nil {
 		return reportErr(stderr, err)
 	}
 	return exitOK
 }
 
-func runSuite(ctx context.Context, out, root string, end time.Time, spec *suiteManifest, settings suiteProfile, stdout io.Writer) error {
+// suiteRun holds the suite's paths and time limits.
+type suiteRun struct {
+	out, root  string
+	end        time.Time // zero means no deadline
+	keepUnused time.Duration
+}
+
+func runSuite(ctx context.Context, run suiteRun, spec *suiteManifest, settings suiteProfile, stdout io.Writer) error {
+	out, root, end := run.out, run.root, run.end
 	minCPUs := 2
 	if spec.Profile == "full" {
 		minCPUs = 16
@@ -128,6 +142,7 @@ func runSuite(ctx context.Context, out, root string, end time.Time, spec *suiteM
 	defer stopEscalation()
 	w, err := openSuiteWorkspace(suiteWorkspaceOptions{
 		Root: root, Out: out, Profile: spec.Profile, Cases: settings.SSD, Log: stdout, Evictable: true,
+		KeepUnused: run.keepUnused,
 	})
 	if err != nil {
 		return err

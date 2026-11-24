@@ -44,6 +44,9 @@ type suiteWorkspaceOptions struct {
 	// Evictable rejects a root whose filesystem cannot evict cached pages,
 	// before anything is written there.
 	Evictable bool
+	// KeepUnused is how long a reference no case in Cases uses stays after
+	// its last use. Zero keeps it until a run needs its space.
+	KeepUnused time.Duration
 }
 
 type suiteWorkspace struct {
@@ -147,7 +150,7 @@ func openSuiteWorkspace(opts suiteWorkspaceOptions) (*suiteWorkspace, error) {
 	if err := w.reclaim(w.scratch, suiteCopyPrefix); err != nil {
 		return nil, err
 	}
-	if err := w.prepareReferences(profile, cases); err != nil {
+	if err := w.prepareReferences(profile, cases, opts.KeepUnused); err != nil {
 		return nil, err
 	}
 	ready = true
@@ -273,7 +276,8 @@ func (w *suiteWorkspace) removeTree(path string) error {
 	return os.RemoveAll(path)
 }
 
-func (w *suiteWorkspace) prepareReferences(profile string, cases []suiteCase) error {
+func (w *suiteWorkspace) prepareReferences(profile string, cases []suiteCase, keepUnused time.Duration) error {
+	now := time.Now()
 	var missing, scratch int64
 	for _, c := range cases {
 		scratch = max(scratch, c.Bytes)
@@ -302,7 +306,21 @@ func (w *suiteWorkspace) prepareReferences(profile string, cases []suiteCase) er
 		if err := w.removeTree(runs); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("clear cached run state: %w", err)
 		}
+		// The source directory's mtime records the last run that used this
+		// entry. Older harnesses bump it too, by replacing runs/ and
+		// send-tree's state files in it.
+		ts := unix.NsecToTimespec(now.UnixNano())
+		if err := unix.UtimesNanoAt(unix.AT_FDCWD, filepath.Join(entry, "source"), []unix.Timespec{ts, ts}, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			fmt.Fprintf(w.log, "Could not mark reference %s as used: %v\n", entry, err)
+		}
 		w.references[c.ID] = d.Bench
+	}
+	if keepUnused > 0 {
+		// Another commit's harness may still use an older recipe, so keep
+		// an unused entry for a while rather than thrash with it.
+		if err := w.removeStaleReferences(cases, now.Add(-keepUnused)); err != nil {
+			return err
+		}
 	}
 	needed := missing + scratch
 	if profile == "full" {
@@ -315,7 +333,7 @@ func (w *suiteWorkspace) prepareReferences(profile string, cases []suiteCase) er
 	if fs.Available < needed {
 		// References for other recipes only matter to the commits that
 		// made them. Remove them only when this run needs their space.
-		if err := w.removeStaleReferences(cases); err != nil {
+		if err := w.removeStaleReferences(cases, time.Time{}); err != nil {
 			return err
 		}
 		if fs, err = suiteStatFS(w.root); err != nil {
@@ -343,8 +361,9 @@ func (w *suiteWorkspace) quarantine(entry string) error {
 	return w.removeTree(hold)
 }
 
-// removeStaleReferences reclaims owned entries for older recipes or retired cases.
-func (w *suiteWorkspace) removeStaleReferences(cases []suiteCase) error {
+// removeStaleReferences reclaims owned entries for older recipes or retired
+// cases. A nonzero usedBefore keeps entries a run used at or after it.
+func (w *suiteWorkspace) removeStaleReferences(cases []suiteCase, usedBefore time.Time) error {
 	keep := make(map[string]bool, len(cases))
 	for _, c := range cases {
 		keep[filepath.Base(w.cacheEntry(c))] = true
@@ -373,7 +392,14 @@ func (w *suiteWorkspace) removeStaleReferences(cases []suiteCase) error {
 		if _, err := hex.DecodeString(fingerprint); err != nil {
 			continue
 		}
-		fmt.Fprintf(w.log, "Removing stale reference %s\n", name)
+		used, err := os.Lstat(source)
+		if err != nil {
+			continue
+		}
+		if !usedBefore.IsZero() && !used.ModTime().Before(usedBefore) {
+			continue
+		}
+		fmt.Fprintf(w.log, "Removing stale reference %s, last used %s\n", name, used.ModTime().UTC().Format(time.RFC3339))
 		if err := w.quarantine(entry); err != nil {
 			return fmt.Errorf("remove stale reference: %w", err)
 		}

@@ -36,6 +36,9 @@ Run from the tx checkout root on Linux. Build and run the driver with
 - `--deadline DURATION` skips each case whose worst-case time no longer fits
   before that long after the start, recording it as `skipped`. `0`, the
   default, sets no limit.
+- `--keep-unused DURATION` removes references in the data root that the
+  profile no longer uses once no run has used them for that long, and
+  defaults to `168h`. `0` keeps them until a run needs their space.
 - `--describe` prints the reproduction commands and each case's worst-case
   time.
 
