@@ -81,9 +81,11 @@ lock while it runs, so a later suite cannot reclaim a copy that outlived an
 interrupted one. The suite reclaims interrupted runs' staging trees and copy
 scratch on the next run. It provisions a cached reference again when its
 metadata no longer matches, or when it fails a rehash after a copy
-mismatched it. It removes references for earlier recipes and retired
-workloads only when it needs their space. Each full run writes 258 GiB of
-destination payload.
+mismatched it. It removes a reference for an earlier recipe or a retired
+workload once no run has used it for `--keep-unused` (7 days by default),
+and sooner when it needs the space. Runs of older commits also count as
+use, so runs of an older and a newer commit do not regenerate each other's
+references. Each full run writes 258 GiB of destination payload.
 
 Smoke runs use a temporary data root under `bench/data/` by default. Set
 `BENCH_SUITE_DATA_ROOT` to reuse smoke references under its `smoke/`

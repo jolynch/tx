@@ -520,6 +520,66 @@ func TestSuiteCacheRepair(t *testing.T) {
 			t.Fatalf("removed an unowned entry: %v", err)
 		}
 	})
+	t.Run("unused entries go after keep-unused", func(t *testing.T) {
+		root := t.TempDir()
+		current := ssdCase("ssd-tiny", "Tiny files", "64KiB", "rand=100%@16KiB", 64<<10)
+		w, err := open(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		provisionTestReference(t, w, current, w.cacheEntry(current))
+		retired := filepath.Join(w.sources, "ssd-tiny-00000000000000000000")
+		recent := filepath.Join(w.sources, "ssd-gone-00000000000000000000")
+		other := filepath.Join(w.sources, "unrelated-00000000000000000000")
+		w.close()
+		for _, dir := range []string{retired, recent} {
+			if err := dataset.ClaimDir(filepath.Join(dir, "source"), dataset.BenchMarker); err != nil {
+				t.Fatal(err)
+			}
+			if err := dataset.WriteJSONAtomic(filepath.Join(dir, "reference.json"), "0123456789abcdef"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Mkdir(other, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		long, lately := time.Now().Add(-30*24*time.Hour), time.Now().Add(-24*time.Hour)
+		for dir, stamp := range map[string]time.Time{w.cacheEntry(current): long, retired: long, recent: lately} {
+			if err := os.Chtimes(filepath.Join(dir, "source"), stamp, stamp); err != nil {
+				t.Fatal(err)
+			}
+		}
+		defer func(orig func(string) (dataset.FSInfo, error)) { suiteStatFS = orig }(suiteStatFS)
+		suiteStatFS = func(string) (dataset.FSInfo, error) { return dataset.FSInfo{Available: 1 << 50}, nil }
+		var log strings.Builder
+		w, err = openSuiteWorkspace(suiteWorkspaceOptions{
+			Root: root, Out: t.TempDir(), Profile: "smoke", Cases: []suiteCase{current},
+			Log: &log, KeepUnused: 7 * 24 * time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.close()
+		if w.references[current.ID] == nil {
+			t.Fatalf("current reference not reused; log: %s", log.String())
+		}
+		used, err := os.Stat(filepath.Join(w.cacheEntry(current), "source"))
+		if err != nil || time.Since(used.ModTime()) > time.Hour {
+			t.Fatalf("current reference not marked used: %v", err)
+		}
+		if _, err := os.Stat(retired); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("long-unused reference kept: stat error = %v", err)
+		}
+		for _, keep := range []string{recent, other} {
+			if _, err := os.Stat(keep); err != nil {
+				t.Fatalf("removed %s: %v", keep, err)
+			}
+		}
+		if got := log.String(); !strings.Contains(got, "Removing stale reference "+filepath.Base(retired)) ||
+			strings.Contains(got, filepath.Base(recent)) {
+			t.Fatalf("unexpected removals; log: %s", got)
+		}
+	})
 	t.Run("output inside the root", func(t *testing.T) {
 		root := t.TempDir()
 		_, err := openSuiteWorkspace(suiteWorkspaceOptions{Root: root, Out: filepath.Join(root, "results"), Profile: "smoke"})
@@ -597,5 +657,23 @@ exit 2
 				t.Fatalf("reference removed = %v; want %v", errors.Is(err, os.ErrNotExist), tc.setup)
 			}
 		})
+	}
+}
+
+// provisionTestReference generates c's recipe into entry as reference()
+// does, without a tx-bench binary.
+func provisionTestReference(t *testing.T, w *suiteWorkspace, c suiteCase, entry string) {
+	t.Helper()
+	source := filepath.Join(entry, "source")
+	var out strings.Builder
+	if code := Main(c.prepArgs(source), &out, &out); code != exitOK {
+		t.Fatalf("prep exited %d: %s", code, out.String())
+	}
+	d, err := w.loadReference(source, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dataset.WriteJSONAtomic(filepath.Join(entry, "reference.json"), d.Fingerprint); err != nil {
+		t.Fatal(err)
 	}
 }
