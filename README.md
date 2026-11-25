@@ -8,8 +8,9 @@
 
 `tx` copies directories and files between Linux servers in the cloud at line
 rate by fully saturating modern cloud hardware - SSD, NIC, and CPU -
-simultaneously. On large servers it achieves up to 10x the throughput of a simple `rsync --fsync` + [`happycache`](https://github.com/hashbrowncipher/happycache) while providing above line-rate encryption, compression,
-and page cache transfer.
+simultaneously. On large servers it achieves up to 10x the throughput of a simple
+`rsync --fsync` + [`happycache`](https://github.com/hashbrowncipher/happycache)
+while providing above line-rate encryption, compression, and page cache transfer.
 
 Four capabilities make this possible:
 
@@ -39,15 +40,18 @@ Four capabilities make this possible:
   (`--verify 30s`) checks as much data as it can in that time, which is
   practical on network-attached drives such as EBS. A file that fails
   verification or its `fdatasync` is fetched again on the next run.
-  Fault-injection tests in CI drive whole transfers through network, disk,
-  and syscall failures to check that a copy ends with the right bytes or
-  fails loudly.
 
-`tx` builds and runs only on Linux. These optimizations use Linux-only system
-calls: zero-copy sends (`splice`, `tee`), read-ahead hints (`posix_fadvise`,
-`readahead`), background durability (`fdatasync`, `syncfs`), page cache
-transfer (`mincore`), local copies (`copy_file_range`), and the TCP delivery
-rate that adaptive compression reads from `TCP_INFO`.
+`tx` builds and runs only on Linux at this time. Many optimizations use
+Linux-only system calls: zero-copy sends (`splice`, `tee`), read-ahead hints
+(`posix_fadvise`, `readahead`), background durability (`fdatasync`, `syncfs`),
+page cache transfer (`mincore`), and local copies (`copy_file_range`). It also
+uses a variety of TCP socket options meant to improve reliability and
+performance in Linux, for example `TCP_NODELAY` to send small messages promptly
+and `TCP_USER_TIMEOUT` to close stalled connections after 30 seconds. We tune
+`SO_RCVBUF` on the client and `SO_SNDBUF` on the server to maximize throughput.
+The client uses TCP keepalive and limits unsent bytes during link probes with
+`TCP_NOTSENT_LOWAT`.  The server reads delivery rates from `TCP_INFO` to guide
+adaptive compression.
 
 See [docs/README.md](docs/README.md) for the documentation index and
 [docs/arch/OVERVIEW.md](docs/arch/OVERVIEW.md) for a deeper dive.
@@ -159,6 +163,36 @@ the `get` / `status` subcommands. FTCP wire-format details live in
 go build ./cmd/tx
 go test ./...
 ```
+
+`make test` builds both binaries and runs the unit and acceptance suites.
+
+- `make unit` runs unit and integration tests with Go's race detector and
+  reruns tests that need it disabled.
+- `make acceptance` runs `fuzz-short` for focused invariants and `fuzz-long`
+  for broader behavior. The longer suites cover adaptive compression
+  (`fuzz-long-policy`), protocol framing and transfers (`fuzz-long-wire`),
+  and pools, transfer state, verification, and tooling (`fuzz-long-state`).
+- `make lint` checks code and enforces the syscall boundary. `make lint-check`
+  tests the lint rules themselves.
+- `make bench` measures hot paths. `make bench-acceptance` checks real copies
+  and their resource budgets, and `make bench-acceptance-dials` checks their
+  connection counts. `make bench-throughput` checks the CPU cost of copying
+  small files relative to large ones.
+
+### Fault injection
+
+`make pbt-faults` tests in-memory transfers, CLI tree copies, and connection
+pools under seeded faults:
+
+- Network and protocol faults include stalls, resets, corrupted streams,
+  lost responses, duplicate requests, and busy servers.
+- Disk faults include missing files, slow or failed I/O, full disks, and
+  partial, lost, or corrupted writes.
+- Syscall faults include errors, delays, and short transfers.
+
+CI checks that copies produce the right bytes or report failures. It also
+checks that `--verify` detects silent corruption and a subsequent copy
+repairs it. See the [fault catalog](docs/arch/FAULTS.md#catalog).
 
 ## Performance history
 
