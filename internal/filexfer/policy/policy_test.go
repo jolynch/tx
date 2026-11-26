@@ -212,8 +212,9 @@ func TestCompressionPolicyIgnoresOneStalledFrame(t *testing.T) {
 	}
 }
 
-// TestFileCompressionFitsMapValue checks C7: the store keeps FileCompression
-// in a map, and Go stores values over 128 bytes out of line, which allocates.
+// TestFileCompressionFitsMapValue keeps FileCompression small: every decided
+// frame of a chained window copies it while holding the chain, so a larger
+// state lengthens the hold that other windows skip their decisions behind.
 func TestFileCompressionFitsMapValue(t *testing.T) {
 	size := unsafe.Sizeof(FileCompression{})
 	if size > 128 {
@@ -1028,5 +1029,150 @@ func TestCompressionPolicyReferenceUsesHomeObservations(t *testing.T) {
 	p.homeFrame(1.1, .22, 2, false)
 	if abs32(p.ref-want) > 1e-6 {
 		t.Fatal("reference followed a drift being confirmed")
+	}
+}
+
+// A FileChain grants its state to one holder at a time and never waits:
+// windows that find it held skip their decision. Each holder counts its
+// hold in the state with a plain write, so a lost update or, under -race, a
+// hold that fails to order those writes shows up. Holding allocates
+// nothing.
+func TestFileChainHoldsOneAtATime(t *testing.T) {
+	var c FileChain
+	st := c.TryHold()
+	if st == nil {
+		t.Fatal("a free chain refused a hold")
+	}
+	if c.TryHold() != nil {
+		t.Fatal("a held chain granted a second hold")
+	}
+	c.Release()
+
+	const windows, frames = 8, 2000
+	var granted [windows]int
+	var wg sync.WaitGroup
+	for w := range windows {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range frames {
+				if st := c.TryHold(); st != nil {
+					st.Policy.mean++
+					c.Release()
+					granted[w]++
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	total := 0
+	for _, n := range granted {
+		total += n
+	}
+	if got := int(c.TryHold().Policy.mean); got != total {
+		t.Fatalf("state counted %d holds, %d were granted", got, total)
+	}
+	c.Release()
+	if n := testing.AllocsPerRun(100, func() {
+		if st := c.TryHold(); st != nil {
+			st.Mode = CompressionModeNone
+			c.Release()
+		}
+	}); n != 0 {
+		t.Fatalf("a hold allocated %v times", n)
+	}
+}
+
+// A check started on a chain hands out maxCheckFrames check frames, however
+// many windows ask. A claimed frame the check never observed is charged and
+// goes back, so a check that lost frames to a held chain still finishes; a
+// frame returned after its check ended credits no later check. Claiming and
+// returning allocate nothing.
+func TestFileChainBoundsCheckFrames(t *testing.T) {
+	var c FileChain
+	p, m := recoveryFixture(CompressionModeZstdLevel1)
+	if c.ClaimCheckFrame().Held() {
+		t.Fatal("a chain with no check handed out a check frame")
+	}
+	st := c.TryHold()
+	st.Policy = p
+	d := startCheck(t, &st.Policy, m)
+	st.Mode = d.Next
+	c.Release()
+	if d.Reason != "recovery-check" || !st.Policy.CheckRunning() || c.SteadyMode() != CompressionModeZstdLevel1 {
+		t.Fatalf("no check started, or the steady codec is not home's: %+v steady=%v", d, c.SteadyMode())
+	}
+	var claims []CheckClaim
+	for range 3 * maxCheckFrames {
+		if cl := c.ClaimCheckFrame(); cl.Held() {
+			claims = append(claims, cl)
+		}
+	}
+	if len(claims) != maxCheckFrames {
+		t.Fatalf("handed out %d check frames, want %d", len(claims), maxCheckFrames)
+	}
+
+	// A frame 10 ms over the 20 ms baseline that the check did not observe
+	// is charged.
+	frame := m
+	frame.PrepareLatency, frame.WriteLatency = 0, 20*time.Millisecond
+	late := frame
+	late.WriteLatency = 30 * time.Millisecond
+	if loss := st.Policy.CheckFrameLoss(late); abs32(float32(loss-10*time.Millisecond)) > 100 {
+		t.Fatalf("a late check frame lost %v, want 10ms", loss)
+	}
+
+	// Two frames at the baseline leave the check confirming; two more are
+	// lost to a held chain and come back, and the check finishes on frames
+	// claimed again.
+	for range 2 {
+		st = c.TryHold()
+		d = st.Policy.DecideSampled(st.Mode, frame, nil)
+		st.Mode = d.Next
+		c.Release()
+	}
+	if d.Reason != "recovery-confirm" {
+		t.Fatalf("two baseline frames ended the check: %+v", d)
+	}
+	c.ReturnCheckFrame(claims[2])
+	c.ReturnCheckFrame(claims[3])
+	for i := 0; c.TryHold().Policy.CheckRunning(); i++ {
+		c.Release()
+		if i == maxCheckFrames || !c.ClaimCheckFrame().Held() {
+			t.Fatalf("the check could not claim frame %d to finish", i)
+		}
+		st = c.TryHold()
+		d = st.Policy.DecideSampled(st.Mode, frame, nil)
+		st.Mode = d.Next
+		c.Release()
+	}
+	c.Release()
+
+	// The check ended: what is left is taken back, a late return credits
+	// nothing, and the next check hands out a full set.
+	if c.ClaimCheckFrame().Held() {
+		t.Fatal("an ended check still handed out a check frame")
+	}
+	c.ReturnCheckFrame(claims[0])
+	if c.ClaimCheckFrame().Held() {
+		t.Fatal("a frame returned after its check ended was handed out again")
+	}
+	st = c.TryHold()
+	st.Policy, st.Mode = p, p.home
+	st.Mode = startCheck(t, &st.Policy, m).Next
+	c.Release()
+	n := 0
+	for c.ClaimCheckFrame().Held() {
+		n++
+	}
+	if n != maxCheckFrames {
+		t.Fatalf("the next check handed out %d check frames, want %d", n, maxCheckFrames)
+	}
+	c.ReturnCheckFrame(claims[1]) // from the earlier check
+	if c.ClaimCheckFrame().Held() {
+		t.Fatal("a frame of an earlier check credited the next one")
+	}
+	if n := testing.AllocsPerRun(100, func() { c.ReturnCheckFrame(c.ClaimCheckFrame()) }); n != 0 {
+		t.Fatalf("claiming a check frame allocated %v times", n)
 	}
 }

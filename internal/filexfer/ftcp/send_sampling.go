@@ -201,10 +201,8 @@ type sampleWork struct {
 
 // framesLeft estimates the frames still to send from cursor: the rest of this
 // window, whose last frame may be short, then the rest of the file at full
-// frames. It undercounts when later windows are not multiples of 4 MiB, and
-// overcounts frames this window's evidence reaches, since concurrent windows
-// of the file load their state before this one saves. The process-wide
-// sample slots bound the cost of a wrong guess.
+// frames. It undercounts when later windows are not multiples of 4 MiB. The
+// process-wide sample slots bound the cost of a wrong guess.
 func framesLeft(cursor, windowEnd, fileEnd int64) int {
 	ceil := func(n int64) int64 {
 		return (max(0, n) + defaultFileFrameLogicalSize - 1) / defaultFileFrameLogicalSize

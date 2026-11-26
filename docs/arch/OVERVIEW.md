@@ -350,11 +350,27 @@ stays in the background and resumes as soon as a check wins.
 
 ### Policy state
 
-Each file keeps its codec and learned policy across windows. Concurrent
-windows work on independent copies, with the last save becoming the next
-window's starting point. This avoids locking per frame, but many small
-parallel windows can slow learning. State is released when the file finishes
-or its transfer is removed.
+Each file keeps its codec and learned policy across windows. The windows of
+a file sent in several share one chain of that state, so their frames
+advance one policy in the order they finish, as one stream's frames would,
+however many windows are in flight. A SEND resolves its windows' chains in
+one store call. A window holds its chain only to decide a frame: a `TryLock`
+takes it, nothing waits for it, and no I/O or allocation happens under it.
+A window skips a frame's decision when it finds the chain held, when the
+frame used a codec the chain has since left, or when the chain runs a
+recovery check or its validation that the frame was not timed for; it then
+sends its next frame in the chain's codec and measurement. A window whose
+start finds the chain held sends its first frame from a fresh state in the
+chain's steady codec, home's while a check runs; that frame's decision
+follows the same rules, and the window follows the chain from then on. A check has at most `policy.MaxCheckFrames` frames in its
+candidate codec in flight: when one starts, the chain holds that many check
+frames, and a window sends the candidate only on a frame it claims. Windows
+without one send home's codec, unmeasured. A claimed frame that the check
+never observes is charged to the recovery budget and goes back to the
+chain, so the check still finishes. Frames commit to a
+codec when they start, so a switch reaches the wire only after the frames
+already in flight. State is released when the file finishes or its transfer
+is removed.
 
 Connections share their uncompressed link estimate with new files, so each
 file need not relearn the same baseline. Compression ratios and codec evidence

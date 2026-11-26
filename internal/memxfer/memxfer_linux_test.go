@@ -903,18 +903,23 @@ func TestAdaptiveUnderRateFaults(t *testing.T) {
 		// minShare and maxShare bound the share of bytes sent compressed.
 		minShare, maxShare float64
 		kernel             bool // whether a kernel rate is read
+		concurrency        int  // connections; zero means 2
 	}{
-		{"fast link", nil, 0, nil, 0, 0, 0.2, true},
-		{"fast link, some readings slow", map[faults.Family]string{faults.FamilyNet: "rate=0.3:β(20ms,50ms,100ms,200ms)"}, 0, nil, 0, 0, 0.2, true},
-		{"slow link", nil, link, nil, 0, 0.3, 1, true},
-		{"slow link, no kernel rate", map[faults.Family]string{faults.FamilySys: "getsockopt.fail=1"}, link, nil, 0, 0.3, 1, false},
-		// An 8-frame chain switches only when its file starts from the
+		{"fast link", nil, 0, nil, 0, 0, 0.2, true, 0},
+		{"fast link, some readings slow", map[faults.Family]string{faults.FamilyNet: "rate=0.3:β(20ms,50ms,100ms,200ms)"}, 0, nil, 0, 0, 0.2, true, 0},
+		{"slow link", nil, link, nil, 0, 0.3, 1, true, 0},
+		{"slow link, no kernel rate", map[faults.Family]string{faults.FamilySys: "getsockopt.fail=1"}, link, nil, 0, 0.3, 1, false, 0},
+		// Two-frame windows, eight in flight: the windows of a file share
+		// one policy, which usually switches late in each file's 16 frames,
+		// so about a sixth to a quarter of the bytes go compressed.
+		{"slow link, small parallel windows", nil, link, slices.Repeat([]int64{64 << 20}, 2), 8 << 20, 0.1, 1, true, 8},
+		// A file's two 8-frame windows switch only when it starts from the
 		// connection's link estimate, and then only if every sample lands
 		// in its frame: about 40% alone, and as little as none under CPU
 		// load. TestSeedLinkSkipsTheBaseline and
 		// TestSendLinkSeedsTheConnectionsNextFile guard the seeding; this
 		// case checks the copy completes with parallel windows.
-		{"slow link, parallel windows", nil, 2 * link, slices.Repeat([]int64{64 << 20}, 8), 32 << 20, 0, 1, true},
+		{"slow link, parallel windows", nil, 2 * link, slices.Repeat([]int64{64 << 20}, 8), 32 << 20, 0, 1, true, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var inj *faults.Injector
@@ -924,15 +929,19 @@ func TestAdaptiveUnderRateFaults(t *testing.T) {
 			shares := &codecShares{bytes: map[string]int64{}}
 			sink := events.NewSink()
 			sink.Subscribe(shares.observe)
-			// One window per file, so its frames reach the policy in order:
-			// the windows of a file sent in parallel learn about one frame
-			// per round (docs/IDEAS.md).
+			// One window per file unless the case sets one: windows in
+			// flight together commit to their codec before the policy
+			// sees their frames, and each window samples on its own.
 			sizes, window := tc.sizes, tc.window
 			if sizes == nil {
 				sizes, window = []int64{64 << 20, 64 << 20}, 64<<20
 			}
+			concurrency := tc.concurrency
+			if concurrency == 0 {
+				concurrency = 2
+			}
 			e, err := Start(Config{Sizes: sizes, Seed: 1, Comp: "adapt", Compressible: true,
-				WindowBytes: window, RateBps: tc.rateBps, Concurrency: 2, KeepAlive: true, Faults: inj, Events: sink})
+				WindowBytes: window, RateBps: tc.rateBps, Concurrency: concurrency, KeepAlive: true, Faults: inj, Events: sink})
 			if err != nil {
 				t.Fatal(err)
 			}

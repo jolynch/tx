@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -59,6 +60,13 @@ func multiWindowFile(t *testing.T, data []byte) (Deps, string, string) {
 // nsPerByte, and returns the raw response.
 func sendWindow(t *testing.T, deps Deps, txferID, path string, firstFrame, frames int, nsPerByte int64) []byte {
 	t.Helper()
+	return sendWindowOn(t, deps, txferID, path, nil, firstFrame, frames, nsPerByte)
+}
+
+// sendWindowOn is sendWindow on a connection whose measurements src keeps
+// across its SENDs, or on a fresh one when src is nil.
+func sendWindowOn(t *testing.T, deps Deps, txferID, path string, src *sendRateSource, firstFrame, frames int, nsPerByte int64) []byte {
+	t.Helper()
 	refs, errs := deps.GetFileRefs(txferID, []FileLookup{{FileID: 1, Path: path}})
 	if errs[0] != nil {
 		t.Errorf("GetFileRefs: %v", errs[0])
@@ -67,20 +75,56 @@ func sendWindow(t *testing.T, deps Deps, txferID, path string, firstFrame, frame
 	var raw bytes.Buffer
 	link := &rateWriter{w: &raw, nsPerByte: nsPerByte}
 	item := sendItem{FileID: 1, Offset: int64(firstFrame) * defaultFileFrameLogicalSize, Size: int64(frames) * defaultFileFrameLogicalSize, Comp: "adapt", Path: path}
-	sent, err := streamSendItem(context.Background(), unbufferedSendOutput(link), deps, txferID, item, refs[0], defaultZeroCopyMinFrameBytes)
-	if err != nil {
+	out := unbufferedSendOutput(link)
+	out.ownRate.src = src
+	if _, err := streamSendItem(context.Background(), out, deps, txferID, item, refs[0], defaultZeroCopyMinFrameBytes); err != nil {
 		t.Errorf("streamSendItem window at frame %d: %v", firstFrame, err)
 	}
-	applyWindowState(deps, txferID, sent)
 	return raw.Bytes()
 }
 
-// applyWindowState stores what a window left for its file's next one, as a
-// SEND does once it has sent all its items.
-func applyWindowState(deps Deps, txferID string, sent sentItem) {
-	if sent.hasComp {
-		deps.RecordTransferWindows(txferID, WindowRecords{Compression: []FileCompressionUpdate{sent.comp}})
+// streamSendItem sends one window as a SEND of that window alone does,
+// resolving its file's chain first.
+func streamSendItem(ctx context.Context, out *sendOutput, deps Deps, txferID string, item sendItem, fileRef FileRef, zeroCopyMinBytes int64) (sentItem, error) {
+	var chain *policy.FileChain
+	if want, create := windowChain(item, fileRef); want {
+		reqs := [1]ChainRequest{{FileID: item.FileID, Create: create}}
+		deps.FileCompressionChains(txferID, reqs[:])
+		chain = reqs[0].Chain
 	}
+	return streamSendWindow(ctx, out, deps, txferID, item, fileRef, chain, zeroCopyMinBytes)
+}
+
+// fileChain returns a file's chain, creating it when create is set.
+func fileChain(deps Deps, txferID string, fileID uint64, create bool) *policy.FileChain {
+	reqs := [1]ChainRequest{{FileID: fileID, Create: create}}
+	deps.FileCompressionChains(txferID, reqs[:])
+	return reqs[0].Chain
+}
+
+// storeFileCompression sets a file's shared state, creating its chain.
+func storeFileCompression(t *testing.T, deps Deps, txferID string, fileID uint64, st policy.FileCompression) {
+	t.Helper()
+	c := fileChain(deps, txferID, fileID, true)
+	if c == nil {
+		t.Fatalf("no chain for file %d", fileID)
+	}
+	held := c.TryHold()
+	*held = st
+	c.Release()
+}
+
+// loadFileCompression returns a copy of a file's shared state, and false
+// when the file has no chain. Nothing else may hold the chain.
+func loadFileCompression(deps Deps, txferID string, fileID uint64) (policy.FileCompression, bool) {
+	c := fileChain(deps, txferID, fileID, false)
+	if c == nil {
+		return policy.FileCompression{}, false
+	}
+	held := c.TryHold()
+	st := *held
+	c.Release()
+	return st, true
 }
 
 func compressibleBytes(n int64) []byte {
@@ -137,7 +181,7 @@ func TestSendWindowsStartWhereThePreviousWindowEnded(t *testing.T) {
 		if comps[0] != next {
 			t.Fatalf("window %d starts with %q, the previous window chose %q; frames = %v", w, comps[0], next, comps)
 		}
-		st, ok := deps.LoadFileCompression(txferID, 1)
+		st, ok := loadFileCompression(deps, txferID, 1)
 		if w < windows-1 && !ok {
 			t.Fatalf("window %d saved no state for the next", w)
 		}
@@ -147,8 +191,7 @@ func TestSendWindowsStartWhereThePreviousWindowEnded(t *testing.T) {
 	t.Logf("a window's last frame chose a new codec for the next: %v", switched)
 }
 
-// sendOneItem streams one adaptive item of file 1 through a fresh output and
-// applies what it leaves, as handleSENDWithOptions does.
+// sendOneItem streams one adaptive item of file 1 through a fresh output.
 func sendOneItem(t *testing.T, deps Deps, txferID, path string, item sendItem) sentItem {
 	t.Helper()
 	refs, errs := deps.GetFileRefs(txferID, []FileLookup{{FileID: 1, Path: path}})
@@ -161,14 +204,15 @@ func sendOneItem(t *testing.T, deps Deps, txferID, path string, item sendItem) s
 	if err != nil {
 		t.Fatalf("streamSendItem: %v", err)
 	}
-	applyWindowState(deps, txferID, sent)
 	return sent
 }
 
-// A window saves state only when another window follows. The last window of a
-// file, a resumed tail window, and a file that shrank since its manifest would
-// otherwise leave an entry that no ACK frees.
-func TestSendWindowsSaveOnlyWhenAnotherWindowFollows(t *testing.T) {
+// A window creates its file's chain only when another window follows within
+// the manifest size. The last window of a file, a resumed tail window, and a
+// whole-file SEND would otherwise leave an entry that no ACK frees. A request
+// resolves chains before it opens files, so a file that shrank since its
+// manifest gets one; it stays until the transfer is reaped.
+func TestSendWindowsCreateChainOnlyWhenAnotherWindowFollows(t *testing.T) {
 	const frames = 4
 	size := int64(frames) * defaultFileFrameLogicalSize
 	tests := []struct {
@@ -183,7 +227,7 @@ func TestSendWindowsSaveOnlyWhenAnotherWindowFollows(t *testing.T) {
 		{"resumed tail window", 0, sendItem{Offset: size / 2}, false},
 		{"whole file", 0, sendItem{}, false},
 		{"shrunk file, whole-file SEND", size / 2, sendItem{}, false},
-		{"shrunk file, window ends at the new end", size / 2, sendItem{Size: size / 2}, false},
+		{"shrunk file, window ends at the new end", size / 2, sendItem{Size: size / 2}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -193,35 +237,89 @@ func TestSendWindowsSaveOnlyWhenAnotherWindowFollows(t *testing.T) {
 					t.Fatalf("Truncate: %v", err)
 				}
 			}
-			sent := sendOneItem(t, deps, txferID, path, tc.item)
-			if sent.hasComp != tc.wantSave {
-				t.Fatalf("window reported state = %v, want %v", sent.hasComp, tc.wantSave)
-			}
-			if _, ok := deps.LoadFileCompression(txferID, 1); ok != tc.wantSave {
+			sendOneItem(t, deps, txferID, path, tc.item)
+			if _, ok := loadFileCompression(deps, txferID, 1); ok != tc.wantSave {
 				t.Fatalf("store holds state = %v, want %v", ok, tc.wantSave)
 			}
 		})
 	}
 }
 
-// A request loads state only for a window an earlier one preceded and saves it
-// only for a window another follows, and applies the saves in one store call
-// with the window hashes.
-func TestHandleSENDCompressionStateLoadsAndSaves(t *testing.T) {
+// requestChains resolves only the windows that want a chain, hands each
+// record its own, and keeps its slices in a pool: a request allocates
+// nothing once its file has a chain, two requests in flight never share
+// slices, and a released set keeps no chain alive.
+func TestRequestChainsReuseTheirSlices(t *testing.T) {
+	const frame = defaultFileFrameLogicalSize
+	deps := &mockDeps{}
+	records := []sendRequestRecord{
+		{FileID: 1, Size: frame},                // first window: creates
+		{FileID: 2, Size: frame, Codec: 1},      // fixed codec: none
+		{FileID: 1, Offset: frame, Size: frame}, // middle window: creates
+		{FileID: 3},                             // whole file: none
+		{FileID: 1, Offset: 2 * frame},          // tail window: takes
+	}
+	refs := []FileRef{{FileSize: 3 * frame}, {FileSize: 3 * frame}, {FileSize: 3 * frame}, {FileSize: frame}, {FileSize: 3 * frame}}
+	refErrs := make([]error, len(records))
+	use := func() *sendChains { return requestChains(deps, "t", loadStrategyFast, records, refs, refErrs) }
+
+	c := use()
+	want := deps.chains[1]
+	if want == nil || deps.chainCalls != 1 || len(c.reqs) != 3 {
+		t.Fatalf("resolved %d windows in %d calls, chain %p; want 3 in 1", len(c.reqs), deps.chainCalls, want)
+	}
+	for i, wantChain := range []*policy.FileChain{want, nil, want, nil, want} {
+		if got := c.chain(i); got != wantChain {
+			t.Fatalf("record %d got chain %p, want %p", i, got, wantChain)
+		}
+	}
+	c.release()
+	if !raceEnabled {
+		if n := testing.AllocsPerRun(100, func() { use().release() }); n != 0 {
+			t.Fatalf("resolving a request's chains allocated %v times", n)
+		}
+	}
+
+	first, second := use(), use()
+	if first == second || &first.reqs[0] == &second.reqs[0] {
+		t.Fatal("requests in flight share chain slices")
+	}
+	reqs := first.reqs
+	first.release()
+	second.release()
+	if reqs[:cap(reqs)][0].Chain != nil {
+		t.Fatal("a released set kept a chain alive")
+	}
+	if requestChains(deps, "t", loadStrategyFast, records[1:2], refs[1:2], refErrs[1:2]) != nil {
+		t.Fatal("a request without chained windows took a set")
+	}
+	var none *sendChains
+	if none.chain(0) != nil {
+		t.Fatal("a nil set has a chain")
+	}
+	none.release()
+}
+
+// A request takes a file's chain only for a window another precedes or
+// follows and creates it only for a window another follows. It resolves
+// all its windows' chains in one store call, and records its window hashes
+// in one more.
+func TestHandleSENDCompressionChainTakenOnlyForSeveralWindows(t *testing.T) {
 	const frames = 3
 	size := int64(frames) * defaultFileFrameLogicalSize
 	path := writeTempSendFile(t, compressibleBytes(size))
 	quoted := strconv.Quote(path)
 	half := strconv.FormatInt(size/2, 10)
 	tests := []struct {
-		name                string
-		item                string
-		wantLoads, wantSave int
+		name                   string
+		item                   string
+		wantCalls, wantCreates int
 	}{
 		{"single window", `fd=1 ` + quoted, 0, 0},
-		{"first window", `fd=1 ` + quoted + ` size=` + half, 0, 1},
+		{"first window", `fd=1 ` + quoted + ` size=` + half, 1, 1},
 		{"middle window", `fd=1 ` + quoted + ` offset=` + strconv.FormatInt(size/4, 10) + ` size=` + half, 1, 1},
 		{"resumed tail window", `fd=1 ` + quoted + ` offset=` + half, 1, 0},
+		{"two windows", `fd=1 ` + quoted + ` size=` + half + "\n" + `fd=1 ` + quoted + ` offset=` + half, 1, 1},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -234,11 +332,11 @@ func TestHandleSENDCompressionStateLoadsAndSaves(t *testing.T) {
 			if err := handleSENDWithOptions(context.Background(), req, framedItemBody(t, tc.item), &out, deps, nil, defaultZeroCopyMinFrameBytes, 25); err != nil {
 				t.Fatalf("handleSENDWithOptions: %v", err)
 			}
-			if deps.compLoads != tc.wantLoads || deps.compSaves != tc.wantSave {
-				t.Fatalf("loads, saves = %d, %d; want %d, %d", deps.compLoads, deps.compSaves, tc.wantLoads, tc.wantSave)
+			if deps.chainCalls != tc.wantCalls || deps.chainCreates != tc.wantCreates {
+				t.Fatalf("chain calls, creates = %d, %d; want %d, %d", deps.chainCalls, deps.chainCreates, tc.wantCalls, tc.wantCreates)
 			}
 			if deps.windowBatches != 1 {
-				t.Fatalf("window hashes and state took %d store calls, want 1", deps.windowBatches)
+				t.Fatalf("window hashes and rates took %d store calls, want 1", deps.windowBatches)
 			}
 		})
 	}
@@ -257,9 +355,9 @@ func (w *failAfterWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// A SEND that fails partway still reports what its frames taught the policy,
-// so the request saves it with its hashes.
-func TestSendWindowStateReportedOnErrorExit(t *testing.T) {
+// A SEND that fails partway leaves what its decided frames taught the policy
+// on the file's chain.
+func TestSendWindowStateKeptOnErrorExit(t *testing.T) {
 	size := 4 * defaultFileFrameLogicalSize
 	data := make([]byte, size)
 	rand.New(rand.NewSource(3)).Read(data)
@@ -268,12 +366,11 @@ func TestSendWindowStateReportedOnErrorExit(t *testing.T) {
 	// Room for the first frame and part of the second.
 	out := &failAfterWriter{budget: int(defaultFileFrameLogicalSize * 3 / 2)}
 	item := sendItem{FileID: 1, Size: 3 * defaultFileFrameLogicalSize, Comp: "adapt", Path: path}
-	sent, err := streamSendItem(context.Background(), unbufferedSendOutput(out), deps, txferID, item, refs[0], defaultZeroCopyMinFrameBytes)
-	if err == nil {
+	if _, err := streamSendItem(context.Background(), unbufferedSendOutput(out), deps, txferID, item, refs[0], defaultZeroCopyMinFrameBytes); err == nil {
 		t.Fatalf("window succeeded through a failing writer")
 	}
-	if !sent.hasComp {
-		t.Fatalf("a window that sent a frame before failing reported no state")
+	if st, ok := loadFileCompression(deps, txferID, 1); !ok || st == (policy.FileCompression{}) {
+		t.Fatalf("a window that sent a frame before failing left no state: %v", ok)
 	}
 }
 
@@ -291,7 +388,7 @@ func TestSendSingleWindowFileLeavesNoCompressionState(t *testing.T) {
 	if _, err := streamSendItem(context.Background(), unbufferedSendOutput(&raw), deps, txferID, item, refs[0], defaultZeroCopyMinFrameBytes); err != nil {
 		t.Fatalf("streamSendItem: %v", err)
 	}
-	if _, ok := deps.LoadFileCompression(txferID, 1); ok {
+	if _, ok := loadFileCompression(deps, txferID, 1); ok {
 		t.Fatalf("single-window file left compression state in the store")
 	}
 }
@@ -329,6 +426,263 @@ func TestSendConcurrentWindowsOfOneFile(t *testing.T) {
 	}
 	if !bytes.Equal(got, data) {
 		t.Fatalf("reassembled windows differ from file: got %d bytes, want %d", len(got), len(data))
+	}
+}
+
+// sendSlidingWindows sends file 1 as one-frame windows, inFlight at a time
+// on as many connections, each taking the next window when its last one
+// ends, as the client's sliding window does. It returns each frame's codec,
+// in file order.
+func sendSlidingWindows(t *testing.T, deps Deps, txferID, path string, frames, inFlight int, nsPerByte int64) []string {
+	t.Helper()
+	comps := make([]string, frames)
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range inFlight {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			src := &sendRateSource{}
+			for {
+				w := int(next.Add(1) - 1)
+				if w >= frames {
+					return
+				}
+				got, err := frameComps(sendWindowOn(t, deps, txferID, path, src, w, 1, nsPerByte))
+				if err != nil || len(got) != 1 {
+					t.Errorf("window %d: %d frames: %v", w, len(got), err)
+					return
+				}
+				comps[w] = got[0]
+			}
+		}()
+	}
+	wg.Wait()
+	return comps
+}
+
+// Concurrent one-frame windows of a file advance one shared policy, so the
+// file adapts as one stream of its frames would. On a slow link, where zstd
+// sends compressible data several times faster, the file switches within
+// its first half and sends most of its second half compressed. On a fast
+// link, where compression costs more than it saves, the file stays
+// uncompressed. The race detector slows the codecs past the slow link, so
+// the slow link goes unchecked there.
+func TestSendConcurrentSmallWindowsAdapt(t *testing.T) {
+	const frames, inFlight = 64, 8
+	for _, tc := range []struct {
+		name              string
+		nsPerByte         int64
+		minLate, maxShare float64
+	}{
+		{"slow link", 20, 0.4, 1},
+		{"fast link", 0, 0, 0.2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if raceEnabled {
+				t.Skip("the race detector slows the codecs, which skews both cases' timing")
+			}
+			deps, txferID, path := multiWindowFile(t, compressibleBytes(frames*defaultFileFrameLogicalSize))
+			comps := sendSlidingWindows(t, deps, txferID, path, frames, inFlight, tc.nsPerByte)
+			compressed, late := 0, 0
+			for i, c := range comps {
+				if c != "none" {
+					compressed++
+					if i >= frames/2 {
+						late++
+					}
+				}
+			}
+			t.Logf("codecs by frame: %v", comps)
+			// A check between compressed frames sends at most
+			// MaxCheckFrames frames in none, however many windows are in
+			// flight.
+			for i, run := 0, 0; i < len(comps); i++ {
+				if comps[i] == "none" {
+					run++
+					continue
+				}
+				if run > policy.MaxCheckFrames && i > run && comps[i-run-1] != "none" {
+					t.Errorf("a check sent %d frames in none before frame %d, want at most %d", run, i, policy.MaxCheckFrames)
+				}
+				run = 0
+			}
+			if share := float64(late) / (frames / 2); share < tc.minLate {
+				t.Errorf("sent %.0f%% of the second half compressed, want at least %.0f%%", 100*share, 100*tc.minLate)
+			}
+			if share := float64(compressed) / frames; share > tc.maxShare {
+				t.Errorf("sent %.0f%% of frames compressed, want at most %.0f%%", 100*share, 100*tc.maxShare)
+			}
+		})
+	}
+}
+
+// decideChained decides a frame only when it holds the chain and the frame
+// was sent in the chain's codec; otherwise the window follows the chain's
+// codec. None of the three cases allocates, which keeps a chained frame's
+// per-frame path free of allocations.
+func TestDecideChainedFeedsOnlyMatchingFrames(t *testing.T) {
+	m := policy.CompressionMetrics{LogicalSize: defaultFileFrameLogicalSize, WireSize: defaultFileFrameLogicalSize,
+		PrepareLatency: time.Millisecond, WriteLatency: 20 * time.Millisecond}
+	rate := &sendRate{src: &sendRateSource{}}
+	var chain policy.FileChain
+	set := func(st policy.FileCompression) {
+		*chain.TryHold() = st
+		chain.Release()
+	}
+	var local policy.FileCompression
+	if _, fed := decideChained(&chain, &local, rate, chainedFrame{Mode: policy.CompressionModeNone, Metrics: m}); !fed || local == (policy.FileCompression{}) {
+		t.Fatalf("a frame in the chain's codec was not decided: fed=%v local=%+v", fed, local)
+	}
+	if st := *chain.TryHold(); st != local {
+		t.Fatalf("the window's copy %+v differs from the chain's %+v", local, st)
+	}
+	chain.Release()
+
+	// A sibling moved the codec to lz4 while a none frame was in flight.
+	moved := learnedFileCompression()
+	set(moved)
+	if _, fed := decideChained(&chain, &local, rate, chainedFrame{Mode: policy.CompressionModeNone, Metrics: m}); fed || local != moved {
+		t.Fatalf("a frame in a codec the chain left was decided (%v), or the window did not follow: %+v", fed, local)
+	}
+
+	// A sibling holds the chain: the frame is skipped and nothing waits.
+	chain.TryHold()
+	local = policy.FileCompression{}
+	if _, fed := decideChained(&chain, &local, rate, chainedFrame{Mode: policy.CompressionModeLz4, Metrics: m}); fed || local != (policy.FileCompression{}) {
+		t.Fatalf("a frame was decided on a held chain")
+	}
+	chain.Release()
+
+	for _, tc := range []struct {
+		name string
+		mode policy.CompressionMode
+		hold bool
+	}{
+		{"decided", policy.CompressionModeLz4, false},
+		{"codec moved", policy.CompressionModeZstdLevel1, false},
+		{"held", policy.CompressionModeLz4, true},
+	} {
+		if tc.hold {
+			chain.TryHold()
+		}
+		if n := testing.AllocsPerRun(100, func() {
+			if !tc.hold {
+				set(moved)
+			}
+			decideChained(&chain, &local, rate, chainedFrame{Mode: tc.mode, Metrics: m})
+		}); n != 0 {
+			t.Errorf("%s: a chained decision allocated %v times", tc.name, n)
+		}
+		if tc.hold {
+			chain.Release()
+		}
+	}
+}
+
+// A recovery check judges frames flushed and timed on their own. When one
+// window's decision starts a check on the file's chain, a sibling whose frame
+// began before it sent that frame untimed, in the home codec the check's
+// baseline also uses. That frame must not become a baseline frame, where
+// the fastest one can lower the bar: it is skipped, the sibling adopts the
+// chain's state, and its next frame, measured for recovery, is decided.
+func TestDecideChainedRecoveryNeedsMeasuredFrames(t *testing.T) {
+	p, m, d := zstdRecoveryBaseline(t)
+	if !p.RecoveryActive() {
+		t.Fatal("setup started no check")
+	}
+	var chain policy.FileChain
+	started := policy.FileCompression{Mode: d.Next, Policy: *p}
+	*chain.TryHold() = started
+	chain.Release()
+	rate := &sendRate{src: &sendRateSource{}}
+
+	// The sibling's view predates the check, and its untimed frame looks
+	// fast: buffered output left its write time out.
+	untimed := m
+	untimed.WriteLatency = time.Microsecond
+	sibling := policy.FileCompression{Mode: d.Next}
+	if _, fed := decideChained(&chain, &sibling, rate, chainedFrame{Mode: d.Next, Metrics: untimed}); fed {
+		t.Fatal("a frame not measured for recovery fed the check")
+	}
+	if st := *chain.TryHold(); st != started {
+		t.Fatalf("a skipped frame changed the chain")
+	}
+	chain.Release()
+	if !sibling.Policy.RecoveryActive() {
+		t.Fatal("the sibling did not adopt the running check")
+	}
+
+	// Its next frame starts with the check in view, so it is timed and fed.
+	if _, fed := decideChained(&chain, &sibling, rate, chainedFrame{
+		Mode: sibling.Mode, Recovering: sibling.Policy.RecoveryActive(), Metrics: m}); !fed {
+		t.Fatal("a frame measured for recovery was skipped")
+	}
+	if st := *chain.TryHold(); st == started {
+		t.Fatal("the measured frame did not reach the check")
+	}
+	chain.Release()
+}
+
+// A check frame that a held chain kept from the check is charged once and
+// goes back to the chain, so the check still finishes on frames claimed
+// again; a window that claimed nothing sends home's codec and is charged
+// nothing.
+func TestSettleCheckFrameKeepsChecksFinishing(t *testing.T) {
+	p, m, d := zstdRecoveryBaseline(t)
+	for d.Reason == "recovery-baseline" {
+		d = p.DecideSampled(d.Next, m, nil)
+	}
+	if !p.CheckRunning() {
+		t.Fatalf("no check started: %+v", d)
+	}
+	var chain policy.FileChain
+	*chain.TryHold() = policy.FileCompression{Mode: d.Next, Policy: *p}
+	chain.Release()
+	rate := &sendRate{src: &sendRateSource{}}
+	check := m
+	check.WireSize, check.PrepareLatency, check.WriteLatency = check.LogicalSize, 0, 30*time.Millisecond
+	frame := func(local *policy.FileCompression, claim *policy.CheckClaim) time.Duration {
+		mode, recovering := local.Mode, local.Policy.RecoveryActive()
+		if local.Policy.CheckRunning() && mode != local.Policy.Home() {
+			if *claim = chain.ClaimCheckFrame(); !claim.Held() {
+				mode, recovering = local.Policy.Home(), false
+			}
+		}
+		decision, fed := decideChained(&chain, local, rate, chainedFrame{Mode: mode, Recovering: recovering, Metrics: check})
+		return settleCheckFrame(&chain, claim, fed, &local.Policy, decision.RecoveryLoss, check)
+	}
+
+	// Every window claims a check frame, and a sibling holds the chain
+	// when they finish.
+	windows := make([]policy.FileCompression, policy.MaxCheckFrames)
+	claims := make([]policy.CheckClaim, len(windows))
+	for i := range windows {
+		windows[i] = policy.FileCompression{Mode: d.Next, Policy: *p}
+	}
+	chain.TryHold()
+	for i := range windows {
+		if loss := frame(&windows[i], &claims[i]); loss <= 0 || loss != windows[i].Policy.CheckFrameLoss(check) || claims[i].Held() {
+			t.Fatalf("window %d: a lost check frame was charged %v, or kept its claim", i, loss)
+		}
+	}
+	chain.Release()
+	var unclaimed policy.CheckClaim
+	extra := policy.FileCompression{Mode: d.Next, Policy: *p}
+	for range policy.MaxCheckFrames {
+		frame(&windows[0], &claims[0])
+		if !chain.TryHold().Policy.CheckRunning() {
+			chain.Release()
+			break
+		}
+		chain.Release()
+	}
+	if st := chain.TryHold(); st.Policy.CheckRunning() {
+		t.Fatal("the check never finished after its frames were lost")
+	}
+	chain.Release()
+	if loss := frame(&extra, &unclaimed); loss != 0 || unclaimed.Held() {
+		t.Fatalf("a frame of a stale view was charged %v or claimed a frame", loss)
 	}
 }
 
@@ -596,9 +950,9 @@ func learnedFileCompression() policy.FileCompression {
 	return policy.FileCompression{Mode: policy.CompressionModeLz4, Policy: *p}
 }
 
-// sendMockWindow streams one adaptive window of a file of frames frames
-// through mockDeps, which holds any preloaded state, and returns the result.
-func sendMockWindow(t *testing.T, deps *mockDeps, path string, offsetFrames, windowFrames int64) sentItem {
+// sendMockWindow streams one adaptive window of file 1 through deps, which
+// holds any preset chain, and returns the file's state afterward.
+func sendMockWindow(t *testing.T, deps *mockDeps, path string, offsetFrames, windowFrames int64) policy.FileCompression {
 	t.Helper()
 	ref, err := deps.GetFileRef("tx1", 1, path)
 	if err != nil {
@@ -606,46 +960,53 @@ func sendMockWindow(t *testing.T, deps *mockDeps, path string, offsetFrames, win
 	}
 	item := sendItem{FileID: 1, Offset: offsetFrames * defaultFileFrameLogicalSize, Size: windowFrames * defaultFileFrameLogicalSize, Comp: "adapt", Path: path}
 	var raw bytes.Buffer
-	sent, err := streamSendItem(context.Background(), unbufferedSendOutput(&raw), deps, "tx1", item, ref, defaultZeroCopyMinFrameBytes)
-	if err != nil {
+	if _, err := streamSendItem(context.Background(), unbufferedSendOutput(&raw), deps, "tx1", item, ref, defaultZeroCopyMinFrameBytes); err != nil {
 		t.Fatalf("streamSendItem: %v", err)
 	}
-	return sent
+	st, _ := loadFileCompression(deps, "tx1", 1)
+	return st
 }
 
-// A window starts from the loaded mode and policy together.
+// mockWithChain returns mockDeps serving path whose file 1 has a chain
+// holding st.
+func mockWithChain(path string, st policy.FileCompression) *mockDeps {
+	c := new(policy.FileChain)
+	*c.TryHold() = st
+	c.Release()
+	return &mockDeps{filePath: path, chains: map[uint64]*policy.FileChain{1: c}}
+}
+
+// A window starts from the chain's mode and policy together.
 func TestSendWindowStartsFromLoadedPolicy(t *testing.T) {
 	path := writeTempSendFile(t, compressibleBytes(4*defaultFileFrameLogicalSize))
 	loaded := learnedFileCompression()
 
-	// The last window loads the state but saves nothing, since no window
-	// follows, so the stored state stays as it was.
-	deps := &mockDeps{filePath: path, compression: map[uint64]policy.FileCompression{1: loaded}}
-	if sent := sendMockWindow(t, deps, path, 3, 1); sent.hasComp {
-		t.Fatalf("last window reported state %+v", sent.comp.State)
+	// The last window takes the chain but decides nothing, since its one
+	// frame is terminal and no window follows, so the state stays as it was.
+	deps := mockWithChain(path, loaded)
+	if got := sendMockWindow(t, deps, path, 3, 1); got != loaded {
+		t.Fatalf("last window changed the state: %+v, want %+v", got, loaded)
 	}
-	if deps.compLoads != 1 || deps.compSaves != 0 {
-		t.Fatalf("loads, saves = %d, %d; want 1, 0", deps.compLoads, deps.compSaves)
-	}
-	if got := deps.compression[1]; got != loaded {
-		t.Fatalf("stored state changed: %+v, want %+v", got, loaded)
+	if deps.chainCalls != 2 || deps.chainCreates != 0 {
+		t.Fatalf("chain calls, creates = %d, %d; want 2 (window and check), 0", deps.chainCalls, deps.chainCreates)
 	}
 
-	// A window with decisions continues from the loaded policy, so it does
+	// A window with decisions continues from the chain's policy, so it does
 	// not end where the same window from a fresh policy does.
-	fromLoaded := sendMockWindow(t, &mockDeps{filePath: path, compression: map[uint64]policy.FileCompression{1: loaded}}, path, 1, 2)
+	fromLoaded := sendMockWindow(t, mockWithChain(path, loaded), path, 1, 2)
 	fromFresh := sendMockWindow(t, &mockDeps{filePath: path}, path, 1, 2)
-	if !fromLoaded.hasComp || !fromFresh.hasComp {
-		t.Fatalf("windows with decisions saved no state: %v, %v", fromLoaded.hasComp, fromFresh.hasComp)
+	if fromLoaded == loaded || fromFresh == (policy.FileCompression{}) {
+		t.Fatalf("windows with decisions left their state as it was")
 	}
-	if fromLoaded.comp.State.Policy == fromFresh.comp.State.Policy {
+	if fromLoaded.Policy == fromFresh.Policy {
 		t.Fatalf("window ignored the loaded policy")
 	}
 }
 
-// A request whose only item fails mid-window has no window hash, yet still
-// saves what its frames taught the policy, through the batched store call.
-func TestHandleSENDFailedOnlyItemSavesCompressionState(t *testing.T) {
+// A request whose only item fails mid-window has no window hash, yet its
+// frames still teach the file's chain, and its rates reach the store in one
+// call.
+func TestHandleSENDFailedOnlyItemKeepsCompressionState(t *testing.T) {
 	size := 4 * defaultFileFrameLogicalSize
 	data := make([]byte, size)
 	rand.New(rand.NewSource(5)).Read(data)
@@ -661,43 +1022,10 @@ func TestHandleSENDFailedOnlyItemSavesCompressionState(t *testing.T) {
 	if err == nil {
 		t.Fatalf("request succeeded through a failing writer")
 	}
-	if deps.compSaves != 1 || deps.windowBatches != 1 {
-		t.Fatalf("saves, store calls = %d, %d; want 1, 1", deps.compSaves, deps.windowBatches)
+	if st, _ := loadFileCompression(deps, "tx1", 1); deps.chainCreates != 1 || st == (policy.FileCompression{}) || deps.windowBatches != 1 {
+		t.Fatalf("chains, store calls = %d, %d, state %+v; want 1, 1, a learned state", deps.chainCreates, deps.windowBatches, st)
 	}
 	if len(deps.windowHash) != 0 {
 		t.Fatalf("failed item recorded window hashes: %v", deps.windowHash)
 	}
-}
-
-// The compression updates of a request reuse one pooled slice.
-func TestCompUpdatesReuseTheirSlice(t *testing.T) {
-	update := FileCompressionUpdate{FileID: 1}
-	use := func() {
-		c := compUpdatesPool.Get().(*compUpdates)
-		for range 4 {
-			c.s = append(c.s, update)
-		}
-		c.release()
-	}
-	use()
-	if !raceEnabled {
-		if allocs := testing.AllocsPerRun(100, use); allocs != 0 {
-			t.Fatalf("pooled updates allocate %v times per request", allocs)
-		}
-	}
-	first := compUpdatesPool.Get().(*compUpdates)
-	defer first.release()
-	second := compUpdatesPool.Get().(*compUpdates)
-	if first == second {
-		t.Fatal("outstanding borrowers share compression updates")
-	}
-	defer second.release()
-	if len(first.s) != 0 || len(second.s) != 0 {
-		t.Fatal("pooled updates retained entries from a previous borrower")
-	}
-	var none *compUpdates
-	if none.list() != nil {
-		t.Fatalf("nil updates have a list")
-	}
-	none.release()
 }

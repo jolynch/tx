@@ -75,9 +75,9 @@ type mockDeps struct {
 	windowBatches    int         // SetTransferFileWindowHashes calls
 	rates            RateSummary // counts of the windows RecordTransferWindows saw
 	ratedFiles       []uint64    // the distinct files rates.Files counted
-	compression      map[uint64]policy.FileCompression
-	compLoads        int        // LoadFileCompression calls
-	compSaves        int        // compression updates saved
+	chains           map[uint64]*policy.FileChain
+	chainCalls       int        // FileCompressionChains calls
+	chainCreates     int        // chains FileCompressionChains created
 	refBatches       int        // GetFileRefs calls
 	openFileCalls    int        // OpenFileRef calls
 	openedFiles      []*os.File // files OpenFileRef opened, to check they close
@@ -240,21 +240,30 @@ func (m *mockDeps) RecordTransferWindows(txferID string, rec WindowRecords) bool
 	c.Sender += rec.Rates.Bottlenecks.Sender
 	c.Network += rec.Rates.Bottlenecks.Network
 	c.Receiver += rec.Rates.Bottlenecks.Receiver
-	for _, c := range rec.Compression {
-		m.compSaves++
-		if m.compression == nil {
-			m.compression = make(map[uint64]policy.FileCompression)
-		}
-		m.compression[c.FileID] = c.State
-	}
 	return m.SetTransferFileWindowHashes(txferID, hashes)
 }
 
-// LoadFileCompression keeps per-file state in a map and counts its calls.
-func (m *mockDeps) LoadFileCompression(_ string, fileID uint64) (policy.FileCompression, bool) {
-	m.compLoads++
-	st, ok := m.compression[fileID]
-	return st, ok
+// FileCompressionChains keeps per-file chains in a map and counts its calls
+// and the chains it creates.
+func (m *mockDeps) FileCompressionChains(_ string, reqs []ChainRequest) {
+	m.chainCalls++
+	for _, create := range [2]bool{true, false} {
+		for i := range reqs {
+			r := &reqs[i]
+			if r.Create != create {
+				continue
+			}
+			r.Chain = m.chains[r.FileID]
+			if r.Chain == nil && create {
+				if m.chains == nil {
+					m.chains = make(map[uint64]*policy.FileChain)
+				}
+				r.Chain = new(policy.FileChain)
+				m.chains[r.FileID] = r.Chain
+				m.chainCreates++
+			}
+		}
+	}
 }
 
 func (m *mockDeps) VerifyTransferFileWindowHash(string, uint64, int64, string) bool { return true }

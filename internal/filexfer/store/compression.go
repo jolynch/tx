@@ -8,33 +8,76 @@ import (
 	"github.com/jolynch/tx/internal/filexfer/policy"
 )
 
-// LoadFileCompression returns the compression state the file's last window
-// saved, and false when it has none or the transfer is unknown. The caller
-// owns the returned copy.
-func (s *Store) LoadFileCompression(txferID string, fileID uint64) (policy.FileCompression, bool) {
+// ChainRequest asks for the adaptive compression chain of one SEND window's
+// file. Create also makes a missing chain, for a file that is in range and
+// below Done, which excludes Done and Missing files. FileCompressionChains
+// sets Chain, or leaves it nil when the file has none.
+type ChainRequest struct {
+	FileID uint64
+	Create bool
+	Chain  *policy.FileChain
+}
+
+// chainSlabSize is how many chains a transfer allocates at once. Chains are
+// never reused, since a window may still hold one its file dropped; the slab
+// only spreads one allocation over that many files.
+const chainSlabSize = 16
+
+// FileCompressionChains resolves a SEND request's chains in place, under one
+// acquisition of the transfer's locks: compMu, and a shared hold of mu only
+// when a request may create one. It creates before it looks up, so a window
+// that only takes its file's chain gets one that a window anywhere in the
+// same request creates. Windows then share their chains without the store's
+// locks. An unknown transfer leaves every Chain nil.
+func (s *Store) FileCompressionChains(txferID string, reqs []ChainRequest) {
 	managed, ok := s.getManagedTransfer(txferID)
 	if !ok {
-		return policy.FileCompression{}, false
+		return
+	}
+	create := false
+	for i := range reqs {
+		create = create || reqs[i].Create
+	}
+	if create {
+		managed.mu.RLock()
+		defer managed.mu.RUnlock()
 	}
 	managed.compMu.Lock()
-	st, ok := managed.compression[fileID]
-	managed.compMu.Unlock()
-	return st, ok
+	defer managed.compMu.Unlock()
+	for _, create := range [2]bool{true, false} {
+		for i := range reqs {
+			if r := &reqs[i]; r.Create == create {
+				r.Chain = managed.chainLocked(r.FileID, create)
+			}
+		}
+	}
 }
 
-// FileCompressionUpdate is the state a file's window leaves for its next one.
-type FileCompressionUpdate struct {
-	FileID uint64
-	State  policy.FileCompression
+// chainLocked returns a file's chain, creating it when create is set and the
+// file may have one. Callers hold compMu, and mu when create is set.
+func (m *managedTransfer) chainLocked(fileID uint64, create bool) *policy.FileChain {
+	c := m.compression[fileID]
+	if c != nil || !create || m.deleted ||
+		fileID >= uint64(len(m.transfer.State)) || m.transfer.State[fileID] >= TransferStateDone {
+		return c
+	}
+	if m.compression == nil {
+		m.compression = make(map[uint64]*policy.FileChain)
+	}
+	if len(m.chainSlab) == 0 {
+		m.chainSlab = make([]policy.FileChain, chainSlabSize)
+	}
+	c = &m.chainSlab[0]
+	m.chainSlab = m.chainSlab[1:]
+	m.compression[fileID] = c
+	return c
 }
 
-// saveCompressionLocked stores each update whose file is below Done, which
-// excludes Done and Missing files, and adds rates to the transfer's summary.
-// Concurrent windows of one file each work on a copy, so the last save wins.
-// Callers hold mu, shared or exclusive; compMu nests inside it and covers no
-// I/O.
-func (m *managedTransfer) saveCompressionLocked(updates []FileCompressionUpdate, rates RateSummary, rated []uint64) {
-	if len(updates) == 0 && rates.Windows == 0 {
+// saveRatesLocked adds a request's delivery rates to the transfer's
+// summary. Callers hold mu, shared or exclusive; compMu nests inside it and
+// covers no I/O.
+func (m *managedTransfer) saveRatesLocked(rates RateSummary, rated []uint64) {
+	if rates.Windows == 0 {
 		return
 	}
 	m.compMu.Lock()
@@ -44,29 +87,21 @@ func (m *managedTransfer) saveCompressionLocked(updates []FileCompressionUpdate,
 			m.rates.Files++
 		}
 	}
-	for _, u := range updates {
-		if u.FileID >= uint64(len(m.transfer.State)) || m.transfer.State[u.FileID] >= TransferStateDone {
-			continue
-		}
-		if m.compression == nil {
-			m.compression = make(map[uint64]policy.FileCompression)
-		}
-		m.compression[u.FileID] = u.State
-	}
 	m.compMu.Unlock()
 }
 
-// dropFileCompression forgets a file's saved state. Callers hold mu.
+// dropFileCompression forgets a file's chain. Windows still holding it
+// finish on it; a later window starts a new one. Callers hold mu.
 func (m *managedTransfer) dropFileCompression(fileID uint64) {
 	m.compMu.Lock()
 	delete(m.compression, fileID)
 	m.compMu.Unlock()
 }
 
-// dropAllCompression forgets every file's saved state. Callers hold mu.
+// dropAllCompression forgets every file's chain. Callers hold mu.
 func (m *managedTransfer) dropAllCompression() {
 	m.compMu.Lock()
-	m.compression = nil
+	m.compression, m.chainSlab = nil, nil
 	m.compMu.Unlock()
 }
 
