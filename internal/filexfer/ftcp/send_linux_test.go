@@ -15,6 +15,8 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -683,5 +685,89 @@ func TestHandleSENDFastBandwidthLimit(t *testing.T) {
 				t.Fatal("no window events")
 			}
 		})
+	}
+}
+
+// directIOTempDir returns a temporary directory whose filesystem accepts
+// O_DIRECT, or skips the test. t.TempDir is often tmpfs, which rejects
+// O_DIRECT at open, so /var/tmp is tried after it.
+func directIOTempDir(t *testing.T) string {
+	t.Helper()
+	for _, parent := range []string{"", "/var/tmp"} {
+		dir, err := os.MkdirTemp(parent, "tx-direct-io-")
+		if err != nil {
+			continue
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+		probe := filepath.Join(dir, "probe")
+		if err := os.WriteFile(probe, make([]byte, 4096), 0o644); err != nil {
+			continue
+		}
+		fd, err := os.OpenFile(probe, os.O_RDONLY|unix.O_DIRECT, 0)
+		if err != nil {
+			continue
+		}
+		_ = fd.Close()
+		return dir
+	}
+	t.Skip("no temporary directory accepts O_DIRECT")
+	return ""
+}
+
+// A gentle SEND opens its file with O_DIRECT, so a compressed frame reads
+// contiguously into one buffer and an uncompressed one is staged. On kernels
+// that reject an unaligned direct read with EINVAL, an unaligned tail makes
+// the item reopen without direct I/O and resend that frame: after earlier
+// frames, or as the window's first; newer kernels serve the tail directly.
+// Each run checks the decoded bytes, every header's codec, offset, and size,
+// and that the terminal trailer and the recorded hash cover exactly the
+// window.
+func TestSendItemDirectIOFramesAndFallback(t *testing.T) {
+	dir := directIOTempDir(t)
+	frame := int(defaultFileFrameLogicalSize)
+	for _, size := range []int{
+		2 * frame,       // aligned: O_DIRECT throughout
+		2*frame + 1000,  // unaligned tail: falls back after two frames
+		5000,            // unaligned single frame: falls back before any frame
+		frame + 64<<10,  // aligned tail shorter than a frame
+		3*frame + 4097,  // tail one byte past a page
+		frame - 512 + 1, // unaligned, just under one frame
+	} {
+		data := wordyBytes(size)
+		path := filepath.Join(dir, "f"+strconv.Itoa(size))
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		want := encoding.FormatXXH128HashToken(xxh3.Hash128(data))
+		for _, comp := range []string{"none", encoding.EncodingLz4, encoding.EncodingZstd} {
+			for _, mode := range []string{loadStrategyGentle, loadStrategyFast} {
+				deps := &mockDeps{filePath: path}
+				var out bytes.Buffer
+				sent, err := streamSendItem(context.Background(), unbufferedSendOutput(&out), deps, "tx1",
+					sendItem{FileID: 1, Comp: comp, Path: path, Mode: mode},
+					mustFileRef(t, deps, 1, path), zeroCopyOff)
+				if err != nil {
+					t.Fatalf("size %d %s %s: %v", size, comp, mode, err)
+				}
+				frames, err := decodeFrameStream(out.Bytes())
+				if err != nil {
+					t.Fatalf("size %d %s %s: %v", size, comp, mode, err)
+				}
+				var got []byte
+				for i, f := range frames {
+					if f.Header.Comp != comp || f.Header.Offset != int64(len(got)) || f.Header.Size != int64(len(f.Logical)) {
+						t.Fatalf("size %d %s %s frame %d: header %+v after %d bytes, %d decoded", size, comp, mode, i, f.Header, len(got), len(f.Logical))
+					}
+					got = append(got, f.Logical...)
+				}
+				if !bytes.Equal(got, data) {
+					t.Fatalf("size %d %s %s: decoded %d bytes that differ from the %d sent", size, comp, mode, len(got), len(data))
+				}
+				last := frames[len(frames)-1].Trailer
+				if last.FileHashToken != want || sent.hash.HashToken != want || sent.hash.EndBytes != int64(size) {
+					t.Fatalf("size %d %s %s: trailer hash %q, recorded %+v; want %q over %d bytes", size, comp, mode, last.FileHashToken, sent.hash, want, size)
+				}
+			}
+		}
 	}
 }

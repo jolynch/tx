@@ -1111,23 +1111,26 @@ func windowEncoderConcurrency(t *testing.T, data []byte, comp, mode string) []in
 	return conc
 }
 
-// A window widens only after a frame shows its data compresses slowly. Its
-// first frame, every frame of random data, which compresses far faster than
-// the threshold, and every frame of a gentle window use one goroutine; slow
-// text frames after the first go wide when cores are free.
+// A window widens only after a frame shows its data compresses slowly. Every
+// frame of a gentle window uses one goroutine; slow text frames go wide when
+// cores are free, from the first frame once an earlier window has shown lz4
+// or zstd to be slow. Random data compresses far faster than the threshold,
+// so a window of it stays mostly narrow: a frame misjudged as slow, such as a
+// cold first frame or one following the text window's hint, widens only the
+// next frame, whose measured speed narrows the window again.
 func TestStreamSendItemWidensOnlySlowCompression(t *testing.T) {
-	const frames = 4
-	random := make([]byte, frames*defaultFileFrameLogicalSize)
+	const textFrames, randomFrames = 4, 12
+	text := wordyBytes(textFrames * int(defaultFileFrameLogicalSize))
+	random := make([]byte, randomFrames*defaultFileFrameLogicalSize)
 	_, _ = cryptorand.Read(random)
-	text := wordyBytes(frames * int(defaultFileFrameLogicalSize))
 	for _, comp := range []string{encoding.EncodingLz4, encoding.EncodingZstd} {
 		t.Run(comp, func(t *testing.T) {
 			if conc := windowEncoderConcurrency(t, text, comp, loadStrategyGentle); !slices.Equal(conc, []int{1, 1, 1, 1}) {
 				t.Errorf("gentle text frames used %v goroutines, want one each", conc)
 			}
 			conc := windowEncoderConcurrency(t, text, comp, loadStrategyFast)
-			if len(conc) != frames || conc[0] != 1 {
-				t.Fatalf("fast text frames used %v goroutines, want %d frames starting at 1", conc, frames)
+			if len(conc) != textFrames {
+				t.Fatalf("fast text frames used %v goroutines, want %d frames", conc, textFrames)
 			}
 			if runtime.GOMAXPROCS(0) >= 4 && !raceEnabled {
 				for i, c := range conc[1:] {
@@ -1135,14 +1138,116 @@ func TestStreamSendItemWidensOnlySlowCompression(t *testing.T) {
 						t.Errorf("text frame %d used %d goroutine after slow frames on an idle %d-CPU budget: %v", i+1, c, runtime.GOMAXPROCS(0), conc)
 					}
 				}
+				// The first window above left a slow hint, so this one's
+				// first frame goes wide too.
+				if conc := windowEncoderConcurrency(t, text, comp, loadStrategyFast); conc[0] < 2 {
+					t.Errorf("a text window's first frame after a slow text window used %v goroutines", conc)
+				}
 			}
 			// Under the race detector, the encoders run slowly enough that
 			// even random data can fall below the threshold.
-			if !raceEnabled {
-				if conc := windowEncoderConcurrency(t, random, comp, loadStrategyFast); !slices.Equal(conc, []int{1, 1, 1, 1}) {
-					t.Errorf("random frames used %v goroutines, want one each", conc)
+			if raceEnabled {
+				return
+			}
+			conc = windowEncoderConcurrency(t, random, comp, loadStrategyFast)
+			wide := 0
+			for _, c := range conc {
+				if c > 1 {
+					wide++
 				}
+			}
+			if len(conc) != randomFrames || wide >= randomFrames/2 {
+				t.Errorf("random frames used %v goroutines; want at most %d of %d frames wide", conc, randomFrames/2-1, randomFrames)
 			}
 		})
 	}
+}
+
+// shortReaderAt serves data at most limit bytes per call, the next limit
+// drawn from r when it is set. eofWithData returns io.EOF with the call that
+// reaches the end, as os.File does not but io.ReaderAt allows.
+type shortReaderAt struct {
+	data        []byte
+	limit       int
+	r           *rand.Rand
+	eofWithData bool
+}
+
+func (s *shortReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(s.data)) {
+		return 0, io.EOF
+	}
+	limit := s.limit
+	if s.r != nil {
+		limit = 1 + s.r.Intn(s.limit)
+	}
+	n := copy(p[:min(len(p), limit)], s.data[off:])
+	if s.eofWithData && off+int64(n) == int64(len(s.data)) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// FuzzStreamBufferedRead reads a frame through a reader that returns a few
+// bytes per call. A contiguous read, which a compressed frame uses, must
+// reassemble the frame in buf exactly; either kind must hand the handler the
+// frame's bytes in order, so the window hash matches the source, and leave
+// the file offset at the frame's end. A file too short for the frame fails.
+func FuzzStreamBufferedRead(f *testing.F) {
+	f.Add(int64(1), uint32(5000), uint16(0), uint32(4096), uint16(300), uint32(8192), true, false, false)
+	f.Add(int64(2), uint32(5000), uint16(17), uint32(4096), uint16(300), uint32(1024), false, true, true)
+	f.Add(int64(3), uint32(100), uint16(0), uint32(200), uint16(7), uint32(4096), true, true, false)
+	f.Add(int64(4), uint32(1<<20), uint16(1), uint32(1<<20-1), uint16(511), uint32(1<<20), true, false, true)
+	f.Fuzz(func(t *testing.T, seed int64, fileSize uint32, start uint16, frameSize uint32, limit uint16, bufLen uint32, contiguous, varyLimit, eofWithData bool) {
+		r := rand.New(rand.NewSource(seed))
+		data := make([]byte, fileSize%(2<<20))
+		r.Read(data)
+		off0 := int64(start) % (int64(len(data)) + 1)
+		frame := int64(frameSize%(2<<20)) + 1
+		buf := make([]byte, bufLen%(2<<20)+1)
+		src := &shortReaderAt{data: data, limit: int(limit) + 1, eofWithData: eofWithData}
+		if varyLimit {
+			src.r = rand.New(rand.NewSource(seed + 1))
+		}
+
+		var handled []byte
+		var hasher xxh3.Hasher128
+		fileOffset := off0
+		_, _, err := streamBufferedRead(src, &fileOffset, frame, buf, contiguous, timeReadsAndHandling, func(chunk []byte) error {
+			if !contiguous && &chunk[0] != &buf[0] {
+				t.Fatal("a non-contiguous chunk does not reuse the start of buf")
+			}
+			handled = append(handled, chunk...)
+			_, _ = hasher.Write(chunk)
+			return nil
+		})
+		switch {
+		case contiguous && int64(len(buf)) < frame:
+			if err == nil || fileOffset != off0 || len(handled) != 0 {
+				t.Fatalf("%d-byte frame into a %d-byte contiguous buffer: err %v, offset %d->%d, %d bytes handled", frame, len(buf), err, off0, fileOffset, len(handled))
+			}
+			return
+		case off0+frame > int64(len(data)):
+			if err == nil {
+				t.Fatalf("frame [%d, %d) past the %d-byte file read without error", off0, off0+frame, len(data))
+			}
+			if !bytes.Equal(handled, data[off0:off0+int64(len(handled))]) {
+				t.Fatal("a short file handed the handler bytes it does not hold")
+			}
+			return
+		}
+		want := data[off0 : off0+frame]
+		if err != nil {
+			t.Fatalf("frame [%d, %d) of a %d-byte file, limit %d: %v", off0, off0+frame, len(data), src.limit, err)
+		}
+		if fileOffset != off0+frame {
+			t.Fatalf("offset %d after the frame, want %d", fileOffset, off0+frame)
+		}
+		if !bytes.Equal(handled, want) || hasher.Sum128() != xxh3.Hash128(want) {
+			t.Fatalf("handler saw %d bytes that differ from the %d-byte frame", len(handled), frame)
+		}
+		if contiguous && !bytes.Equal(buf[:frame], want) {
+			t.Fatal("a contiguous read left a buffer that differs from the frame")
+		}
+	})
 }

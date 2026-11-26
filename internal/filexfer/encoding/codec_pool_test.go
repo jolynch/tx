@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"runtime"
+	"runtime/debug"
 	"testing"
+	"time"
 
 	"github.com/jolynch/tx/internal/bufpool"
 	"github.com/klauspost/compress/zstd"
@@ -257,6 +260,66 @@ func TestAppendCompressedFrameDoesNotAllocate(t *testing.T) {
 		})
 		if allocs != 0 {
 			t.Errorf("%s: %.1f allocations per 4 MiB frame at concurrency 1, want 0", codec, allocs)
+		}
+	}
+}
+
+// Wide encoders reuse their pooled state: once warm, a frame at concurrency 2
+// or 4 allocates only its goroutines and channels, never an encoder, block
+// buffers, or history sized by the frame. Frames at concurrency 1 stay free
+// of allocations while wide frames run between them.
+func TestFrameEncodersReusePooledState(t *testing.T) {
+	if raceEnabled {
+		t.Skip("allocation counts are meaningless under the race detector")
+	}
+	// A collection would empty the pools mid-test, and a goroutine moving
+	// between Ps misses the pooled encoder it left in the old P's private
+	// slot. Neither is what this test measures.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	src := frameTestContent(9, 4<<20, true)
+	dst := make([]byte, 0, bufpool.FrameBucket)
+	run := func(i int) {
+		e := frameEncoders[i]
+		if _, err := e.appendFrame(dst, src, e.concurrency); err != nil {
+			t.Fatalf("%s c%d: %v", e.codec, e.concurrency, err)
+		}
+	}
+	for range 2 {
+		for i := range frameEncoders {
+			run(i)
+		}
+	}
+	// A wide frame's block goroutines may still be returning buffers to
+	// their pools after it returns; let them finish before measuring the
+	// next frame, so their allocations are not charged to it.
+	idle := runtime.NumGoroutine()
+	settle := func() {
+		for deadline := time.Now().Add(time.Second); runtime.NumGoroutine() > idle && time.Now().Before(deadline); {
+			runtime.Gosched()
+		}
+	}
+	const rounds = 20
+	mallocs := make([]uint64, len(frameEncoders))
+	allocated := make([]uint64, len(frameEncoders))
+	var before, after runtime.MemStats
+	for range rounds {
+		for i := range frameEncoders {
+			settle()
+			runtime.ReadMemStats(&before)
+			run(i)
+			runtime.ReadMemStats(&after)
+			mallocs[i] += after.Mallocs - before.Mallocs
+			allocated[i] += after.TotalAlloc - before.TotalAlloc
+		}
+	}
+	for i, e := range frameEncoders {
+		perFrame := allocated[i] / rounds
+		switch {
+		case e.concurrency == 1 && mallocs[i] != 0:
+			t.Errorf("%s c1: %d allocations in %d frames interleaved with wide ones, want 0", e.codec, mallocs[i], rounds)
+		case perFrame > uint64(len(src))/8:
+			t.Errorf("%s c%d: %d bytes allocated per warm 4 MiB frame, want at most %d", e.codec, e.concurrency, perFrame, len(src)/8)
 		}
 	}
 }

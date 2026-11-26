@@ -5,6 +5,7 @@ package encoding
 
 import (
 	"errors"
+	"io"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -42,20 +43,18 @@ func frameConcurrencyIndex(concurrency int) int {
 // MaxEncodedFrameSizeBytes bounds what it appends, so a dst with that much
 // spare capacity is never reallocated.
 func AppendCompressedFrame(dst, src []byte, opts FrameCompression) ([]byte, int, error) {
+	appendFrame, codecMax := appendLz4Frame, lz4MaxFrameConcurrency
 	switch opts.Codec {
 	case EncodingLz4:
-		c := frameCoreBudget.reserve(frameConcurrencyCap(len(src), lz4MaxFrameConcurrency, opts.MaxConcurrency))
-		defer frameCoreBudget.release(c)
-		out, err := appendLz4Frame(dst, src, c)
-		return out, c, err
 	case EncodingZstd:
-		c := frameCoreBudget.reserve(frameConcurrencyCap(len(src), zstdMaxFrameConcurrency, opts.MaxConcurrency))
-		defer frameCoreBudget.release(c)
-		out, err := appendZstdFrame(dst, src, c)
-		return out, c, err
+		appendFrame, codecMax = appendZstdFrame, zstdMaxFrameConcurrency
 	default:
 		return dst, 0, errors.New("unsupported frame compression codec")
 	}
+	c := frameCoreBudget.reserve(frameConcurrencyCap(len(src), codecMax, opts.MaxConcurrency))
+	defer frameCoreBudget.release(c)
+	out, err := appendFrame(dst, src, c)
+	return out, c, err
 }
 
 // appendBuffer is an io.Writer that appends to a caller's slice. Each pooled
@@ -67,6 +66,26 @@ type appendBuffer struct {
 func (a *appendBuffer) Write(p []byte) (int, error) {
 	a.b = append(a.b, p...)
 	return len(p), nil
+}
+
+// streamEncoder is the streaming API that lz4.Writer and zstd.Encoder share.
+type streamEncoder interface {
+	Reset(io.Writer)
+	io.WriteCloser
+}
+
+// appendStream compresses src through w into out, appending to dst. A
+// failed encoder may hold state Reset does not clear, so on error the caller
+// drops it rather than returning it to its pool.
+func appendStream(w streamEncoder, out *appendBuffer, dst, src []byte) ([]byte, error) {
+	out.b = dst
+	w.Reset(out)
+	_, err := w.Write(src)
+	if err == nil {
+		err = w.Close()
+	}
+	dst, out.b = out.b, nil
+	return dst, err
 }
 
 // lz4FrameEncoder is a pooled lz4 frame writer configured once for data
@@ -103,20 +122,11 @@ func appendLz4Frame(dst, src []byte, concurrency int) ([]byte, error) {
 			return dst, err
 		}
 	}
-	e.out.b = dst
-	e.w.Reset(&e.out)
-	_, err := e.w.Write(src)
+	dst, err := appendStream(e.w, &e.out, dst, src)
 	if err == nil {
-		err = e.w.Close()
+		pool.Put(e)
 	}
-	dst = e.out.b
-	e.out.b = nil
-	if err != nil {
-		// A writer that failed may hold state Reset does not clear; drop it.
-		return dst, err
-	}
-	pool.Put(e)
-	return dst, nil
+	return dst, err
 }
 
 // zstdFrameEncoderOptions configures the data-frame zstd encoders. They
@@ -141,7 +151,9 @@ type zstdFrameEncoder struct {
 	out appendBuffer
 }
 
-var zstdFrameEncoderPools [2]sync.Pool
+// zstdFrameEncoderPools has a pool for each concurrency frameConcurrencyIndex
+// maps, although zstdMaxFrameConcurrency stops at 2.
+var zstdFrameEncoderPools [3]sync.Pool
 
 // appendZstdFrame compresses src with a pooled encoder. At concurrency 1,
 // EncodeAll reads src in place with no streaming state. At 2, the streaming
@@ -161,17 +173,9 @@ func appendZstdFrame(dst, src []byte, concurrency int) ([]byte, error) {
 		pool.Put(e)
 		return dst, nil
 	}
-	e.out.b = dst
-	e.enc.Reset(&e.out)
-	_, err := e.enc.Write(src)
+	dst, err := appendStream(e.enc, &e.out, dst, src)
 	if err == nil {
-		err = e.enc.Close()
+		pool.Put(e)
 	}
-	dst = e.out.b
-	e.out.b = nil
-	if err != nil {
-		return dst, err
-	}
-	pool.Put(e)
-	return dst, nil
+	return dst, err
 }

@@ -409,12 +409,16 @@ frame bucket. Encoders come from pools kept per codec and
 concurrency, so a frame builds no encoder.
 
 A frame compresses on one goroutine unless the previous frame of the same
-window and codec compressed below 2 GiB/s per core, counting wall time times
-the goroutines it used (`encoding.FrameWidth`, in `frame_width.go` with the
-budget below). That one goroutine reads its input in place and
-allocates nothing, and its cost matches the policy's single-core samples.
-Random and zero-filled data compress far faster than 2 GiB/s, so extra
-goroutines would only add overhead to them.
+window and codec compressed below 2 GiB/s on one goroutine
+(`encoding.FrameWidth`, in `frame_width.go` with the budget below). A
+window's first frame follows the process's last frame of its codec, so a
+file sent as one window still goes wide when its data is slow. A wide
+frame's time counts as its wall time times the encoder's measured speedup,
+so a window of fast data that one misjudged frame widened narrows again
+after its next frame. One goroutine reads its input in place and allocates
+nothing, and its cost matches the policy's single-core samples. Random and
+zero-filled data compress far faster than 2 GiB/s, so extra goroutines
+would only add overhead to them.
 
 A slow frame may take more goroutines from a process-wide budget of
 GOMAXPROCS encoder goroutines: up to 4 for lz4 and 2 for zstd, at most one

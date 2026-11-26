@@ -220,10 +220,13 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 	var compressConcurrency int
 	if isCompressed {
 		compRegion := trace.StartRegion(args.Ctx, "frame-compress")
-		wireSize, compressLatency, compressConcurrency, err = writeCompressedFrame(readBuf[:args.FrameSize], args, &prepareLatency, timedWrites)
+		wireSize, compressLatency, compressConcurrency, err = writeCompressedFrame(readBuf[:args.FrameSize], args, timedWrites)
 		compRegion.End()
 		if err != nil {
 			return frameStreamStats{}, err
+		}
+		if args.Timed {
+			prepareLatency += compressLatency
 		}
 	} else if stagedDirectWrite {
 		if err := writeFrameHeader(args.Output, args, wireSize, timedWrites); err != nil {
@@ -597,10 +600,9 @@ func streamBufferedRead(
 }
 
 // writeCompressedFrame compresses one frame read in full into payload and
-// writes its header and wire bytes. Compression time counts as prepare
-// latency when the frame is timed. It returns the wire size and the
+// writes its header and wire bytes. It returns the wire size and the
 // encoder's wall time and goroutines.
-func writeCompressedFrame(payload []byte, args frameStreamArgs, prepareLatency *time.Duration, timedWrites *time.Duration) (int64, time.Duration, int, error) {
+func writeCompressedFrame(payload []byte, args frameStreamArgs, timedWrites *time.Duration) (int64, time.Duration, int, error) {
 	maxEncoded, err := encoding.MaxEncodedFrameSizeBytes(args.Comp, int64(len(payload)))
 	if err != nil {
 		return 0, 0, 0, err
@@ -620,9 +622,6 @@ func writeCompressedFrame(payload []byte, args frameStreamArgs, prepareLatency *
 		return 0, 0, 0, err
 	}
 	compressWall := time.Since(compressStart)
-	if args.Timed {
-		*prepareLatency += compressWall
-	}
 	wireSize := int64(len(frame))
 	if err := writeFrameHeader(args.Output, args, wireSize, timedWrites); err != nil {
 		return 0, 0, 0, err

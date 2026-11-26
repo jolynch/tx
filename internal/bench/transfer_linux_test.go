@@ -412,28 +412,10 @@ var memTransferSizes = []struct {
 func BenchmarkTransferInMemory(b *testing.B) {
 	for _, sz := range memTransferSizes {
 		b.Run(sz.name, func(b *testing.B) {
-			cfg := memTransferConfig{fileSize: sz.size, totalBytes: 256 << 20}
-			env := startMemTransfer(b, cfg)
+			env := startMemTransfer(b, memTransferConfig{fileSize: sz.size, totalBytes: 256 << 20})
 			defer env.close()
 			env.copyOnce(b) // warm the connection pools
-			b.SetBytes(int64(cfg.files()) * cfg.fileSize)
-			var cpuNS int64
-			b.ResetTimer()
-			for b.Loop() {
-				b.StopTimer()
-				manifest := env.register(b)
-				b.StartTimer()
-				cpu0 := processCPUNS()
-				env.download(b, manifest)
-				cpuNS += processCPUNS() - cpu0
-				b.StopTimer()
-				env.store.DeleteTransfer(manifest.TransferID)
-				b.StartTimer()
-			}
-			b.StopTimer()
-			gib := float64(b.N) * float64(cfg.files()) * float64(cfg.fileSize) / (1 << 30)
-			b.ReportMetric(float64(cpuNS)/1e9/gib, "core-s/GiB")
-			b.ReportMetric(float64(b.N)*float64(cfg.files())/b.Elapsed().Seconds(), "files/s")
+			timeCopies(b, env)
 		})
 	}
 }
@@ -452,32 +434,14 @@ func BenchmarkTransferInMemoryModes(b *testing.B) {
 			size int64
 		}{{"4KiB", 4 << 10}, {"1MiB", 1 << 20}} {
 			b.Run(mode+"/"+sz.name, func(b *testing.B) {
-				cfg := memTransferConfig{fileSize: sz.size, totalBytes: 256 << 20, encrypt: cipher, keepAlive: keepAlive}
-				env := startMemTransfer(b, cfg)
+				env := startMemTransfer(b, memTransferConfig{fileSize: sz.size, totalBytes: 256 << 20, encrypt: cipher, keepAlive: keepAlive})
 				defer env.close()
 				if _, err := env.client.ProbeLink(context.Background(), tx.ProbeRequest{ProbeBytes: 1}); err != nil {
 					b.Fatalf("probe: %v", err)
 				}
 				env.copyOnce(b) // warm the connection pools
-				b.SetBytes(int64(cfg.files()) * cfg.fileSize)
-				var cpuNS int64
 				dials0 := env.client.MetricSnapshot().DialCount
-				b.ResetTimer()
-				for b.Loop() {
-					b.StopTimer()
-					manifest := env.register(b)
-					b.StartTimer()
-					cpu0 := processCPUNS()
-					env.download(b, manifest)
-					cpuNS += processCPUNS() - cpu0
-					b.StopTimer()
-					env.store.DeleteTransfer(manifest.TransferID)
-					b.StartTimer()
-				}
-				b.StopTimer()
-				gib := float64(b.N) * float64(cfg.files()) * float64(cfg.fileSize) / (1 << 30)
-				b.ReportMetric(float64(cpuNS)/1e9/gib, "core-s/GiB")
-				b.ReportMetric(float64(b.N)*float64(cfg.files())/b.Elapsed().Seconds(), "files/s")
+				timeCopies(b, env)
 				b.ReportMetric(float64(env.client.MetricSnapshot().DialCount-dials0)/float64(b.N), "dials/op")
 			})
 		}
@@ -502,20 +466,12 @@ func envBytes(b *testing.B, name string, def int64) int64 {
 // the suite's smoke profile can run a short copy.
 const envCompressedBytes = "TX_BENCH_COMPRESSED_BYTES"
 
-// benchCompressedCopy times copies of env's files, one per op, and reports
-// CPU per GiB, files/s, and the wire compression ratio (logical over wire
-// bytes received). allocs/op and B/op from -benchmem cover both sides. It
-// probes first, as tx recv copy does, so the client opens its pools and
-// reuses kept-alive connections.
-func benchCompressedCopy(b *testing.B, env *memTransferEnv) {
+// timeCopies times copies of env's files, one per op, and reports CPU per
+// GiB for both sides and files/s. Each op's registration is untimed.
+func timeCopies(b *testing.B, env *memTransferEnv) {
 	b.Helper()
 	cfg := env.cfg
-	if _, err := env.client.ProbeLink(context.Background(), tx.ProbeRequest{ProbeBytes: 1}); err != nil {
-		b.Fatalf("probe: %v", err)
-	}
-	env.copyOnce(b) // warm the connection pools and encoder pools
 	b.SetBytes(int64(cfg.files()) * cfg.fileSize)
-	before := env.client.MetricSnapshot()
 	var cpuNS int64
 	for b.Loop() {
 		b.StopTimer()
@@ -529,23 +485,33 @@ func benchCompressedCopy(b *testing.B, env *memTransferEnv) {
 		b.StartTimer()
 	}
 	b.StopTimer()
-	after := env.client.MetricSnapshot()
 	gib := float64(b.N) * float64(cfg.files()) * float64(cfg.fileSize) / (1 << 30)
 	b.ReportMetric(float64(cpuNS)/1e9/gib, "core-s/GiB")
 	b.ReportMetric(float64(b.N)*float64(cfg.files())/b.Elapsed().Seconds(), "files/s")
+}
+
+// benchCompressedCopy runs timeCopies and also reports the wire compression
+// ratio (logical over wire bytes received). It probes first, as tx recv copy
+// does, so the client opens its pools and reuses kept-alive connections.
+func benchCompressedCopy(b *testing.B, env *memTransferEnv) {
+	b.Helper()
+	if _, err := env.client.ProbeLink(context.Background(), tx.ProbeRequest{ProbeBytes: 1}); err != nil {
+		b.Fatalf("probe: %v", err)
+	}
+	env.copyOnce(b) // warm the connection pools and encoder pools
+	before := env.client.MetricSnapshot()
+	timeCopies(b, env)
+	after := env.client.MetricSnapshot()
 	if wire := after.WireBytes - before.WireBytes; wire > 0 {
 		b.ReportMetric(float64(after.LogicalBytes-before.LogicalBytes)/float64(wire), "comp-ratio")
 	}
 }
 
 // BenchmarkTransferInMemoryCompressed copies compressible files with each
-// codec forced, and with adaptive compression, at GOMAXPROCS CPUs and the
-// connection count tx plans for them, over kept-alive connections. That plan
-// opens at least one connection per CPU, so the copy saturates the host: run
-// it with -cpu=$(nproc). The batch plan shrinks as CPUs grow, so on 24 or
-// more CPUs every window is one 4 MiB frame and every frame compresses on one
-// goroutine; on fewer, a 16 MiB file's later frames may go wide. Each op
-// copies TX_BENCH_COMPRESSED_BYTES (default 1 GiB).
+// codec forced, and with adaptive compression, over the kept-alive
+// connections tx plans for GOMAXPROCS CPUs, at least one per CPU: run it with
+// -cpu=$(nproc) to saturate the host. Each op copies
+// TX_BENCH_COMPRESSED_BYTES (default 1 GiB).
 func BenchmarkTransferInMemoryCompressed(b *testing.B) {
 	total := envBytes(b, envCompressedBytes, 1<<30)
 	for _, comp := range []string{"lz4", "zstd", "adapt"} {
@@ -565,11 +531,9 @@ func BenchmarkTransferInMemoryCompressed(b *testing.B) {
 }
 
 // BenchmarkTransferInMemoryCompressedFew copies 64 MiB compressible files
-// over two connections, the fewest tx opens, so at most two frames compress
-// at a time while the other cores sit idle. Each file is one window of 16
-// frames; after its first frame shows the data compresses slowly, the core
-// budget should give the rest several encoder goroutines. Each op copies a
-// quarter of TX_BENCH_COMPRESSED_BYTES, and at least one file.
+// over two connections, the fewest tx opens, so the core budget has idle
+// cores to widen slow frames with. Each op copies a quarter of
+// TX_BENCH_COMPRESSED_BYTES, and at least one file.
 func BenchmarkTransferInMemoryCompressedFew(b *testing.B) {
 	total := envBytes(b, envCompressedBytes, 1<<30) / 4
 	for _, comp := range []string{"lz4", "zstd"} {
