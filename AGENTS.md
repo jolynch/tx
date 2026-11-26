@@ -134,8 +134,8 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
     and clears any plaintext in them before `Put`.
   - `internal/filexfer/encoding/codec.go`: pooled zstd encoders and decoders
     and lz4 readers.
-  - `internal/filexfer/ftcp/send.go`: `sendOutputBufferPool` and
-    `compressedFrameBufferPool`.
+  - `internal/filexfer/ftcp`: `sendOutputBufferPool` (`send_output.go`) and
+    `compressedFrameBufferPool` (`send.go`).
   - `Client`: `acquireLineReader` and `acquireScratchBuffer`.
 
   Reuse `bufpool` before adding a pool; a new one stores pointers
