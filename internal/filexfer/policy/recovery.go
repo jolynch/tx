@@ -18,6 +18,9 @@ const (
 	maxCheckFrames      = 4
 )
 
+// MaxCheckFrames is the most frames a check sends in its candidate codec.
+const MaxCheckFrames = maxCheckFrames
+
 // checkZ is how many standard errors of the check frames' mean above the
 // bar end a check before maxCheckFrames. A single noisy frame must not
 // restore a codec the candidate beats: each restore backs off the next
@@ -96,6 +99,25 @@ func (b *RecoveryBudget) Observe(loss, elapsed time.Duration) {
 // RecoveryActive includes validation, whose final frame can still incur debt.
 func (p *CompressionPolicy) RecoveryActive() bool {
 	return p.shadow.phase == phaseCheck || p.shadow.validatingCheck()
+}
+
+// CheckRunning reports a check sending its candidate codec, past its
+// baseline frames.
+func (p *CompressionPolicy) CheckRunning() bool {
+	return p.shadow.phase == phaseCheck && p.trial != p.home
+}
+
+// Home returns the codec the policy settled on, which a check measures its
+// candidate against.
+func (p *CompressionPolicy) Home() CompressionMode { return p.home }
+
+// CheckFrameLoss is the recovery loss of a check frame the check did not
+// observe: its time over the baseline of the policy's last check.
+func (p *CompressionPolicy) CheckFrameLoss(m CompressionMetrics) time.Duration {
+	if p.shadow.priorCost <= 0 {
+		return 0
+	}
+	return p.recoveryLoss(m, false)
 }
 
 func (p *CompressionPolicy) requestRecovery() {

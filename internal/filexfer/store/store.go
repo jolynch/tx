@@ -112,11 +112,14 @@ type managedTransfer struct {
 	hashMu       sync.Mutex
 	windowHashes map[windowHashKey]windowHashState
 
-	// compMu guards compression alone: the adaptive state of files whose
-	// SEND spans several windows, dropped when the file is Done or the
-	// transfer ends. Lock order: mu, then compMu.
+	// compMu guards compression alone: the adaptive state chains of files
+	// whose SEND spans several windows, dropped when the file is Done or
+	// Missing or the transfer ends. Lock order: mu, then compMu.
 	compMu      sync.Mutex
-	compression map[uint64]policy.FileCompression
+	compression map[uint64]*policy.FileChain
+	// chainSlab holds the chains allocated for files that have none yet;
+	// compMu guards it.
+	chainSlab []policy.FileChain
 	// rates totals the transfer's adaptive windows for its completion log,
 	// and ratedFiles holds the files it has counted; compMu guards both.
 	rates      RateSummary
@@ -1107,20 +1110,17 @@ func (s *Store) SetTransferFileWindowHashes(txferID string, hashes []WindowHash)
 }
 
 // WindowRecords is what one SEND leaves for its transfer: its window
-// hashes, its files' compression state, and its adaptive windows' rates.
+// hashes and its adaptive windows' rates.
 // RatedFiles lists the files whose first window is among them; the store
 // counts each file once, however often its first window is sent.
 type WindowRecords struct {
-	Hashes      []WindowHash
-	Compression []FileCompressionUpdate
-	Rates       RateSummary
-	RatedFiles  []uint64
+	Hashes     []WindowHash
+	Rates      RateSummary
+	RatedFiles []uint64
 }
 
-// RecordTransferWindows records a SEND's window hashes, its files'
-// compression state, and its rate summary under one acquisition of the
-// transfer's locks. A compression update for a file that is Done or Missing,
-// or out of range, is skipped without an error. It reports false as
+// RecordTransferWindows records a SEND's window hashes and its rate summary
+// under one acquisition of the transfer's locks. It reports false as
 // SetTransferFileWindowHashes does.
 func (s *Store) RecordTransferWindows(txferID string, rec WindowRecords) bool {
 	hashes := rec.Hashes
@@ -1135,7 +1135,7 @@ func (s *Store) RecordTransferWindows(txferID string, rec WindowRecords) bool {
 		return false
 	}
 	ok = true
-	managed.saveCompressionLocked(rec.Compression, rec.Rates, rec.RatedFiles)
+	managed.saveRatesLocked(rec.Rates, rec.RatedFiles)
 	managed.hashMu.Lock()
 	defer managed.hashMu.Unlock()
 	for _, h := range hashes {

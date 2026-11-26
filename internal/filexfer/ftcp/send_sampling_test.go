@@ -380,6 +380,60 @@ func TestSendSamplingDiscoversZstdPastLz4(t *testing.T) {
 	}
 }
 
+// A window reports Sampled only when a frame that reached the policy used a
+// sample. Holding the chain from the first frame with a sample leaves that
+// frame and the rest unfed, so the window discards its samples and reports
+// none. Until then home is none, and every sample includes lz4, which sets
+// SniffRatio.
+func TestSendWindowSampledOnlyWhenFed(t *testing.T) {
+	pattern := make([]byte, 128<<10)
+	rand.New(rand.NewSource(91)).Read(pattern)
+	data := bytes.Repeat(pattern, 640) // 80 MiB
+	pace := int64(10)
+	if raceEnabled {
+		pace = 80
+	}
+	for _, hold := range []bool{true, false} {
+		t.Run(fmt.Sprintf("hold=%v", hold), func(t *testing.T) {
+			pinSampleCost(t, 0)
+			deps, tid, path := multiWindowFile(t, data)
+			chain := fileChain(deps, tid, 1, true)
+			sampled, held := 0, false
+			sendFrameMetricsHook = func(m policy.CompressionMetrics) {
+				if m.SniffRatio == 0 {
+					return
+				}
+				sampled++
+				if hold && !held {
+					held = chain.TryHold() != nil
+				}
+			}
+			t.Cleanup(func() {
+				sendFrameMetricsHook = nil
+				if held {
+					chain.Release()
+				}
+			})
+			refs, errs := deps.GetFileRefs(tid, []FileLookup{{FileID: 1, Path: path}})
+			if errs[0] != nil {
+				t.Fatal(errs[0])
+			}
+			item := sendItem{FileID: 1, Size: int64(len(data)), Comp: "adapt", Path: path}
+			out := unbufferedSendOutput(&rateWriter{w: io.Discard, nsPerByte: pace})
+			sent, err := streamSendWindow(context.Background(), out, deps, tid, item, refs[0], chain, defaultZeroCopyMinFrameBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sampled == 0 || hold && !held {
+				t.Fatalf("frames with a sample: %d, chain held: %v", sampled, held)
+			}
+			if sent.rate.Sampled == hold {
+				t.Fatalf("Sampled = %v with the chain held from the first sample: %v", sent.rate.Sampled, hold)
+			}
+		})
+	}
+}
+
 // Errors and cancellation are discarded observations, not transfer errors.
 // Both return the admitted slot and pooled input without publishing a hint.
 func TestSendSamplingDiscardsFailedOrCanceledResults(t *testing.T) {
@@ -571,8 +625,7 @@ func testRecoveryAcrossTCPWindows(t *testing.T, buffer int) {
 			LogicalSize: defaultFileFrameLogicalSize, WireSize: defaultFileFrameLogicalSize / 3,
 			PrepareLatency: time.Millisecond, WriteLatency: 400 * time.Millisecond}, nil)
 	}
-	deps.RecordTransferWindows(tid, WindowRecords{Compression: []FileCompressionUpdate{{FileID: 1,
-		State: policy.FileCompression{Mode: policy.CompressionModeZstdLevel1, Policy: *p}}}})
+	storeFileCompression(t, deps, tid, 1, policy.FileCompression{Mode: policy.CompressionModeZstdLevel1, Policy: *p})
 	server, client := newTCPPair(t)
 	t.Cleanup(func() { _ = server.Close(); _ = client.Close() })
 	for _, c := range []*net.TCPConn{server, client} {
@@ -653,13 +706,11 @@ func testRecoveryAcrossTCPWindows(t *testing.T, buffer int) {
 		t.Fatal(errs[0])
 	}
 	for first := 1; first <= frames; first++ {
-		sent, err := streamSendItem(context.Background(), out, deps, tid,
-			sendItem{FileID: 1, Offset: int64(first) * defaultFileFrameLogicalSize, Size: defaultFileFrameLogicalSize, Comp: "adapt", Path: path}, refs[0], 0)
-		if err != nil {
+		if _, err := streamSendItem(context.Background(), out, deps, tid,
+			sendItem{FileID: 1, Offset: int64(first) * defaultFileFrameLogicalSize, Size: defaultFileFrameLogicalSize, Comp: "adapt", Path: path}, refs[0], 0); err != nil {
 			t.Fatal(err)
 		}
-		applyWindowState(deps, tid, sent)
-		if err = out.Flush(); err != nil {
+		if err := out.Flush(); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -684,8 +735,7 @@ func TestRecoveryTerminalFrameChargesLoss(t *testing.T) {
 	if !p.RecoveryActive() {
 		t.Fatal("setup did not request a check")
 	}
-	deps.RecordTransferWindows(tid, WindowRecords{Compression: []FileCompressionUpdate{{FileID: 1,
-		State: policy.FileCompression{Mode: d.Next, Policy: *p}}}})
+	storeFileCompression(t, deps, tid, 1, policy.FileCompression{Mode: d.Next, Policy: *p})
 	refs, errs := deps.GetFileRefs(tid, []FileLookup{{FileID: 1, Path: path}})
 	if errs[0] != nil {
 		t.Fatal(errs[0])
@@ -803,8 +853,7 @@ func TestRecoveryMeasuresFastResponseFlush(t *testing.T) {
 			p, _, d := zstdRecoveryBaseline(t)
 			data := compressibleBytes(12 * defaultFileFrameLogicalSize)
 			deps, tid, path := multiWindowFile(t, data)
-			deps.RecordTransferWindows(tid, WindowRecords{Compression: []FileCompressionUpdate{{FileID: 1,
-				State: policy.FileCompression{Mode: d.Next, Policy: *p}}}})
+			storeFileCompression(t, deps, tid, 1, policy.FileCompression{Mode: d.Next, Policy: *p})
 			req, err := ParseRequest([]byte("SEND " + tid + " mode=fast"))
 			if err != nil {
 				t.Fatal(err)
@@ -879,7 +928,7 @@ func TestRecoveryMeasuresFastResponseFlush(t *testing.T) {
 			if o := observations[2]; o.WireSize != o.LogicalSize {
 				t.Fatalf("check frame was not none: %+v", o)
 			}
-			if st, _ := deps.LoadFileCompression(tid, 1); st.Mode != policy.CompressionModeZstdLevel1 {
+			if st, _ := loadFileCompression(deps, tid, 1); st.Mode != policy.CompressionModeZstdLevel1 {
 				t.Fatalf("a check of none slower on the wire kept mode %v, want zstd restored", st.Mode)
 			}
 			if budget.Ready() {
@@ -923,8 +972,7 @@ func TestRecoveryFlushTimesOnlyItsFrame(t *testing.T) {
 	if d.Reason != "recovery-baseline" {
 		t.Fatalf("no baseline: %+v", d)
 	}
-	deps.RecordTransferWindows(tid, WindowRecords{Compression: []FileCompressionUpdate{{FileID: 1,
-		State: policy.FileCompression{Mode: d.Next, Policy: *p}}}})
+	storeFileCompression(t, deps, tid, 1, policy.FileCompression{Mode: d.Next, Policy: *p})
 	req, err := ParseRequest([]byte("SEND " + tid + " mode=fast"))
 	if err != nil {
 		t.Fatal(err)
@@ -992,8 +1040,7 @@ func TestRecoveryMeasuresAuthenticatedFlush(t *testing.T) {
 			frames, wireCost := tc.frames, tc.wireCost
 			data := compressibleBytes(10 * defaultFileFrameLogicalSize)
 			deps, tid, path := multiWindowFile(t, data)
-			deps.RecordTransferWindows(tid, WindowRecords{Compression: []FileCompressionUpdate{{FileID: 1,
-				State: policy.FileCompression{Mode: d.Next, Policy: *p}}}})
+			storeFileCompression(t, deps, tid, 1, policy.FileCompression{Mode: d.Next, Policy: *p})
 			refs, errs := deps.GetFileRefs(tid, []FileLookup{{FileID: 1, Path: path}})
 			if errs[0] != nil {
 				t.Fatal(errs[0])
@@ -1022,7 +1069,7 @@ func TestRecoveryMeasuresAuthenticatedFlush(t *testing.T) {
 			out.frameFlush = writer.FlushFunc()
 			out.ownRate.src = &sendRateSource{}
 			rec := recordFrameMetrics(t)
-			sent, err := streamSendItem(context.Background(), out, deps, tid, sendItem{
+			_, err = streamSendItem(context.Background(), out, deps, tid, sendItem{
 				FileID: 1, Offset: defaultFileFrameLogicalSize, Size: int64(frames) * defaultFileFrameLogicalSize,
 				Comp: "adapt", Path: path, Mode: loadStrategyGentle}, refs[0], 0)
 			if err != nil {
@@ -1058,15 +1105,15 @@ func TestRecoveryMeasuresAuthenticatedFlush(t *testing.T) {
 					t.Fatalf("flush wait %v missing from frame metrics: %+v", wait, observed)
 				}
 			}
-			if !sent.hasComp {
-				t.Fatal("baseline frames left no compression state")
+			if st, _ := loadFileCompression(deps, tid, 1); st.Policy == *p {
+				t.Fatal("baseline frames left the file's state as it was")
 			}
 			if tc.name == "check" {
 				if o := observations[2]; o.WireSize != o.LogicalSize {
 					t.Fatalf("check frame was not none: %+v", o)
 				}
-				if sent.comp.State.Mode != policy.CompressionModeZstdLevel1 {
-					t.Fatalf("a check of none slower on the wire kept mode %v, want zstd restored", sent.comp.State.Mode)
+				if st, _ := loadFileCompression(deps, tid, 1); st.Mode != policy.CompressionModeZstdLevel1 {
+					t.Fatalf("a check of none slower on the wire kept mode %v, want zstd restored", st.Mode)
 				}
 				if out.rate.recoveryReady() {
 					t.Fatal("the losing check charged nothing to the server's budget")
@@ -1091,7 +1138,7 @@ func TestSendFailedFlushLeavesNoObservation(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("flush error = %v, want cancellation", err)
 	}
-	if len(rec.snapshot()) != 0 || sent.decided || sent.hasComp || sent.hash.HashToken != "" {
+	if st, _ := loadFileCompression(deps, tid, 1); len(rec.snapshot()) != 0 || sent.decided || st != (policy.FileCompression{}) || sent.hash.HashToken != "" {
 		t.Fatalf("failed flush became a completed observation: %+v", sent)
 	}
 	if !out.rate.recoveryReady() {

@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unsafe"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/policy"
@@ -50,32 +49,32 @@ func TestFileCompressionRoundTrip(t *testing.T) {
 	s := newTestStore(t)
 	id := fileCompressionFixture(t, s)
 
-	if _, ok := s.LoadFileCompression(id, 1); ok {
+	if _, ok := loadFileCompression(s, id, 1); ok {
 		t.Fatalf("Load before any Save reported a hit")
 	}
-	if _, ok := s.LoadFileCompression("no-such-transfer", 1); ok {
+	if _, ok := loadFileCompression(s, "no-such-transfer", 1); ok {
 		t.Fatalf("Load on an unknown transfer reported a hit")
 	}
-	if _, ok := s.LoadFileCompression(id, 99); ok {
+	if _, ok := loadFileCompression(s, id, 99); ok {
 		t.Fatalf("Load on an unknown file reported a hit")
 	}
 
 	want := sampleFileCompression()
 	saveFileCompression(s, id, 1, want)
-	got, ok := s.LoadFileCompression(id, 1)
+	got, ok := loadFileCompression(s, id, 1)
 	if !ok {
 		t.Fatalf("Load after Save reported a miss")
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("round trip changed the state:\n got %+v\nwant %+v", got, want)
 	}
-	if _, ok := s.LoadFileCompression(id, 2); ok {
+	if _, ok := loadFileCompression(s, id, 2); ok {
 		t.Fatalf("Save for file 1 is visible to file 2")
 	}
 
 	// A caller owns its copy: changing it must not change the stored state.
 	got.Mode = policy.CompressionModeZstdDefault
-	again, _ := s.LoadFileCompression(id, 1)
+	again, _ := loadFileCompression(s, id, 1)
 	if !reflect.DeepEqual(again, want) {
 		t.Fatalf("mutating a loaded copy changed the stored state")
 	}
@@ -83,13 +82,13 @@ func TestFileCompressionRoundTrip(t *testing.T) {
 	// The last Save wins.
 	next := policy.FileCompression{Mode: policy.CompressionModeNone, Policy: *policy.NewCompressionPolicy()}
 	saveFileCompression(s, id, 1, next)
-	if got, _ := s.LoadFileCompression(id, 1); !reflect.DeepEqual(got, next) {
+	if got, _ := loadFileCompression(s, id, 1); !reflect.DeepEqual(got, next) {
 		t.Fatalf("second Save did not replace the first: %+v", got)
 	}
 
 	// Save for an unknown transfer is a no-op and must not panic.
 	saveFileCompression(s, "no-such-transfer", 1, want)
-	if _, ok := s.LoadFileCompression("no-such-transfer", 1); ok {
+	if _, ok := loadFileCompression(s, "no-such-transfer", 1); ok {
 		t.Fatalf("Save created state for an unknown transfer")
 	}
 }
@@ -115,19 +114,19 @@ func TestFileCompressionDroppedWhenFileDone(t *testing.T) {
 
 			// A partial ACK is not completion.
 			s.AcknowledgeTransferFile(id, 1, 4)
-			if _, ok := s.LoadFileCompression(id, 1); !ok {
+			if _, ok := loadFileCompression(s, id, 1); !ok {
 				t.Fatalf("state dropped by a partial ack")
 			}
 
 			tc.done(s, id)
-			if _, ok := s.LoadFileCompression(id, 1); ok {
+			if _, ok := loadFileCompression(s, id, 1); ok {
 				t.Fatalf("state still present after file became Done")
 			}
-			if _, ok := s.LoadFileCompression(id, 2); !ok {
+			if _, ok := loadFileCompression(s, id, 2); !ok {
 				t.Fatalf("state of an unfinished file was dropped")
 			}
 			saveFileCompression(s, id, 1, st)
-			if _, ok := s.LoadFileCompression(id, 1); ok {
+			if _, ok := loadFileCompression(s, id, 1); ok {
 				t.Fatalf("Save on a Done file stored state")
 			}
 		})
@@ -179,88 +178,142 @@ func TestFileCompressionDroppedWhenFileMissing(t *testing.T) {
 	saveFileCompression(s, id, 2, sampleFileCompression())
 
 	s.AcknowledgeTransferFile(id, 1, -1)
-	if _, ok := s.LoadFileCompression(id, 1); ok {
+	if _, ok := loadFileCompression(s, id, 1); ok {
 		t.Fatalf("state still present after the file went Missing")
 	}
-	if _, ok := s.LoadFileCompression(id, 2); !ok {
+	if _, ok := loadFileCompression(s, id, 2); !ok {
 		t.Fatalf("state of another file was dropped")
 	}
 	saveFileCompression(s, id, 1, sampleFileCompression())
-	if _, ok := s.LoadFileCompression(id, 1); ok {
+	if _, ok := loadFileCompression(s, id, 1); ok {
 		t.Fatalf("Save on a Missing file stored state")
 	}
 
 	// A partial ACK revives the file as Running; it has no state to resume.
 	s.AcknowledgeTransferFile(id, 1, 4)
-	if _, ok := s.LoadFileCompression(id, 1); ok {
+	if _, ok := loadFileCompression(s, id, 1); ok {
 		t.Fatalf("revived file kept state from before it went Missing")
 	}
 	saveFileCompression(s, id, 1, sampleFileCompression())
-	if _, ok := s.LoadFileCompression(id, 1); !ok {
+	if _, ok := loadFileCompression(s, id, 1); !ok {
 		t.Fatalf("Save on a revived file was rejected")
 	}
 }
 
-// The state is a map value, and Go stores map values inline only up to 128
-// bytes; a larger one is boxed and allocates on every insert.
-func TestFileCompressionFitsInlineMapValue(t *testing.T) {
-	if n := unsafe.Sizeof(policy.FileCompression{}); n > 128 {
-		t.Fatalf("policy.FileCompression is %d bytes, over Go's 128-byte inline map value limit", n)
+// A take for a file before the create that makes its chain, in the same
+// request, still gets the chain.
+func TestFileCompressionChainsOrderFree(t *testing.T) {
+	s := newTestStore(t)
+	id := fileCompressionFixture(t, s)
+	reqs := []ChainRequest{{FileID: 1}, {FileID: 1, Create: true}}
+	s.FileCompressionChains(id, reqs)
+	if reqs[0].Chain == nil || reqs[0].Chain != reqs[1].Chain {
+		t.Fatalf("take, create got %p, %p; want one chain for both", reqs[0].Chain, reqs[1].Chain)
 	}
 }
 
-// Load and Save are per window, but they must not allocate: the state is
-// copied by value. That holds for an existing entry, and for an entry saved
-// again after its file's entry was dropped, since the map keeps its buckets.
-func TestFileCompressionDoesNotAllocate(t *testing.T) {
+// Resolving a request's chains is per request, but it must not allocate once
+// the chains exist, with or without create, and holding one never does. A
+// take for a file without a chain gets none.
+func TestFileCompressionChainDoesNotAllocate(t *testing.T) {
 	s := newTestStore(t)
 	id := fileCompressionFixture(t, s)
-	st := sampleFileCompression()
-	saveFileCompression(s, id, 1, st) // inserting the first entry allocates the map
-	managed, _ := s.getManagedTransfer(id)
-	updates := []FileCompressionUpdate{{FileID: 1, State: st}}
-
-	if n := testing.AllocsPerRun(100, func() { s.RecordTransferWindows(id, WindowRecords{Compression: updates}) }); n != 0 {
-		t.Fatalf("Save on an existing entry allocated %v times per call", n)
+	saveFileCompression(s, id, 1, sampleFileCompression()) // creates the map and the chain
+	saveFileCompression(s, id, 2, sampleFileCompression())
+	reqs := []ChainRequest{{FileID: 1}, {FileID: 2, Create: true}, {FileID: 3}}
+	if n := testing.AllocsPerRun(100, func() { s.FileCompressionChains(id, reqs) }); n != 0 {
+		t.Fatalf("resolving existing chains allocated %v times per request", n)
 	}
-	if n := testing.AllocsPerRun(100, func() {
-		managed.dropFileCompression(1)
-		s.RecordTransferWindows(id, WindowRecords{Compression: updates})
-	}); n != 0 {
-		t.Fatalf("Save after a drop allocated %v times per call", n)
+	if reqs[0].Chain == nil || reqs[1].Chain == nil || reqs[2].Chain != nil {
+		t.Fatalf("chains = %v, %v, %v; want the first two only", reqs[0].Chain, reqs[1].Chain, reqs[2].Chain)
 	}
+	c := reqs[0].Chain
 	var sink policy.FileCompression
-	if n := testing.AllocsPerRun(100, func() { sink, _ = s.LoadFileCompression(id, 1) }); n != 0 {
-		t.Fatalf("Load on an existing entry allocated %v times per call", n)
+	if n := testing.AllocsPerRun(100, func() {
+		if st := c.TryHold(); st != nil {
+			sink = *st
+			c.Release()
+		}
+	}); n != 0 {
+		t.Fatalf("holding a chain allocated %v times per call", n)
 	}
 	_ = sink
 }
 
-// saveFileCompression saves one file's state the way a SEND does, with its
-// request's window hashes.
-func saveFileCompression(s *Store, txferID string, fileID uint64, st policy.FileCompression) {
-	s.RecordTransferWindows(txferID, WindowRecords{Compression: []FileCompressionUpdate{{FileID: fileID, State: st}}})
+// Chains come from a per-transfer slab: creating one, including again after
+// its file's chain was dropped, allocates only when a slab runs out. A
+// re-created chain is a new one, never the dropped chain, which a window may
+// still hold.
+func TestFileChainSlab(t *testing.T) {
+	s := newTestStore(t)
+	id := fileCompressionFixture(t, s)
+	managed, _ := s.getManagedTransfer(id)
+	reqs := [1]ChainRequest{{FileID: 1, Create: true}}
+	s.FileCompressionChains(id, reqs[:]) // allocates the map and a slab
+	seen := map[*policy.FileChain]bool{reqs[0].Chain: true}
+	recreate := func() {
+		managed.mu.Lock()
+		managed.dropFileCompression(1)
+		managed.mu.Unlock()
+		reqs[0].Chain = nil
+		s.FileCompressionChains(id, reqs[:])
+	}
+	// AllocsPerRun runs once more to warm up; stay within the first slab.
+	if n := testing.AllocsPerRun(chainSlabSize-3, recreate); n != 0 {
+		t.Fatalf("re-creating a dropped chain allocated %v times per call", n)
+	}
+	for range 2 * chainSlabSize {
+		recreate()
+		if c := reqs[0].Chain; c == nil || seen[c] {
+			t.Fatalf("re-created chain %p is nil or reused", c)
+		}
+		seen[reqs[0].Chain] = true
+	}
 }
 
-// A save for a file ID the transfer does not hold is ignored.
+// saveFileCompression sets one file's shared state, as a window's decided
+// frame does, creating its chain when the store allows one.
+func saveFileCompression(s *Store, txferID string, fileID uint64, st policy.FileCompression) {
+	reqs := [1]ChainRequest{{FileID: fileID, Create: true}}
+	s.FileCompressionChains(txferID, reqs[:])
+	c := reqs[0].Chain
+	if c == nil {
+		return
+	}
+	held := c.TryHold()
+	*held = st
+	c.Release()
+}
+
+// loadFileCompression returns a copy of one file's shared state, and false
+// when the file has no chain.
+func loadFileCompression(s *Store, txferID string, fileID uint64) (policy.FileCompression, bool) {
+	reqs := [1]ChainRequest{{FileID: fileID}}
+	s.FileCompressionChains(txferID, reqs[:])
+	c := reqs[0].Chain
+	if c == nil {
+		return policy.FileCompression{}, false
+	}
+	held := c.TryHold()
+	st := *held
+	c.Release()
+	return st, true
+}
+
+// No chain is created for a file ID the transfer does not hold.
 func TestFileCompressionSaveOutOfRangeIsNoOp(t *testing.T) {
 	s := newTestStore(t)
 	id := fileCompressionFixture(t, s)
 	st := sampleFileCompression()
 	for _, fileID := range []uint64{4, 99, 1 << 40, ^uint64(0)} {
 		saveFileCompression(s, id, fileID, st)
-		if _, ok := s.LoadFileCompression(id, fileID); ok {
+		if _, ok := loadFileCompression(s, id, fileID); ok {
 			t.Fatalf("state stored for out-of-range file %d", fileID)
 		}
 	}
 	managed, _ := s.getManagedTransfer(id)
 	if managed.compression != nil {
 		t.Fatalf("%d entries after out-of-range saves", len(managed.compression))
-	}
-	// An in-range update in the same batch is still stored.
-	s.RecordTransferWindows(id, WindowRecords{Compression: []FileCompressionUpdate{{FileID: 99, State: st}, {FileID: 2, State: st}}})
-	if got, ok := s.LoadFileCompression(id, 2); !ok || got != st {
-		t.Fatalf("in-range update lost beside an out-of-range one")
 	}
 }
 
@@ -366,7 +419,7 @@ func TestFileCompressionLoadReturnsSavedPolicy(t *testing.T) {
 		t.Fatalf("sample policy equals a fresh one")
 	}
 	saveFileCompression(s, id, 1, want)
-	got, ok := s.LoadFileCompression(id, 1)
+	got, ok := loadFileCompression(s, id, 1)
 	if !ok || got != want {
 		t.Fatalf("loaded %+v, %v; want %+v", got, ok, want)
 	}
@@ -386,14 +439,14 @@ func TestFileCompressionDroppedWhenRegisteredDone(t *testing.T) {
 	}
 
 	s.RegisterTransferFileStates(id, update(2), TransferStateRunning)
-	if _, ok := s.LoadFileCompression(id, 2); !ok {
+	if _, ok := loadFileCompression(s, id, 2); !ok {
 		t.Fatalf("state dropped by a registration below Done")
 	}
 	s.RegisterTransferFileStates(id, update(1), TransferStateDone)
-	if _, ok := s.LoadFileCompression(id, 1); ok {
+	if _, ok := loadFileCompression(s, id, 1); ok {
 		t.Fatalf("state survived registering the file Done")
 	}
-	if _, ok := s.LoadFileCompression(id, 2); !ok {
+	if _, ok := loadFileCompression(s, id, 2); !ok {
 		t.Fatalf("state of another file was dropped")
 	}
 }

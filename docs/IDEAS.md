@@ -6,6 +6,13 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Bugs
 
+- **Some recovery losses of chained windows go uncharged.** A validation
+  frame whose decision is skipped because another window holds the chain
+  is never charged its validation loss, and a claimed check frame whose
+  window exits on an error goes back to the chain uncharged. Both
+  undercharge the recovery budget slightly. Charging them from the
+  window's view of the policy, as `settleCheckFrame` does for lost check
+  frames, would close the gap.
 - **A background-sync growth can go unlogged.** After dispatching a batch,
   `backgroundSyncer.run` updates the threshold with a nil `stderr`
   (`internal/fsync/fsync.go`). When pending bytes grew meanwhile, that call
@@ -160,6 +167,14 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Performance
 
+- **A SEND frame's offset escapes to the heap.** `go build -gcflags=-m
+  ./internal/filexfer/ftcp/` reports `moved to heap: frameOffset` in
+  `streamSendWindow` (send.go), one allocation per frame, because the
+  frame streamers take `&frameOffset`. The terminal frame's metadata (`md`)
+  and `maxWSizeHint` escape too, once per window, which for small files
+  is once per file. Returning the next offset
+  in `frameStreamStats` instead of through a pointer would keep them on the
+  stack; lock it in with an allocation test over a multi-frame window.
 - **Let socket buffers autotune.** The client sets `SO_RCVBUF` to
   `max(rmem_max, 4 MiB)` (`client_tcp.go`, default from
   `MaxSocketReadBufferBytes`), and the server sets `SO_SNDBUF`
@@ -333,28 +348,35 @@ instead of widening the current change; remove an entry when it ships.
   checks against 71% with an exact bar (47% against 84% at 0.1 jitter).
   More baseline frames when the first two clear the bound would recover
   some of that at no cost otherwise.
-- **Large files sent as small windows rarely adapt.** The CLI's batch is
-  often 4 MiB, so a large file goes out as one-frame windows, two or more of
-  them in flight at once.
+- **Large files sent as small windows rarely get samples.** A file's
+  windows share one policy chain, so its frames advance one policy however
+  many windows are in flight. In `TestSendConcurrentSmallWindowsAdapt`
+  (64 one-frame windows, 8 in flight, a 20 ns/byte link) the file switches
+  at about frame 25 and sends about 80% of its second half compressed.
+  Codec samples bound adaptation:
+  - Sample slots (`sendSampleSlots`, a quarter of GOMAXPROCS, at least two)
+    stay held until the frame that requested the sample ends, which on a
+    shared slow link is the longest step. In tx-bench local with
+    `--bwlimit 50MiB`, 4 files of 57 to 117 MiB as 8 MiB windows on 16
+    connections on 4 CPUs, each frame takes about 1.2 s, and 6 or 7 of 44
+    adaptive windows got a sample; one file of four switched in one run of
+    three. With 8 slots and 4 workers (GOMAXPROCS=32) two files switched
+    to zstd; releasing a slot and its input copy when the sample finishes,
+    so a waiting result holds neither, raised samples to 22 and switched
+    one file. `TestSendSamplingWorkerAndResultBudgets` currently requires
+    a waiting result to keep its slot.
   - A window's background sample is abandoned when the window ends. Unless
-    the sample finishes during that one frame, as it does only on slow links,
-    the window never uses it. In memxfer's 1 MiB windows over loopback, 94
-    windows used no sample.
-  - The client keeps a sliding window of a file's windows in flight, and
-    each new one loads the state the last finished window saved. With W in
-    flight, the state forms W interleaved chains, each advancing one frame
-    every W windows, and the last save wins. With 16 MiB windows on two
-    connections, a 48 MiB file never switched.
-  - Seeding a file from its connection's link estimate cuts a chain's
-    warm-up to four winning samples, so 16 MiB windows, 16 in flight, can
-    compress about half of each chain's eight frames.
-  - Waiting a bounded time (about the last sample's cost) for a running
-    sample before a window that saves state ends would fix the first. The
-    rest needs windows of a file to share or chain their state.
-  - The cost is large where compression pays. In a policy simulation of
-    one 4 GiB file on a 32 MiB/s link with zstd at 3:1, 16 concurrent
-    16-frame windows ran 19% slower than zstd throughout, against 1% for
-    one stream, because each window relearned from none.
+    the sample finishes during the window, the window never uses it. In
+    memxfer's 1 MiB windows over loopback, 94 windows used no sample.
+    Waiting a bounded time (about the last sample's cost) for a running
+    sample before such a window ends would fix it.
+  - A sample taken for a frame whose decision is skipped, because another
+    window holds the chain or the chain's codec has moved on, is discarded
+    though its CPU is already spent. Holding it for the window's next fed
+    frame, or handing it to the chain, would keep it.
+  - Windows in flight commit to their codec when their frame starts, so a
+    switch reaches the wire W frames late. A check claims its frames from
+    the chain, so it has at most four none frames in flight.
 - **Mix a codec with none when CPU binds.** When a codec is CPU-bound below
   what the wire could carry, sending part of the traffic uncompressed fills
   the idle wire. In the CLOUD.md model of lz4-compressed segment files on
@@ -491,8 +513,9 @@ instead of widening the current change; remove an entry when it ships.
     loopback work. A single grid cell can vary by 45% between runs, so judge
     a change with interleaved A/B runs on pinned cores, not one grid.
   - About 25 allocations per 4 KiB file remain. `CollectFileFrameMetadata`
-    formats mode, uid, and gid as strings (4 per file); `streamSendItem`
-    moves `maxWSizeHint`, `md`, and `frameOffset` to the heap; the client
+    formats mode, uid, and gid as strings (4 per file); `streamSendWindow`
+    moves its frame offset and metadata to the heap (see "A SEND frame's
+    offset escapes to the heap"); the client
     reads each frame's header and trailer with `ReadString`, which also has
     no length bound; and `buildAckToken` builds each ACK token as a string
     before copying it into the request body.
@@ -524,6 +547,22 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Testing
 
+- **`TestAdaptiveUnderRateFaults/slow_link` flakes under load.** In a full
+  `go test ./...` it once compressed 25% of bytes against its 30% floor; alone
+  it compresses 50%. Its files go as one window each, so the share depends on
+  how soon CPU-starved samples land. Repro: run `go test ./...` and look for
+  `compressed 25% of bytes, want 30% to 100%`.
+- **`TestServeOpenServerReturnsPermits` flakes under load.** It failed once
+  in a full `go test ./...` with `permits leaked: server at handshake
+  capacity` and passes alone. Like `TestServeAdmissionBusy`, it dials right
+  after closing connections whose handshake permits the server may not have
+  returned yet; retrying each final dial until a deadline would fix it.
+- **`TestSendSamplingDiscoversZstdPastLz4/1-frame_windows` flakes.** It
+  fails with "zstd was never discovered" in about 1 run in 10 in isolation,
+  with or without shared window chains (3 of 30 and 2 of 30). A likely
+  cause: a one-frame window uses a sample only when it finishes inside the
+  frame, so slow samples leave zstd untried. Repro:
+  `go test -run 'TestSendSamplingDiscoversZstdPastLz4/1-frame_windows' -count=30 ./internal/filexfer/ftcp/`.
 - **`TestServeAdmissionBusy` flakes under load.** Its last loop dials four
   times in a row right after one dial succeeds, assuming every earlier
   connection has returned its handshake permit; on a saturated machine one

@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/jolynch/tx/internal/filexfer/limit"
-	"github.com/jolynch/tx/internal/filexfer/policy"
 )
 
 // Interface is the transfer-state contract consumers depend on. *Store is
@@ -40,17 +39,18 @@ type Interface interface {
 	AcknowledgeTransferFiles(entries []AckEntry) bool
 	SetTransferPageCache(txferID string, fileID uint64, blob []byte) bool
 
-	// Per-file adaptive compression state, kept across a file's windows.
-	// A SEND loads a window's state only when an earlier window preceded it
-	// (offset above zero) and saves it only when another window follows, so
-	// a single-window file never touches the store. Saves arrive with the
-	// request's window hashes in RecordTransferWindows, one lock acquisition
-	// per request; Load takes only the compression mutex. An entry is freed
-	// when its file turns Done or Missing and when the transfer is deleted
-	// or reaped; a save for a Done or Missing file is skipped. The same call
-	// adds the request's delivery-rate summary to the transfer's, which the
-	// completion log reports.
-	LoadFileCompression(txferID string, fileID uint64) (policy.FileCompression, bool)
+	// Per-file adaptive compression state, shared by a file's windows. A
+	// SEND resolves its windows' chains in one call before streaming: a
+	// window takes its file's chain only when another window precedes or
+	// follows it, so a single-window file never touches the store, and only
+	// a window that another follows creates one. The windows then decide
+	// each frame on their chains without the store's locks. A chain is
+	// dropped when its file turns Done or Missing and when the transfer is
+	// deleted or reaped, and none is created for a Done or Missing file.
+	// RecordTransferWindows records a request's window hashes and adds its
+	// delivery-rate summary to the transfer's, which the completion log
+	// reports, in one lock acquisition.
+	FileCompressionChains(txferID string, reqs []ChainRequest)
 	RecordTransferWindows(txferID string, rec WindowRecords) bool
 
 	// Deadlines, backing --exit-after.

@@ -2,6 +2,8 @@ package policy
 
 import (
 	"math"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jolynch/tx/internal/filexfer/encoding"
@@ -767,6 +769,108 @@ func FrameCompTokenForMode(mode CompressionMode) string {
 type FileCompression struct {
 	Mode   CompressionMode
 	Policy CompressionPolicy
+}
+
+// FileChain is one file's FileCompression, shared by every window of the
+// file in flight, so their frames advance one policy as a single stream's
+// would. Windows hold it only to decide a frame and never wait for it: a
+// window that finds it held skips that frame's decision. No I/O happens
+// under the hold. The zero value holds a fresh state. A FileChain must not
+// be copied.
+//
+// A check has at most maxCheckFrames frames in its candidate codec in
+// flight, however many windows send: when a check starts, the chain holds
+// that many check frames, and a window sends a frame in the candidate only
+// after it claims one (ClaimCheckFrame). Other windows send home's codec
+// meanwhile. A claimed frame the check did not observe goes back
+// (ReturnCheckFrame), so a check whose frames were lost to a held chain or
+// a failed window can still finish.
+type FileChain struct {
+	mu       sync.Mutex // taken only with TryLock
+	state    FileCompression
+	checking bool // state ran a check at the last Release; under mu
+	// checks holds the check's epoch in its high 32 bits and the check
+	// frames left to claim in its low 32. Every start and end of a check
+	// moves the epoch, so a frame returned late never credits another.
+	checks atomic.Uint64
+	// steady is the codec a window should send when it cannot hold the
+	// chain: home's while a check runs, the state's otherwise.
+	steady atomic.Uint32
+}
+
+// CheckClaim is one claimed check frame, or the zero value for none.
+type CheckClaim struct{ epoch uint32 }
+
+// Held reports whether the claim holds a check frame.
+func (c CheckClaim) Held() bool { return c.epoch != 0 }
+
+// TryHold returns the chain's state for the caller alone, or nil while
+// another window holds it. It never blocks. A caller that gets the state
+// must Release it.
+func (c *FileChain) TryHold() *FileCompression {
+	if c.mu.TryLock() {
+		return &c.state
+	}
+	return nil
+}
+
+// Release ends a hold that TryHold granted. A check that started under the
+// hold makes maxCheckFrames check frames claimable, and one that ended takes
+// back those left.
+func (c *FileChain) Release() {
+	checking := c.state.Policy.CheckRunning()
+	if checking != c.checking {
+		c.checking = checking
+		epoch := uint32(c.checks.Load()>>32) + 1
+		if epoch == 0 {
+			epoch = 1 // the zero epoch means no claim
+		}
+		n := uint64(0)
+		if checking {
+			n = maxCheckFrames
+		}
+		c.checks.Store(uint64(epoch)<<32 | n)
+	}
+	steady := c.state.Mode
+	if checking {
+		steady = c.state.Policy.home
+	}
+	if CompressionMode(c.steady.Load()) != steady {
+		c.steady.Store(uint32(steady))
+	}
+	c.mu.Unlock()
+}
+
+// SteadyMode returns the codec for a window that could not hold the chain:
+// home's while a check runs, the chain's otherwise. It never blocks.
+func (c *FileChain) SteadyMode() CompressionMode { return CompressionMode(c.steady.Load()) }
+
+// ClaimCheckFrame claims one of the running check's frames, or returns a
+// zero claim when none is left or no check runs. It never blocks.
+func (c *FileChain) ClaimCheckFrame() CheckClaim {
+	for {
+		v := c.checks.Load()
+		if uint32(v) == 0 {
+			return CheckClaim{}
+		}
+		if c.checks.CompareAndSwap(v, v-1) {
+			return CheckClaim{epoch: uint32(v >> 32)}
+		}
+	}
+}
+
+// ReturnCheckFrame gives back a claimed frame the check did not observe,
+// while the check that granted it still runs. It never blocks.
+func (c *FileChain) ReturnCheckFrame(claim CheckClaim) {
+	for claim.Held() {
+		v := c.checks.Load()
+		if uint32(v>>32) != claim.epoch || uint32(v) >= maxCheckFrames {
+			return
+		}
+		if c.checks.CompareAndSwap(v, v+1) {
+			return
+		}
+	}
 }
 
 func abs32(x float32) float32 {
