@@ -292,11 +292,17 @@ func handleSENDWithOptions(ctx context.Context, req Request, in io.Reader, out i
 	// requests stay unbuffered, so their rate limiters pace the socket writes
 	// themselves rather than writes into a buffer. A transport that batches
 	// writes, an authenticated session, already buffers into whole records.
+	// The server's --bwlimit paces a fast request's buffer flushes, and
+	// turns off its zero-copy frames, which would bypass the limiter.
 	inj := faults.FromContext(ctx)
-	resp := unbufferedSendOutput(out)
+	fastOut := out
+	if header.Mode != loadStrategyGentle && limiter.Config().RateBps > 0 {
+		fastOut = limiter.WrapRateLimitedWriter(out, ctx)
+	}
+	resp := unbufferedSendOutput(fastOut)
 	resp.recoveryFlush = transportFlusher(out)
 	if header.Mode != loadStrategyGentle && resp.recoveryFlush == nil {
-		resp = newBufferedSendOutput(out)
+		resp = newBufferedSendOutput(fastOut)
 		defer resp.release()
 		resp.recoveryFlush = resp.Flush
 	}

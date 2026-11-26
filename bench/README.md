@@ -99,7 +99,7 @@ smoke runs too.
 | `ssd-small` | 2 GiB of random data in 16 KiB files |
 | `ssd-large` | 40 GiB of random data in 2 GiB files |
 | `ssd-mixed` | 32 GiB split equally by bytes between random files and compressible Silesia files |
-| `ssd-compressible` | 12 GiB of Silesia data |
+| `ssd-compressible` | 12 GiB of Silesia data, sender capped at 50 MiB/s |
 
 The full Silesia recipes draw file sizes from 128 MiB to 1 GiB. The mixed
 recipe splits its random bytes between small files of 4 KiB to 256 KiB
@@ -107,7 +107,9 @@ and large files of 1 GiB. The [dataset guide](../docs/bench/DATASET.md#sources)
 describes the Silesia cache.
 
 Each workload runs three measured copies with the tested tx's compression
-and encryption defaults. Before each copy, the harness clears the
+and encryption defaults. The `ssd-compressible` sender runs with
+`--bwlimit 50MiB`: over loopback, sending uncompressed is fastest, so an
+uncapped copy never compresses. Before each copy, the harness clears the
 destination and evicts every source page it can. After timing, it runs
 full destination verification. Eviction is advisory, so if more than 10% of
 the source stays cached, the suite stops before that copy and records
@@ -153,4 +155,7 @@ Cases can share a chart ID and title to group related results. Keep case
 IDs stable across revisions of a workload and use a new ID for a distinct
 workload. Every case carries a `revision` for its kind
 (`suiteGoRevision`, `suiteGridRevision`, `suiteSSDRevision`). Bump it when
-harness code changes what that kind measures or how it times it.
+harness code changes what that kind measures or how it times it. A change
+to one case's `identity`, such as `send_bwlimit` on `ssd-compressible`, also
+starts a new series segment, so the revision stays reserved for harness
+changes to the whole kind.

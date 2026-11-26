@@ -188,9 +188,10 @@ Gentle mode's core choices:
 - **Probe:** throughput probing uses linear samples by default instead of
   fanning out across all server CPUs.
 - **Bandwidth:** each gentle `SEND` is wrapped in the per-transfer gentle
-  limiter derived from observed link bandwidth and `gentle-bw%`. If the server
-  has `--bwlimit`, that limiter also applies to gentle transfers. Fast
-  transfers do not respect the gentle bandwidth limiter.
+  limiter derived from observed link bandwidth and `gentle-bw%`. The server's
+  `--bwlimit` paces the file data of gentle and fast `SEND` responses alike,
+  in plaintext bytes before any AEAD record framing; other commands' responses
+  are not limited. Fast transfers do not use the gentle bandwidth limiter.
 - **Batching:** when the suggested concurrency is low, the planner reduces
   window concurrency and gives slots to whole-file downloads instead of
   fragmenting individual files. This avoids creating lots of tiny source reads.

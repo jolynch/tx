@@ -272,6 +272,34 @@ func TestSuiteSSDWorkloads(t *testing.T) {
 	}
 }
 
+// Only the compressible SSD copy caps its sender, and its copy command
+// passes the cap to tx send tree as one --send-arg pair. Capping a case
+// leaves the identity of the case it was built from unchanged.
+func TestSuiteCompressibleCopyCapsSender(t *testing.T) {
+	pair := []string{"--send-arg=--bwlimit", "--send-arg=" + suiteCompressibleBWLimit}
+	for _, profile := range []string{"smoke", "full"} {
+		for _, c := range suiteSettings(profile).SSD {
+			args := c.copyArgs("./tx", "fp", "m.json", "src", "dst")
+			i := slices.Index(args, pair[0])
+			capped := c.ID == "ssd-compressible"
+			if capped != (i >= 0) || capped && (i+1 >= len(args) || args[i+1] != pair[1]) {
+				t.Errorf("%s %s copy args %v: want the --bwlimit pair %v only for ssd-compressible", profile, c.ID, args, pair)
+			}
+			if got, ok := c.Identity["send_bwlimit"]; capped != ok || ok && got != suiteCompressibleBWLimit {
+				t.Errorf("%s %s identity send_bwlimit = %v, %v", profile, c.ID, got, ok)
+			}
+			if !slices.Equal(args[len(args)-4:], []string{"--metrics", "m.json", "src", "dst"}) {
+				t.Errorf("%s %s copy args end %v, want the metrics flag and the paths", profile, c.ID, args[len(args)-4:])
+			}
+		}
+	}
+	base := ssdCase("x", "X", "1MiB", "rand=100%@16KiB", suiteMiB)
+	_ = base.linkLimited("1MiB")
+	if _, ok := base.Identity["send_bwlimit"]; ok {
+		t.Fatal("linkLimited changed the identity of the case it copied")
+	}
+}
+
 func TestSuiteCopyResidency(t *testing.T) {
 	c := suiteSettings("smoke").SSD[0]
 	reference := &dataset.BenchJSON{Fingerprint: "f", Files: 1024, Bytes: c.Bytes}
