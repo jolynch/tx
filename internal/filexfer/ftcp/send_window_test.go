@@ -4,17 +4,21 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"errors"
 	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
 	"github.com/jolynch/tx/internal/filexfer/policy"
 	"github.com/jolynch/tx/internal/filexfer/store"
@@ -1023,31 +1027,12 @@ func TestHandleSENDFailedOnlyItemKeepsCompressionState(t *testing.T) {
 	}
 }
 
-// A window's next frame may go wide only after a frame that compressed below
-// wideCompressMaxBytesPerCoreSec; random and zero-filled data compress far
-// faster than that, so they stay on one goroutine.
-func TestCompressesSlowly(t *testing.T) {
-	const frame = 4 << 20
-	for _, tc := range []struct {
-		cpu  time.Duration
-		want bool
-	}{
-		{0, false},                      // uncompressed
-		{200 * time.Microsecond, false}, // random data through lz4: about 20 GiB/s
-		{1900 * time.Microsecond, false},
-		{2100 * time.Microsecond, true},
-		{8 * time.Millisecond, true}, // text through lz4: about 500 MiB/s
-	} {
-		if got := compressesSlowly(frame, tc.cpu); got != tc.want {
-			t.Errorf("compressesSlowly(4 MiB, %v) = %v, want %v", tc.cpu, got, tc.want)
-		}
-	}
-}
-
-// A compressed frame reports its encoder's CPU estimate so the window can
-// decide the next frame's width; an uncompressed one reports none.
-func TestBufferedFrameReportsCompressCPU(t *testing.T) {
-	data := wordyBytes(1 << 20)
+// A compressed frame reports its encoder's wall time and goroutines so the
+// window can decide the next frame's width; an uncompressed one reports
+// neither. A narrow frame uses one goroutine; a wide 4 MiB lz4 frame on an
+// idle budget uses more.
+func TestBufferedFrameReportsCompressConcurrency(t *testing.T) {
+	data := wordyBytes(int(defaultFileFrameLogicalSize))
 	path := writeTempSendFile(t, data)
 	for _, comp := range []string{"none", encoding.EncodingLz4, encoding.EncodingZstd} {
 		for _, wide := range []bool{false, true} {
@@ -1065,9 +1050,99 @@ func TestBufferedFrameReportsCompressCPU(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s wide=%v: %v", comp, wide, err)
 			}
-			if (stats.CompressCPU > 0) != (comp != "none") {
-				t.Errorf("%s wide=%v: CompressCPU = %v", comp, wide, stats.CompressCPU)
+			c, lat := stats.CompressConcurrency, stats.CompressLatency
+			switch {
+			case comp == "none":
+				if c != 0 || lat != 0 {
+					t.Errorf("none: concurrency %d, latency %v; want 0, 0", c, lat)
+				}
+			case lat <= 0:
+				t.Errorf("%s wide=%v: no compression latency", comp, wide)
+			case !wide && c != 1:
+				t.Errorf("%s narrow frame used %d goroutines", comp, c)
+			case wide && runtime.GOMAXPROCS(0) >= 4 && c < 2:
+				t.Errorf("%s wide frame on an idle %d-CPU budget used %d goroutine", comp, runtime.GOMAXPROCS(0), c)
 			}
 		}
+	}
+}
+
+// windowEncoderConcurrency sends one item of data through streamSendItem and
+// returns the encoder goroutines of each frame, from its window events.
+func windowEncoderConcurrency(t *testing.T, data []byte, comp, mode string) []int {
+	t.Helper()
+	path := writeTempSendFile(t, data)
+	sink := events.NewSink()
+	var mu sync.Mutex
+	var conc []int
+	sink.Subscribe(func(e events.Event) {
+		if e.Name != "window" {
+			return
+		}
+		for _, f := range e.Fields {
+			if f.Key == "enc_conc" {
+				mu.Lock()
+				conc = append(conc, f.Val.(int))
+				mu.Unlock()
+			}
+		}
+	})
+	ctx := events.WithScope(context.Background(), events.Scope{Sink: sink, Conn: 1})
+	deps := &mockDeps{filePath: path}
+	var out bytes.Buffer
+	if _, err := streamSendItem(ctx, unbufferedSendOutput(&out), deps, "tx1",
+		sendItem{FileID: 1, Comp: comp, Path: path, Mode: mode},
+		mustFileRef(t, deps, 1, path), zeroCopyOff); err != nil {
+		t.Fatalf("streamSendItem: %v", err)
+	}
+	frames, err := decodeFrameStream(out.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []byte
+	for _, f := range frames {
+		got = append(got, f.Logical...)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("%s %s: decoded %d bytes, not the %d sent", comp, mode, len(got), len(data))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return conc
+}
+
+// A window widens only after a frame shows its data compresses slowly. Its
+// first frame, every frame of random data, which compresses far faster than
+// the threshold, and every frame of a gentle window use one goroutine; slow
+// text frames after the first go wide when cores are free.
+func TestStreamSendItemWidensOnlySlowCompression(t *testing.T) {
+	const frames = 4
+	random := make([]byte, frames*defaultFileFrameLogicalSize)
+	_, _ = cryptorand.Read(random)
+	text := wordyBytes(frames * int(defaultFileFrameLogicalSize))
+	for _, comp := range []string{encoding.EncodingLz4, encoding.EncodingZstd} {
+		t.Run(comp, func(t *testing.T) {
+			if conc := windowEncoderConcurrency(t, text, comp, loadStrategyGentle); !slices.Equal(conc, []int{1, 1, 1, 1}) {
+				t.Errorf("gentle text frames used %v goroutines, want one each", conc)
+			}
+			conc := windowEncoderConcurrency(t, text, comp, loadStrategyFast)
+			if len(conc) != frames || conc[0] != 1 {
+				t.Fatalf("fast text frames used %v goroutines, want %d frames starting at 1", conc, frames)
+			}
+			if runtime.GOMAXPROCS(0) >= 4 && !raceEnabled {
+				for i, c := range conc[1:] {
+					if c < 2 {
+						t.Errorf("text frame %d used %d goroutine after slow frames on an idle %d-CPU budget: %v", i+1, c, runtime.GOMAXPROCS(0), conc)
+					}
+				}
+			}
+			// Under the race detector, the encoders run slowly enough that
+			// even random data can fall below the threshold.
+			if !raceEnabled {
+				if conc := windowEncoderConcurrency(t, random, comp, loadStrategyFast); !slices.Equal(conc, []int{1, 1, 1, 1}) {
+					t.Errorf("random frames used %v goroutines, want one each", conc)
+				}
+			}
+		})
 	}
 }

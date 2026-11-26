@@ -1,14 +1,11 @@
 package encoding
 
-// SEND data-frame compression: pooled lz4 and zstd encoders, and the
-// process-wide core budget that decides how many goroutines a frame's encoder
-// may use.
+// SEND data-frame compression: pooled lz4 and zstd encoders, one pool per
+// codec and concurrency. frame_width.go decides each frame's concurrency.
 
 import (
 	"errors"
-	"runtime"
 	"sync"
-	"sync/atomic"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
@@ -22,80 +19,6 @@ type FrameCompression struct {
 	// MaxConcurrency caps the frame's encoder goroutines. Gentle mode passes
 	// 1. Zero lets the core budget decide, up to the codec's maximum.
 	MaxConcurrency int
-}
-
-// frameBlockBytes is the lz4 block size of a data frame, and the unit a
-// frame's input is divided into across encoder goroutines.
-const frameBlockBytes = 1 << 20
-
-// Encoder concurrency for a frame is 1, 2, or 4, so each codec keeps at most
-// three encoder pools. Measured on 4 MiB frames, lz4 scales to about 2.9x at
-// 4 goroutines; zstd gains about 1.3x at 2 and nothing more at 4.
-const (
-	lz4MaxFrameConcurrency  = 4
-	zstdMaxFrameConcurrency = 2
-)
-
-// frameCoreBudget limits the encoder goroutines of all frames compressing at
-// once to GOMAXPROCS. Fast mode runs at least one connection per core, so
-// under load nearly every frame compresses on its own goroutine, which reads
-// its input in place and allocates nothing. A frame compressing while cores
-// sit idle may take more. The budget counts only encoder goroutines, not the
-// hashing, encryption, and socket work around them, so it estimates free CPU
-// to a first order; callers ask for more than one goroutine only for data
-// slow enough to gain from it.
-var frameCoreBudget = coreBudget{limit: func() int64 { return int64(runtime.GOMAXPROCS(0)) }}
-
-type coreBudget struct {
-	inUse atomic.Int64
-	limit func() int64
-}
-
-// reserve takes one goroutine without waiting, so compression never queues
-// behind the budget, then tries to raise the frame's concurrency to 4 and
-// then 2, within maxConcurrency. It returns the concurrency granted; release
-// must return exactly that.
-func (b *coreBudget) reserve(maxConcurrency int) int {
-	cur := b.inUse.Add(1)
-	if maxConcurrency <= 1 {
-		return 1
-	}
-	limit := b.limit()
-	for _, want := range [...]int{4, 2} {
-		if want > maxConcurrency {
-			continue
-		}
-		extra := int64(want - 1)
-		for cur+extra <= limit {
-			if b.inUse.CompareAndSwap(cur, cur+extra) {
-				return want
-			}
-			cur = b.inUse.Load()
-		}
-	}
-	return 1
-}
-
-func (b *coreBudget) release(concurrency int) {
-	b.inUse.Add(-int64(concurrency))
-}
-
-// frameConcurrencyCap is the most goroutines a frame of n bytes can use:
-// at most one per 1 MiB block, within the codec's and the caller's maximum,
-// rounded down to 1, 2, or 4.
-func frameConcurrencyCap(n int, codecMax int, callerMax int) int {
-	c := min(codecMax, max(1, (n+frameBlockBytes-1)/frameBlockBytes))
-	if callerMax > 0 {
-		c = min(c, callerMax)
-	}
-	switch {
-	case c >= 4:
-		return 4
-	case c >= 2:
-		return 2
-	default:
-		return 1
-	}
 }
 
 // frameConcurrencyIndex maps a concurrency of 1, 2, or 4 to its pool. Any

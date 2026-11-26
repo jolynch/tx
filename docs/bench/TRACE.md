@@ -93,7 +93,7 @@ Both sides also emit:
 | `cmd_start` / `cmd_end`      | `verb`, `conn`; end: `req_bytes` and `resp_bytes` (from the kernel's TCP counters, so they include zero-copy payloads), `dur`, `err` |
 | `heartbeat`                  | `conn` (a keep-alive PROBE) |
 | `file_open`                  | `conn`, `file`, `path`, `len`, `dur` |
-| `window`                     | `conn`, `file`, `off`, `len`, `wire`, `codec`, `send_path` (`sendfile` or `buffered`), `read_dur`, `comp_dur`, `write_dur` |
+| `window`                     | `conn`, `file`, `off`, `len`, `wire`, `codec`, `send_path` (`sendfile` or `buffered`), `read_dur`, `comp_dur`, `write_dur`, `enc_conc` (encoder goroutines; 0 when uncompressed) |
 | `file_done`                  | `conn`, `file`, `dur` (first window start to last window end) |
 | `ack`                        | `conn`, `files`, `bytes` |
 | `transfer_start` / `transfer_done` | `path`; done: `files`, `bytes`, `dur`, and `rates` when an adaptive window reached the compression policy (as in `--stats`) |

@@ -90,6 +90,7 @@ fuzz-short:
 	$(FUZZ) -race ./internal/utils FuzzCommonPrefixLen $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race ./internal/idset FuzzSet $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race ./internal/filexfer/encoding FuzzFrameCompressionBudget $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
+	$(FUZZ) -race ./internal/filexfer/encoding FuzzFrameWidth $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) . FuzzSuggestBatchMaxBytes $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT) -parallel=1
 	$(FUZZ) -race . FuzzChecksumStreamReuse $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)
 	$(FUZZ) -race . FuzzManifestEntryByID $(FUZZTIME_SHORT) $(FUZZDEADLINE_SHORT)

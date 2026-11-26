@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
-	"sync"
 	"testing"
 
 	"github.com/jolynch/tx/internal/bufpool"
@@ -260,111 +259,4 @@ func TestAppendCompressedFrameDoesNotAllocate(t *testing.T) {
 			t.Errorf("%s: %.1f allocations per 4 MiB frame at concurrency 1, want 0", codec, allocs)
 		}
 	}
-}
-
-func TestFrameConcurrencyCap(t *testing.T) {
-	for _, tc := range []struct{ n, codecMax, callerMax, want int }{
-		{0, 4, 0, 1},
-		{1, 4, 0, 1},
-		{1 << 20, 4, 0, 1},
-		{1<<20 + 1, 4, 0, 2},
-		{4 << 20, 4, 0, 4},
-		{16 << 20, 4, 0, 4},
-		{4 << 20, 2, 0, 2},
-		{4 << 20, 4, 1, 1},
-		{4 << 20, 4, 3, 2},
-		{3 << 20, 4, 0, 2},
-	} {
-		if got := frameConcurrencyCap(tc.n, tc.codecMax, tc.callerMax); got != tc.want {
-			t.Errorf("frameConcurrencyCap(%d, %d, %d) = %d, want %d", tc.n, tc.codecMax, tc.callerMax, got, tc.want)
-		}
-	}
-}
-
-// TestFrameCompressionBudget checks the core budget's grants: one goroutine
-// always, more only within the limit, and everything returned on release.
-func TestFrameCompressionBudget(t *testing.T) {
-	b := coreBudget{limit: func() int64 { return 8 }}
-	first, second, third := b.reserve(4), b.reserve(4), b.reserve(4)
-	if first != 4 || second != 4 || third != 1 {
-		t.Fatalf("grants on an 8-core budget = %d, %d, %d; want 4, 4, 1", first, second, third)
-	}
-	b.release(first)
-	if got := b.reserve(2); got != 2 {
-		t.Fatalf("grant after a release = %d, want 2", got)
-	}
-	b.release(2)
-	b.release(second)
-	b.release(third)
-	if got := b.inUse.Load(); got != 0 {
-		t.Fatalf("%d goroutines still reserved after every release", got)
-	}
-
-	small := coreBudget{limit: func() int64 { return 3 }}
-	if got := small.reserve(4); got != 2 {
-		t.Fatalf("grant on a 3-core budget = %d, want 2", got)
-	}
-
-	// Concurrent callers never leave goroutines reserved.
-	shared := coreBudget{limit: func() int64 { return 4 }}
-	var wg sync.WaitGroup
-	for range 32 {
-		wg.Go(func() {
-			for range 1000 {
-				shared.release(shared.reserve(4))
-			}
-		})
-	}
-	wg.Wait()
-	if got := shared.inUse.Load(); got != 0 {
-		t.Fatalf("%d goroutines still reserved after concurrent callers finished", got)
-	}
-}
-
-// FuzzFrameCompressionBudget drives the budget through a random sequence of
-// reservations and releases against a model. Each grant is 1, 2, or 4 and
-// within its cap; a grant above 1 keeps the total within the limit and is
-// the largest that fits; and releasing everything returns the budget to 0.
-func FuzzFrameCompressionBudget(f *testing.F) {
-	f.Add(uint8(8), []byte{4, 4, 4, 0x80, 2})
-	f.Add(uint8(1), []byte{4, 2, 1})
-	f.Add(uint8(3), []byte{4, 0x80, 4, 4})
-	f.Fuzz(func(t *testing.T, limitRaw uint8, ops []byte) {
-		limit := int64(limitRaw%64) + 1
-		b := coreBudget{limit: func() int64 { return limit }}
-		var held []int
-		var inUse int64
-		for _, op := range ops {
-			if op&0x80 != 0 && len(held) > 0 {
-				i := int(op&0x7f) % len(held)
-				b.release(held[i])
-				inUse -= int64(held[i])
-				held = append(held[:i], held[i+1:]...)
-				continue
-			}
-			maxC := int(op%5) + 1
-			got := b.reserve(maxC)
-			want := 1
-			for _, c := range []int{4, 2} {
-				if c <= maxC && inUse+int64(c) <= limit {
-					want = c
-					break
-				}
-			}
-			if got != want {
-				t.Fatalf("reserve(%d) with %d of %d in use = %d, want %d", maxC, inUse, limit, got, want)
-			}
-			inUse += int64(got)
-			held = append(held, got)
-			if b.inUse.Load() != inUse {
-				t.Fatalf("budget holds %d, model %d", b.inUse.Load(), inUse)
-			}
-		}
-		for _, c := range held {
-			b.release(c)
-		}
-		if got := b.inUse.Load(); got != 0 {
-			t.Fatalf("%d goroutines still reserved after every release", got)
-		}
-	})
 }

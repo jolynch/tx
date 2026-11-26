@@ -136,7 +136,8 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
   - `internal/filexfer/encoding/codec.go`: pooled zstd encoders and decoders
     and lz4 readers. `frame_codec.go`: pooled lz4 and zstd data-frame
     encoders, one pool per codec and concurrency, which
-    `AppendCompressedFrame` draws from under a GOMAXPROCS core budget.
+    `AppendCompressedFrame` draws from; `frame_width.go` chooses each
+    frame's concurrency under a GOMAXPROCS core budget.
   - `internal/filexfer/ftcp`: `sendOutputBufferPool` (`send_output.go`) and
     `sendChainsPool` (`send_chain.go`).
   - `Client`: `acquireLineReader` and `acquireScratchBuffer`.

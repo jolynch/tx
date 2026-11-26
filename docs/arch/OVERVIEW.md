@@ -410,7 +410,8 @@ concurrency, so a frame builds no encoder.
 
 A frame compresses on one goroutine unless the previous frame of the same
 window and codec compressed below 2 GiB/s per core, counting wall time times
-the goroutines it used. That one goroutine reads its input in place and
+the goroutines it used (`encoding.FrameWidth`, in `frame_width.go` with the
+budget below). That one goroutine reads its input in place and
 allocates nothing, and its cost matches the policy's single-core samples.
 Random and zero-filled data compress far faster than 2 GiB/s, so extra
 goroutines would only add overhead to them.
