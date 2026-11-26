@@ -39,9 +39,9 @@ Offer a tree (directory) via a FTCP server.
 Options:
       --listen string                         Listen address (host:port) (default
                                               "127.0.0.1:3453")
-  -b, --bwlimit string                        Response rate limit for gentle transfers
-                                              only; fast transfers do not respect it
-                                              (e.g. 100MiB, 1000mbps) (default "")
+  -b, --bwlimit string                        Server-wide rate limit for file data sent
+                                              in SEND responses (e.g. 100MiB, 1000mbps)
+                                              (default "")
       --bwlimit-burst string                  Rate limit burst size (default "1MiB")
       --gentle-cpu string                     Percent of server CPUs advertised for
                                               gentle concurrency (default "25%")
@@ -412,7 +412,7 @@ tx send tree                                       # serve cwd on default addr
 tx send tree /srv/data                              # serve /srv/data
 tx send tree --listen 0.0.0.0:4000 /srv/data       # custom addr + chroot
 tx send tree --require-auth /srv/data               # AUTH required; any client key
-tx send tree --bwlimit 100MiB /srv/data             # rate limit gentle transfers
+tx send tree --bwlimit 100MiB /srv/data             # rate limit file data sent
 ```
 
 ### Authentication and encryption

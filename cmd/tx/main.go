@@ -197,7 +197,7 @@ func runSendTree(args []string, stderr io.Writer, serve func(net.Listener, ftcp.
 	)
 
 	cf.StringVar(&listenAddr, "", "listen", defaultFileListener, "Listen address (host:port)")
-	cf.StringVar(&rate, "b", "bwlimit", "", "Response rate limit for gentle transfers only; fast transfers do not respect it (e.g. 100MiB, 1000mbps)")
+	cf.StringVar(&rate, "b", "bwlimit", "", "Server-wide rate limit for file data sent in SEND responses (e.g. 100MiB, 1000mbps)")
 	cf.StringVar(&burst, "", "bwlimit-burst", fsFileBurst, "Rate limit burst size")
 	cf.StringVar(&gentleCPURaw, "", "gentle-cpu", gentleCPUDefault, "Percent of server CPUs advertised for gentle concurrency")
 	cf.StringVar(&gentleBWRaw, "", "gentle-bw", gentleBWDefault, "Percent of observed link bandwidth used for gentle limiting")

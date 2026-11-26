@@ -10,14 +10,19 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jolynch/tx/internal/events"
 	"github.com/jolynch/tx/internal/faults"
 	"github.com/jolynch/tx/internal/filexfer/encoding"
+	"github.com/jolynch/tx/internal/filexfer/limit"
 	"github.com/zeebo/xxh3"
 	"golang.org/x/sys/unix"
 )
@@ -563,6 +568,120 @@ func TestRefusalsHalfCloseThroughFaultWrapper(t *testing.T) {
 			default:
 			}
 			<-done
+		})
+	}
+}
+
+// The server's --bwlimit paces a fast SEND's file data, through a plain
+// writer and through a TCP socket. On the socket it also turns off zero-copy
+// frames, which would bypass it. Every frame reaches the writer before the
+// handler returns, so the OK line, or the ERR line of an item that fails
+// after another was sent, follows the frames sent before it.
+func TestHandleSENDFastBandwidthLimit(t *testing.T) {
+	const size, rate, burst = 3 << 20, 16 << 20, 1 << 20
+	// The burst goes out at once and the rest at the rate.
+	const least = (size - burst) * time.Second / rate * 4 / 5
+	data := make([]byte, size)
+	rand.New(rand.NewSource(9)).Read(data)
+	path := writeTempSendFile(t, data)
+	req, err := ParseRequest([]byte("SEND tx1 mode=fast"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name  string
+		tcp   bool
+		items []string
+		ok    bool
+	}{
+		{"plain", false, []string{fmt.Sprintf("fd=1 %q comp=none", path)}, true},
+		{"tcp", true, []string{fmt.Sprintf("fd=1 %q comp=none", path)}, true},
+		{"error after a sent item", true, []string{fmt.Sprintf("fd=1 %q comp=none", path), fmt.Sprintf("fd=2 %q comp=none", path)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			limiter, err := limit.NewLimiterFromBps(rate, burst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sink := events.NewSink()
+			var mu sync.Mutex
+			var paths []string
+			sink.Subscribe(func(e events.Event) {
+				for _, f := range e.Fields {
+					if e.Name == "window" && f.Key == "send_path" {
+						mu.Lock()
+						paths = append(paths, f.Val.(string))
+						mu.Unlock()
+					}
+				}
+			})
+			ctx := events.WithScope(context.Background(), events.Scope{Sink: sink, Conn: 1})
+			deps := &mockDeps{filePath: path, missingIDs: map[uint64]bool{2: true}}
+			var out io.Writer
+			var plain bytes.Buffer
+			var finish func(line string) []byte
+			if tc.tcp {
+				server, client := newTCPPair(t)
+				received := make(chan []byte, 1)
+				go func() {
+					raw, _ := io.ReadAll(client)
+					received <- raw
+				}()
+				out = server
+				finish = func(line string) []byte {
+					_, _ = io.WriteString(server, line)
+					_ = server.Close()
+					raw := <-received
+					_ = client.Close()
+					return raw
+				}
+			} else {
+				out = &plain
+				finish = func(line string) []byte {
+					plain.WriteString(line)
+					return plain.Bytes()
+				}
+			}
+			start := time.Now()
+			// A 64 KiB zero-copy minimum makes every frame eligible for it.
+			err = handleSENDWithOptions(ctx, req, framedItemBody(t, tc.items...), out, deps, limiter, 64<<10, 25)
+			elapsed := time.Since(start)
+			line := "OK\r\n"
+			if err != nil {
+				line = "ERR NOT_FOUND\r\n"
+			}
+			if (err == nil) != tc.ok {
+				t.Fatalf("handler error = %v, want ok=%v", err, tc.ok)
+			}
+			raw := finish(line)
+			if elapsed < least {
+				t.Fatalf("%d bytes at %d B/s took %v, under %v: the limiter did not pace them", size, rate, elapsed, least)
+			}
+			body, found := bytes.CutSuffix(raw, []byte(line))
+			if !found {
+				t.Fatalf("response does not end with its status line %q", line)
+			}
+			frames, err := decodeFrameStream(body)
+			if err != nil {
+				t.Fatalf("frames before the status line: %v", err)
+			}
+			var got []byte
+			for _, f := range frames {
+				got = append(got, f.Logical...)
+			}
+			if !bytes.Equal(got, data) {
+				t.Fatalf("frames carried %d bytes, want the file's %d", len(got), len(data))
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, p := range paths {
+				if p != sendPathBuffered {
+					t.Fatalf("a limited frame took the %s path", p)
+				}
+			}
+			if len(paths) == 0 {
+				t.Fatal("no window events")
+			}
 		})
 	}
 }

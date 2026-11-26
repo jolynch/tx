@@ -5,6 +5,7 @@ package harness
 import (
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -55,7 +56,10 @@ type suiteCase struct {
 	Identity map[string]any `json:"identity"`
 	Bytes    int64          `json:"bytes,omitempty"`
 	Recipe   *suiteRecipe   `json:"recipe,omitempty"`
-	Charts   []suiteChart   `json:"charts,omitempty"`
+	// SendBWLimit caps an SSD copy's sender with tx send tree --bwlimit, so
+	// the link rather than the sender's CPU limits the copy.
+	SendBWLimit string       `json:"send_bwlimit,omitempty"`
+	Charts      []suiteChart `json:"charts,omitempty"`
 
 	Samples suiteSamples      `json:"samples,omitempty"`
 	Details *suiteCopyDetails `json:"details,omitempty"`
@@ -123,6 +127,24 @@ func ssdCase(id, label, size, mix string, bytes int64) suiteCase {
 	}
 }
 
+// suiteCompressibleBWLimit caps the compressible copy's sender. Over
+// loopback, sending uncompressed is the fastest choice, so an uncapped copy
+// never compresses; under this cap compression pays, and the copy measures
+// the adaptive codec path.
+const suiteCompressibleBWLimit = "50MiB"
+
+// linkLimited caps a copy's sender at bwlimit and records the cap in the
+// case's identity. It returns a copy and leaves c's identity unchanged.
+func (c suiteCase) linkLimited(bwlimit string) suiteCase {
+	c.SendBWLimit = bwlimit
+	c.Identity = maps.Clone(c.Identity)
+	if c.Identity == nil {
+		c.Identity = map[string]any{}
+	}
+	c.Identity["send_bwlimit"] = bwlimit
+	return c
+}
+
 func suiteSettings(profile string) suiteProfile {
 	const silesiaSizes = "128MiB..1GiB"
 	if profile == "smoke" {
@@ -134,7 +156,7 @@ func suiteSettings(profile string) suiteProfile {
 				ssdCase("ssd-small", "Small files", "16MiB", "rand=100%@16KiB", 16*suiteMiB),
 				ssdCase("ssd-large", "Large files", "32MiB", "rand=100%@16MiB", 32*suiteMiB),
 				ssdCase("ssd-mixed", "Mixed files", "512MiB", "rand=25%@16KiB,rand=25%@32MiB,silesia=50%@128MiB..160MiB", 512*suiteMiB),
-				ssdCase("ssd-compressible", "Compressible files", "512MiB", "silesia=100%@128MiB..160MiB", 512*suiteMiB),
+				ssdCase("ssd-compressible", "Compressible files", "512MiB", "silesia=100%@128MiB..160MiB", 512*suiteMiB).linkLimited(suiteCompressibleBWLimit),
 			},
 		}
 	}
@@ -146,7 +168,7 @@ func suiteSettings(profile string) suiteProfile {
 			ssdCase("ssd-small", "Small files", "2GiB", "rand=100%@16KiB", 2*suiteGiB),
 			ssdCase("ssd-large", "Large files", "40GiB", "rand=100%@2GiB", 40*suiteGiB),
 			ssdCase("ssd-mixed", "Mixed files", "32GiB", "rand=25%@4KiB..256KiB,rand=25%@1GiB,silesia=50%@"+silesiaSizes, 32*suiteGiB),
-			ssdCase("ssd-compressible", "Compressible files", "12GiB", "silesia=100%@"+silesiaSizes, 12*suiteGiB),
+			ssdCase("ssd-compressible", "Compressible files", "12GiB", "silesia=100%@"+silesiaSizes, 12*suiteGiB).linkLimited(suiteCompressibleBWLimit),
 		},
 	}
 }
@@ -246,9 +268,12 @@ func (c suiteCase) prepArgs(source string) []string {
 }
 
 func (c suiteCase) copyArgs(tx, fingerprint, metrics, source, dest string) []string {
-	return []string{"local", "--tx", tx, "--auth", "off", "--cache-warm", "0%",
-		"--require-cold-cache", strconv.FormatFloat(suiteMaxHotPct, 'g', -1, 64) + "%", "--expect", fingerprint, "--oracle", "full", "-w", "0", "-n", strconv.Itoa(c.Repeats),
-		"--metrics", metrics, source, dest}
+	args := []string{"local", "--tx", tx, "--auth", "off", "--cache-warm", "0%",
+		"--require-cold-cache", strconv.FormatFloat(suiteMaxHotPct, 'g', -1, 64) + "%", "--expect", fingerprint, "--oracle", "full", "-w", "0", "-n", strconv.Itoa(c.Repeats)}
+	if c.SendBWLimit != "" {
+		args = append(args, "--send-arg=--bwlimit", "--send-arg="+c.SendBWLimit)
+	}
+	return append(args, "--metrics", metrics, source, dest)
 }
 
 func describeSuite(out io.Writer, cases []suiteCase) {
