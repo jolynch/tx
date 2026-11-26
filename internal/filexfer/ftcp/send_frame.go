@@ -6,6 +6,7 @@ package ftcp
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -140,29 +141,16 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 	}
 	isCompressed := args.Comp != "none"
 
-	// For compressed: collect into frameBuf so wireSize is known before writing the header.
-	// For none: normally stream directly, but when using direct I/O retry path we stage
-	// payload in-memory until the read succeeds to avoid writing partial frame headers.
+	// For compressed: read the whole frame into readBuf, then compress it
+	// into frameBuf, so wireSize is known before writing the header. For
+	// none: normally stream directly, but when using direct I/O retry path we
+	// stage payload in-memory until the read succeeds to avoid writing partial
+	// frame headers.
 	payloadWriter := io.Writer(args.Output)
-	var frameBuf *bytes.Buffer
-	var closeCompWriter func() error
 	var stagingBuf *bytes.Buffer
 	stagedDirectWrite := args.DirectIO && !isCompressed
 
-	if isCompressed {
-		frameBuf = acquireCompressedFrameBuffer(args.FrameSize, args.Comp)
-		defer releaseCompressedFrameBuffer(frameBuf)
-		var compWriter io.Writer
-		var selected string
-		compWriter, closeCompWriter, selected, err = encoding.WrapCompressedWriter(frameBuf, args.Comp, args.Mode)
-		if err != nil {
-			return frameStreamStats{}, err
-		}
-		if selected != args.Comp {
-			return frameStreamStats{}, errors.New("compression mode negotiation mismatch")
-		}
-		payloadWriter = compWriter
-	} else {
+	if !isCompressed {
 		if stagedDirectWrite {
 			stagingPtr, stageErr := bufpool.Get(bufpool.BucketSize(args.FrameSize))
 			if stageErr != nil {
@@ -195,7 +183,7 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 	if args.Faults != nil {
 		src = args.Faults.WrapReaderAt(args.Ctx, faults.SiteSendRead, args.FileID, fd)
 	}
-	prepareLatency, readLatency, err := streamBufferedRead(src, fileOffset, args.FrameSize, readBuf, timing, func(chunk []byte) error {
+	prepareLatency, readLatency, err := streamBufferedRead(src, fileOffset, args.FrameSize, readBuf, isCompressed, timing, func(chunk []byte) error {
 		var hashStart, writeStart time.Time
 		if timeChunkWrites {
 			hashStart = time.Now()
@@ -205,6 +193,9 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 		if timeChunkWrites {
 			writeStart = time.Now()
 			hashLatency += writeStart.Sub(hashStart)
+		}
+		if isCompressed {
+			return nil // the whole frame is compressed once it is read
 		}
 		written, writeErr := payloadWriter.Write(chunk)
 		if timeChunkWrites {
@@ -225,31 +216,14 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 	prepareLatency += hashLatency
 
 	wireSize := args.FrameSize
+	var compressCPU time.Duration
 	if isCompressed {
 		compRegion := trace.StartRegion(args.Ctx, "frame-compress")
-		// Close finishes the frame. A codec that compresses blocks on
-		// goroutines, such as lz4 in fast mode, does most of its work here.
-		var closeStart time.Time
-		if args.Timed {
-			closeStart = time.Now()
-		}
-		if err := closeCompWriter(); err != nil {
-			compRegion.End()
-			return frameStreamStats{}, err
-		}
-		if args.Timed {
-			prepareLatency += time.Since(closeStart)
-		}
-		wireSize = int64(frameBuf.Len())
-		if err := writeFrameHeader(args.Output, args, wireSize, timedWrites); err != nil {
-			compRegion.End()
-			return frameStreamStats{}, err
-		}
-		if err := timedWrite(args.Output, frameBuf.Bytes(), timedWrites); err != nil {
-			compRegion.End()
-			return frameStreamStats{}, err
-		}
+		wireSize, compressCPU, err = writeCompressedFrame(readBuf[:args.FrameSize], args, &prepareLatency, timedWrites)
 		compRegion.End()
+		if err != nil {
+			return frameStreamStats{}, err
+		}
 	} else if stagedDirectWrite {
 		if err := writeFrameHeader(args.Output, args, wireSize, timedWrites); err != nil {
 			return frameStreamStats{}, err
@@ -272,6 +246,7 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 		WriteLatency:    writeLatency,
 		NextOffset:      *fileOffset,
 		WindowHashToken: windowHashToken,
+		CompressCPU:     compressCPU,
 	}, nil
 }
 
@@ -565,12 +540,23 @@ func streamBufferedRead(
 	fileOffset *int64,
 	frameSize int64,
 	buf []byte,
+	contiguous bool,
 	timing readTiming,
 	handle func([]byte) error,
 ) (prepareLatency, readLatency time.Duration, err error) {
+	if contiguous && int64(len(buf)) < frameSize {
+		return 0, 0, fmt.Errorf("frame of %d bytes does not fit its %d-byte read buffer", frameSize, len(buf))
+	}
 	remaining := frameSize
 	for remaining > 0 {
-		readSize := len(buf)
+		// A contiguous read lands each chunk after the previous one, so the
+		// whole frame ends up in buf; buf must then hold frameSize bytes.
+		// Otherwise every chunk reuses the start of buf.
+		chunkBuf := buf
+		if contiguous {
+			chunkBuf = buf[frameSize-remaining:]
+		}
+		readSize := len(chunkBuf)
 		if int64(readSize) > remaining {
 			readSize = int(remaining)
 		}
@@ -578,7 +564,7 @@ func streamBufferedRead(
 		if timing != timeNothing {
 			start = time.Now()
 		}
-		n, readErr := src.ReadAt(buf[:readSize], *fileOffset)
+		n, readErr := src.ReadAt(chunkBuf[:readSize], *fileOffset)
 		if timing != timeNothing {
 			readLatency += time.Since(start)
 		}
@@ -588,7 +574,7 @@ func streamBufferedRead(
 			if timing == timeReadsAndHandling {
 				start = time.Now()
 			}
-			if err := handle(buf[:n]); err != nil {
+			if err := handle(chunkBuf[:n]); err != nil {
 				return 0, 0, err
 			}
 			if timing == timeReadsAndHandling {
@@ -608,37 +594,54 @@ func streamBufferedRead(
 	return prepareLatency + readLatency, readLatency, nil
 }
 
-func acquireCompressedFrameBuffer(logicalSize int64, comp string) *bytes.Buffer {
-	maxEncoded, err := encoding.MaxEncodedFrameSizeBytes(comp, logicalSize)
-	if err != nil || maxEncoded <= 0 {
-		maxEncoded = defaultCompressedFrameBufferBytes
-	}
-	capacity := int(maxEncoded)
-	if capacity <= 0 {
-		capacity = defaultCompressedFrameBufferBytes
-	}
+// wideCompressMaxBytesPerCoreSec is the compression rate per core below
+// which a window's next frame may use several encoder goroutines. Below it,
+// a 4 MiB frame takes over 2 ms of CPU, and spreading it saves wall time for
+// a few percent more CPU. Above it, as for random or zero-filled data, the
+// extra goroutines cost more than the encoding itself.
+const wideCompressMaxBytesPerCoreSec = 2 << 30
 
-	if raw := compressedFrameBufferPool.Get(); raw != nil {
-		if buf, ok := raw.(*bytes.Buffer); ok && buf != nil {
-			buf.Reset()
-			if buf.Cap() >= capacity {
-				return buf
-			}
-			return bytes.NewBuffer(make([]byte, 0, capacity))
-		}
-	}
-	return bytes.NewBuffer(make([]byte, 0, capacity))
+// compressesSlowly reports whether a frame of logical bytes that took cpu
+// to compress ran below wideCompressMaxBytesPerCoreSec.
+func compressesSlowly(logical int64, cpu time.Duration) bool {
+	return cpu > 0 && float64(logical) < float64(wideCompressMaxBytesPerCoreSec)*cpu.Seconds()
 }
 
-func releaseCompressedFrameBuffer(buf *bytes.Buffer) {
-	if buf == nil {
-		return
+// writeCompressedFrame compresses one frame read in full into payload and
+// writes its header and wire bytes. Compression time counts as prepare
+// latency when the frame is timed. It returns the wire size and the
+// encoder's estimated CPU time.
+func writeCompressedFrame(payload []byte, args frameStreamArgs, prepareLatency *time.Duration, timedWrites *time.Duration) (int64, time.Duration, error) {
+	maxEncoded, err := encoding.MaxEncodedFrameSizeBytes(args.Comp, int64(len(payload)))
+	if err != nil {
+		return 0, 0, err
 	}
-	if buf.Cap() > maxCompressedFrameBufferPoolBytes {
-		return
+	frameBufPtr, err := bufpool.Get(int(maxEncoded))
+	if err != nil {
+		return 0, 0, err
 	}
-	buf.Reset()
-	compressedFrameBufferPool.Put(buf)
+	defer bufpool.Put(frameBufPtr)
+	opts := encoding.FrameCompression{Codec: args.Comp, MaxConcurrency: 1}
+	if args.CompressWide && args.Mode != loadStrategyGentle {
+		opts.MaxConcurrency = 0
+	}
+	compressStart := time.Now()
+	frame, concurrency, err := encoding.AppendCompressedFrame((*frameBufPtr)[:0], payload, opts)
+	if err != nil {
+		return 0, 0, err
+	}
+	compressWall := time.Since(compressStart)
+	if args.Timed {
+		*prepareLatency += compressWall
+	}
+	wireSize := int64(len(frame))
+	if err := writeFrameHeader(args.Output, args, wireSize, timedWrites); err != nil {
+		return 0, 0, err
+	}
+	if err := timedWrite(args.Output, frame, timedWrites); err != nil {
+		return 0, 0, err
+	}
+	return wireSize, compressWall * time.Duration(concurrency), nil
 }
 
 // minSequentialAdviceBytes is the smallest window worth advising. The kernel's

@@ -400,6 +400,28 @@ network line rate in logical bytes. Incompressible data stays uncompressed,
 with occasional background samples to detect changes. Use
 `--compress none|lz4|zstd` to force a codec and skip adaptation.
 
+### Frame encoding
+
+SEND reads a compressed frame whole, then compresses it once with
+`encoding.AppendCompressedFrame` into a `bufpool` buffer sized by
+`MaxEncodedFrameSizeBytes`, which for a 4 MiB frame is the 4 MiB + 64 KiB
+frame bucket. Encoders come from pools kept per codec and
+concurrency, so a frame builds no encoder.
+
+A frame compresses on one goroutine unless the previous frame of the same
+window and codec compressed below 2 GiB/s per core, counting wall time times
+the goroutines it used. That one goroutine reads its input in place and
+allocates nothing, and its cost matches the policy's single-core samples.
+Random and zero-filled data compress far faster than 2 GiB/s, so extra
+goroutines would only add overhead to them.
+
+A slow frame may take more goroutines from a process-wide budget of
+GOMAXPROCS encoder goroutines: up to 4 for lz4 and 2 for zstd, at most one
+per 1 MiB of input. Each frame takes one without waiting and the rest only
+if they are free. Fast mode runs at least one connection per core, so under
+load nearly every frame stays on one goroutine, while a frame compressing
+on an otherwise idle host finishes sooner. Gentle mode always uses one.
+
 ## Verification
 
 `tx` verifies integrity in two layers:

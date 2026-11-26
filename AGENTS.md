@@ -127,16 +127,18 @@ Start at the [docs index](docs/README.md), then open only the reference needed:
   Prefer fixed-size buffers held in a long-lived struct, or reuse from an
   existing pool, to a fresh `make` or `new` per call:
   - `internal/bufpool`: size-bucketed byte buffers (4 KiB to 64 MiB, with
-    64 KiB, 128 KiB, and 256 KiB the common I/O sizes). `Get`/`Put` pool a
+    64 KiB, 128 KiB, and 256 KiB the common I/O sizes, and `FrameBucket`,
+    4 MiB + 64 KiB, for a compressed 4 MiB frame). `Get`/`Put` pool a
     `*[]byte` and allocate nothing; `Put` each pointer exactly once, after
     its last use. `Growing` sizes a buffer by bytes actually received.
   - `internal/aead`: takes its record buffers from `bufpool` (`Get`/`Put`)
     and clears any plaintext in them before `Put`.
   - `internal/filexfer/encoding/codec.go`: pooled zstd encoders and decoders
-    and lz4 readers.
-  - `internal/filexfer/ftcp`: `sendOutputBufferPool` (`send_output.go`),
-    `compressedFrameBufferPool` (`send.go`), and `sendChainsPool`
-    (`send_chain.go`).
+    and lz4 readers. `frame_codec.go`: pooled lz4 and zstd data-frame
+    encoders, one pool per codec and concurrency, which
+    `AppendCompressedFrame` draws from under a GOMAXPROCS core budget.
+  - `internal/filexfer/ftcp`: `sendOutputBufferPool` (`send_output.go`) and
+    `sendChainsPool` (`send_chain.go`).
   - `Client`: `acquireLineReader` and `acquireScratchBuffer`.
 
   Reuse `bufpool` before adding a pool; a new one stores pointers

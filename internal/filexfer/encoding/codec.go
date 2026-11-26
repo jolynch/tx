@@ -136,45 +136,6 @@ func SelectEncoding(acceptEncoding string) string {
 	return best
 }
 
-// WrapCompressedWriter compresses a SEND data frame. Its output carries no
-// zstd or lz4 checksum, since the receiver verifies the window hash; do not
-// store it where nothing else checks it.
-func WrapCompressedWriter(dst io.Writer, acceptEncoding string, strategy string) (io.Writer, func() error, string, error) {
-	if dst == nil {
-		return nil, nil, "", errors.New("nil destination writer")
-	}
-
-	concurrency := 0 // fast: all cores (both lz4 and zstd treat 0 as GOMAXPROCS)
-	if strategy == "gentle" {
-		concurrency = 1
-	}
-
-	switch SelectEncoding(acceptEncoding) {
-	case EncodingZstd:
-		// The client verifies each window's xxh3 hash, and data frames are
-		// never stored raw, so they carry no zstd checksum. Framed bodies
-		// keep theirs: tx recv copy saves TXFER frames as-is to
-		// manifest.server.zst, where nothing else checks them.
-		zw, err := zstd.NewWriter(dst, zstd.WithEncoderLevel(1), zstd.WithEncoderConcurrency(concurrency), zstd.WithEncoderCRC(false))
-		if err != nil {
-			return nil, nil, "", err
-		}
-		return zw, zw.Close, EncodingZstd, nil
-	case EncodingLz4:
-		lw := lz4.NewWriter(dst)
-		lw.Apply(
-			lz4.BlockSizeOption(lz4.Block1Mb),
-			lz4.CompressionLevelOption(lz4.Fast),
-			lz4.ConcurrencyOption(concurrency),
-			lz4.ChecksumOption(false),
-			lz4.BlockChecksumOption(false),
-		)
-		return lw, lw.Close, EncodingLz4, nil
-	default:
-		return dst, func() error { return nil }, "", nil
-	}
-}
-
 func WrapDecompressedReader(src io.Reader, contentEncoding string) (io.ReadCloser, error) {
 	if src == nil {
 		return nil, errors.New("nil source reader")

@@ -22,7 +22,9 @@ func TestBucketSizeLadder(t *testing.T) {
 		{128 * kiB, 128 * kiB},
 		{128*kiB + 1, 256 * kiB},
 		{4 * miB, 4 * miB},
-		{4*miB + 1, 8 * miB},
+		{4*miB + 1, FrameBucket},
+		{FrameBucket, FrameBucket},
+		{FrameBucket + 1, 8 * miB},
 		{64 * miB, 64 * miB},
 		{64*miB + 1, MaxBucket}, // clamps rather than growing without bound
 	}

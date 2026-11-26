@@ -12,7 +12,9 @@ const (
 	miB = 1024 * kiB
 )
 
-// buckets covers frame sizes up to 64 MiB.
+// buckets covers frame sizes up to 64 MiB. The bucket just above 4 MiB holds
+// a compressed 4 MiB SEND frame, whose worst case is a few KiB over 4 MiB;
+// without it, every such buffer would take 8 MiB.
 var buckets = [...]int{
 	4 * kiB,
 	16 * kiB,
@@ -22,11 +24,15 @@ var buckets = [...]int{
 	1 * miB,
 	2 * miB,
 	4 * miB,
+	FrameBucket,
 	8 * miB,
 	16 * miB,
 	32 * miB,
 	64 * miB,
 }
+
+// FrameBucket holds the worst-case lz4 or zstd encoding of a 4 MiB frame.
+const FrameBucket = 4*miB + 64*kiB
 
 // MaxBucket is the largest bucket size.
 const MaxBucket = 64 * miB
