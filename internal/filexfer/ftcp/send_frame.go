@@ -216,10 +216,11 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 	prepareLatency += hashLatency
 
 	wireSize := args.FrameSize
-	var compressCPU time.Duration
+	var compressLatency time.Duration
+	var compressConcurrency int
 	if isCompressed {
 		compRegion := trace.StartRegion(args.Ctx, "frame-compress")
-		wireSize, compressCPU, err = writeCompressedFrame(readBuf[:args.FrameSize], args, &prepareLatency, timedWrites)
+		wireSize, compressLatency, compressConcurrency, err = writeCompressedFrame(readBuf[:args.FrameSize], args, &prepareLatency, timedWrites)
 		compRegion.End()
 		if err != nil {
 			return frameStreamStats{}, err
@@ -239,14 +240,15 @@ func streamFramePayloadBuffered(fd *os.File, fileOffset *int64, args frameStream
 	}
 
 	return frameStreamStats{
-		LogicalSize:     args.FrameSize,
-		WireSize:        wireSize,
-		PrepareLatency:  prepareLatency,
-		ReadLatency:     readLatency,
-		WriteLatency:    writeLatency,
-		NextOffset:      *fileOffset,
-		WindowHashToken: windowHashToken,
-		CompressCPU:     compressCPU,
+		LogicalSize:         args.FrameSize,
+		WireSize:            wireSize,
+		PrepareLatency:      prepareLatency,
+		ReadLatency:         readLatency,
+		WriteLatency:        writeLatency,
+		NextOffset:          *fileOffset,
+		WindowHashToken:     windowHashToken,
+		CompressLatency:     compressLatency,
+		CompressConcurrency: compressConcurrency,
 	}, nil
 }
 
@@ -594,41 +596,28 @@ func streamBufferedRead(
 	return prepareLatency + readLatency, readLatency, nil
 }
 
-// wideCompressMaxBytesPerCoreSec is the compression rate per core below
-// which a window's next frame may use several encoder goroutines. Below it,
-// a 4 MiB frame takes over 2 ms of CPU, and spreading it saves wall time for
-// a few percent more CPU. Above it, as for random or zero-filled data, the
-// extra goroutines cost more than the encoding itself.
-const wideCompressMaxBytesPerCoreSec = 2 << 30
-
-// compressesSlowly reports whether a frame of logical bytes that took cpu
-// to compress ran below wideCompressMaxBytesPerCoreSec.
-func compressesSlowly(logical int64, cpu time.Duration) bool {
-	return cpu > 0 && float64(logical) < float64(wideCompressMaxBytesPerCoreSec)*cpu.Seconds()
-}
-
 // writeCompressedFrame compresses one frame read in full into payload and
 // writes its header and wire bytes. Compression time counts as prepare
 // latency when the frame is timed. It returns the wire size and the
-// encoder's estimated CPU time.
-func writeCompressedFrame(payload []byte, args frameStreamArgs, prepareLatency *time.Duration, timedWrites *time.Duration) (int64, time.Duration, error) {
+// encoder's wall time and goroutines.
+func writeCompressedFrame(payload []byte, args frameStreamArgs, prepareLatency *time.Duration, timedWrites *time.Duration) (int64, time.Duration, int, error) {
 	maxEncoded, err := encoding.MaxEncodedFrameSizeBytes(args.Comp, int64(len(payload)))
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	frameBufPtr, err := bufpool.Get(int(maxEncoded))
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	defer bufpool.Put(frameBufPtr)
 	opts := encoding.FrameCompression{Codec: args.Comp, MaxConcurrency: 1}
-	if args.CompressWide && args.Mode != loadStrategyGentle {
+	if args.CompressWide {
 		opts.MaxConcurrency = 0
 	}
 	compressStart := time.Now()
 	frame, concurrency, err := encoding.AppendCompressedFrame((*frameBufPtr)[:0], payload, opts)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	compressWall := time.Since(compressStart)
 	if args.Timed {
@@ -636,12 +625,12 @@ func writeCompressedFrame(payload []byte, args frameStreamArgs, prepareLatency *
 	}
 	wireSize := int64(len(frame))
 	if err := writeFrameHeader(args.Output, args, wireSize, timedWrites); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	if err := timedWrite(args.Output, frame, timedWrites); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
-	return wireSize, compressWall * time.Duration(concurrency), nil
+	return wireSize, compressWall, concurrency, nil
 }
 
 // minSequentialAdviceBytes is the smallest window worth advising. The kernel's

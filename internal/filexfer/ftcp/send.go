@@ -118,9 +118,8 @@ type frameStreamArgs struct {
 	// Sample copies already-read bytes for a nonblocking background job.
 	Sample *sendSampleJob
 	// CompressWide lets a compressed frame use more than one encoder
-	// goroutine when the core budget has them free. The window sets it after
-	// a frame of the same codec compressed slowly (compressesSlowly);
-	// cheaply compressed data only pays for the extra goroutines.
+	// goroutine when the core budget has them free. The window's
+	// encoding.FrameWidth sets it.
 	CompressWide bool
 }
 
@@ -134,9 +133,10 @@ type frameStreamStats struct {
 	WriteLatency    time.Duration
 	NextOffset      int64
 	WindowHashToken string
-	// CompressCPU estimates the encoder's CPU time: its wall time times
-	// the goroutines it was granted. Zero for an uncompressed frame.
-	CompressCPU time.Duration
+	// CompressLatency and CompressConcurrency are the encoder's wall time
+	// and goroutines. Both are zero for an uncompressed frame.
+	CompressLatency     time.Duration
+	CompressConcurrency int
 }
 
 // parseSENDHeader reads the command line, which now carries only
@@ -159,6 +159,7 @@ func emitWindow(scope events.Scope, txferID string, fileID uint64, off int64, co
 		events.F("send_path", sendPath),
 		events.Dur("read_dur", stats.ReadLatency),
 		events.Dur("comp_dur", stats.PrepareLatency-stats.ReadLatency),
+		events.F("enc_conc", stats.CompressConcurrency),
 		events.Dur("write_dur", stats.WriteLatency))
 }
 
@@ -596,10 +597,7 @@ func streamSendWindow(ctx context.Context, out *sendOutput, deps Deps, txferID s
 	}
 
 	var recorded WindowHash
-	// compressWide carries whether the last frame compressed slowly, and
-	// wideComp the codec it used: only a frame of the same codec goes wide.
-	var compressWide bool
-	var wideComp string
+	width := encoding.FrameWidth{Gentle: item.Mode == loadStrategyGentle}
 	for remaining := windowLen; remaining > 0; {
 		frameSize := min(remaining, defaultFileFrameLogicalSize)
 		nextOffset := cursor + frameSize
@@ -658,7 +656,7 @@ func streamSendWindow(ctx context.Context, out *sendOutput, deps Deps, txferID s
 			DirectIO:      usedDirectOpen,
 			Faults:        inj,
 			Timed:         scope.Sink.Enabled() || decide,
-			CompressWide:  compressWide && wideComp == frameComp,
+			CompressWide:  width.Wide(frameComp),
 		}
 
 		if decide && (compressPolicy.BackgroundPending() || (cursor/defaultFileFrameLogicalSize)%sendSniffEvery == 0) {
@@ -788,7 +786,7 @@ func streamSendWindow(ctx context.Context, out *sendOutput, deps Deps, txferID s
 		}
 		cursor = stats.NextOffset
 		remaining -= frameSize
-		compressWide, wideComp = compressesSlowly(stats.LogicalSize, stats.CompressCPU), frameComp
+		width.Observe(frameComp, stats.LogicalSize, stats.CompressConcurrency, stats.CompressLatency)
 		firstFrame = false
 		if isTerminal && scope.Sink.Enabled() && cursor >= fileRef.FileSize {
 			scope.Sink.Emit("file_done", txferID, events.F("conn", scope.Conn), events.F("file", item.FileID), events.Dur("dur", time.Since(itemStart)))
