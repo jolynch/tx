@@ -64,7 +64,9 @@ make bench                  # go test -bench, results in bench/results/latest.tx
 
 On Linux, run `make bench-suite` for a smoke run on at least two available
 CPUs. The full suite needs at least 16 available CPUs and runs the in-memory
-Go benchmarks followed by the four SSD workloads on the data root.
+Go benchmarks followed by the four SSD workloads on the data root. The
+`transfer-compressed` case uses every host CPU, so its results compare only
+between runs on the same host.
 
 ```bash
 make bench-suite BENCH_SUITE=full BENCH_SUITE_DATA_ROOT="/path/to/bench data" \

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -79,7 +80,7 @@ type suiteChart struct {
 // suiteBetter is the direction that counts as better for each metric the
 // suite charts. A chart that judges a metric the other way sets its own entry.
 var suiteBetter = map[string]string{
-	"MiB/s": "inc", "files/s": "inc",
+	"MiB/s": "inc", "files/s": "inc", "comp-ratio": "inc",
 	"core-s/GiB": "dec", "ratio": "dec", "allocs/op": "dec", "B/op": "dec",
 	"ns/op": "dec", "ns/ack": "dec", "copy_ns": "dec", "verify_ns": "dec",
 }
@@ -109,7 +110,9 @@ type suiteProfile struct {
 	GridMinWall string
 	VerifyBytes int64
 	VerifyConc  int
-	SSD         []suiteCase
+	// CompressedBytes is what each op of the compressed-transfer case copies.
+	CompressedBytes int64
+	SSD             []suiteCase
 }
 
 func ssdCase(id, label, size, mix string, bytes int64) suiteCase {
@@ -151,7 +154,7 @@ func suiteSettings(profile string) suiteProfile {
 		return suiteProfile{
 			CPUs: 2, Repeats: 1, BenchTime: "1x",
 			GridSize: "16MiB", GridCPUs: "2", GridEncrypt: "none", GridMinWall: "1ms",
-			VerifyBytes: 16 * suiteMiB, VerifyConc: 1,
+			VerifyBytes: 16 * suiteMiB, VerifyConc: 1, CompressedBytes: 64 * suiteMiB,
 			SSD: []suiteCase{
 				ssdCase("ssd-small", "Small files", "16MiB", "rand=100%@16KiB", 16*suiteMiB),
 				ssdCase("ssd-large", "Large files", "32MiB", "rand=100%@16MiB", 32*suiteMiB),
@@ -163,7 +166,7 @@ func suiteSettings(profile string) suiteProfile {
 	return suiteProfile{
 		CPUs: 8, Repeats: 3, BenchTime: "1s",
 		GridSize: "256MiB", GridCPUs: "4,16", GridEncrypt: "none,aes,chacha20", GridMinWall: "5s",
-		VerifyBytes: 256 * suiteMiB, VerifyConc: 4,
+		VerifyBytes: 256 * suiteMiB, VerifyConc: 4, CompressedBytes: suiteGiB,
 		SSD: []suiteCase{
 			ssdCase("ssd-small", "Small files", "2GiB", "rand=100%@16KiB", 2*suiteGiB),
 			ssdCase("ssd-large", "Large files", "40GiB", "rand=100%@2GiB", 40*suiteGiB),
@@ -204,8 +207,10 @@ func (p suiteProfile) cases() []suiteCase {
 		page.Prefix = mode + "/"
 		grid.Charts = append(grid.Charts, page)
 	}
+	compressed := p.compressedTransferCase(min(runtime.NumCPU(), runtime.GOMAXPROCS(0)))
 	return append([]suiteCase{
 		grid,
+		compressed,
 		bench("verify", "./internal/cmd/filexfercli",
 			"^BenchmarkVerifyInMemory$/^(4KiB|1MiB|16MiB)$/^cpus="+cpus+"$/^c="+conc+"$",
 			map[string]string{
@@ -232,6 +237,10 @@ func (p suiteProfile) cases() []suiteCase {
 		bench("codec", "./internal/bench", "^BenchmarkWrapDecompressedReader$/^(zstd|lz4)$", nil,
 			chart("codecs", "Ciphers and codecs", "MiB/s", "allocs/op"),
 			"BenchmarkWrapDecompressedReader/zstd", "BenchmarkWrapDecompressedReader/lz4"),
+		bench("frame-codec", "./internal/bench", "^BenchmarkAppendCompressedFrame$/^(lz4|zstd)$/^(c1|auto)$", nil,
+			chart("codecs", "Ciphers and codecs", "MiB/s", "allocs/op"),
+			"BenchmarkAppendCompressedFrame/lz4/c1", "BenchmarkAppendCompressedFrame/lz4/auto",
+			"BenchmarkAppendCompressedFrame/zstd/c1", "BenchmarkAppendCompressedFrame/zstd/auto"),
 		bench("split", ".", "^BenchmarkSplitEncodedRequests$/^(short-paths|long-paths)$", nil,
 			chart("control-path", "Control path", "ns/op", "B/op"),
 			"BenchmarkSplitEncodedRequests/short-paths", "BenchmarkSplitEncodedRequests/long-paths"),
@@ -245,6 +254,36 @@ func (p suiteProfile) cases() []suiteCase {
 			chart("control-path", "Control path", "ns/op", "B/op", "ns/ack"),
 			"BenchmarkTransferStoreAckBatch"),
 	}, p.SSD...)
+}
+
+// compressedTransferCase copies compressible files through an in-memory
+// server and client at every CPU the suite may use, so tx plans at least one
+// connection per CPU and the copy saturates whichever host runs the suite.
+// The CPU count is part of the identity, so hosts of different sizes keep
+// separate histories; results compare only between runs on the same host.
+func (p suiteProfile) compressedTransferCase(cpus int) suiteCase {
+	n := strconv.Itoa(cpus)
+	env := map[string]string{"TX_BENCH_COMPRESSED_BYTES": strconv.FormatInt(p.CompressedBytes, 10)}
+	var series []string
+	for _, comp := range []string{"lz4", "zstd", "adapt"} {
+		for _, size := range []string{"1MiB", "16MiB"} {
+			series = append(series, "BenchmarkTransferInMemoryCompressed/"+comp+"/"+size+"-"+n)
+		}
+	}
+	for _, comp := range []string{"lz4", "zstd"} {
+		series = append(series, "BenchmarkTransferInMemoryCompressedFew/"+comp+"-"+n)
+	}
+	return suiteCase{
+		ID: "transfer-compressed", Kind: "go", Repeats: p.Repeats, Revision: suiteGoRevision,
+		Charts: []suiteChart{chart("transfer-compressed", "Compressed transfer", "MiB/s", "core-s/GiB", "allocs/op", "comp-ratio")},
+		Argv: []string{"go", "test", "-run=^$", "-cpu=" + n, "-benchmem",
+			"-benchtime=" + p.BenchTime, "-count=" + strconv.Itoa(p.Repeats),
+			"-bench=^BenchmarkTransferInMemoryCompressed(Few)?$", "./internal/bench"},
+		Env: env, Series: series,
+		Identity: map[string]any{
+			"pkg": "./internal/bench", "cpu": cpus, "benchtime": p.BenchTime, "count": p.Repeats, "env": env,
+		},
+	}
 }
 
 func checkSuiteIDs(cases []suiteCase) error {

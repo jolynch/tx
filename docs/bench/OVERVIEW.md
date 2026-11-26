@@ -532,6 +532,43 @@ Without `TX_BENCH_THROUGHPUT_SIZE`, the test is skipped, so `go test ./...`
 stays fast. `BenchmarkTransferInMemory` runs the unencrypted copies under
 `make bench`; use `-cpu N` to plan for N CPUs.
 
+### Compressed transfers
+
+The grid sends random bytes, which never compress. Two benchmarks in the
+same file copy compressible files through the same in-memory server and
+client with a codec forced (`tx.WithComp`):
+
+- `BenchmarkTransferInMemoryCompressed/{lz4,zstd,adapt}/{1MiB,16MiB}`
+  probes and plans connections for GOMAXPROCS CPUs as `tx recv copy` does,
+  at least one per CPU over kept-alive connections, so with `-cpu=$(nproc)`
+  it saturates the host. The batch plan shrinks as CPUs grow: on 24 or more
+  CPUs every window is one 4 MiB frame, so every frame compresses on one
+  goroutine; on fewer, a 16 MiB file's later frames may go wide.
+- `BenchmarkTransferInMemoryCompressedFew/{lz4,zstd}` copies 64 MiB files
+  over two connections, the fewest tx opens, so at most two frames compress
+  at a time. Each file is one window of 16 frames; once its first frame
+  shows the data compresses slowly, the budget gives the rest several
+  encoder goroutines.
+
+Each op copies `TX_BENCH_COMPRESSED_BYTES` (default 1 GiB; for the second
+benchmark a quarter of that, and at least one file). The content comes from `compressibleContent`, a
+seeded generator of log lines, prose, and short binary records that lz4
+compresses about 2.0x and zstd about 2.6x on 1 MiB blocks, close to Silesia,
+with nothing to download. Besides MiB/s, `allocs/op`, and `B/op`, each
+reports `core-s/GiB` for both sides, `files/s`, and `comp-ratio`, the
+logical bytes received over the wire bytes, which the suite charts. With
+`adapt`, loopback is faster than any codec, so the policy should stay at
+`none` and `comp-ratio` at 1.0.
+
+The published suite runs both as the `transfer-compressed` case at every CPU
+it may use (the smaller of the CPU count and GOMAXPROCS), copying 1 GiB per
+op in the full profile and 64 MiB in smoke. The CPU count is part of the
+case identity, so hosts of different sizes keep separate histories. The
+`frame-codec` case runs `BenchmarkAppendCompressedFrame/{lz4,zstd}/{c1,auto}`
+in `codec_pool_test.go`, one 4 MiB frame per op. In the full profile, its c1
+series shows the one-goroutine path allocating nothing; smoke's single op
+also counts filling the encoder pools.
+
 ## Failure Semantics
 
 | Condition                                                                 | Behavior |

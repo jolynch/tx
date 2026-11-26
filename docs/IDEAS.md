@@ -266,7 +266,8 @@ instead of widening the current change; remove an entry when it ships.
   two-frame send buffer it adopted lz4 on a near-tie by prepare plus write,
   where overlap made zstd 40% faster, and its checks cost more than the
   send-buffer budget allows. Repros: `FuzzBackgroundThroughput`
-  `"A20120010020A01000"` and `"X0009000000090000001922010"` (zstd stays),
+  `"A20120010020A01000"`, `"X0009000000090000001922010"`, and
+  `"ɀ0720222020200100"` (zstd stays),
   and `FuzzBackgroundSendBuffer` `"00200X0200"` and `"00201X0211"` (an lz4
   check adopts lz4). Pricing codecs by overlapped time would let samples
   compare lz4 with zstd from a zstd home.
