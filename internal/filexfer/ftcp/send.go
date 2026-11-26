@@ -41,13 +41,10 @@ const sendSniffEvery = 8
 // through, so a small file's header, payload, and trailer, and many small
 // files together, share one write syscall.
 const sendOutputBufferBytes = 64 << 10
-const defaultCompressedFrameBufferBytes = 4 * 1024 * 1024
 const defaultMaxLinuxPipeSizeBytes int64 = 1 * 1024 * 1024
-const maxCompressedFrameBufferPoolBytes = 32 * 1024 * 1024
 const loadStrategyFast = "fast"
 const loadStrategyGentle = "gentle"
 
-var compressedFrameBufferPool sync.Pool
 var pipeMaxSizeOnce sync.Once
 var pipeMaxSizeBytes int64 = defaultMaxLinuxPipeSizeBytes
 
@@ -120,6 +117,11 @@ type frameStreamArgs struct {
 	Timed bool
 	// Sample copies already-read bytes for a nonblocking background job.
 	Sample *sendSampleJob
+	// CompressWide lets a compressed frame use more than one encoder
+	// goroutine when the core budget has them free. The window sets it after
+	// a frame of the same codec compressed slowly (compressesSlowly);
+	// cheaply compressed data only pays for the extra goroutines.
+	CompressWide bool
 }
 
 type frameStreamStats struct {
@@ -132,6 +134,9 @@ type frameStreamStats struct {
 	WriteLatency    time.Duration
 	NextOffset      int64
 	WindowHashToken string
+	// CompressCPU estimates the encoder's CPU time: its wall time times
+	// the goroutines it was granted. Zero for an uncompressed frame.
+	CompressCPU time.Duration
 }
 
 // parseSENDHeader reads the command line, which now carries only
@@ -591,6 +596,10 @@ func streamSendWindow(ctx context.Context, out *sendOutput, deps Deps, txferID s
 	}
 
 	var recorded WindowHash
+	// compressWide carries whether the last frame compressed slowly, and
+	// wideComp the codec it used: only a frame of the same codec goes wide.
+	var compressWide bool
+	var wideComp string
 	for remaining := windowLen; remaining > 0; {
 		frameSize := min(remaining, defaultFileFrameLogicalSize)
 		nextOffset := cursor + frameSize
@@ -649,6 +658,7 @@ func streamSendWindow(ctx context.Context, out *sendOutput, deps Deps, txferID s
 			DirectIO:      usedDirectOpen,
 			Faults:        inj,
 			Timed:         scope.Sink.Enabled() || decide,
+			CompressWide:  compressWide && wideComp == frameComp,
 		}
 
 		if decide && (compressPolicy.BackgroundPending() || (cursor/defaultFileFrameLogicalSize)%sendSniffEvery == 0) {
@@ -778,6 +788,7 @@ func streamSendWindow(ctx context.Context, out *sendOutput, deps Deps, txferID s
 		}
 		cursor = stats.NextOffset
 		remaining -= frameSize
+		compressWide, wideComp = compressesSlowly(stats.LogicalSize, stats.CompressCPU), frameComp
 		firstFrame = false
 		if isTerminal && scope.Sink.Enabled() && cursor >= fileRef.FileSize {
 			scope.Sink.Emit("file_done", txferID, events.F("conn", scope.Conn), events.F("file", item.FileID), events.Dur("dur", time.Since(itemStart)))

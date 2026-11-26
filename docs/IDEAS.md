@@ -446,14 +446,6 @@ instead of widening the current change; remove an entry when it ships.
   throughput probe opens one connection per server CPU, in both the transfer
   and converge phases of `tx recv copy`. Probe over pooled connections, or
   once per client.
-- **Data-frame compressors are built per frame.** `WrapCompressedWriter`
-  creates a zstd or lz4 writer for every compressed SEND frame, sized to
-  GOMAXPROCS in fast mode. At 24 CPUs a 4 KiB frame costs about 19
-  allocations and 630 KiB with zstd (7 and 200 KiB with lz4), which dominates
-  small compressible files sent with `comp=zstd`. Pool them with
-  `Reset`, apart from the framed-body pool, which must keep zstd's checksum.
-  Construction also precedes the prepare-time timer in
-  `streamFramePayloadBuffered`; include that setup in the measured cost.
 - **Framed-body zstd buffer churn.** `CompressZstdPooled` reallocates about
   8 MiB of encoder history and decoder block whenever GC empties the pool:
   about 60% of the bytes allocated during a small-file `--verify full`.

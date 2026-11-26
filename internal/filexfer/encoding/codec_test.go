@@ -329,23 +329,20 @@ func TestZstdChecksumOnlyWhereNothingElseVerifies(t *testing.T) {
 		t.Fatal("CompressZstdPooled frame has no zstd checksum")
 	}
 
-	var data bytes.Buffer
-	w, closeFn, _, err := WrapCompressedWriter(&data, EncodingZstd, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.Write(payload); err != nil {
-		t.Fatal(err)
-	}
-	if err := closeFn(); err != nil {
-		t.Fatal(err)
-	}
-	h = zstd.Header{}
-	if err := h.Decode(data.Bytes()); err != nil {
-		t.Fatal(err)
-	}
-	if h.HasCheckSum {
-		t.Fatal("data frame carries a zstd checksum the window hash makes redundant")
+	// Both data-frame encoders: EncodeAll at concurrency 1 and the
+	// streaming encoder at 2.
+	for _, concurrency := range []int{1, 2} {
+		data, err := appendZstdFrame(nil, payload, concurrency)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h = zstd.Header{}
+		if err := h.Decode(data); err != nil {
+			t.Fatal(err)
+		}
+		if h.HasCheckSum {
+			t.Fatalf("concurrency %d data frame carries a zstd checksum the window hash makes redundant", concurrency)
+		}
 	}
 }
 

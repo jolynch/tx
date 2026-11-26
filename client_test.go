@@ -1096,18 +1096,8 @@ func encodeSingleFramePayload(data []byte, comp string) ([]byte, error) {
 	case "none":
 		return data, nil
 	case EncodingZstd, EncodingLz4:
-		var buf bytes.Buffer
-		out, closeEncoded, _, err := intencoding.WrapCompressedWriter(&buf, comp, "")
-		if err != nil {
-			return nil, err
-		}
-		if _, err := out.Write(data); err != nil {
-			return nil, err
-		}
-		if err := closeEncoded(); err != nil {
-			return nil, err
-		}
-		return buf.Bytes(), nil
+		out, _, err := intencoding.AppendCompressedFrame(nil, data, intencoding.FrameCompression{Codec: comp})
+		return out, err
 	default:
 		return nil, errors.New("unsupported compression mode")
 	}

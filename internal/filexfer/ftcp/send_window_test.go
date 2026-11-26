@@ -705,12 +705,10 @@ func wordyBytes(n int) []byte {
 }
 
 // TestFramePrepareLatencyCoversCompression checks that a frame's
-// PrepareLatency includes all of the codec's work, Close included. pierrec lz4
-// in fast mode compresses its blocks while Close waits, so a timer that
-// stops before Close sees a fraction of the cost. The reference is the time
-// to compress the same bytes with the same settings; the margin is wide
-// because the frame is taken at its slowest run and the reference at its
-// fastest.
+// PrepareLatency includes all of the codec's work, which runs after the frame
+// is read. The reference is the time to compress the same bytes with the same
+// settings; the margin is wide because the frame is taken at its slowest run
+// and the reference at its fastest.
 func TestFramePrepareLatencyCoversCompression(t *testing.T) {
 	data := wordyBytes(int(defaultFileFrameLogicalSize))
 	path := writeTempSendFile(t, data)
@@ -720,16 +718,11 @@ func TestFramePrepareLatencyCoversCompression(t *testing.T) {
 				const runs = 4
 				ref := time.Duration(1 << 62)
 				for i := 0; i < runs; i++ {
-					var sink bytes.Buffer
+					// A window's first frame compresses on one goroutine.
+					opts := encoding.FrameCompression{Codec: comp, MaxConcurrency: 1}
+					dst := make([]byte, 0, 2*len(data))
 					start := time.Now()
-					w, closeW, _, err := encoding.WrapCompressedWriter(&sink, comp, mode)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if _, err := w.Write(data); err != nil {
-						t.Fatal(err)
-					}
-					if err := closeW(); err != nil {
+					if _, _, err := encoding.AppendCompressedFrame(dst, data, opts); err != nil {
 						t.Fatal(err)
 					}
 					ref = min(ref, time.Since(start))
@@ -1027,5 +1020,54 @@ func TestHandleSENDFailedOnlyItemKeepsCompressionState(t *testing.T) {
 	}
 	if len(deps.windowHash) != 0 {
 		t.Fatalf("failed item recorded window hashes: %v", deps.windowHash)
+	}
+}
+
+// A window's next frame may go wide only after a frame that compressed below
+// wideCompressMaxBytesPerCoreSec; random and zero-filled data compress far
+// faster than that, so they stay on one goroutine.
+func TestCompressesSlowly(t *testing.T) {
+	const frame = 4 << 20
+	for _, tc := range []struct {
+		cpu  time.Duration
+		want bool
+	}{
+		{0, false},                      // uncompressed
+		{200 * time.Microsecond, false}, // random data through lz4: about 20 GiB/s
+		{1900 * time.Microsecond, false},
+		{2100 * time.Microsecond, true},
+		{8 * time.Millisecond, true}, // text through lz4: about 500 MiB/s
+	} {
+		if got := compressesSlowly(frame, tc.cpu); got != tc.want {
+			t.Errorf("compressesSlowly(4 MiB, %v) = %v, want %v", tc.cpu, got, tc.want)
+		}
+	}
+}
+
+// A compressed frame reports its encoder's CPU estimate so the window can
+// decide the next frame's width; an uncompressed one reports none.
+func TestBufferedFrameReportsCompressCPU(t *testing.T) {
+	data := wordyBytes(1 << 20)
+	path := writeTempSendFile(t, data)
+	for _, comp := range []string{"none", encoding.EncodingLz4, encoding.EncodingZstd} {
+		for _, wide := range []bool{false, true} {
+			fd, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var off int64
+			var out bytes.Buffer
+			stats, err := streamFramePayloadBuffered(fd, &off, frameStreamArgs{
+				Ctx: context.Background(), FileID: 1, FrameSize: int64(len(data)), Comp: comp,
+				Mode: loadStrategyFast, WindowHasher: xxh3.New128(), Output: &out, CompressWide: wide,
+			})
+			_ = fd.Close()
+			if err != nil {
+				t.Fatalf("%s wide=%v: %v", comp, wide, err)
+			}
+			if (stats.CompressCPU > 0) != (comp != "none") {
+				t.Errorf("%s wide=%v: CompressCPU = %v", comp, wide, stats.CompressCPU)
+			}
+		}
 	}
 }

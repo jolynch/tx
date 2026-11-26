@@ -34,19 +34,9 @@ func BenchmarkWrapDecompressedReader(b *testing.B) {
 
 func encodeForCodecPoolBench(b *testing.B, comp string, payload []byte) []byte {
 	b.Helper()
-	var out bytes.Buffer
-	writer, closeFn, selected, err := encoding.WrapCompressedWriter(&out, comp, "")
+	out, _, err := encoding.AppendCompressedFrame(nil, payload, encoding.FrameCompression{Codec: comp})
 	if err != nil {
-		b.Fatalf("compress setup (%s): %v", comp, err)
+		b.Fatalf("compress (%s): %v", comp, err)
 	}
-	if selected != comp {
-		b.Fatalf("compress mode mismatch: got=%s want=%s", selected, comp)
-	}
-	if _, err := writer.Write(payload); err != nil {
-		b.Fatalf("compress write (%s): %v", comp, err)
-	}
-	if err := closeFn(); err != nil {
-		b.Fatalf("compress close (%s): %v", comp, err)
-	}
-	return out.Bytes()
+	return out
 }
