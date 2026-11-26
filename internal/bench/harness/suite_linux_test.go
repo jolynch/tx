@@ -212,13 +212,50 @@ func TestSuiteCaseIdentity(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, name := range c.Series {
-				if strings.Contains(string(raw), strings.TrimSuffix(name, "-"+strconv.Itoa(suiteSettings(profile).CPUs))) {
+				if i := strings.LastIndexByte(name, '-'); i > 0 {
+					name = name[:i] // the -N CPU suffix
+				}
+				if strings.Contains(string(raw), name) {
 					t.Errorf("%s %s identity names series %s", profile, c.ID, name)
 				}
 			}
 			if strings.Contains(string(raw), "-bench") {
 				t.Errorf("%s %s identity includes the -bench filter", profile, c.ID)
 			}
+		}
+	}
+}
+
+// The compressed-transfer case runs at the CPU count it was built for, and
+// every series it expects parses from the benchmark's real output format.
+func TestSuiteCompressedTransferCase(t *testing.T) {
+	c := suiteSettings("smoke").compressedTransferCase(6)
+	if !slices.Contains(c.Argv, "-cpu=6") || c.Identity["cpu"] != 6 {
+		t.Fatalf("case does not run at 6 CPUs: argv %q, identity %v", c.Argv, c.Identity)
+	}
+	if c.Env["TX_BENCH_COMPRESSED_BYTES"] != strconv.Itoa(64*suiteMiB) {
+		t.Fatalf("smoke copy size = %q", c.Env["TX_BENCH_COMPRESSED_BYTES"])
+	}
+	if len(c.Series) != 8 {
+		t.Fatalf("%d series, want 8: %q", len(c.Series), c.Series)
+	}
+	var out strings.Builder
+	for range c.Repeats {
+		for _, name := range c.Series {
+			fmt.Fprintf(&out, "%s \t 1\t  51874232 ns/op\t1293.68 MB/s\t 2.067 comp-ratio\t 3.196 core-s/GiB\t 1234 files/s\t 1847528 B/op\t 6924 allocs/op\n", name)
+		}
+	}
+	log := filepath.Join(t.TempDir(), "case.log")
+	if err := os.WriteFile(log, []byte(out.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	samples, missing, err := readSuiteBenchmarks(log, c)
+	if err != nil || len(missing) != 0 {
+		t.Fatalf("readSuiteBenchmarks: missing %q, err %v", missing, err)
+	}
+	for _, name := range c.Series {
+		if got := samples[name]; len(got) != c.Repeats || got[0]["allocs/op"] != 6924 || got[0]["core-s/GiB"] != 3.196 || got[0]["comp-ratio"] != 2.067 {
+			t.Fatalf("%s: unexpected samples %v", name, got)
 		}
 	}
 }
