@@ -513,6 +513,15 @@ instead of widening the current change; remove an entry when it ships.
     no length bound; and `buildAckToken` builds each ACK token as a string
     before copying it into the request body.
 
+- **The frame core budget ignores other CPU work.** It counts only encoder
+  goroutines, so a slow frame can take 4 lz4 goroutines while hashing,
+  sockets, and the receiver keep every core busy. At 4 CPUs on
+  `BenchmarkTransferInMemoryCompressed/lz4/16MiB`, one frame in 256 got 4
+  goroutines and took 204 ms against about 34 ms narrow. Throughput and
+  CPU per GiB did not change, so it only adds latency outliers. A cheap
+  measure of CPU saturation, such as runnable goroutines, could gate wide
+  grants.
+
 ## Security
 
 - **Credentials carry no scope.** Any allowlisted token or age key can list
@@ -540,6 +549,13 @@ instead of widening the current change; remove an entry when it ships.
 
 ## Testing
 
+- **The direct-I/O EINVAL fallback is untested.** `streamSendItem` reopens a
+  file without `O_DIRECT` when a direct read fails with `EINVAL`, both
+  mid-window and on the first frame with the window hasher reset. Linux 7.0
+  on ext4 accepts unaligned `O_DIRECT` reads, so
+  `TestSendItemDirectIOFramesAndFallback` reaches that branch only on older
+  kernels. An `EINVAL` read fault in `internal/faults` would cover it
+  everywhere.
 - **`TestAdaptiveUnderRateFaults/slow_link` flakes under load.** In a full
   `go test ./...` it once compressed 25% of bytes against its 30% floor; alone
   it compresses 50%. Its files go as one window each, so the share depends on

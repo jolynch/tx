@@ -9,29 +9,23 @@ import (
 
 func TestCompressesSlowly(t *testing.T) {
 	const frame = 4 << 20
-	// A 4 MiB frame is slow at or above 2 ms of encoder CPU.
+	// A 4 MiB frame is slow at or above 2 ms on one goroutine.
 	threshold := time.Duration(float64(frame) / WideCompressMaxBytesPerCoreSec * float64(time.Second))
 	for _, tc := range []struct {
-		name        string
-		logical     int64
-		concurrency int
-		wall        time.Duration
-		want        bool
+		name    string
+		logical int64
+		wall    time.Duration
+		want    bool
 	}{
-		{"uncompressed frame", frame, 0, time.Millisecond, false},
-		{"no time measured", frame, 1, 0, false},
-		{"empty frame", 0, 1, time.Millisecond, false},
-		{"random data through lz4, about 20 GiB/s", frame, 1, 200 * time.Microsecond, false},
-		{"just under the threshold", frame, 1, threshold - time.Microsecond, false},
-		{"just over the threshold", frame, 1, threshold + time.Microsecond, true},
-		{"text through lz4, about 500 MiB/s", frame, 1, 8 * time.Millisecond, true},
-		// A wide frame's wall time understates its CPU: 1 ms on 4 goroutines
-		// is 4 ms of CPU, which is slow, so the next frame stays wide.
-		{"wide text frame", frame, 4, time.Millisecond, true},
-		{"wide random frame", frame, 4, 100 * time.Microsecond, false},
+		{"no time measured", frame, 0, false},
+		{"empty frame", 0, time.Millisecond, false},
+		{"random data through lz4, about 20 GiB/s", frame, 200 * time.Microsecond, false},
+		{"just under the threshold", frame, threshold - time.Microsecond, false},
+		{"just over the threshold", frame, threshold + time.Microsecond, true},
+		{"text through lz4, about 500 MiB/s", frame, 8 * time.Millisecond, true},
 	} {
-		if got := compressesSlowly(tc.logical, tc.concurrency, tc.wall); got != tc.want {
-			t.Errorf("%s: compressesSlowly(%d, %d, %v) = %v, want %v", tc.name, tc.logical, tc.concurrency, tc.wall, got, tc.want)
+		if got := compressesSlowly(tc.logical, tc.wall); got != tc.want {
+			t.Errorf("%s: compressesSlowly(%d, %v) = %v, want %v", tc.name, tc.logical, tc.wall, got, tc.want)
 		}
 	}
 }
@@ -40,7 +34,7 @@ func TestCompressesSlowly(t *testing.T) {
 func TestFrameWidth(t *testing.T) {
 	const frame = 4 << 20
 	slow, fast := 8*time.Millisecond, 200*time.Microsecond
-	var w FrameWidth
+	w := FrameWidth{hints: &frameHints{}}
 	if w.Wide(EncodingLz4) {
 		t.Fatal("a window's first frame went wide")
 	}
@@ -64,27 +58,110 @@ func TestFrameWidth(t *testing.T) {
 	if w.Wide(EncodingLz4) {
 		t.Fatal("the frame after an uncompressed frame went wide")
 	}
-	gentle := FrameWidth{Gentle: true}
+	gentle := FrameWidth{Gentle: true, hints: w.hints}
 	gentle.Observe(EncodingLz4, frame, 1, slow)
 	if gentle.Wide(EncodingLz4) {
 		t.Fatal("a gentle window went wide")
 	}
 }
 
-// FuzzFrameWidth drives a window through random frames and checks Wide
-// against a model: wide only after a frame of the same codec whose encoder
-// CPU (wall time times goroutines) put it below the threshold, and never in
-// a gentle window.
+// A window's first frame follows the process's last frame of its codec, so
+// a file that is a single window can compress wide, and fast data does not.
+func TestFrameWidthFirstFrameFollowsHints(t *testing.T) {
+	const frame = 4 << 20
+	slow, fast := 8*time.Millisecond, 200*time.Microsecond
+	hints := &frameHints{}
+	first := FrameWidth{hints: hints}
+	first.Observe(EncodingLz4, frame, 1, slow)
+	if w := (FrameWidth{hints: hints}); !w.Wide(EncodingLz4) || w.Wide(EncodingZstd) {
+		t.Fatal("after a slow lz4 frame, a new window's first frame should go wide for lz4 only")
+	}
+	first.Observe("none", frame, 0, 0) // an uncompressed frame leaves the hint
+	if w := (FrameWidth{hints: hints}); !w.Wide(EncodingLz4) {
+		t.Fatal("an uncompressed frame cleared the lz4 hint")
+	}
+	other := FrameWidth{hints: hints}
+	other.Observe(EncodingLz4, frame, 4, fast/4)
+	if w := (FrameWidth{hints: hints}); w.Wide(EncodingLz4) {
+		t.Fatal("after a fast lz4 frame, a new window's first frame went wide")
+	}
+	if w := (FrameWidth{Gentle: true, hints: hints}); w.Wide(EncodingLz4) {
+		t.Fatal("a gentle window's first frame went wide")
+	}
+}
+
+// A window of data that compresses faster than the threshold on one
+// goroutine must narrow again after one frame misjudged as slow, such as the
+// first frame on a cold encoder pool, or one preempted. Wide encoders scale
+// sublinearly, so a wide frame's wall time times its goroutines overstates
+// the CPU a narrow frame of the same data would take, and fast data then
+// stays wide for the rest of the window.
+//
+// The cases use frame_width.go's measured scaling (lz4 2.9x at 4, zstd 1.3x
+// at 2) and, for random data through zstd, measured wall times: 0.5 ms on
+// one goroutine, 1.2 ms on two through the streaming encoder.
+func TestFrameWidthNarrowsWhenWideFramesOfFastData(t *testing.T) {
+	const frame = 4 << 20
+	narrow := func(bytesPerSec float64) time.Duration {
+		return time.Duration(frame / bytesPerSec * float64(time.Second))
+	}
+	const giB = 1 << 30
+	for _, tc := range []struct {
+		name        string
+		codec       string
+		concurrency int
+		narrowWall  time.Duration
+		wideWall    time.Duration
+	}{
+		{"lz4 at 2.5 GiB/s, 2.9x on 4", EncodingLz4, 4, narrow(2.5 * giB), narrow(2.5 * giB * 2.9)},
+		{"zstd at 2.5 GiB/s, 1.3x on 2", EncodingZstd, 2, narrow(2.5 * giB), narrow(2.5 * giB * 1.3)},
+		{"random data through zstd", EncodingZstd, 2, 500 * time.Microsecond, 1200 * time.Microsecond},
+	} {
+		if compressesSlowly(frame, tc.narrowWall) {
+			t.Fatalf("%s: the case's narrow frame is slow; it must model fast data", tc.name)
+		}
+		w := FrameWidth{hints: &frameHints{}}
+		w.Observe(tc.codec, frame, 1, 3*time.Millisecond) // misjudged as slow
+		if !w.Wide(tc.codec) {
+			t.Fatalf("%s: the frame after a slow one stayed narrow", tc.name)
+		}
+		w.Observe(tc.codec, frame, tc.concurrency, tc.wideWall)
+		if w.Wide(tc.codec) {
+			t.Errorf("%s: a %v frame on %d goroutines, whose data takes %v on one, kept the window wide", tc.name, tc.wideWall, tc.concurrency, tc.narrowWall)
+		}
+	}
+}
+
+// FuzzFrameWidth drives windows that share hints through random frames and
+// checks Wide against a model. Within a window, a frame may go wide only
+// after a frame of the same codec whose estimated one-goroutine time (wall
+// time times the encoder's speedup) put it below the threshold. A window's
+// first frame follows the last compressed frame of its codec in any window.
+// A gentle window never goes wide.
 func FuzzFrameWidth(f *testing.F) {
 	f.Add(false, []byte{0, 1, 200, 0, 1, 10})
 	f.Add(true, []byte{0, 1, 255, 0, 1, 255})
 	f.Add(false, []byte{1, 2, 128, 2, 0, 0, 1, 4, 30})
+	// Slow lz4, then zstd (narrow), slow lz4, wide and still slow, wide and
+	// fast, then narrow.
+	f.Add(false, []byte{0, 0, 200, 1, 0, 0, 0, 0, 200, 0, 2, 31, 0, 2, 1, 0, 0, 0})
+	// Slow lz4, a new window, its first lz4 frame, then fast lz4 and a new
+	// window again.
+	f.Add(false, []byte{0, 0, 200, 3, 0, 0, 0, 0, 200, 0, 2, 1, 3, 0, 0, 0, 0, 10})
 	f.Fuzz(func(t *testing.T, gentle bool, ops []byte) {
 		codecs := []string{EncodingLz4, EncodingZstd, "none"}
-		w := FrameWidth{Gentle: gentle}
+		hints := &frameHints{}
+		w := FrameWidth{Gentle: gentle, hints: hints}
+		hint := map[string]bool{}
 		var lastCodec string
 		var lastSlow bool
 		for len(ops) >= 3 {
+			if ops[0]%4 == 3 { // a new window
+				w = FrameWidth{Gentle: gentle, hints: hints}
+				lastCodec, lastSlow = "", false
+				ops = ops[3:]
+				continue
+			}
 			codec := codecs[int(ops[0])%len(codecs)]
 			concurrency := []int{1, 2, 4}[int(ops[1])%3]
 			if codec == "none" {
@@ -96,12 +173,18 @@ func FuzzFrameWidth(f *testing.F) {
 			ops = ops[3:]
 
 			want := !gentle && lastSlow && lastCodec == codec
+			if lastCodec == "" {
+				want = !gentle && hint[codec]
+			}
 			if got := w.Wide(codec); got != want {
-				t.Fatalf("Wide(%s) = %v after a %s frame (slow %v), gentle %v", codec, got, lastCodec, lastSlow, gentle)
+				t.Fatalf("Wide(%s) = %v after a %q frame (slow %v, hint %v), gentle %v", codec, got, lastCodec, lastSlow, hint[codec], gentle)
 			}
 			w.Observe(codec, 4<<20, concurrency, wall)
-			cpu := wall.Seconds() * float64(concurrency)
-			lastCodec, lastSlow = codec, cpu > 0 && float64(4<<20) < WideCompressMaxBytesPerCoreSec*cpu
+			narrow := wall.Seconds() * frameSpeedup(codec, concurrency)
+			lastCodec, lastSlow = codec, concurrency > 0 && narrow > 0 && float64(4<<20) < WideCompressMaxBytesPerCoreSec*narrow
+			if concurrency > 0 {
+				hint[codec] = lastSlow
+			}
 		}
 	})
 }
@@ -149,52 +232,12 @@ func TestFrameConcurrencyCap(t *testing.T) {
 		{16 << 20, 4, 0, 4},
 		{4 << 20, 2, 0, 2},
 		{4 << 20, 4, 1, 1},
-		{4 << 20, 4, 3, 2},
-		{3 << 20, 4, 0, 2},
+		{4 << 20, 4, 3, 3},
+		{3 << 20, 4, 0, 3},
 	} {
 		if got := frameConcurrencyCap(tc.n, tc.codecMax, tc.callerMax); got != tc.want {
 			t.Errorf("frameConcurrencyCap(%d, %d, %d) = %d, want %d", tc.n, tc.codecMax, tc.callerMax, got, tc.want)
 		}
-	}
-}
-
-// TestFrameCompressionBudget checks the core budget's grants: one goroutine
-// always, more only within the limit, and everything returned on release.
-func TestFrameCompressionBudget(t *testing.T) {
-	b := coreBudget{limit: func() int64 { return 8 }}
-	first, second, third := b.reserve(4), b.reserve(4), b.reserve(4)
-	if first != 4 || second != 4 || third != 1 {
-		t.Fatalf("grants on an 8-core budget = %d, %d, %d; want 4, 4, 1", first, second, third)
-	}
-	b.release(first)
-	if got := b.reserve(2); got != 2 {
-		t.Fatalf("grant after a release = %d, want 2", got)
-	}
-	b.release(2)
-	b.release(second)
-	b.release(third)
-	if got := b.inUse.Load(); got != 0 {
-		t.Fatalf("%d goroutines still reserved after every release", got)
-	}
-
-	small := coreBudget{limit: func() int64 { return 3 }}
-	if got := small.reserve(4); got != 2 {
-		t.Fatalf("grant on a 3-core budget = %d, want 2", got)
-	}
-
-	// Concurrent callers never leave goroutines reserved.
-	shared := coreBudget{limit: func() int64 { return 4 }}
-	var wg sync.WaitGroup
-	for range 32 {
-		wg.Go(func() {
-			for range 1000 {
-				shared.release(shared.reserve(4))
-			}
-		})
-	}
-	wg.Wait()
-	if got := shared.inUse.Load(); got != 0 {
-		t.Fatalf("%d goroutines still reserved after concurrent callers finished", got)
 	}
 }
 
@@ -206,6 +249,7 @@ func FuzzFrameCompressionBudget(f *testing.F) {
 	f.Add(uint8(8), []byte{4, 4, 4, 0x80, 2})
 	f.Add(uint8(1), []byte{4, 2, 1})
 	f.Add(uint8(3), []byte{4, 0x80, 4, 4})
+	f.Add(uint8(8), []byte{1})
 	f.Fuzz(func(t *testing.T, limitRaw uint8, ops []byte) {
 		limit := int64(limitRaw%64) + 1
 		b := coreBudget{limit: func() int64 { return limit }}

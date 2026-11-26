@@ -179,18 +179,7 @@ func suiteSettings(profile string) suiteProfile {
 func (p suiteProfile) cases() []suiteCase {
 	cpus, conc := strconv.Itoa(p.CPUs), strconv.Itoa(p.VerifyConc)
 	bench := func(id, pkg, filter string, env map[string]string, chart suiteChart, names ...string) suiteCase {
-		for i := range names {
-			names[i] += "-" + cpus
-		}
-		return suiteCase{
-			ID: id, Kind: "go", Repeats: p.Repeats, Revision: suiteGoRevision, Charts: []suiteChart{chart},
-			Argv: []string{"go", "test", "-run=^$", "-cpu=" + cpus, "-benchmem",
-				"-benchtime=" + p.BenchTime, "-count=" + strconv.Itoa(p.Repeats), "-bench=" + filter, pkg},
-			Env: env, Series: names,
-			Identity: map[string]any{
-				"pkg": pkg, "cpu": p.CPUs, "benchtime": p.BenchTime, "count": p.Repeats, "env": env,
-			},
-		}
+		return p.goCase(p.CPUs, id, pkg, filter, env, chart, names...)
 	}
 	verifySuffix := "/cpus=" + cpus + "/c=" + conc
 	gridEnv := map[string]string{"TX_BENCH_THROUGHPUT_MIN_WALL": p.GridMinWall}
@@ -256,34 +245,43 @@ func (p suiteProfile) cases() []suiteCase {
 	}, p.SSD...)
 }
 
+// goCase runs the Go benchmarks matching filter in pkg at cpus CPUs and
+// expects the named series, to which it adds the -N CPU suffix.
+func (p suiteProfile) goCase(cpus int, id, pkg, filter string, env map[string]string, chart suiteChart, names ...string) suiteCase {
+	n := strconv.Itoa(cpus)
+	for i := range names {
+		names[i] += "-" + n
+	}
+	return suiteCase{
+		ID: id, Kind: "go", Repeats: p.Repeats, Revision: suiteGoRevision, Charts: []suiteChart{chart},
+		Argv: []string{"go", "test", "-run=^$", "-cpu=" + n, "-benchmem",
+			"-benchtime=" + p.BenchTime, "-count=" + strconv.Itoa(p.Repeats), "-bench=" + filter, pkg},
+		Env: env, Series: names,
+		Identity: map[string]any{
+			"pkg": pkg, "cpu": cpus, "benchtime": p.BenchTime, "count": p.Repeats, "env": env,
+		},
+	}
+}
+
 // compressedTransferCase copies compressible files through an in-memory
 // server and client at every CPU the suite may use, so tx plans at least one
 // connection per CPU and the copy saturates whichever host runs the suite.
 // The CPU count is part of the identity, so hosts of different sizes keep
 // separate histories; results compare only between runs on the same host.
 func (p suiteProfile) compressedTransferCase(cpus int) suiteCase {
-	n := strconv.Itoa(cpus)
-	env := map[string]string{"TX_BENCH_COMPRESSED_BYTES": strconv.FormatInt(p.CompressedBytes, 10)}
 	var series []string
 	for _, comp := range []string{"lz4", "zstd", "adapt"} {
 		for _, size := range []string{"1MiB", "16MiB"} {
-			series = append(series, "BenchmarkTransferInMemoryCompressed/"+comp+"/"+size+"-"+n)
+			series = append(series, "BenchmarkTransferInMemoryCompressed/"+comp+"/"+size)
 		}
 	}
 	for _, comp := range []string{"lz4", "zstd"} {
-		series = append(series, "BenchmarkTransferInMemoryCompressedFew/"+comp+"-"+n)
+		series = append(series, "BenchmarkTransferInMemoryCompressedFew/"+comp)
 	}
-	return suiteCase{
-		ID: "transfer-compressed", Kind: "go", Repeats: p.Repeats, Revision: suiteGoRevision,
-		Charts: []suiteChart{chart("transfer-compressed", "Compressed transfer", "MiB/s", "core-s/GiB", "allocs/op", "comp-ratio")},
-		Argv: []string{"go", "test", "-run=^$", "-cpu=" + n, "-benchmem",
-			"-benchtime=" + p.BenchTime, "-count=" + strconv.Itoa(p.Repeats),
-			"-bench=^BenchmarkTransferInMemoryCompressed(Few)?$", "./internal/bench"},
-		Env: env, Series: series,
-		Identity: map[string]any{
-			"pkg": "./internal/bench", "cpu": cpus, "benchtime": p.BenchTime, "count": p.Repeats, "env": env,
-		},
-	}
+	return p.goCase(cpus, "transfer-compressed", "./internal/bench", "^BenchmarkTransferInMemoryCompressed(Few)?$",
+		map[string]string{"TX_BENCH_COMPRESSED_BYTES": strconv.FormatInt(p.CompressedBytes, 10)},
+		chart("transfer-compressed", "Compressed transfer", "MiB/s", "core-s/GiB", "allocs/op", "comp-ratio"),
+		series...)
 }
 
 func checkSuiteIDs(cases []suiteCase) error {

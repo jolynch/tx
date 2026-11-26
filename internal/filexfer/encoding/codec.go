@@ -41,7 +41,9 @@ var lz4ReaderPool sync.Pool
 
 func (c *zstdMaxEncodedSizeCache) maxEncodedSize(n int) (int, error) {
 	c.once.Do(func() {
-		// Same configuration as acquirePooledZstdEncoder: a bound measured on a
+		// Same level and block size as every zstd encoder in this package,
+		// including the data-frame encoders, which differ only in leaving
+		// out the CRC and using less memory: a bound measured on a
 		// differently-tuned encoder does not bound this one's output.
 		c.enc, c.err = zstd.NewWriter(io.Discard, zstdEncoderOptions()...)
 		if c.err == nil {

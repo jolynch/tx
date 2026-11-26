@@ -4,11 +4,13 @@ package encoding
 // how many goroutines a frame's encoder uses:
 //
 //   - FrameWidth, per window: may this frame use more than one? Only when the
-//     window's previous frame, of the same codec, compressed slowly.
+//     window's previous frame, of the same codec, compressed slowly; for a
+//     window's first frame, when the process's last frame of that codec did.
 //   - frameConcurrencyCap, per frame: at most one goroutine per 1 MiB block,
-//     within the codec's maximum, rounded down to 1, 2, or 4.
-//   - frameCoreBudget, per process: extra goroutines only while the encoders
-//     of all frames compressing at once fit in GOMAXPROCS.
+//     within the codec's maximum.
+//   - frameCoreBudget, per process: 1, 2, or 4 goroutines within that cap,
+//     more than one only while the encoders of all frames compressing at
+//     once fit in GOMAXPROCS.
 
 import (
 	"runtime"
@@ -23,31 +25,83 @@ import (
 // goroutines cost more than the encoding itself.
 const WideCompressMaxBytesPerCoreSec = 2 << 30
 
-// compressesSlowly reports whether logical bytes compressed by concurrency
-// goroutines in wall time ran below WideCompressMaxBytesPerCoreSec per core.
-// The encoder's CPU time is estimated as wall time times its goroutines.
-func compressesSlowly(logical int64, concurrency int, wall time.Duration) bool {
-	cpu := wall.Seconds() * float64(concurrency)
-	return logical > 0 && cpu > 0 && float64(logical) < WideCompressMaxBytesPerCoreSec*cpu
+// compressesSlowly reports whether logical bytes that one encoder goroutine
+// compresses in narrowWall ran below WideCompressMaxBytesPerCoreSec.
+func compressesSlowly(logical int64, narrowWall time.Duration) bool {
+	return logical > 0 && narrowWall > 0 && float64(logical) < WideCompressMaxBytesPerCoreSec*narrowWall.Seconds()
 }
 
+// frameSpeedup is the wall-time speedup of a data-frame encoder on
+// concurrency goroutines over one, measured on 4 MiB frames of text. A wide
+// frame's wall time times this speedup estimates what one goroutine would
+// take. Wall time times the goroutine count would overstate it, since the
+// encoders scale sublinearly, and would keep a window of fast data wide once
+// one frame was misjudged as slow, such as a window's first frame on a cold
+// encoder pool.
+func frameSpeedup(codec string, concurrency int) float64 {
+	switch {
+	case concurrency <= 1:
+		return 1
+	case codec == EncodingZstd:
+		return 1.3
+	case concurrency == 2:
+		return 1.6
+	default:
+		return 2.9
+	}
+}
+
+// frameHints records, per codec, whether the process's most recent
+// compressed frame compressed slowly. A window's first frame follows it, so
+// a file that is a single window still compresses wide when its data is
+// slow, and a workload of fast data stays narrow from its first frame.
+type frameHints struct {
+	lz4, zstd atomic.Bool
+}
+
+func (h *frameHints) slow(codec string) *atomic.Bool {
+	switch codec {
+	case EncodingLz4:
+		return &h.lz4
+	case EncodingZstd:
+		return &h.zstd
+	}
+	return nil
+}
+
+var processFrameHints frameHints
+
 // FrameWidth tracks one window's frames and decides whether the next may use
-// more than one encoder goroutine. The zero value starts narrow: a window's
-// first frame always compresses on one goroutine, which costs nothing extra
-// and shows how fast its data compresses.
+// more than one encoder goroutine. The zero value uses the process's hints.
 type FrameWidth struct {
 	// Gentle keeps every frame on one goroutine.
 	Gentle bool
 
+	hints *frameHints // nil means processFrameHints
 	slow  bool
 	codec string
 }
 
+func (w *FrameWidth) hintFor(codec string) *atomic.Bool {
+	if w.hints == nil {
+		return processFrameHints.slow(codec)
+	}
+	return w.hints.slow(codec)
+}
+
 // Wide reports whether the next frame, compressed with codec, may use more
 // than one encoder goroutine: the previous frame used the same codec and
-// compressed slowly.
+// compressed slowly, or, for a window's first frame, the process's last frame
+// of that codec did.
 func (w *FrameWidth) Wide(codec string) bool {
-	return !w.Gentle && w.slow && w.codec == codec
+	if w.Gentle {
+		return false
+	}
+	if w.codec == "" {
+		h := w.hintFor(codec)
+		return h != nil && h.Load()
+	}
+	return w.slow && w.codec == codec
 }
 
 // Observe records a sent frame: its codec, its logical size, and the
@@ -55,7 +109,10 @@ func (w *FrameWidth) Wide(codec string) bool {
 // concurrency of 0.
 func (w *FrameWidth) Observe(codec string, logical int64, concurrency int, wall time.Duration) {
 	w.codec = codec
-	w.slow = compressesSlowly(logical, concurrency, wall)
+	w.slow = concurrency > 0 && compressesSlowly(logical, time.Duration(float64(wall)*frameSpeedup(codec, concurrency)))
+	if h := w.hintFor(codec); h != nil && concurrency > 0 && h.Load() != w.slow {
+		h.Store(w.slow)
+	}
 }
 
 // frameBlockBytes is the lz4 block size of a data frame, and the unit a
@@ -115,19 +172,12 @@ func (b *coreBudget) release(concurrency int) {
 }
 
 // frameConcurrencyCap is the most goroutines a frame of n bytes can use:
-// at most one per 1 MiB block, within the codec's and the caller's maximum,
-// rounded down to 1, 2, or 4.
+// at most one per 1 MiB block, within the codec's and the caller's maximum.
+// reserve rounds it down to 1, 2, or 4.
 func frameConcurrencyCap(n int, codecMax int, callerMax int) int {
 	c := min(codecMax, max(1, (n+frameBlockBytes-1)/frameBlockBytes))
 	if callerMax > 0 {
 		c = min(c, callerMax)
 	}
-	switch {
-	case c >= 4:
-		return 4
-	case c >= 2:
-		return 2
-	default:
-		return 1
-	}
+	return c
 }

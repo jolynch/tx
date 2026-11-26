@@ -546,15 +546,15 @@ client with a codec forced (`tx.WithComp`):
   goroutine; on fewer, a 16 MiB file's later frames may go wide.
 - `BenchmarkTransferInMemoryCompressedFew/{lz4,zstd}` copies 64 MiB files
   over two connections, the fewest tx opens, so at most two frames compress
-  at a time. Each file is one window of 16 frames; once its first frame
-  shows the data compresses slowly, the budget gives the rest several
-  encoder goroutines.
+  at a time. Each file is one window of 16 frames; once a frame shows the
+  data compresses slowly, the budget gives later frames, and the next
+  windows' first frames, several encoder goroutines.
 
 Each op copies `TX_BENCH_COMPRESSED_BYTES` (default 1 GiB; for the second
-benchmark a quarter of that, and at least one file). The content comes from `compressibleContent`, a
-seeded generator of log lines, prose, and short binary records that lz4
-compresses about 2.0x and zstd about 2.6x on 1 MiB blocks, close to Silesia,
-with nothing to download. Besides MiB/s, `allocs/op`, and `B/op`, each
+benchmark a quarter of that, and at least one file). The content comes from
+`compressibleContent`, a seeded generator of log lines, prose, and short
+binary records that lz4 compresses about 2.0x and zstd about 2.6x on 1 MiB
+blocks, close to Silesia, with nothing to download. Besides MiB/s, `allocs/op`, and `B/op`, each
 reports `core-s/GiB` for both sides, `files/s`, and `comp-ratio`, the
 logical bytes received over the wire bytes, which the suite charts. With
 `adapt`, loopback is faster than any codec, so the policy should stay at
