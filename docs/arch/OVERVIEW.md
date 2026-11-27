@@ -411,16 +411,34 @@ concurrency, so a frame builds no encoder.
 A frame compresses on one goroutine unless the previous frame of the same
 window and codec compressed below 2 GiB/s on one goroutine
 (`encoding.FrameWidth`, in `frame_width.go` with the budget below). A
-window's first frame follows the process's last frame of its codec, so a
-file sent as one window still goes wide when its data is slow. A wide
-frame's time counts as its wall time times a speedup at or below the
-encoder's measured one, so a window of fast data that one misjudged frame
-widened narrows again after its next frame. A frame that did not shrink
-always counts as fast, since a loaded host can stretch a wide frame's wall
-time past the threshold. One goroutine reads its input in place and
-allocates nothing, and its cost matches the policy's single-core samples.
-Random and zero-filled data compress far faster than 2 GiB/s, so extra
-goroutines would only add overhead to them.
+window's first lz4 frame follows the process's last lz4 frame, so a file
+sent as one window still goes wide when its data is slow.
+
+A window's first zstd frame is narrow: it sets the ratio the window's wide
+zstd frames must keep, so a file of one zstd frame never compresses wide. A
+wide zstd frame finds matches only within 256 KiB, and across jobs only
+within the previous job's last 32 KiB, so data that repeats farther apart,
+such as duplicate files in an archive, can compress several times worse
+wide. A wide zstd frame that compresses by more than 1/4 worse than the
+window's last narrow one sends the next frame narrow, to measure the ratio
+next to it. A second loss in a row keeps the window's zstd frames narrow
+for 16 frames, and each loss on the wide frame that ends such a run doubles
+it, up to 256. Since a window can span a whole file whose data changes, a
+run of 16 wide zstd frames also sends one narrow frame to refresh the
+ratio. With every frame slow, 86% of a 1 GiB tar of source, binaries, and
+documentation goes wide, for 0.75% more wire bytes than narrow. The guard
+compares a wide frame with a neighboring narrow one, so it assumes
+neighboring frames compress alike; it misses lossy frames interleaved with
+ordinary ones.
+
+A wide frame's time counts as its wall time times a speedup at or below
+the encoder's measured one, so a window of fast data that one misjudged
+frame widened narrows again after its next frame. A frame that did not
+shrink always counts as fast, since a loaded host can stretch a wide
+frame's wall time past the threshold. One goroutine reads its input in
+place and allocates nothing, and its cost matches the policy's single-core
+samples. Random and zero-filled data compress far faster than 2 GiB/s, so
+extra goroutines would only add overhead to them.
 
 A slow frame may take more goroutines from a process-wide budget of
 GOMAXPROCS encoder goroutines: up to 4, at most one per 1 MiB of input. A

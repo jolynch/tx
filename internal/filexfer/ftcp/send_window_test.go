@@ -1113,11 +1113,13 @@ func windowEncoderConcurrency(t *testing.T, data []byte, comp, mode string) []in
 
 // A window widens only after a frame shows its data compresses slowly. Every
 // frame of a gentle window uses one goroutine; slow text frames go wide when
-// cores are free, from the first frame once an earlier window has shown lz4
-// or zstd to be slow. Random data compresses far faster than the threshold,
-// so a window of it stays mostly narrow: a frame misjudged as slow, such as a
-// cold first frame or one following the text window's hint, widens only the
-// next frame, whose measured speed narrows the window again.
+// cores are free, from the first lz4 frame once an earlier window has shown
+// lz4 to be slow. A window's first zstd frame stays narrow, since it sets
+// the ratio the window's wide zstd frames must keep. Random data compresses
+// far faster than the threshold, so a window of it stays mostly narrow: a
+// frame misjudged as slow, such as a cold first frame or one following the
+// text window's hint, widens only the next frame, whose measured speed
+// narrows the window again.
 func TestStreamSendItemWidensOnlySlowCompression(t *testing.T) {
 	const textFrames, randomFrames = 4, 12
 	text := wordyBytes(textFrames * int(defaultFileFrameLogicalSize))
@@ -1138,10 +1140,11 @@ func TestStreamSendItemWidensOnlySlowCompression(t *testing.T) {
 						t.Errorf("text frame %d used %d goroutine after slow frames on an idle %d-CPU budget: %v", i+1, c, runtime.GOMAXPROCS(0), conc)
 					}
 				}
-				// The first window above left a slow hint, so this one's
-				// first frame goes wide too.
-				if conc := windowEncoderConcurrency(t, text, comp, loadStrategyFast); conc[0] < 2 {
-					t.Errorf("a text window's first frame after a slow text window used %v goroutines", conc)
+				// The first window above left a slow lz4 hint, so this one's
+				// first lz4 frame goes wide too; its first zstd frame does not.
+				conc := windowEncoderConcurrency(t, text, comp, loadStrategyFast)
+				if wantWide := comp == encoding.EncodingLz4; (conc[0] >= 2) != wantWide {
+					t.Errorf("a %s text window's first frame after a slow text window used %v goroutines, want wide %v", comp, conc, wantWide)
 				}
 			}
 			// Under the race detector, the encoders run slowly enough that

@@ -5,7 +5,9 @@ package encoding
 //
 //   - FrameWidth, per window: may this frame use more than one? Only when the
 //     window's previous frame, of the same codec, compressed slowly; for a
-//     window's first frame, when the process's last frame of that codec did.
+//     window's first lz4 frame, when the process's last lz4 frame did. A
+//     window's zstd frames also keep the ratio of its narrow ones (see
+//     wideLosesMatches).
 //   - frameConcurrencyCap, per frame: at most one goroutine per 1 MiB block,
 //     within the codec's maximum.
 //   - frameCoreBudget, per process: 1, 2, or 4 goroutines within that cap,
@@ -59,22 +61,60 @@ func frameSpeedup(codec string, concurrency int) float64 {
 	}
 }
 
-// frameHints records, per codec, whether the process's most recent
-// compressed frame compressed slowly. A window's first frame follows it, so
-// a file that is a single window still compresses wide when its data is
-// slow, and a workload of fast data stays narrow from its first frame.
+// frameHints records whether the process's most recent lz4 frame
+// compressed slowly. A window's first lz4 frame follows it, so a file that
+// is a single window still compresses wide when its data is slow, and a
+// workload of fast data stays narrow from its first frame. zstd has no hint:
+// a window's first zstd frame is narrow, since it measures the ratio that
+// the window's wide frames must keep (see wideLosesMatches).
 type frameHints struct {
-	lz4, zstd atomic.Bool
+	lz4 atomic.Bool
 }
 
 func (h *frameHints) slow(codec string) *atomic.Bool {
-	switch codec {
-	case EncodingLz4:
+	if codec == EncodingLz4 {
 		return &h.lz4
-	case EncodingZstd:
-		return &h.zstd
 	}
 	return nil
+}
+
+// wideLosesMatches reports whether codec's wide frames can find fewer
+// matches than its narrow ones. A wide zstd frame compresses 1 MiB jobs in
+// parallel, each seeing only the last 32 KiB of the job before it and 256 KiB
+// within its own, while a narrow frame matches across the whole frame. Data
+// that repeats farther apart, such as duplicate files in an archive or
+// disk images, can compress several times worse wide. lz4 matches within
+// 64 KiB either way.
+func wideLosesMatches(codec string) bool {
+	return codec == EncodingZstd
+}
+
+// wideRatioLossDivisor sets how much worse than the window's last narrow
+// frame a wide frame may compress before it counts as a loss: by more than
+// 1/4 of the narrow ratio. Neighboring frames of an archive differ by more
+// than that often enough that a tighter bound keeps windows of ordinary data
+// narrow, while each frame's own wide and narrow ratios agree within a few
+// percent; data that repeats farther apart than a job sees loses 25-90%.
+const wideRatioLossDivisor = 4
+
+// zstdRecheckFrames is how many wide zstd frames a window sends before one
+// narrow frame refreshes the reference ratio, since a window can span a
+// whole file whose data changes; that takes about 14% more time than
+// staying wide at 3.4x. It is also the first narrow run after a confirmed
+// ratio loss. Each later loss, on the wide frame that ends a narrow run,
+// doubles the run, up to zstdMaxNarrowFrames, so data that keeps losing
+// sends few wide frames.
+const (
+	zstdRecheckFrames   = 16
+	zstdMaxNarrowFrames = 256
+)
+
+// losesRatio reports whether a frame compressed to wire bytes from logical
+// compressed by more than 1/wideRatioLossDivisor worse than the reference
+// frame. Both frames are at most a few MiB, so the products fit in int64.
+func losesRatio(logical, wire, refLogical, refWire int64) bool {
+	const d = wideRatioLossDivisor
+	return d*logical*refWire < (d-1)*refLogical*wire
 }
 
 var processFrameHints frameHints
@@ -88,6 +128,22 @@ type FrameWidth struct {
 	hints *frameHints // nil means processFrameHints
 	slow  bool
 	codec string
+	// refLogical and refWire are the sizes of the window's last narrow zstd
+	// frame, the ratio its wide zstd frames must keep.
+	refLogical, refWire int64
+	// suspect records a wide zstd frame that lost ratio against a reference
+	// that may hold different data. The next zstd frame is narrow, to take
+	// a reference next to it, and if the zstd frame after that is wide and
+	// loses ratio too, the loss is confirmed.
+	suspect bool
+	// narrowOnly keeps the window's zstd frames narrow after a confirmed
+	// ratio loss, until narrowRun narrow frames have passed. Frames of other
+	// codecs leave it.
+	narrowOnly bool
+	narrowRun  int
+	// zstdRun counts the window's zstd frames since the reference was taken
+	// or, while narrowOnly, since the ratio loss.
+	zstdRun int
 }
 
 func (w *FrameWidth) hintFor(codec string) *atomic.Bool {
@@ -99,8 +155,11 @@ func (w *FrameWidth) hintFor(codec string) *atomic.Bool {
 
 // Wide reports whether the next frame, compressed with codec, may use more
 // than one encoder goroutine: the previous frame used the same codec and
-// compressed slowly, or, for a window's first frame, the process's last frame
-// of that codec did.
+// compressed slowly, or, for a window's first lz4 frame, the process's last
+// lz4 frame did. A codec whose wide frames can lose matches widens only
+// after a narrow frame has set the ratio to keep, sends a narrow frame to
+// refresh it every zstdRecheckFrames frames or after a wide frame lost it,
+// and stays narrow for a while once a loss is confirmed.
 func (w *FrameWidth) Wide(codec string) bool {
 	if w.Gentle {
 		return false
@@ -109,7 +168,16 @@ func (w *FrameWidth) Wide(codec string) bool {
 		h := w.hintFor(codec)
 		return h != nil && h.Load()
 	}
-	return w.slow && w.codec == codec
+	if w.codec != codec || !w.slow {
+		return false
+	}
+	if !wideLosesMatches(codec) {
+		return true
+	}
+	if w.narrowOnly {
+		return w.zstdRun >= w.narrowRun
+	}
+	return w.refWire > 0 && w.zstdRun < zstdRecheckFrames
 }
 
 // FrameSample describes a sent frame to FrameWidth.Observe.
@@ -127,11 +195,46 @@ type FrameSample struct {
 // whatever its wall time: both codecs store incompressible input, such as
 // random, media, or encrypted data, at several GiB/s on one goroutine, and
 // on a loaded host the scheduling of a wide frame's goroutines can stretch
-// its wall time past the threshold.
+// its wall time past the threshold. A wide zstd frame that compressed worse
+// than the window's last narrow zstd frame makes the next one narrow, for a
+// reference next to it. A second loss in a row keeps the window's zstd
+// frames narrow for zstdRecheckFrames frames, and a loss on the wide frame
+// that ends such a run doubles it; a wide frame that kept the ratio ends
+// that.
 func (w *FrameWidth) Observe(s FrameSample) {
 	w.codec = s.Codec
 	w.slow = s.Concurrency > 0 && s.Wire < s.Logical &&
 		compressesSlowly(s.Logical, time.Duration(float64(s.Wall)*frameSpeedup(s.Codec, s.Concurrency)))
+	switch {
+	case !wideLosesMatches(s.Codec):
+	case s.Concurrency == 1:
+		w.refLogical, w.refWire = s.Logical, s.Wire
+		switch {
+		case w.narrowOnly:
+			w.zstdRun++
+		case w.suspect && w.zstdRun < zstdRecheckFrames:
+			// A second narrow frame since the loss: the next loss would not
+			// follow it.
+			w.suspect, w.zstdRun = false, 0
+		default:
+			w.zstdRun = 0
+		}
+	case s.Concurrency > 1 && w.refWire > 0 && losesRatio(s.Logical, s.Wire, w.refLogical, w.refWire):
+		switch {
+		case w.narrowOnly:
+			w.narrowRun, w.zstdRun = min(2*w.narrowRun, zstdMaxNarrowFrames), 0
+		case w.suspect:
+			w.suspect, w.narrowOnly, w.narrowRun, w.zstdRun = false, true, zstdRecheckFrames, 0
+		default:
+			// A full run makes Wide send the next frame narrow.
+			w.suspect, w.zstdRun = true, zstdRecheckFrames
+		}
+	case s.Concurrency > 1 && w.narrowOnly:
+		w.narrowOnly, w.zstdRun = false, 1
+	case s.Concurrency > 1:
+		w.suspect = false
+		w.zstdRun++
+	}
 	if h := w.hintFor(s.Codec); h != nil && s.Concurrency > 0 && h.Load() != w.slow {
 		h.Store(w.slow)
 	}

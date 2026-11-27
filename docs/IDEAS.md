@@ -529,9 +529,53 @@ instead of widening the current change; remove an entry when it ships.
   stays wide. Frames that do not shrink, such as random data, are exempt,
   but zeros shrink. With a zero-filled window appended to
   `TestStreamSendItemWidensOnlySlowCompression`, the lz4 subtest failed 1
-  of 18 runs on main and passed 18 of 18 with concurrent zstd blocks at a load of 34 on
-  24 CPUs. The cost is extra CPU on a host that has none to spare. The
-  CPU-saturation gate above would cover this too.
+  of 18 runs at a load of 34 on 24 CPUs. The cost is extra CPU on a host
+  that has none to spare. The CPU-saturation gate above would cover this
+  too.
+
+- **zstd frame width alternates for data between about 1.06 and
+  2 GiB/s.** `frameSpeedup` assumes 1.8x for a wide zstd frame where text
+  measures 3.4x on 4 goroutines. A narrow frame of such data reads as slow
+  and a wide one as fast, so widths alternate 1, 4, 1, 4. Text with
+  embedded random regions measured 1.27 and 1.68 GiB/s per core. The
+  alternating frame costs add noise to the policy's inputs. Hysteresis in
+  `FrameWidth` would settle it.
+
+- **The compression policy does not account for wide frames.**
+  `predictedFrame` (`policy/background.go`) subtracts the current codec's
+  single-goroutine sample cost from `PrepareLatency`, which holds a wide
+  frame's wall time, so with zstd wide the result clamps to
+  `ReadLatency`. Upward predictions use zstd's single-goroutine sample, so
+  adaptive mode rarely picks zstd where wide zstd would win, and the wide
+  zstd speedup reaches only forced-zstd transfers.
+
+- **The zstd ratio guard misses lossy frames among ordinary ones.**
+  `FrameWidth` compares a wide zstd frame with the window's last narrow
+  frame, which holds other data. When every second or third frame repeats
+  far back (ratio 20 narrow, 5 wide) and the rest is text at 3.5, a lossy
+  wide frame beats 3/4 of a text reference, so most go wide: at period 3,
+  1252 of 1365 lossy frames went wide and wire bytes rose to 1.22x of
+  narrow, against 1.24x all-wide. Disk images and tars of mixed trees can
+  look like this. Re-encoding a sampled frame narrow, to compare it with
+  its own wide encoding, would compare like with like for some extra CPU.
+
+- **A zstd file of one frame never compresses wide.** A window's first
+  zstd frame is narrow, since it sets the ratio that wide frames must keep,
+  so a 1–4 MiB file sent as one window compresses on one goroutine even on
+  an idle host. A process-wide reference ratio, or a hint that holds only
+  when recent windows kept their ratio wide, could let first frames widen
+  again.
+
+- **A wide zstd frame allocates about 35 times.** Each `Close` stops the
+  concurrent-block workers, so the next frame re-creates their channels,
+  goroutines, and job structs. The narrow path allocates nothing, and no
+  test pins the wide count. A frame encoder that keeps its workers between
+  frames, if the library allows it, would remove them.
+
+- **A failed wide frame leaks its encoder's workers.** When `Write` fails,
+  `appendStream` skips `Close`, and the dropped zstd encoder's job workers
+  stay blocked. Only an internal encode error or a recovered panic reaches
+  this path. Closing the encoder before dropping it would fix it.
 
 ## Security
 
