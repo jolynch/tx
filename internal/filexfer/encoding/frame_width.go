@@ -38,12 +38,20 @@ func compressesSlowly(logical int64, narrowWall time.Duration) bool {
 // encoders scale sublinearly, and would keep a window of fast data wide once
 // one frame was misjudged as slow, such as a window's first frame on a cold
 // encoder pool.
+//
+// Cheap data gains little from extra goroutines, so the estimate overstates
+// its single-goroutine time by nearly the full speedup. zstd therefore uses
+// its 2-goroutine speedup, 1.8x, at 4 goroutines as well, where text
+// measures 3.4x: at 3.4x, a wide frame of cheap data that a loaded host
+// slowed past 0.57 ms would read as slow and keep the window wide. Observe
+// counts incompressible frames as fast regardless; this margin covers cheap
+// data that does compress, such as zero-filled regions.
 func frameSpeedup(codec string, concurrency int) float64 {
 	switch {
 	case concurrency <= 1:
 		return 1
 	case codec == EncodingZstd:
-		return 1.3
+		return 1.8
 	case concurrency == 2:
 		return 1.6
 	default:
@@ -104,13 +112,27 @@ func (w *FrameWidth) Wide(codec string) bool {
 	return w.slow && w.codec == codec
 }
 
-// Observe records a sent frame: its codec, its logical size, and the
-// goroutines and wall time its encoder used. An uncompressed frame passes a
-// concurrency of 0.
-func (w *FrameWidth) Observe(codec string, logical int64, concurrency int, wall time.Duration) {
-	w.codec = codec
-	w.slow = concurrency > 0 && compressesSlowly(logical, time.Duration(float64(wall)*frameSpeedup(codec, concurrency)))
-	if h := w.hintFor(codec); h != nil && concurrency > 0 && h.Load() != w.slow {
+// FrameSample describes a sent frame to FrameWidth.Observe.
+type FrameSample struct {
+	Codec string
+	// Logical and Wire are the frame's size before and after compression.
+	Logical, Wire int64
+	// Concurrency and Wall are the goroutines and wall time its encoder
+	// used. An uncompressed frame passes a concurrency of 0.
+	Concurrency int
+	Wall        time.Duration
+}
+
+// Observe records a sent frame. A frame that did not shrink counts as fast
+// whatever its wall time: both codecs store incompressible input, such as
+// random, media, or encrypted data, at several GiB/s on one goroutine, and
+// on a loaded host the scheduling of a wide frame's goroutines can stretch
+// its wall time past the threshold.
+func (w *FrameWidth) Observe(s FrameSample) {
+	w.codec = s.Codec
+	w.slow = s.Concurrency > 0 && s.Wire < s.Logical &&
+		compressesSlowly(s.Logical, time.Duration(float64(s.Wall)*frameSpeedup(s.Codec, s.Concurrency)))
+	if h := w.hintFor(s.Codec); h != nil && s.Concurrency > 0 && h.Load() != w.slow {
 		h.Store(w.slow)
 	}
 }
@@ -120,11 +142,10 @@ func (w *FrameWidth) Observe(codec string, logical int64, concurrency int, wall 
 const frameBlockBytes = 1 << 20
 
 // Encoder concurrency for a frame is 1, 2, or 4, so each codec keeps at most
-// three encoder pools. Measured on 4 MiB frames, lz4 scales to about 2.9x at
-// 4 goroutines; zstd gains about 1.3x at 2 and nothing more at 4.
+// three encoder pools. frameSpeedup holds the measured scaling.
 const (
 	lz4MaxFrameConcurrency  = 4
-	zstdMaxFrameConcurrency = 2
+	zstdMaxFrameConcurrency = 4
 )
 
 // frameCoreBudget limits the encoder goroutines of all frames compressing at

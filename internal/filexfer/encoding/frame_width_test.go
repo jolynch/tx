@@ -30,6 +30,11 @@ func TestCompressesSlowly(t *testing.T) {
 	}
 }
 
+// sample describes a frame that compressed to half its size.
+func sample(codec string, logical int64, concurrency int, wall time.Duration) FrameSample {
+	return FrameSample{Codec: codec, Logical: logical, Wire: logical / 2, Concurrency: concurrency, Wall: wall}
+}
+
 // TestFrameWidth walks a window through the cases its policy distinguishes.
 func TestFrameWidth(t *testing.T) {
 	const frame = 4 << 20
@@ -38,28 +43,34 @@ func TestFrameWidth(t *testing.T) {
 	if w.Wide(EncodingLz4) {
 		t.Fatal("a window's first frame went wide")
 	}
-	w.Observe(EncodingLz4, frame, 1, slow)
+	w.Observe(sample(EncodingLz4, frame, 1, slow))
 	if !w.Wide(EncodingLz4) {
 		t.Fatal("the frame after a slow lz4 frame stayed narrow")
 	}
 	if w.Wide(EncodingZstd) {
 		t.Fatal("a zstd frame went wide on lz4's evidence")
 	}
-	w.Observe(EncodingLz4, frame, 4, slow/4) // still slow once spread
+	w.Observe(sample(EncodingLz4, frame, 4, slow/4)) // still slow once spread
 	if !w.Wide(EncodingLz4) {
 		t.Fatal("a wide frame that stayed slow narrowed the next")
 	}
-	w.Observe(EncodingLz4, frame, 4, fast/4) // the data turned cheap
+	w.Observe(sample(EncodingLz4, frame, 4, fast/4)) // the data turned cheap
 	if w.Wide(EncodingLz4) {
 		t.Fatal("the frame after a fast frame went wide")
 	}
-	w.Observe(EncodingLz4, frame, 1, slow)
-	w.Observe("none", frame, 0, 0)
+	stored := sample(EncodingZstd, frame, 4, slow)
+	stored.Wire = frame + 1
+	w.Observe(stored) // incompressible, slowed by a loaded host
+	if w.Wide(EncodingZstd) {
+		t.Fatal("the frame after a slow frame that did not shrink went wide")
+	}
+	w.Observe(sample(EncodingLz4, frame, 1, slow))
+	w.Observe(sample("none", frame, 0, 0))
 	if w.Wide(EncodingLz4) {
 		t.Fatal("the frame after an uncompressed frame went wide")
 	}
 	gentle := FrameWidth{Gentle: true, hints: w.hints}
-	gentle.Observe(EncodingLz4, frame, 1, slow)
+	gentle.Observe(sample(EncodingLz4, frame, 1, slow))
 	if gentle.Wide(EncodingLz4) {
 		t.Fatal("a gentle window went wide")
 	}
@@ -72,16 +83,16 @@ func TestFrameWidthFirstFrameFollowsHints(t *testing.T) {
 	slow, fast := 8*time.Millisecond, 200*time.Microsecond
 	hints := &frameHints{}
 	first := FrameWidth{hints: hints}
-	first.Observe(EncodingLz4, frame, 1, slow)
+	first.Observe(sample(EncodingLz4, frame, 1, slow))
 	if w := (FrameWidth{hints: hints}); !w.Wide(EncodingLz4) || w.Wide(EncodingZstd) {
 		t.Fatal("after a slow lz4 frame, a new window's first frame should go wide for lz4 only")
 	}
-	first.Observe("none", frame, 0, 0) // an uncompressed frame leaves the hint
+	first.Observe(sample("none", frame, 0, 0)) // an uncompressed frame leaves the hint
 	if w := (FrameWidth{hints: hints}); !w.Wide(EncodingLz4) {
 		t.Fatal("an uncompressed frame cleared the lz4 hint")
 	}
 	other := FrameWidth{hints: hints}
-	other.Observe(EncodingLz4, frame, 4, fast/4)
+	other.Observe(sample(EncodingLz4, frame, 4, fast/4))
 	if w := (FrameWidth{hints: hints}); w.Wide(EncodingLz4) {
 		t.Fatal("after a fast lz4 frame, a new window's first frame went wide")
 	}
@@ -97,9 +108,12 @@ func TestFrameWidthFirstFrameFollowsHints(t *testing.T) {
 // the CPU a narrow frame of the same data would take, and fast data then
 // stays wide for the rest of the window.
 //
-// The cases use frame_width.go's measured scaling (lz4 2.9x at 4, zstd 1.3x
-// at 2) and, for random data through zstd, measured wall times: 0.5 ms on
-// one goroutine, 1.2 ms on two through the streaming encoder.
+// The cases use measured scaling on text (lz4 2.9x at 4, zstd 1.8x at 2 and
+// 3.4x at 4) and, for cheap data that compresses, the wall times measured
+// for random data on 4 goroutines: 0.27 ms through lz4 and 0.45 ms through
+// zstd, against 0.17 ms and 0.43 ms on one. A loaded host may double the
+// wide times. Random data itself does not shrink, so Observe counts it as
+// fast whatever its wall time.
 func TestFrameWidthNarrowsWhenWideFramesOfFastData(t *testing.T) {
 	const frame = 4 << 20
 	narrow := func(bytesPerSec float64) time.Duration {
@@ -114,18 +128,22 @@ func TestFrameWidthNarrowsWhenWideFramesOfFastData(t *testing.T) {
 		wideWall    time.Duration
 	}{
 		{"lz4 at 2.5 GiB/s, 2.9x on 4", EncodingLz4, 4, narrow(2.5 * giB), narrow(2.5 * giB * 2.9)},
-		{"zstd at 2.5 GiB/s, 1.3x on 2", EncodingZstd, 2, narrow(2.5 * giB), narrow(2.5 * giB * 1.3)},
-		{"random data through zstd", EncodingZstd, 2, 500 * time.Microsecond, 1200 * time.Microsecond},
+		{"zstd at 2.5 GiB/s, 1.8x on 2", EncodingZstd, 2, narrow(2.5 * giB), narrow(2.5 * giB * 1.8)},
+		{"zstd at 2.5 GiB/s, 3.4x on 4", EncodingZstd, 4, narrow(2.5 * giB), narrow(2.5 * giB * 3.4)},
+		{"cheap data through zstd on 2", EncodingZstd, 2, 430 * time.Microsecond, 470 * time.Microsecond},
+		{"cheap data through zstd on 4", EncodingZstd, 4, 430 * time.Microsecond, 450 * time.Microsecond},
+		{"cheap data through zstd on 4, loaded", EncodingZstd, 4, 430 * time.Microsecond, 900 * time.Microsecond},
+		{"cheap data through lz4 on 4, loaded", EncodingLz4, 4, 170 * time.Microsecond, 540 * time.Microsecond},
 	} {
 		if compressesSlowly(frame, tc.narrowWall) {
 			t.Fatalf("%s: the case's narrow frame is slow; it must model fast data", tc.name)
 		}
 		w := FrameWidth{hints: &frameHints{}}
-		w.Observe(tc.codec, frame, 1, 3*time.Millisecond) // misjudged as slow
+		w.Observe(sample(tc.codec, frame, 1, 3*time.Millisecond)) // misjudged as slow
 		if !w.Wide(tc.codec) {
 			t.Fatalf("%s: the frame after a slow one stayed narrow", tc.name)
 		}
-		w.Observe(tc.codec, frame, tc.concurrency, tc.wideWall)
+		w.Observe(sample(tc.codec, frame, tc.concurrency, tc.wideWall))
 		if w.Wide(tc.codec) {
 			t.Errorf("%s: a %v frame on %d goroutines, whose data takes %v on one, kept the window wide", tc.name, tc.wideWall, tc.concurrency, tc.narrowWall)
 		}
@@ -134,14 +152,17 @@ func TestFrameWidthNarrowsWhenWideFramesOfFastData(t *testing.T) {
 
 // FuzzFrameWidth drives windows that share hints through random frames and
 // checks Wide against a model. Within a window, a frame may go wide only
-// after a frame of the same codec whose estimated one-goroutine time (wall
-// time times the encoder's speedup) put it below the threshold. A window's
+// after a frame of the same codec that shrank and whose estimated
+// one-goroutine time (wall time times the encoder's speedup) put it below
+// the threshold. A window's
 // first frame follows the last compressed frame of its codec in any window.
 // A gentle window never goes wide.
 func FuzzFrameWidth(f *testing.F) {
 	f.Add(false, []byte{0, 1, 200, 0, 1, 10})
 	f.Add(true, []byte{0, 1, 255, 0, 1, 255})
 	f.Add(false, []byte{1, 2, 128, 2, 0, 0, 1, 4, 30})
+	// Slow zstd, then a slow wide zstd frame that did not shrink.
+	f.Add(false, []byte{1, 0, 200, 1, 0x82, 200, 1, 2, 200})
 	// Slow lz4, then zstd (narrow), slow lz4, wide and still slow, wide and
 	// fast, then narrow.
 	f.Add(false, []byte{0, 0, 200, 1, 0, 0, 0, 0, 200, 0, 2, 31, 0, 2, 1, 0, 0, 0})
@@ -163,7 +184,8 @@ func FuzzFrameWidth(f *testing.F) {
 				continue
 			}
 			codec := codecs[int(ops[0])%len(codecs)]
-			concurrency := []int{1, 2, 4}[int(ops[1])%3]
+			concurrency := []int{1, 2, 4}[int(ops[1]&0x7f)%3]
+			stored := ops[1]&0x80 != 0
 			if codec == "none" {
 				concurrency = 0
 			}
@@ -179,9 +201,13 @@ func FuzzFrameWidth(f *testing.F) {
 			if got := w.Wide(codec); got != want {
 				t.Fatalf("Wide(%s) = %v after a %q frame (slow %v, hint %v), gentle %v", codec, got, lastCodec, lastSlow, hint[codec], gentle)
 			}
-			w.Observe(codec, 4<<20, concurrency, wall)
+			s := sample(codec, 4<<20, concurrency, wall)
+			if stored {
+				s.Wire = s.Logical + int64(wall/time.Microsecond)%64
+			}
+			w.Observe(s)
 			narrow := wall.Seconds() * frameSpeedup(codec, concurrency)
-			lastCodec, lastSlow = codec, concurrency > 0 && narrow > 0 && float64(4<<20) < WideCompressMaxBytesPerCoreSec*narrow
+			lastCodec, lastSlow = codec, concurrency > 0 && !stored && narrow > 0 && float64(4<<20) < WideCompressMaxBytesPerCoreSec*narrow
 			if concurrency > 0 {
 				hint[codec] = lastSlow
 			}

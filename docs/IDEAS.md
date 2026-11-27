@@ -522,6 +522,17 @@ instead of widening the current change; remove an entry when it ships.
   measure of CPU saturation, such as runnable goroutines, could gate wide
   grants.
 
+- **Cheap data that compresses can stay wide on an overloaded host.** On a
+  host loaded well past its core count, scheduling delays a wide frame's
+  goroutines enough that a frame of zero-filled data reads as slow after
+  `FrameWidth` scales its wall time by the encoder's speedup, so the window
+  stays wide. Frames that do not shrink, such as random data, are exempt,
+  but zeros shrink. With a zero-filled window appended to
+  `TestStreamSendItemWidensOnlySlowCompression`, the lz4 subtest failed 1
+  of 18 runs on main and passed 18 of 18 with concurrent zstd blocks at a load of 34 on
+  24 CPUs. The cost is extra CPU on a host that has none to spare. The
+  CPU-saturation gate above would cover this too.
+
 ## Security
 
 - **Credentials carry no scope.** Any allowlisted token or age key can list
