@@ -126,6 +126,7 @@ var frameEncoders = []struct {
 	{EncodingLz4, 4, appendLz4Frame},
 	{EncodingZstd, 1, appendZstdFrame},
 	{EncodingZstd, 2, appendZstdFrame},
+	{EncodingZstd, 4, appendZstdFrame},
 }
 
 // checkFrameRoundTrip appends src as a frame after prefix, then checks the
@@ -174,6 +175,8 @@ func FuzzAppendCompressedFrame(f *testing.F) {
 	f.Add(uint64(4), uint32(1<<20+1), uint8(3), true, uint8(17))
 	f.Add(uint64(5), uint32(4<<20), uint8(4), false, uint8(1))
 	f.Add(uint64(6), uint32(4<<20), uint8(5), true, uint8(0))
+	f.Add(uint64(7), uint32(4<<20), uint8(6), true, uint8(4))
+	f.Add(uint64(8), uint32(3<<20+17), uint8(5), false, uint8(9))
 	f.Fuzz(func(t *testing.T, seed uint64, size uint32, which uint8, compressible bool, prefixLen uint8) {
 		n := int(size % (8<<20 + 1))
 		src := frameTestContent(seed, n, compressible)

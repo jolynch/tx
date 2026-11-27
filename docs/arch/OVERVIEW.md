@@ -413,19 +413,23 @@ window and codec compressed below 2 GiB/s on one goroutine
 (`encoding.FrameWidth`, in `frame_width.go` with the budget below). A
 window's first frame follows the process's last frame of its codec, so a
 file sent as one window still goes wide when its data is slow. A wide
-frame's time counts as its wall time times the encoder's measured speedup,
-so a window of fast data that one misjudged frame widened narrows again
-after its next frame. One goroutine reads its input in place and allocates
-nothing, and its cost matches the policy's single-core samples. Random and
-zero-filled data compress far faster than 2 GiB/s, so extra goroutines
-would only add overhead to them.
+frame's time counts as its wall time times a speedup at or below the
+encoder's measured one, so a window of fast data that one misjudged frame
+widened narrows again after its next frame. A frame that did not shrink
+always counts as fast, since a loaded host can stretch a wide frame's wall
+time past the threshold. One goroutine reads its input in place and
+allocates nothing, and its cost matches the policy's single-core samples.
+Random and zero-filled data compress far faster than 2 GiB/s, so extra
+goroutines would only add overhead to them.
 
 A slow frame may take more goroutines from a process-wide budget of
-GOMAXPROCS encoder goroutines: up to 4 for lz4 and 2 for zstd, at most one
-per 1 MiB of input. Each frame takes one without waiting and the rest only
-if they are free. Fast mode runs at least one connection per core, so under
-load nearly every frame stays on one goroutine, while a frame compressing
-on an otherwise idle host finishes sooner. Gentle mode always uses one.
+GOMAXPROCS encoder goroutines: up to 4, at most one per 1 MiB of input. A
+wide zstd frame compresses concurrent blocks with a 256 KiB window, so each
+1 MiB of input is a separate job. Each frame takes one goroutine without
+waiting and the rest only if they are free. Fast mode runs at least one
+connection per core, so under load nearly every frame stays on one
+goroutine, while a frame compressing on an otherwise idle host finishes
+sooner. Gentle mode always uses one.
 
 ## Verification
 

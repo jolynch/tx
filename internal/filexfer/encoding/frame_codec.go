@@ -135,14 +135,32 @@ func appendLz4Frame(dst, src []byte, concurrency int) ([]byte, error) {
 // frames as-is, where nothing else checks them; and in lower encoder memory,
 // which saves about 4 MiB per pooled encoder at the same speed and ratio on
 // 4 MiB frames.
+//
+// Above concurrency 1, the encoder compresses concurrent blocks: it splits
+// the input into jobs of four windows and compresses them on separate
+// goroutines, each job seeded with the last 32 KiB of the one before. The
+// zstdFrameWindowBytes window makes a job one frameBlockBytes block, so a
+// 4 MiB frame splits four ways; the default window would make the whole
+// frame one job.
 func zstdFrameEncoderOptions(concurrency int) []zstd.EOption {
-	return []zstd.EOption{
+	opts := []zstd.EOption{
 		zstd.WithEncoderLevel(zstd.SpeedFastest),
 		zstd.WithEncoderConcurrency(concurrency),
 		zstd.WithEncoderCRC(false),
 		zstd.WithLowerEncoderMem(true),
 	}
+	if concurrency > 1 {
+		opts = append(opts, zstd.WithWindowSize(zstdFrameWindowBytes), zstd.WithConcurrentBlocks(true))
+	}
+	return opts
 }
+
+// zstdFrameWindowBytes is the window of a data frame compressed on several
+// goroutines. On 4 MiB frames of text it matches the default window's ratio.
+// zstd's block size is the smaller of the window and 128 KiB, and
+// MaxEncodedFrameSizeBytes assumes 128 KiB blocks, so the window must not
+// drop below 128 KiB.
+const zstdFrameWindowBytes = frameBlockBytes / 4
 
 // zstdFrameEncoder is a pooled data-frame zstd encoder with a fixed
 // concurrency.
@@ -152,12 +170,12 @@ type zstdFrameEncoder struct {
 }
 
 // zstdFrameEncoderPools has a pool for each concurrency frameConcurrencyIndex
-// maps, although zstdMaxFrameConcurrency stops at 2.
+// maps.
 var zstdFrameEncoderPools [3]sync.Pool
 
 // appendZstdFrame compresses src with a pooled encoder. At concurrency 1,
-// EncodeAll reads src in place with no streaming state. At 2, the streaming
-// encoder pipelines block compression on a second goroutine.
+// EncodeAll reads src in place with no streaming state. At 2 and 4, the
+// streaming encoder compresses concurrent blocks.
 func appendZstdFrame(dst, src []byte, concurrency int) ([]byte, error) {
 	pool := &zstdFrameEncoderPools[frameConcurrencyIndex(concurrency)]
 	e, _ := pool.Get().(*zstdFrameEncoder)

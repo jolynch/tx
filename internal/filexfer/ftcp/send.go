@@ -786,7 +786,13 @@ func streamSendWindow(ctx context.Context, out *sendOutput, deps Deps, txferID s
 		}
 		cursor = stats.NextOffset
 		remaining -= frameSize
-		width.Observe(frameComp, stats.LogicalSize, stats.CompressConcurrency, stats.CompressLatency)
+		width.Observe(encoding.FrameSample{
+			Codec:       frameComp,
+			Logical:     stats.LogicalSize,
+			Wire:        stats.WireSize,
+			Concurrency: stats.CompressConcurrency,
+			Wall:        stats.CompressLatency,
+		})
 		firstFrame = false
 		if isTerminal && scope.Sink.Enabled() && cursor >= fileRef.FileSize {
 			scope.Sink.Emit("file_done", txferID, events.F("conn", scope.Conn), events.F("file", item.FileID), events.Dur("dur", time.Since(itemStart)))
