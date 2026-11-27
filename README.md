@@ -1,12 +1,14 @@
 # tx performance history
 
-Latest: [e41b895](https://github.com/jolynch/tx/commit/e41b89511b79e11f6e37f787f1bd0a2a8983b4c5) (2026-11-26).
+Latest: [bfc1b8a](https://github.com/jolynch/tx/commit/bfc1b8a5b00ab33de0a0b96e115dbb77cfd9e7b1) (2026-11-26).
 
 One point per `main` merge: the median, with repeats as dots and min–max whiskers. Red and green lines mark sustained shifts. A dashed line means the benchmark changed; dotted, the machine.
 
 ## Shifts
 
-None detected.
+| Commits | Worse | Better |
+|---|---|---|
+| [1dc72fa…aeb3456](https://github.com/jolynch/tx/compare/1dc72fa086e85cdfe39c6359bd1ce4463800e7db...aeb3456be5c1c8744cfee8437b6a7e18c0650d73) | +8% [RequestRecords/long-paths](#control-path) B/op | +297% [WrapDecompressedReader/lz4](#ciphers-and-codecs) MiB/s<br>-33% [WrapDecompressedReader/lz4](#ciphers-and-codecs) allocs/op |
 
 ## End-to-End Copy Suites
 
@@ -14,10 +16,10 @@ Median and range across measured copies.
 
 | Workload | Throughput (MiB/s) | Copy time | Verification time | Most-used codec by frame count |
 | --- | --- | --- | --- | --- |
-| Compressible files | 68.1 (67.3–69.7) | 180 s (176–182) | 0.188 s (0.184–0.191) | none (58.3%) |
-| Large files | 3,109 (3,104–3,156) | 13.2 s (13–13.2) | 6.82 s (6.8–6.84) | none (100.0%) |
-| Mixed files | 1,487 (1,259–1,508) | 22 s (21.7–26) | 5.94 s (5.7–5.96) | none (100.0%) |
-| Small files | 309 (305–311) | 6.62 s (6.59–6.72) | 0.57 s (0.566–0.588) | none (100.0%) |
+| Compressible files | 66.5 (63.9–68.2) | 185 s (180–192) | 0.184 s (0.184–0.191) | none (61.9%) |
+| Large files | 3,128 (3,123–3,159) | 13.1 s (13–13.1) | 6.84 s (6.77–6.86) | none (100.0%) |
+| Mixed files | 1,484 (1,465–1,505) | 22.1 s (21.8–22.4) | 6.02 s (5.82–6.14) | none (100.0%) |
+| Small files | 308 (306–312) | 6.66 s (6.57–6.69) | 0.57 s (0.547–0.588) | none (100.0%) |
 
 ## End-to-End Copy Suites, throughput
 
@@ -26,7 +28,7 @@ Median and range across measured copies.
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout e41b89511b79e11f6e37f787f1bd0a2a8983b4c5
+git checkout bfc1b8a5b00ab33de0a0b96e115dbb77cfd9e7b1
 GOFLAGS= GOWORK=off go build -o ./tx ./cmd/tx
 GOFLAGS= GOWORK=off go build -o ./tx-bench ./cmd/tx-bench
 DATA=/path/on/the/drive/under/test  # remove the -dst trees between runs
@@ -65,7 +67,7 @@ Same commands as [End-to-End Copy Suites, throughput](#end-to-end-copy-suites-th
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout e41b89511b79e11f6e37f787f1bd0a2a8983b4c5
+git checkout bfc1b8a5b00ab33de0a0b96e115dbb77cfd9e7b1
 
 # transfer
 TX_BENCH_THROUGHPUT_MIN_WALL=5s make bench-throughput THROUGHPUT_SIZE=256MiB THROUGHPUT_CPUS=4,16 THROUGHPUT_ENCRYPT=none,aes,chacha20
@@ -80,13 +82,16 @@ TX_BENCH_THROUGHPUT_MIN_WALL=5s make bench-throughput THROUGHPUT_SIZE=256MiB THR
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout e41b89511b79e11f6e37f787f1bd0a2a8983b4c5
+git checkout bfc1b8a5b00ab33de0a0b96e115dbb77cfd9e7b1
 
 # cipher
 go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^Benchmark(Encrypt|Decrypt)Throughput$/^1MiB$/^(aesgcm|chacha20poly1305)$' ./internal/aead
 
 # codec
 go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkWrapDecompressedReader$/^(zstd|lz4)$' ./internal/bench
+
+# frame-codec
+go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkAppendCompressedFrame$/^(lz4|zstd)$/^(c1|auto)$' ./internal/bench
 ~~~
 
 </details>
@@ -98,7 +103,7 @@ go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkWrap
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout e41b89511b79e11f6e37f787f1bd0a2a8983b4c5
+git checkout bfc1b8a5b00ab33de0a0b96e115dbb77cfd9e7b1
 
 # ack
 go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkServePlaintextACKBody$' ./internal/filexfer/ftcp
@@ -122,7 +127,7 @@ go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkSpli
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout e41b89511b79e11f6e37f787f1bd0a2a8983b4c5
+git checkout bfc1b8a5b00ab33de0a0b96e115dbb77cfd9e7b1
 
 # handshake
 go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkHandshake$/^(token|age)$/^(aes|chacha20)$' ./internal/aead
@@ -137,13 +142,19 @@ go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkHand
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout e41b89511b79e11f6e37f787f1bd0a2a8983b4c5
+git checkout bfc1b8a5b00ab33de0a0b96e115dbb77cfd9e7b1
 
 # frames
 go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkSendFramePayload$/^(zerocopy|buffered)$/^(4KiB|1MiB)$' ./internal/filexfer/ftcp
 ~~~
 
 </details>
+
+## Compressed transfer
+
+![Compressed transfer](transfer-compressed.png)
+
+Commands for transfer-compressed were not recorded; see [Reproduce the workloads](#reproduce-the-workloads).
 
 ## Verification
 
@@ -152,7 +163,7 @@ go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkSend
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout e41b89511b79e11f6e37f787f1bd0a2a8983b4c5
+git checkout bfc1b8a5b00ab33de0a0b96e115dbb77cfd9e7b1
 
 # verify
 TX_VERIFY_BYTES=268435456 TX_VERIFY_CONCURRENCY=4 TX_VERIFY_IO_DEPTH=4 TX_VERIFY_IO_LATENCY='' go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkVerifyInMemory$/^(4KiB|1MiB|16MiB)$/^cpus=8$/^c=4$' ./internal/cmd/filexfercli
@@ -165,7 +176,7 @@ TX_VERIFY_BYTES=268435456 TX_VERIFY_CONCURRENCY=4 TX_VERIFY_IO_DEPTH=4 TX_VERIFY
 Print the commands from the measured checkout.
 
 ~~~bash
-git checkout e41b89511b79e11f6e37f787f1bd0a2a8983b4c5
+git checkout bfc1b8a5b00ab33de0a0b96e115dbb77cfd9e7b1
 make bench-suite-commands BENCH_SUITE=full
 ~~~
 
@@ -175,5 +186,5 @@ Flagged when the 8 measured commits before and after don't overlap and their med
 
 </details>
 
-Not measured: b85f279, e694c0c, bfc1b8a.
+Not measured: b85f279, e694c0c.
 
