@@ -1,6 +1,6 @@
 # tx performance history
 
-Latest: [e694c0c](https://github.com/jolynch/tx/commit/e694c0c5d4f1d6a0a0f3e3f2c653d58224ad3acb) (2026-11-26).
+Latest: [b85f279](https://github.com/jolynch/tx/commit/b85f279acae5f7268e10a2eb3a08603afee646c7) (2026-11-26).
 
 One point per `main` merge: the median, with repeats as dots and min–max whiskers. Red and green lines mark sustained shifts. A dashed line means the benchmark changed; dotted, the machine.
 
@@ -8,8 +8,8 @@ One point per `main` merge: the median, with repeats as dots and min–max whisk
 
 | Commits | Worse | Better |
 |---|---|---|
-| [aeb3456…e41b895](https://github.com/jolynch/tx/compare/aeb3456be5c1c8744cfee8437b6a7e18c0650d73...e41b89511b79e11f6e37f787f1bd0a2a8983b4c5) |  | -6% [Handshake/token/chacha20](#handshake) time/op |
-| [1dc72fa…aeb3456](https://github.com/jolynch/tx/compare/1dc72fa086e85cdfe39c6359bd1ce4463800e7db...aeb3456be5c1c8744cfee8437b6a7e18c0650d73) | +9% [RequestRecords/long-paths](#control-path) B/op | +297% [WrapDecompressedReader/lz4](#ciphers-and-codecs) MiB/s<br>-33% [WrapDecompressedReader/lz4](#ciphers-and-codecs) allocs/op |
+| [aeb3456…e41b895](https://github.com/jolynch/tx/compare/aeb3456be5c1c8744cfee8437b6a7e18c0650d73...e41b89511b79e11f6e37f787f1bd0a2a8983b4c5) | +5% [ServePlaintextACKBody](#control-path) B/op | -6% [Handshake/token/chacha20](#handshake) time/op |
+| [1dc72fa…aeb3456](https://github.com/jolynch/tx/compare/1dc72fa086e85cdfe39c6359bd1ce4463800e7db...aeb3456be5c1c8744cfee8437b6a7e18c0650d73) | +8% [RequestRecords/long-paths](#control-path) B/op | +297% [WrapDecompressedReader/lz4](#ciphers-and-codecs) MiB/s<br>-33% [WrapDecompressedReader/lz4](#ciphers-and-codecs) allocs/op |
 
 ## End-to-End Copy Suites
 
@@ -17,10 +17,10 @@ Median and range across measured copies.
 
 | Workload | Throughput (MiB/s) | Copy time | Verification time | Most-used codec by frame count |
 | --- | --- | --- | --- | --- |
-| Compressible files | 71.6 (57.4–73.9) | 172 s (166–214) | 0.174 s (0.174–0.178) | none (61.2%) |
-| Large files | 3,116 (3,111–3,138) | 13.1 s (13.1–13.2) | 6.83 s (6.8–6.87) | none (100.0%) |
-| Mixed files | 1,494 (1,287–1,512) | 21.9 s (21.7–25.5) | 5.84 s (5.65–5.99) | none (100.0%) |
-| Small files | 308 (305–310) | 6.64 s (6.61–6.7) | 0.55 s (0.547–0.57) | none (100.0%) |
+| Compressible files | 66.9 (65.3–70.4) | 184 s (175–188) | 0.19 s (0.184–0.19) | none (59.9%) |
+| Large files | 3,137 (3,134–3,140) | 13.1 s (13–13.1) | 6.8 s (6.76–6.82) | none (100.0%) |
+| Mixed files | 1,517 (1,295–1,524) | 21.6 s (21.5–25.3) | 5.88 s (4.9–6.06) | none (100.0%) |
+| Small files | 308 (307–310) | 6.65 s (6.61–6.66) | 0.576 s (0.572–0.581) | none (100.0%) |
 
 ## End-to-End Copy Suites, throughput
 
@@ -29,7 +29,7 @@ Median and range across measured copies.
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout e694c0c5d4f1d6a0a0f3e3f2c653d58224ad3acb
+git checkout b85f279acae5f7268e10a2eb3a08603afee646c7
 GOFLAGS= GOWORK=off go build -o ./tx ./cmd/tx
 GOFLAGS= GOWORK=off go build -o ./tx-bench ./cmd/tx-bench
 DATA=/path/on/the/drive/under/test  # remove the -dst trees between runs
@@ -68,7 +68,7 @@ Same commands as [End-to-End Copy Suites, throughput](#end-to-end-copy-suites-th
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout e694c0c5d4f1d6a0a0f3e3f2c653d58224ad3acb
+git checkout b85f279acae5f7268e10a2eb3a08603afee646c7
 
 # transfer
 TX_BENCH_THROUGHPUT_MIN_WALL=5s make bench-throughput THROUGHPUT_SIZE=256MiB THROUGHPUT_CPUS=4,16 THROUGHPUT_ENCRYPT=none,aes,chacha20
@@ -83,7 +83,7 @@ TX_BENCH_THROUGHPUT_MIN_WALL=5s make bench-throughput THROUGHPUT_SIZE=256MiB THR
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout e694c0c5d4f1d6a0a0f3e3f2c653d58224ad3acb
+git checkout b85f279acae5f7268e10a2eb3a08603afee646c7
 
 # cipher
 go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^Benchmark(Encrypt|Decrypt)Throughput$/^1MiB$/^(aesgcm|chacha20poly1305)$' ./internal/aead
@@ -104,7 +104,7 @@ go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkAppe
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout e694c0c5d4f1d6a0a0f3e3f2c653d58224ad3acb
+git checkout b85f279acae5f7268e10a2eb3a08603afee646c7
 
 # ack
 go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkServePlaintextACKBody$' ./internal/filexfer/ftcp
@@ -128,7 +128,7 @@ go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkSpli
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout e694c0c5d4f1d6a0a0f3e3f2c653d58224ad3acb
+git checkout b85f279acae5f7268e10a2eb3a08603afee646c7
 
 # handshake
 go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkHandshake$/^(token|age)$/^(aes|chacha20)$' ./internal/aead
@@ -143,7 +143,7 @@ go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkHand
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout e694c0c5d4f1d6a0a0f3e3f2c653d58224ad3acb
+git checkout b85f279acae5f7268e10a2eb3a08603afee646c7
 
 # frames
 go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkSendFramePayload$/^(zerocopy|buffered)$/^(4KiB|1MiB)$' ./internal/filexfer/ftcp
@@ -164,7 +164,7 @@ Commands for transfer-compressed were not recorded; see [Reproduce the workloads
 <details><summary>Commands</summary>
 
 ~~~bash
-git checkout e694c0c5d4f1d6a0a0f3e3f2c653d58224ad3acb
+git checkout b85f279acae5f7268e10a2eb3a08603afee646c7
 
 # verify
 TX_VERIFY_BYTES=268435456 TX_VERIFY_CONCURRENCY=4 TX_VERIFY_IO_DEPTH=4 TX_VERIFY_IO_LATENCY='' go test '-run=^$' -cpu=8 -benchmem -benchtime=1s -count=3 '-bench=^BenchmarkVerifyInMemory$/^(4KiB|1MiB|16MiB)$/^cpus=8$/^c=4$' ./internal/cmd/filexfercli
@@ -177,7 +177,7 @@ TX_VERIFY_BYTES=268435456 TX_VERIFY_CONCURRENCY=4 TX_VERIFY_IO_DEPTH=4 TX_VERIFY
 Print the commands from the measured checkout.
 
 ~~~bash
-git checkout e694c0c5d4f1d6a0a0f3e3f2c653d58224ad3acb
+git checkout b85f279acae5f7268e10a2eb3a08603afee646c7
 make bench-suite-commands BENCH_SUITE=full
 ~~~
 
@@ -186,6 +186,4 @@ make bench-suite-commands BENCH_SUITE=full
 Flagged when the 8 measured commits before and after don't overlap and their medians differ by at least 5% and 4× the median absolute deviation. Needs three commits after; never spans a dashed or dotted line.
 
 </details>
-
-Not measured: b85f279.
 
