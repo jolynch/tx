@@ -156,7 +156,9 @@ func zstdFrameEncoderOptions(concurrency int) []zstd.EOption {
 }
 
 // zstdFrameWindowBytes is the window of a data frame compressed on several
-// goroutines. On 4 MiB frames of text it matches the default window's ratio.
+// goroutines. On 4 MiB frames of text it matches the default window's ratio,
+// but data that repeats farther apart than a job sees compresses worse, so
+// FrameWidth narrows a window's zstd frames when wide ones lose ratio.
 // zstd's block size is the smaller of the window and 128 KiB, and
 // MaxEncodedFrameSizeBytes assumes 128 KiB blocks, so the window must not
 // drop below 128 KiB.
