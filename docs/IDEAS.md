@@ -616,23 +616,25 @@ instead of widening the current change; remove an entry when it ships.
   it compresses 50%. Its files go as one window each, so the share depends on
   how soon CPU-starved samples land. Repro: run `go test ./...` and look for
   `compressed 25% of bytes, want 30% to 100%`.
-- **`TestServeOpenServerReturnsPermits` flakes under load.** It failed once
-  in a full `go test ./...` with `permits leaked: server at handshake
-  capacity` and passes alone. Like `TestServeAdmissionBusy`, it dials right
-  after closing connections whose handshake permits the server may not have
-  returned yet; retrying each final dial until a deadline would fix it.
+- **`FuzzBackgroundThroughput` can exceed the heavy-noise share.** Input
+  `"Z,0222120007202020"` compresses 31.1% of frames where none would be 1.5
+  times faster, against `simHeavyOverShare` of 25%, while finishing 4.6%
+  faster than sending uncompressed. Over all 256 values of byte 1, the sim
+  seed, 2 fail (also `0x4b`, 36.7%); the seed `"Z00222120007202020"` passes.
+  It fails as far back as 1dc72fa. Repro: save the input under
+  `internal/filexfer/policy/testdata/fuzz/FuzzBackgroundThroughput/` and run
+  `go test -run=FuzzBackgroundThroughput ./internal/filexfer/policy`.
 - **`TestSendSamplingDiscoversZstdPastLz4/1-frame_windows` flakes.** It
   fails with "zstd was never discovered" in about 1 run in 10 in isolation,
   with or without shared window chains (3 of 30 and 2 of 30). A likely
   cause: a one-frame window uses a sample only when it finishes inside the
   frame, so slow samples leave zstd untried. Repro:
   `go test -run 'TestSendSamplingDiscoversZstdPastLz4/1-frame_windows' -count=30 ./internal/filexfer/ftcp/`.
-- **`TestServeAdmissionBusy` flakes under load.** Its last loop dials four
-  times in a row right after one dial succeeds, assuming every earlier
-  connection has returned its handshake permit; on a saturated machine one
-  has not yet, and the test fails with `server at handshake capacity`. It
-  passes alone. Retry each of the four dials until the deadline, as the
-  loop before them does.
+- **No test catches an admission permit released twice.** A connection's
+  permit release is idempotent, but nothing checks that one connection
+  cannot free another's slot. A second release after FINISH passes every
+  ftcp test. A test would hold one idle socket, complete a handshake, open a
+  second idle socket, and expect the next handshake to be refused.
 - **The policy sim does not model a fast response's buffer.** Recovery
   checks flush fast responses so home and candidates are timed to the same
   point, but the sim times every frame completely, so its fuzzers cannot

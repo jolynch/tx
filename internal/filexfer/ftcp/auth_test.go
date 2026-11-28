@@ -465,7 +465,7 @@ func TestServeAuthenticatedStalledRequestCloses(t *testing.T) {
 }
 
 func TestServeAdmissionBusy(t *testing.T) {
-	addr, pub := authServer(t, ServerOptions{RequireAuth: true, MaxUnauthenticatedConns: 2})
+	addr, pub := authServer(t, ServerOptions{RequireAuth: true, MaxUnauthenticatedConns: 2, KeepAliveTimeout: 10 * time.Second})
 	kp, _ := clientKey(t)
 	cfg := aead.ClientConfig{Mode: aead.ModeAge, Cipher: aead.AlgorithmAES, Static: kp, ServerKey: pub}
 	var idle []net.Conn
@@ -481,21 +481,49 @@ func TestServeAdmissionBusy(t *testing.T) {
 		c.Close()
 	}
 	// Permits come back when connections close, and after FINISH.
+	noiseDialServedEventually(t, addr, cfg)
+	for range 4 {
+		if err := noiseDialServed(t, addr, cfg); err != nil {
+			t.Fatalf("authenticated connections held permits: %v", err)
+		}
+	}
+}
+
+// noiseDialServed authenticates and completes one keep-alive PROBE, so the
+// server has read FINISH and released the handshake's admission permit: the
+// client's handshake returns once FINISH is sent, before the server reads
+// it. The server must set KeepAliveTimeout: the PROBE fails unless the
+// server grants keep-alive, so the session stays open and keeps proving it
+// holds no permit.
+func noiseDialServed(t *testing.T, addr string, cfg aead.ClientConfig) error {
+	t.Helper()
+	s, err := noiseDial(t, addr, cfg)
+	if err != nil {
+		return err
+	}
+	lines, err := noiseCommand(t, s, heartbeat)
+	if err != nil || len(lines) != 2 || !strings.HasPrefix(lines[0], "PROBE ") ||
+		!strings.Contains(lines[0], "keep-alive-ms=") || lines[1] != "OK" {
+		t.Fatalf("keep-alive PROBE = (%q, %v)", lines, err)
+	}
+	return nil
+}
+
+// noiseDialServedEventually retries noiseDialServed for up to 3s, for
+// permits that come back only once the server has closed earlier
+// connections.
+func noiseDialServedEventually(t *testing.T, addr string, cfg aead.ClientConfig) {
+	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		_, err := noiseDial(t, addr, cfg)
+		err := noiseDialServed(t, addr, cfg)
 		if err == nil {
-			break
+			return
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("permits not released: %v", err)
 		}
 		time.Sleep(20 * time.Millisecond)
-	}
-	for range 4 {
-		if _, err := noiseDial(t, addr, cfg); err != nil {
-			t.Fatalf("authenticated connections held permits: %v", err)
-		}
 	}
 }
 
@@ -541,7 +569,7 @@ func TestServeRejectsInvalidAllowlist(t *testing.T) {
 // An open server takes a permit when a connection starts AUTH; discovery,
 // refused handshakes, and successful ones must all return it.
 func TestServeOpenServerReturnsPermits(t *testing.T) {
-	addr, pub := authServer(t, ServerOptions{MaxUnauthenticatedConns: 2})
+	addr, pub := authServer(t, ServerOptions{MaxUnauthenticatedConns: 2, KeepAliveTimeout: 10 * time.Second})
 	kp, _ := clientKey(t)
 	for range 6 {
 		conn, _ := net.Dial("tcp", addr)
@@ -555,8 +583,11 @@ func TestServeOpenServerReturnsPermits(t *testing.T) {
 		// A handshake against the wrong server key is refused.
 		_, _ = noiseDial(t, addr, aead.ClientConfig{Mode: aead.ModeAge, Cipher: aead.AlgorithmAES, Static: kp, ServerKey: other.Public})
 	}
+	// Those connections return their permits as the server closes them.
+	cfg := aead.ClientConfig{Mode: aead.ModeAge, Cipher: aead.AlgorithmAES, Static: kp, ServerKey: pub}
+	noiseDialServedEventually(t, addr, cfg)
 	for range 4 {
-		if _, err := noiseDial(t, addr, aead.ClientConfig{Mode: aead.ModeAge, Cipher: aead.AlgorithmAES, Static: kp, ServerKey: pub}); err != nil {
+		if err := noiseDialServed(t, addr, cfg); err != nil {
 			t.Fatalf("permits leaked: %v", err)
 		}
 	}
