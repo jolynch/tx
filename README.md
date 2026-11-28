@@ -8,7 +8,8 @@ One point per `main` merge: the median, with repeats as dots and min–max whisk
 
 | Commits | Worse | Better |
 |---|---|---|
-| [b85f279…e950e02](https://github.com/jolynch/tx/compare/b85f279acae5f7268e10a2eb3a08603afee646c7...e950e02191b33e21aea343138a4e22df4c6ceb0a) |  | +45% [WrapDecompressedReader/zstd](#ciphers-and-codecs) MiB/s<br>-16% [TransferInMemoryCompressed/zstd/1MiB](#compressed-transfer) core-s/GiB<br>-14% [TransferInMemoryCompressed/zstd/16MiB](#compressed-transfer) core-s/GiB |
+| [e950e02…f3baa70](https://github.com/jolynch/tx/compare/e950e02191b33e21aea343138a4e22df4c6ceb0a...f3baa709d02e5dd64216f71138fd674a87df2375) |  | +85% [TransferInMemoryCompressedFew/zstd](#compressed-transfer) MiB/s |
+| [b85f279…e950e02](https://github.com/jolynch/tx/compare/b85f279acae5f7268e10a2eb3a08603afee646c7...e950e02191b33e21aea343138a4e22df4c6ceb0a) |  | +45% [WrapDecompressedReader/zstd](#ciphers-and-codecs) MiB/s<br>+17% [TransferInMemoryCompressed/zstd/1MiB](#compressed-transfer) MiB/s<br>+16% [TransferInMemoryCompressed/zstd/16MiB](#compressed-transfer) MiB/s<br>+3 more |
 | [aeb3456…e41b895](https://github.com/jolynch/tx/compare/aeb3456be5c1c8744cfee8437b6a7e18c0650d73...e41b89511b79e11f6e37f787f1bd0a2a8983b4c5) | +5% [ServePlaintextACKBody](#control-path) B/op |  |
 | [1dc72fa…aeb3456](https://github.com/jolynch/tx/compare/1dc72fa086e85cdfe39c6359bd1ce4463800e7db...aeb3456be5c1c8744cfee8437b6a7e18c0650d73) |  | +297% [WrapDecompressedReader/lz4](#ciphers-and-codecs) MiB/s<br>-33% [WrapDecompressedReader/lz4](#ciphers-and-codecs) allocs/op |
 
